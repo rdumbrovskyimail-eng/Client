@@ -19,4 +19,6 @@ out/
 build/
 *.log
 *.hprof
-!gradle/wrapper/gradle-wrapper.jar
+
+# Игнорируем бинарные jar — CI генерирует враппер сам
+*.jar
