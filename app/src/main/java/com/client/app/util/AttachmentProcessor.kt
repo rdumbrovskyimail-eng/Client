@@ -1,11 +1,9 @@
 package com.client.app.util
 
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Canvas
-import android.graphics.Color
+import android.graphics.*
 import android.graphics.pdf.PdfRenderer
+import android.media.ExifInterface
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
@@ -86,6 +84,22 @@ class AttachmentProcessor @Inject constructor(
 
     private fun loadScaledJpeg(uri: Uri): ByteArray? {
         val cr = context.contentResolver
+
+        // 1. Извлекаем EXIF поворот фото камеры S23 Ultra
+        val orientation = runCatching {
+            cr.openInputStream(uri)?.use { stream ->
+                ExifInterface(stream).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+            }
+        }.getOrNull() ?: ExifInterface.ORIENTATION_NORMAL
+
+        val rotationDegrees = when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+            ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+            ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+            else -> 0f
+        }
+
+        // 2. Читаем размеры
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
         if (bounds.outWidth <= 0) return null
@@ -97,16 +111,25 @@ class AttachmentProcessor @Inject constructor(
         val opts = BitmapFactory.Options().apply { inSampleSize = sample }
         val src = cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) } ?: return null
 
-        val scaled = if (maxOf(src.width, src.height) > MAX_SIDE) {
-            val scale = MAX_SIDE.toFloat() / maxOf(src.width, src.height)
-            Bitmap.createScaledBitmap(src, (src.width * scale).toInt(), (src.height * scale).toInt(), true).also {
+        // 3. Масштабируем и поворачиваем правильно
+        val matrix = Matrix()
+        if (rotationDegrees != 0f) matrix.postRotate(rotationDegrees)
+
+        val longestDecoded = maxOf(src.width, src.height)
+        if (longestDecoded > MAX_SIDE) {
+            val scale = MAX_SIDE.toFloat() / longestDecoded
+            matrix.postScale(scale, scale)
+        }
+
+        val resultBmp = if (!matrix.isIdentity) {
+            Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true).also {
                 if (it != src) src.recycle()
             }
         } else src
 
         val out = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
-        scaled.recycle()
+        resultBmp.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
+        resultBmp.recycle()
         return out.toByteArray()
     }
 
