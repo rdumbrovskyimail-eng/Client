@@ -1,3 +1,4 @@
+# >>> FILE: .github/workflows/android-build.yml
 name: Android CI
 
 on:
@@ -25,14 +26,14 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.10.2'
+          gradle-version: '8.14.3'
           cache-read-only: false
 
       - name: Ensure Gradle Wrapper JAR
         run: |
           if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
             echo "▶ Wrapper jar not found. Generating dynamically..."
-            gradle wrapper --gradle-version 8.10.2 --distribution-type bin
+            gradle wrapper --gradle-version 8.14.3 --distribution-type bin
           fi
           chmod +x gradlew
 
