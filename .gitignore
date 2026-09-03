@@ -22,3 +22,4 @@ build/
 
 # Игнорируем бинарные jar — CI генерирует враппер сам
 *.jar
+!gradle/wrapper/gradle-wrapper.jar
