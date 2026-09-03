@@ -20,9 +20,9 @@
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
-        android:label="Gemini Live Ultra"
+        android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.Material.NoActionBar"
+        android:theme="@style/Theme.ClientApp"
         android:enableOnBackInvokedCallback="true"
         tools:targetApi="36">
 
