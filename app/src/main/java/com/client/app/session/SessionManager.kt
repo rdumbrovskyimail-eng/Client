@@ -8,6 +8,7 @@ import android.os.Build
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import com.client.app.api.*
 import com.client.app.attach.AnalysisResult
@@ -94,6 +95,8 @@ class SessionManager @Inject constructor(
         val KEY_SYSTEM_PROMPT = stringPreferencesKey("gemini_system_prompt")
         val KEY_ENABLE_FORVO = booleanPreferencesKey("enable_forvo")
         val KEY_VOICE = stringPreferencesKey("gemini_voice")
+        val KEY_VOLUME = floatPreferencesKey("audio_volume")
+        val KEY_MIC_GAIN = floatPreferencesKey("audio_mic_gain")
 
         const val DEFAULT_SYSTEM_PROMPT =
             "Ты — интеллектуальный персональный ассистент с академической культурой речи. " +
