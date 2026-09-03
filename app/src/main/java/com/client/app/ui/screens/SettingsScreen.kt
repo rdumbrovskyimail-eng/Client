@@ -205,7 +205,7 @@ fun SettingsScreen(
                     value = settings.systemPrompt,
                     onValueChange = viewModel::setSystemPrompt,
                     label = { Text("Базовая инструкция ассистента") },
-                    modifier = Modifier.fillMaxWidth().height(140.dp),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp, max = 220.dp),
                     maxLines = 8,
                     shape = RoundedCornerShape(10.dp),
                     colors = darkFieldColors()
