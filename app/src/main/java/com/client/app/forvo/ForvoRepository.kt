@@ -27,9 +27,10 @@ class ForvoRepository @Inject constructor(
     companion object {
         val KEY_FORVO_API = stringPreferencesKey("forvo_api_key")
         private const val HOST = "https://apifree.forvo.com"
-        // Мультиязычная фильтрация артиклей (немецкий, английский, французский, испанский, итальянский)
+
+        // Мультиязычная фильтрация артиклей (с поддержкой апострофов l' и d' без пробела)
         private val ARTICLE_REGEX = Regex(
-            "^(der|die|das|dem|den|des|ein|eine|eines|einer|einem|einen|the|a|an|le|la|les|l'|un|une|des|el|la|los|las|lo|il|lo|la|i|gli|le|un'|uno)\\s+",
+            "^(der|die|das|dem|den|des|ein|eine|eines|einer|einem|einen|the|a|an|le|la|les|un|une|des|el|la|los|las|lo|il|i|gli|uno)\\s+|^([ldl]['’])",
             RegexOption.IGNORE_CASE
         )
     }
