@@ -1,3 +1,4 @@
+// >>> FILE: app/build.gradle.kts
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -18,7 +19,6 @@ android {
         versionCode = 1
         versionName = "1.0.0"
 
-        buildConfigField("String", "GEMINI_API_KEY", "\"${project.findProperty("GEMINI_API_KEY") ?: ""}\"")
         ndk {
             abiFilters.addAll(listOf("arm64-v8a"))
         }
@@ -46,23 +46,24 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-        freeCompilerArgs += listOf(
-            "-opt-in=kotlinx.coroutines.ExperimentalCoroutinesApi",
-            "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api"
-        )
-    }
-
     packaging {
         resources {
             excludes += setOf(
                 "META-INF/INDEX.LIST",
-                "META-INF/io.netty.versions.properties",
                 "META-INF/AL2.0",
                 "META-INF/LGPL2.1"
             )
         }
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        freeCompilerArgs.addAll(
+            "-opt-in=kotlinx.coroutines.ExperimentalCoroutinesApi",
+            "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api"
+        )
     }
 }
 
@@ -71,27 +72,36 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.10.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
-    implementation("androidx.lifecycle:lifecycle-service:2.8.7")
 
     // Compose Platform
-    val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
+    val composeBom = platform("androidx.compose:compose-bom:2025.02.00")
     implementation(composeBom)
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
-    implementation("androidx.compose.material:material-icons-extended")
+    
+    // Защита: явная версия extended иконок вне BOM
+    implementation("androidx.compose.material:material-icons-extended:1.7.8")
     implementation("androidx.compose.animation:animation")
     implementation("androidx.navigation:navigation-compose:2.8.5")
 
-    // Dagger Hilt
-    implementation("com.google.dagger:hilt-android:2.52")
-    ksp("com.google.dagger:hilt-android-compiler:2.52")
+    // Dagger Hilt (Синхронизирован с корнем 2.57.2)
+    implementation("com.google.dagger:hilt-android:2.57.2")
+    ksp("com.google.dagger:hilt-android-compiler:2.57.2")
     implementation("androidx.hilt:hilt-navigation-compose:1.2.0")
 
-    // Network & Data
+    // Network & Data (Актуальные стабильные под Kotlin 2.2.21)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
-    implementation("androidx.datastore:datastore-preferences:1.1.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
+    implementation("androidx.datastore:datastore-preferences:1.1.2")
     implementation("com.jakewharton.timber:timber:5.0.1")
+
+    // Hardware & Media Stack (10/10)
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
+    // Критично для MediaSessionCompat (защита от засыпания Samsung One UI)
+    implementation("androidx.media:media:1.7.0")
+
+    // Markdown рендеринг чата
+    implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.27.0")
 }
