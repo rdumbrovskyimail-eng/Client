@@ -33,17 +33,14 @@ class SettingsViewModel @Inject constructor(
     private val dataStore: DataStore<Preferences>
 ) : ViewModel() {
 
-    // Мгновенный in-memory стейт для плавной работы UI без задержек дискового ввода-вывода
     private val _settings = MutableStateFlow(AppSettingsState())
     val settings: StateFlow<AppSettingsState> = _settings.asStateFlow()
 
-    // Дебаунс-каналы для пакетной записи на накопитель
     private val apiKeyDebounce = MutableSharedFlow<String>(extraBufferCapacity = 1)
     private val promptDebounce = MutableSharedFlow<String>(extraBufferCapacity = 1)
     private val forvoKeyDebounce = MutableSharedFlow<String>(extraBufferCapacity = 1)
 
     init {
-        // Быстрая первоначальная загрузка настроек
         viewModelScope.launch {
             dataStore.data.first().let { p ->
                 _settings.value = AppSettingsState(
@@ -60,7 +57,6 @@ class SettingsViewModel @Inject constructor(
             }
         }
 
-        // Пакетная отложенная запись (350 мс) исключает лаги UI при наборе текста
         viewModelScope.launch {
             apiKeyDebounce.debounce(350).collect { k ->
                 dataStore.edit { it[SessionManager.KEY_API] = k.trim() }
@@ -112,24 +108,20 @@ class SettingsViewModel @Inject constructor(
         promptDebounce.tryEmit(sp)
     }
 
-    // Изменение громкости в UI (без дисковой записи на каждый шаг ползунка)
+    /** Вызывается из SettingsScreen строго при отпускании пальца (onValueChangeFinished) */
     fun setVolume(v: Float) {
         _settings.update { it.copy(volume = v) }
+        viewModelScope.launch {
+            dataStore.edit { it[SessionManager.KEY_VOLUME] = v }
+        }
     }
 
-    // Фиксация громкости на накопителе строго в момент отпускания пальца
-    fun saveVolume(v: Float) = viewModelScope.launch {
-        dataStore.edit { it[SessionManager.KEY_VOLUME] = v }
-    }
-
-    // Изменение чувствительности в UI
+    /** Вызывается из SettingsScreen строго при отпускании пальца (onValueChangeFinished) */
     fun setMicGain(g: Float) {
         _settings.update { it.copy(micGain = g) }
-    }
-
-    // Фиксация чувствительности микрофона при отпускании пальца
-    fun saveMicGain(g: Float) = viewModelScope.launch {
-        dataStore.edit { it[SessionManager.KEY_MIC_GAIN] = g }
+        viewModelScope.launch {
+            dataStore.edit { it[SessionManager.KEY_MIC_GAIN] = g }
+        }
     }
 
     fun setEnableForvo(e: Boolean) {
