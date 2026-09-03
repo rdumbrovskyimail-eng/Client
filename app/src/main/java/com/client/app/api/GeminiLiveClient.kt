@@ -298,8 +298,8 @@ class GeminiLiveClient @Inject constructor(
                         })
                     }
                 })
-                // turnComplete = false: история не должна вызывать спонтанный ответ модели
-                put("turnComplete", false)
+                // turnComplete = true: завершает этап initialHistoryInClientContent и открывает прием realtimeInput
+                put("turnComplete", true)
             })
         }
         ws.send(msg.toString())
