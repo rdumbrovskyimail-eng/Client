@@ -397,8 +397,8 @@ class SessionManager @Inject constructor(
         val voice = prefs[KEY_VOICE]?.ifBlank { null } ?: "Charon"
         val enableForvo = prefs[KEY_ENABLE_FORVO] ?: false
 
-        audioEngine.playbackVolume = prefs[SettingsViewModel.KEY_VOLUME] ?: 1.0f
-        audioEngine.micGain = prefs[SettingsViewModel.KEY_MIC_GAIN] ?: 1.0f
+        audioEngine.playbackVolume = prefs[KEY_VOLUME] ?: 1.0f
+        audioEngine.micGain = prefs[KEY_MIC_GAIN] ?: 1.0f
 
         _state.update {
             it.copy(
@@ -750,8 +750,8 @@ class SessionManager @Inject constructor(
             .map { prefs ->
                 Triple(
                     prefs[KEY_SYSTEM_PROMPT],
-                    prefs[SettingsViewModel.KEY_VOLUME] ?: 1.0f,
-                    prefs[SettingsViewModel.KEY_MIC_GAIN] ?: 1.0f
+                    prefs[KEY_VOLUME] ?: 1.0f,
+                    prefs[KEY_MIC_GAIN] ?: 1.0f
                 )
             }
             .distinctUntilChanged()
