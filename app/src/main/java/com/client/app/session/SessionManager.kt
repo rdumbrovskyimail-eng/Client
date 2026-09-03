@@ -165,6 +165,13 @@ class SessionManager @Inject constructor(
         }
     }
 
+    fun stopSession() = scope.launch {
+        mutex.withLock {
+            userStopped = true
+            stopInternal(full = true)
+        }
+    }
+
     fun applyPrompt(newPrompt: String) {
         val changed = _state.value.activePrompt != newPrompt
         _state.update { it.copy(activePrompt = newPrompt) }
