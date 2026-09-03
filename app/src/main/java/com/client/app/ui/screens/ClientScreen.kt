@@ -85,7 +85,6 @@ fun ClientScreen(
 
                 Spacer(Modifier.width(8.dp))
 
-                // Компактная плашка текущего промпта: клик открывает ModalBottomSheet для редактирования
                 Row(
                     modifier = Modifier
                         .weight(1f)
@@ -137,7 +136,6 @@ fun ClientScreen(
                 .padding(padding)
                 .imePadding()
         ) {
-            // Ошибки
             AnimatedVisibility(visible = state.error != null) {
                 Row(
                     modifier = Modifier
@@ -155,7 +153,6 @@ fun ClientScreen(
                 }
             }
 
-            // Forvo-панель
             AnimatedVisibility(visible = state.forvoWords.isNotEmpty()) {
                 Column(
                     modifier = Modifier
@@ -195,7 +192,6 @@ fun ClientScreen(
                 }
             }
 
-            // Центральная область: Живой Орб либо Лента сообщений
             Box(
                 modifier = Modifier.weight(1f).fillMaxWidth()
             ) {
@@ -209,8 +205,16 @@ fun ClientScreen(
                             isMicActive = state.isMicActive,
                             hasError = state.error != null,
                             onClick = {
-                                if (checkRecordPermission()) viewModel.toggleMic()
-                                else permLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                if (checkRecordPermission()) {
+                                    // Умный тап: если отключен — соединяемся, если подключен — управляем микрофоном
+                                    if (!state.isConnected && !state.isConnecting) {
+                                        viewModel.toggleConnection()
+                                    } else {
+                                        viewModel.toggleMic()
+                                    }
+                                } else {
+                                    permLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                }
                             }
                         )
                     }
@@ -232,7 +236,6 @@ fun ClientScreen(
                 }
             }
 
-            // Нижняя панель ввода
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -327,7 +330,6 @@ fun ClientScreen(
             }
         }
 
-        // Quick-Sheet для мгновенного изменения или очистки промпта
         if (isSheetOpen) {
             ModalBottomSheet(
                 onDismissRequest = { isSheetOpen = false },
