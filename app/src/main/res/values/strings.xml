@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Gemini Live Ultra</string>
+    <string name="session_active_title">Gemini Live Ultra активен</string>
+    <string name="session_active_desc">Аппаратный дуплекс и микрофон S23 Ultra активны</string>
+</resources>
