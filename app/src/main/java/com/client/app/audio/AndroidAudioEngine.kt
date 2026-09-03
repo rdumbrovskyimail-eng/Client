@@ -28,7 +28,6 @@ class AndroidAudioEngine @Inject constructor(
     companion object {
         const val SAMPLE_RATE_IN = 16000
         const val SAMPLE_RATE_OUT = 24000
-        // 40 мс при 16 кГц = 640 сэмплов (1280 байт) — минимальный квант задержки для S23 Ultra
         const val CHUNK_SIZE_SAMPLES = 640
         private const val JITTER_PRE_BUFFER_COUNT = 2
     }
@@ -39,7 +38,16 @@ class AndroidAudioEngine @Inject constructor(
     @Volatile var isPlaying: Boolean = false; private set
 
     @Volatile var micGain: Float = 1.25f
+
     @Volatile var playbackVolume: Float = 1.0f
+        set(value) {
+            val clamped = value.coerceIn(0f, 1f)
+            field = clamped
+            synchronized(trackLock) {
+                runCatching { audioTrack?.setVolume(clamped) }
+            }
+        }
+
     private var originalVoiceCallVolume: Int = -1
 
     private val _micOutput = MutableSharedFlow<ByteArray>(
@@ -83,7 +91,6 @@ class AndroidAudioEngine @Inject constructor(
                     @Suppress("DEPRECATION")
                     audioManager.isSpeakerphoneOn = true
                 }
-                // Принудительно устанавливаем громкость звонкового тракта на максимум
                 if (originalVoiceCallVolume == -1) {
                     originalVoiceCallVolume = audioManager.getStreamVolume(AudioManager.STREAM_VOICE_CALL)
                 }
@@ -176,7 +183,6 @@ class AndroidAudioEngine @Inject constructor(
                     val read = kotlinx.coroutines.runInterruptible { record.read(inBuf, 0, inBuf.size) }
                     if (read > 0) {
                         for (i in 0 until read) {
-                            // Лимитер с кубическим насыщением: быстрый DSP-фильтр без вызовов трансцендентных функций
                             val scaled = inBuf[i] * micGain
                             val norm = scaled / 32768.0f
                             val sat = when {
