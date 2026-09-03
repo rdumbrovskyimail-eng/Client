@@ -196,30 +196,11 @@ class GeminiLiveClient @Inject constructor(
                             })
                         })
                     })
-                    if (!cfg.conservative) {
-                        put("thinkingConfig", buildJsonObject {
-                            put("thinkingLevel", cfg.thinkingLevel.wire)
-                        })
-                        put("mediaResolution", "MEDIA_RESOLUTION_HIGH")
-                    }
+                    // thinkingConfig и mediaResolution не поддерживаются в BidiGenerateContentSetup и вызывают 1007
                 })
 
-                put("inputAudioTranscription", buildJsonObject {
-                    if (!cfg.conservative && cfg.transcriptionLanguages.isNotEmpty()) {
-                        put("languageCodes", buildJsonArray {
-                            cfg.transcriptionLanguages.forEach { add(JsonPrimitive(it)) }
-                        })
-                    }
-                    if (!cfg.conservative && cfg.customVocabulary.isNotEmpty()) {
-                        put("customVocabulary", buildJsonArray {
-                            cfg.customVocabulary.take(200).forEach { add(JsonPrimitive(it)) }
-                        })
-                    }
-                    if (!cfg.conservative) put("mode", "SMART")
-                })
-                put("outputAudioTranscription", buildJsonObject {
-                    if (!cfg.conservative) put("mode", "SMART")
-                })
+                put("inputAudioTranscription", buildJsonObject {})
+                put("outputAudioTranscription", buildJsonObject {})
 
                 if (cfg.systemInstruction.isNotBlank()) {
                     put("systemInstruction", buildJsonObject {
@@ -254,7 +235,7 @@ class GeminiLiveClient @Inject constructor(
                     cfg.resumptionHandle?.takeIf { it.isNotBlank() }?.let { put("handle", it) }
                 })
 
-                if (!cfg.conservative && cfg.initialHistory.isNotEmpty()) {
+                if (cfg.initialHistory.isNotEmpty()) {
                     put("historyConfig", buildJsonObject {
                         put("initialHistoryInClientContent", true)
                     })
@@ -344,7 +325,7 @@ class GeminiLiveClient @Inject constructor(
                 isReady = true
                 _events.tryEmit(GeminiEvent.SetupComplete)
                 // Затравка истории вызывается только если флаг historyConfig был передан в setup
-                if (!cfg.conservative && cfg.initialHistory.isNotEmpty()) {
+                if (cfg.initialHistory.isNotEmpty()) {
                     seedHistory(cfg.initialHistory)
                 }
             }
