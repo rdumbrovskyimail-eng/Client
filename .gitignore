@@ -1,25 +1,33 @@
+# IDE и системные файлы
 *.iml
-.gradle
-/local.properties
-/.idea/
+.idea/
 .DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+Thumbs.db
+*.ipr
+*.iws
+
+# Сборочные артефакты и кэш
+.gradle/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+out/
+bin/
+gen/
+
+# Локальные свойства окружения (SDK пути и ключи)
 local.properties
+
+# Скомпилированные бинарники
 *.apk
 *.aab
 *.dex
 *.class
-bin/
-gen/
-out/
-.gradle/
-build/
+
+# Логи и дампы памяти
 *.log
 *.hprof
 
-# Игнорируем бинарные jar — CI генерирует враппер сам
+# Игнорируем ВСЕ бинарные jar (CI генерирует wrapper.jar динамически)
 *.jar
-!gradle/wrapper/gradle-wrapper.jar
