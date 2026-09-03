@@ -1,12 +1,13 @@
+// >>> FILE: app/src/main/java/com/client/app/util/AttachmentProcessor.kt
 package com.client.app.util
 
 import android.content.Context
 import android.graphics.*
 import android.graphics.pdf.PdfRenderer
-import android.media.ExifInterface
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
+import androidx.exifinterface.media.ExifInterface
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -26,8 +27,8 @@ class AttachmentProcessor @Inject constructor(
     )
 
     companion object {
-        private const val MAX_SIDE = 1280
-        private const val JPEG_QUALITY = 82
+        private const val MAX_SIDE = 1568
+        private const val JPEG_QUALITY = 90
         private const val MAX_PDF_PAGES = 10
     }
 
@@ -85,7 +86,6 @@ class AttachmentProcessor @Inject constructor(
     private fun loadScaledJpeg(uri: Uri): ByteArray? {
         val cr = context.contentResolver
 
-        // 1. Извлекаем EXIF поворот фото камеры S23 Ultra
         val orientation = runCatching {
             cr.openInputStream(uri)?.use { stream ->
                 ExifInterface(stream).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
@@ -99,7 +99,6 @@ class AttachmentProcessor @Inject constructor(
             else -> 0f
         }
 
-        // 2. Читаем размеры
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
         if (bounds.outWidth <= 0) return null
@@ -111,7 +110,6 @@ class AttachmentProcessor @Inject constructor(
         val opts = BitmapFactory.Options().apply { inSampleSize = sample }
         val src = cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) } ?: return null
 
-        // 3. Масштабируем и поворачиваем правильно
         val matrix = Matrix()
         if (rotationDegrees != 0f) matrix.postRotate(rotationDegrees)
 
