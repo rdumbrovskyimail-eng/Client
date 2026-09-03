@@ -17,6 +17,7 @@ import com.client.app.forvo.ForvoRepository
 import com.client.app.service.LiveSessionForegroundService
 import com.client.app.util.AppLogger
 import com.client.app.util.AttachmentProcessor
+import com.client.app.viewmodel.SettingsViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -94,6 +95,11 @@ class SessionManager @Inject constructor(
                 if (!savedPrompt.isNullOrBlank() && _state.value.activePrompt == DEFAULT_SYSTEM_PROMPT) {
                     _state.update { it.copy(activePrompt = savedPrompt) }
                 }
+                // Применяем громкость и гейн S23 Ultra динамически
+                val vol = prefs[SettingsViewModel.KEY_VOLUME] ?: 1.0f
+                val gain = prefs[SettingsViewModel.KEY_MIC_GAIN] ?: 1.25f
+                audioEngine.playbackVolume = vol
+                audioEngine.micGain = gain
             }
         }
         observeEvents()
@@ -102,7 +108,17 @@ class SessionManager @Inject constructor(
     }
 
     fun updatePrompt(newPrompt: String) {
+        val changed = _state.value.activePrompt != newPrompt
         _state.update { it.copy(activePrompt = newPrompt) }
+        // Если сессия уже подключена, переподключаем с новым промптом
+        if (changed && (_state.value.isConnected || _state.value.isConnecting)) {
+            scope.launch {
+                mutex.withLock {
+                    stopInternal()
+                    startInternal()
+                }
+            }
+        }
     }
 
     fun toggleConnection() = scope.launch {
@@ -119,6 +135,16 @@ class SessionManager @Inject constructor(
     fun sendText(text: String, uris: List<Uri> = emptyList()) = scope.launch {
         val trimmed = text.trim()
         if (trimmed.isEmpty() && uris.isEmpty()) return@launch
+
+        // Если не подключены, подключаемся автоматически
+        if (!_state.value.isConnected && !_state.value.isConnecting) {
+            startInternal()
+            // Ждем готовности до 4 секунд
+            withTimeoutOrNull(4000L) {
+                while (!client.isReady) delay(50)
+            }
+        }
+
         streamingRole = null
 
         if (uris.isEmpty()) {
@@ -156,6 +182,9 @@ class SessionManager @Inject constructor(
         val apiKey = prefs[KEY_API]?.trim().orEmpty()
         val model = prefs[KEY_MODEL]?.ifBlank { "gemini-3.1-flash-live-preview" } ?: "gemini-3.1-flash-live-preview"
         val enableForvo = prefs[KEY_ENABLE_FORVO] ?: false
+
+        audioEngine.playbackVolume = prefs[SettingsViewModel.KEY_VOLUME] ?: 1.0f
+        audioEngine.micGain = prefs[SettingsViewModel.KEY_MIC_GAIN] ?: 1.25f
 
         if (apiKey.isEmpty()) {
             _state.update { it.copy(error = "Укажите Gemini API Key в Настройках") }
@@ -244,8 +273,14 @@ class SessionManager @Inject constructor(
                     audioEngine.enqueuePlayback(event.pcm)
                 }
                 is GeminiEvent.TurnComplete -> {
-                    _state.update { it.copy(isAiSpeaking = false) }
-                    audioEngine.resetClock()
+                    // TurnComplete означает конец генерации, но звук еще проигрывается из буфера!
+                    // resetClock() намеренно НЕ вызываем здесь, чтобы не обнулять audibleUntilMs
+                    scope.launch {
+                        delay(audioEngine.audibleUntilMs - System.currentTimeMillis())
+                        if (!_state.value.isConnecting) {
+                            _state.update { it.copy(isAiSpeaking = false) }
+                        }
+                    }
                 }
                 is GeminiEvent.Interrupted -> {
                     _state.update { it.copy(isAiSpeaking = false) }
