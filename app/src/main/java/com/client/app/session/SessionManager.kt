@@ -425,11 +425,34 @@ class SessionManager @Inject constructor(
         )
     }
 
-    private fun recentHistory(): List<Pair<String, String>> =
-        _state.value.messages
+    private fun recentHistory(): List<Pair<String, String>> {
+        val raw = _state.value.messages
             .filter { !it.interim && it.text.isNotBlank() }
-            .takeLast(20)
-            .map { it.role to it.text }
+
+        if (raw.isEmpty()) return emptyList()
+
+        // 1. Схлопываем идущие подряд реплики одной роли (user+user или model+model)
+        val merged = mutableListOf<Pair<String, String>>()
+        for (msg in raw) {
+            val role = if (msg.role == "model") "model" else "user"
+            val last = merged.lastOrNull()
+            if (last != null && last.first == role) {
+                merged[merged.size - 1] = role to "${last.second}\n\n${msg.text.trim()}"
+            } else {
+                merged.add(role to msg.text.trim())
+            }
+        }
+
+        // 2. Ограничиваем срез последними ходами (до 20)
+        var slice = merged.takeLast(20)
+
+        // 3. Диалог в Gemini обязан начинаться строго с реплики "user"
+        while (slice.isNotEmpty() && slice.first().first != "user") {
+            slice = slice.drop(1)
+        }
+
+        return slice
+    }
 
     private fun buildLanguageHints(): List<String> =
         listOfNotNull("ru", materialLanguage?.takeIf { it != "ru" }).distinct()
