@@ -225,10 +225,9 @@ class GeminiLiveClient @Inject constructor(
                     put("activityHandling", "START_OF_ACTIVITY_INTERRUPTS")
                 })
 
-                // Стандартные механизмы управления сессией (всегда включены)
+                // Стандартные механизмы управления сессией (калиброванные дефолты Google: 80% порог / 50% сохранение)
                 put("contextWindowCompression", buildJsonObject {
-                    put("triggerTokens", 48000L)
-                    put("slidingWindow", buildJsonObject { put("targetTokens", 16000L) })
+                    put("slidingWindow", buildJsonObject {})
                 })
 
                 put("sessionResumption", buildJsonObject {
