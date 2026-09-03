@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/java/com/client/app/viewmodel/ClientViewModel.kt
 package com.client.app.viewmodel
 
 import android.net.Uri
@@ -11,14 +12,18 @@ import javax.inject.Inject
 class ClientViewModel @Inject constructor(
     private val sessionManager: SessionManager
 ) : ViewModel() {
+
     val state = sessionManager.state
     val amplitude = sessionManager.amplitude
 
     fun toggleConnection() = sessionManager.toggleConnection()
+    fun stopSession() = sessionManager.stopSession()
     fun toggleMic() = sessionManager.toggleMic()
-    fun applyPrompt(p: String) = sessionManager.updatePrompt(p)
+    fun applyPrompt(p: String) = sessionManager.applyPrompt(p)
     fun sendText(text: String, uris: List<Uri>) = sessionManager.sendText(text, uris)
     fun playForvo(word: ForvoWord) = sessionManager.playForvo(word)
+    fun refetchAllForvo() = sessionManager.refetchAllForvo()
     fun clearForvo() = sessionManager.clearForvo()
     fun clearError() = sessionManager.clearError()
+    fun clearChat() = sessionManager.clearChat()
 }
