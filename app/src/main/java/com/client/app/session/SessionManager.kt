@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/java/com/client/app/session/SessionManager.kt
 package com.client.app.session
 
 import android.content.Context
@@ -21,7 +20,6 @@ import com.client.app.forvo.ForvoResult
 import com.client.app.service.LiveSessionForegroundService
 import com.client.app.util.AppLogger
 import com.client.app.util.AttachmentProcessor
-import com.client.app.viewmodel.SettingsViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -665,119 +663,4 @@ class SessionManager @Inject constructor(
                 ToolResponse(call.name, call.id, """{"error":"unknown_tool"}""")
             }
         }
-        client.sendToolResponses(responses)
-    }
-
-    /* ═════════════════════════ ТРАНСКРИПЦИИ ═════════════════════════ */
-
-    private fun appendTranscript(role: String, text: String, interim: Boolean) {
-        _state.update { s ->
-            val list = s.messages.toMutableList()
-
-            if (interim) {
-                val idx = list.indexOfLast { it.role == role && it.interim }
-                val msg = ChatMessage(role = role, text = text, interim = true)
-                if (idx >= 0) list[idx] = list[idx].copy(text = text) else list.add(msg)
-                return@update s.copy(messages = list.takeLast(MAX_MESSAGES))
-            }
-
-            list.removeAll { it.role == role && it.interim }
-
-            val last = list.lastOrNull()
-            if (streamingRole == role && last != null && last.role == role && !last.interim) {
-                list[list.size - 1] = last.copy(text = last.text + text)
-            } else {
-                list.add(ChatMessage(role = role, text = text))
-                streamingRole = role
-            }
-            s.copy(messages = list.takeLast(MAX_MESSAGES))
-        }
-    }
-
-    private fun addMessage(msg: ChatMessage) {
-        streamingRole = null
-        _state.update { it.copy(messages = (it.messages + msg).takeLast(MAX_MESSAGES)) }
-    }
-
-    /* ═════════════════════════ СИСТЕМНЫЙ ПРОМПТ ═════════════════════════ */
-
-    private fun buildEffectivePrompt(base: String, enableForvo: Boolean): String {
-        if (!enableForvo) return base
-        return base + "\n\n" + """
-            ИНСТРУМЕНТ ПРОИЗНОШЕНИЯ.
-            Тебе доступен `lookup_pronunciation`. Приложение уже самостоятельно
-            озвучивает всю лексику из загруженных материалов через Forvo.
-            Вызывай инструмент только для слов, которые возникают в живом разговоре
-            и которых не было в материале: когда пользователь спрашивает, как
-            что-то произносится, или ты вводишь новое редкое слово.
-            Передавай слова в базовой словарной форме БЕЗ артикля и указывай двухбуквенный код языка.
-        """.trimIndent()
-    }
-
-    private fun buildForvoToolsSchema(): JsonArray = buildJsonArray {
-        add(buildJsonObject {
-            put("functionDeclarations", buildJsonArray {
-                add(buildJsonObject {
-                    put("name", "lookup_pronunciation")
-                    put("description",
-                        "Показывает пользователю аудиокарточки с эталонным произношением слов от носителей языка.")
-                    put("parameters", buildJsonObject {
-                        put("type", "OBJECT")
-                        put("properties", buildJsonObject {
-                            put("words", buildJsonObject {
-                                put("type", "ARRAY")
-                                put("description", "Слова в начальной форме, без артиклей")
-                                put("items", buildJsonObject { put("type", "STRING") })
-                            })
-                            put("language", buildJsonObject {
-                                put("type", "STRING")
-                                put("description", "Код языка ISO 639-1: de, en, fr, es, it")
-                            })
-                        })
-                        put("required", buildJsonArray {
-                            add(JsonPrimitive("words")); add(JsonPrimitive("language"))
-                        })
-                    })
-                })
-            })
-        })
-    }
-
-    /* ═════════════════════════ НАСТРОЙКИ ═════════════════════════ */
-
-    private fun observeSettings() = scope.launch {
-        dataStore.data
-            .map { prefs ->
-                Triple(
-                    prefs[KEY_SYSTEM_PROMPT],
-                    prefs[KEY_VOLUME] ?: 1.0f,
-                    prefs[KEY_MIC_GAIN] ?: 1.0f
-                )
-            }
-            .distinctUntilChanged()
-            .collect { (prompt, vol, gain) ->
-                audioEngine.playbackVolume = vol
-                audioEngine.micGain = gain
-                if (!prompt.isNullOrBlank() && _state.value.link == LinkState.IDLE) {
-                    _state.update { it.copy(activePrompt = prompt) }
-                }
-            }
-    }
-
-    private fun startForegroundService() {
-        val intent = Intent(context, LiveSessionForegroundService::class.java)
-        runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
-        }.onFailure { logger.e("FGS start failed", it) }
-    }
-
-    private fun stopForegroundService() {
-        runCatching {
-            context.stopService(Intent(context, LiveSessionForegroundService::class.java))
-        }
-    }
-}
+        client.sendToolR
