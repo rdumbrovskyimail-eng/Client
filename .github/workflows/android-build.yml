@@ -6,6 +6,11 @@ on:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
+# Предотвращает конфликт параллельных сборок при быстрых пушах
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
@@ -23,18 +28,18 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      # Устанавливаем официальный CLI Gradle 8.14.3 в окружение runner'а
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.14.3'
           cache-read-only: false
 
-      - name: Ensure Gradle Wrapper JAR
+      # Динамическая генерация wrapper.jar и перезапись канонического gradlew
+      - name: Ensure Gradle Wrapper
         run: |
-          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
-            echo "▶ Wrapper jar not found. Generating dynamically..."
-            gradle wrapper --gradle-version 8.14.3 --distribution-type bin
-          fi
+          echo "▶ Генерация официального Gradle Wrapper 8.14.3..."
+          gradle wrapper --gradle-version 8.14.3 --distribution-type bin
           chmod +x gradlew
 
       - name: Setup Keystore
@@ -43,7 +48,7 @@ jobs:
           if [ -n "${{ secrets.DEBUG_KEYSTORE_B64 }}" ]; then
             echo "${{ secrets.DEBUG_KEYSTORE_B64 }}" | base64 -d > ~/.android/debug.keystore
           else
-            echo "▶ Generating fresh debug keystore for APK signing..."
+            echo "▶ Генерация временного отладочного ключа..."
             keytool -genkey -v \
               -keystore ~/.android/debug.keystore \
               -alias androiddebugkey \
@@ -71,9 +76,9 @@ jobs:
             SIZE_BYTES=$(stat -c%s "$APK_PATH")
             SIZE_MB=$(awk "BEGIN {printf \"%.2f\", $SIZE_BYTES / 1048576}")
             echo "apk_size=${SIZE_MB} MB" >> $GITHUB_OUTPUT
-            echo "▶ APK Size: ${SIZE_MB} MB"
+            echo "▶ Размер APK: ${SIZE_MB} MB"
           else
-            echo "❌ APK not found!"
+            echo "❌ Ошибка: APK не найден!"
             exit 1
           fi
 
@@ -90,13 +95,15 @@ jobs:
         with:
           tag_name: v1.0.${{ github.run_number }}
           name: "Gemini Live Ultra v1.0.${{ github.run_number }}"
+          make_latest: true
           body: |
-            ### 🚀 Gemini Live Ultra (Samsung S23 Ultra Optimized)
-            - **Commit:** `${{ github.sha }}`
+            ### 🚀 Gemini Live Ultra (Оптимизировано для Samsung S23 Ultra)
+            - **Коммит:** `${{ github.sha }}`
             - **Размер APK:** ${{ steps.apk_info.outputs.apk_size }}
-            - **Движок:** Gemini 3.1 Flash Live (`v1beta`) + Sub-40ms Low Latency
+            - **Движок:** Gemini 3.1 Flash Live (`v1beta`) + Sub-40ms Barge-In (Локальный VAD)
+            - **Лингвистика:** Автономный Forvo API + Двухуровневый разбор лексики Vision
             
-            **Установка:** Скачайте `.apk` ниже и установите на телефон.
+            **Установка:** Скачайте `.apk` ниже и установите на устройство.
           files: app/build/outputs/apk/debug/app-debug.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
