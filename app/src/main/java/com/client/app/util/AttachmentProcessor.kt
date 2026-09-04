@@ -50,14 +50,17 @@ class AttachmentProcessor @Inject constructor(
                         }
                     }
                     mime == "application/pdf" || name.endsWith(".pdf", true) -> {
-                        val (rendered, totalPages) = renderPdf(uri, MAX_PDF_PAGES)
-                        if (rendered.isNotEmpty()) {
-                            images.addAll(rendered)
-                            val label = if (totalPages > rendered.size) {
-                                "$name (первые ${rendered.size} из $totalPages стр.)"
-                            } else {
-                                "$name (${rendered.size} стр.)"
-                            }
+                        val pdf = processPdf(uri, MAX_PDF_PAGES)
+                        val label = if (pdf.totalPages > pdf.processedPages) {
+                            "$name (первые ${pdf.processedPages} из ${pdf.totalPages} стр.)"
+                        } else {
+                            "$name (${pdf.processedPages} стр.)"
+                        }
+                        if (pdf.text.isNotBlank()) {
+                            textBuilder.append("\n\n--- Документ: $name ---\n").append(pdf.text.take(60000))
+                            accepted.add("$label (текст)")
+                        } else if (pdf.images.isNotEmpty()) {
+                            images.addAll(pdf.images)
                             accepted.add(label)
                         }
                     }
@@ -136,14 +139,45 @@ class AttachmentProcessor @Inject constructor(
         return out.toByteArray()
     }
 
-    private fun renderPdf(uri: Uri, maxPages: Int): Pair<List<ByteArray>, Int> {
-        val list = mutableListOf<ByteArray>()
+    private data class PdfProcessed(
+        val images: List<ByteArray>,
+        val text: String,
+        val totalPages: Int,
+        val processedPages: Int
+    )
+
+    private fun processPdf(uri: Uri, maxPages: Int): PdfProcessed {
+        val images = mutableListOf<ByteArray>()
         var totalPages = 0
-        val pfd: ParcelFileDescriptor = context.contentResolver.openFileDescriptor(uri, "r") ?: return Pair(list, 0)
+        var count = 0
+        val pfd: ParcelFileDescriptor = context.contentResolver.openFileDescriptor(uri, "r")
+            ?: return PdfProcessed(images, "", 0, 0)
+
         pfd.use {
             PdfRenderer(it).use { renderer ->
                 totalPages = renderer.pageCount
-                val count = minOf(totalPages, maxPages)
+                count = minOf(totalPages, maxPages)
+
+                // 1. Извлечение нативного цифрового текстового слоя на Android 15+ (API 35+)
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+                    val sb = StringBuilder()
+                    for (i in 0 until count) {
+                        renderer.openPage(i).use { page ->
+                            runCatching {
+                                val pageText = page.textContents.joinToString(" ") { tc -> tc.text }.trim()
+                                if (pageText.isNotEmpty()) {
+                                    sb.append("--- Стр. ").append(i + 1).append(" ---\n").append(pageText).append("\n\n")
+                                }
+                            }
+                        }
+                    }
+                    // Если обнаружен связный текст (не пустой скан), отдаем чистый текст без создания растровых картинок
+                    if (sb.length > count * 50) {
+                        return PdfProcessed(images, sb.toString().trim(), totalPages, count)
+                    }
+                }
+
+                // 2. Графический скан или Android < 15: попиксельный рендеринг в JPEG для Gemini Vision OCR
                 for (i in 0 until count) {
                     renderer.openPage(i).use { page ->
                         val scale = MAX_SIDE.toFloat() / maxOf(page.width, page.height)
@@ -155,11 +189,11 @@ class AttachmentProcessor @Inject constructor(
                         val out = ByteArrayOutputStream()
                         bmp.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
                         bmp.recycle()
-                        list.add(out.toByteArray())
+                        images.add(out.toByteArray())
                     }
                 }
             }
         }
-        return Pair(list, totalPages)
+        return PdfProcessed(images, "", totalPages, count)
     }
 }
