@@ -265,11 +265,6 @@ class AndroidAudioEngine @Inject constructor(
                         .build()
                 )
                 .setBufferSizeInBytes(maxOf(minBuf, CHUNK_BYTES * 8))
-                .apply {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        setPrivacySensitive(true)
-                    }
-                }
                 .build()
         } catch (e: Exception) {
             logger.e("AudioRecord creation failed", e)
