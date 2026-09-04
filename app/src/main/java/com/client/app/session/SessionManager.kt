@@ -241,6 +241,7 @@ class SessionManager @Inject constructor(
     fun refetchAllForvo() {
         val words = _state.value.forvoWords
         if (words.isEmpty()) return
+        forvoRepo.clearMisses()
         scope.launch {
             resolveForvo(
                 words.map { VocabItem(it.word, it.query, it.translation) },
@@ -249,7 +250,10 @@ class SessionManager @Inject constructor(
         }
     }
 
-    fun clearForvo() = _state.update { it.copy(forvoWords = emptyList()) }
+    fun clearForvo() {
+        forvoRepo.clearMisses()
+        _state.update { it.copy(forvoWords = emptyList()) }
+    }
     fun clearError() = _state.update { it.copy(error = null) }
     fun clearChat() = _state.update { it.copy(messages = emptyList()) }
 
