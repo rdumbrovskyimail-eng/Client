@@ -41,6 +41,9 @@ class AndroidAudioEngine @Inject constructor(
         /** Пре-буфер воспроизведения для сглаживания сетевого джиттера */
         private const val JITTER_PRE_BUFFER = 2
 
+        /** Максимальная емкость очереди воспроизведения для защиты от бесконечного раздувания кучи */
+        private const val PLAYBACK_BUFFER_CAPACITY = 1024
+
         /* ── Пороги локального VAD (10/10 Reference-Based) ── */
         private const val VAD_FLOOR_MIN = 0.012f
         private const val VAD_RATIO_IDLE = 3.0f
@@ -103,7 +106,7 @@ class AndroidAudioEngine @Inject constructor(
 
     private val captureMutex = Mutex()
     private val trackLock = Any()
-    private var playbackChannel = Channel<ByteArray>(Channel.UNLIMITED)
+    private var playbackChannel = Channel<ByteArray>(PLAYBACK_BUFFER_CAPACITY, BufferOverflow.DROP_OLDEST)
 
     /* ── Метрики воспроизведения и VAD ── */
     @Volatile private var framesWritten: Long = 0L
@@ -452,7 +455,9 @@ class AndroidAudioEngine @Inject constructor(
         if (!engineScope.isActive) {
             engineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         }
-        if (playbackChannel.isClosedForSend) playbackChannel = Channel(Channel.UNLIMITED)
+        if (playbackChannel.isClosedForSend) {
+            playbackChannel = Channel(PLAYBACK_BUFFER_CAPACITY, BufferOverflow.DROP_OLDEST)
+        }
 
         requestFocus()
 
