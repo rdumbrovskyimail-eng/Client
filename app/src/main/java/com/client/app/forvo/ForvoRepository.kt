@@ -229,7 +229,6 @@ class ForvoRepository @Inject constructor(
         var attempt = 0
         while (true) {
             try {
-                bump(1)
                 client.newCall(Request.Builder().url(url).get().build()).execute().use { resp ->
                     val body = resp.body?.string().orEmpty()
 
@@ -254,6 +253,7 @@ class ForvoRepository @Inject constructor(
                             return ForvoResult.Failed("Forvo: HTTP ${resp.code}")
                     }
 
+                    bump(1)
                     return parseBody(body, word)
                 }
             } catch (e: Exception) {
