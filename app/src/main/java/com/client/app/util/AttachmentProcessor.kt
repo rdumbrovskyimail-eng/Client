@@ -29,7 +29,7 @@ class AttachmentProcessor @Inject constructor(
     companion object {
         private const val MAX_SIDE = 1568
         private const val JPEG_QUALITY = 90
-        private const val MAX_PDF_PAGES = 10
+        private const val MAX_PDF_PAGES = 16
     }
 
     suspend fun process(uris: List<Uri>): Result = withContext(Dispatchers.IO) {
@@ -50,10 +50,15 @@ class AttachmentProcessor @Inject constructor(
                         }
                     }
                     mime == "application/pdf" || name.endsWith(".pdf", true) -> {
-                        val rendered = renderPdf(uri, MAX_PDF_PAGES)
+                        val (rendered, totalPages) = renderPdf(uri, MAX_PDF_PAGES)
                         if (rendered.isNotEmpty()) {
                             images.addAll(rendered)
-                            accepted.add("$name (${rendered.size} стр.)")
+                            val label = if (totalPages > rendered.size) {
+                                "$name (первые ${rendered.size} из $totalPages стр.)"
+                            } else {
+                                "$name (${rendered.size} стр.)"
+                            }
+                            accepted.add(label)
                         }
                     }
                     isTextFormat(mime, name) -> {
@@ -131,12 +136,14 @@ class AttachmentProcessor @Inject constructor(
         return out.toByteArray()
     }
 
-    private fun renderPdf(uri: Uri, maxPages: Int): List<ByteArray> {
+    private fun renderPdf(uri: Uri, maxPages: Int): Pair<List<ByteArray>, Int> {
         val list = mutableListOf<ByteArray>()
-        val pfd: ParcelFileDescriptor = context.contentResolver.openFileDescriptor(uri, "r") ?: return list
+        var totalPages = 0
+        val pfd: ParcelFileDescriptor = context.contentResolver.openFileDescriptor(uri, "r") ?: return Pair(list, 0)
         pfd.use {
             PdfRenderer(it).use { renderer ->
-                val count = minOf(renderer.pageCount, maxPages)
+                totalPages = renderer.pageCount
+                val count = minOf(totalPages, maxPages)
                 for (i in 0 until count) {
                     renderer.openPage(i).use { page ->
                         val scale = MAX_SIDE.toFloat() / maxOf(page.width, page.height)
@@ -153,6 +160,6 @@ class AttachmentProcessor @Inject constructor(
                 }
             }
         }
-        return list
+        return Pair(list, totalPages)
     }
 }
