@@ -197,9 +197,17 @@ class AndroidAudioEngine @Inject constructor(
                     } ?: devices.firstOrNull {
                         it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
                     }
+                    var routed = false
                     if (preferred != null) {
-                        audioManager.setCommunicationDevice(preferred)
-                        logger.d("Audio route → ${preferred.type}")
+                        routed = audioManager.setCommunicationDevice(preferred)
+                        logger.d("Audio route → ${preferred.type} (success=$routed)")
+                    }
+                    if (!routed) {
+                        devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }?.let { speaker ->
+                            audioManager.setCommunicationDevice(speaker)
+                        }
+                        @Suppress("DEPRECATION")
+                        audioManager.isSpeakerphoneOn = true
                     }
                 } else {
                     @Suppress("DEPRECATION")
