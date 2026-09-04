@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import com.client.app.util.AppLogger
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -117,11 +118,11 @@ class ForvoRepository @Inject constructor(
         words: List<String>,
         lang: String,
         onResult: (word: String, result: ForvoResult) -> Unit
-    ) = coroutineScope {
+    ) = withContext(Dispatchers.IO) {
         val apiKey = readApiKey()
         if (apiKey.isEmpty()) {
             words.forEach { onResult(it, ForvoResult.NoApiKey) }
-            return@coroutineScope
+            return@withContext
         }
 
         // Синхронизируем квоту с DataStore один раз перед запуском батча
@@ -132,10 +133,19 @@ class ForvoRepository @Inject constructor(
             .filter { it.isNotBlank() }
             .distinctBy { it.lowercase() }
 
-        unique.forEach { word ->
+        if (unique.isEmpty()) return@withContext
+
+        val channel = Channel<String>(unique.size)
+        unique.forEach { channel.trySend(it) }
+        channel.close()
+
+        val workers = minOf(MAX_PARALLEL, unique.size)
+        repeat(workers) {
             launch {
-                val res = lookupInternal(word, lang, apiKey)
-                onResult(word, res)
+                for (word in channel) {
+                    val res = lookupInternal(word, lang, apiKey)
+                    onResult(word, res)
+                }
             }
         }
     }
