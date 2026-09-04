@@ -123,7 +123,10 @@ class GeminiLiveClient @Inject constructor(
         epoch = myEpoch
 
         val url = "wss://$WS_HOST/$WS_PATH?key=${cfg.apiKey.trim()}"
-        val req = Request.Builder().url(url).build()
+        val req = Request.Builder()
+            .url(url)
+            .header("x-goog-api-key", cfg.apiKey.trim())
+            .build()
 
         webSocket = httpClient.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
