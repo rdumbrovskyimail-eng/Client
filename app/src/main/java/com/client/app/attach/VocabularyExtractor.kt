@@ -178,8 +178,8 @@ class VocabularyExtractor @Inject constructor(
                 put("responseSchema", schema(forLanguageLearning))
                 put("temperature", 0.1)
                 put("maxOutputTokens", 32768)
-                // mediaResolution используется только на первичной модели 3.x во избежание ошибки 400
-                if (!isFallbackAttempt && !modelId.contains("2.0") && !modelId.contains("1.5")) {
+                // Запрашиваем высокое разрешение (1120 токенов на изображение) для глубокого OCR страниц учебников
+                if (!isFallbackAttempt) {
                     put("mediaResolution", "MEDIA_RESOLUTION_HIGH")
                 }
             })
