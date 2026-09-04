@@ -106,6 +106,7 @@ class AndroidAudioEngine @Inject constructor(
 
     /* ── Метрики воспроизведения и VAD ── */
     @Volatile private var framesWritten: Long = 0L
+    @Volatile private var headOffset: Long = 0L
     @Volatile private var noiseFloor: Float = VAD_FLOOR_MIN
     @Volatile private var referencePlaybackRms: Float = 0f
     @Volatile private var speechRun: Int = 0
@@ -118,8 +119,11 @@ class AndroidAudioEngine @Inject constructor(
      */
     fun pendingPlaybackFrames(): Long {
         val t = audioTrack ?: return 0L
-        val head = runCatching { t.playbackHeadPosition.toLong() }.getOrDefault(0L)
-        return (framesWritten - head).coerceAtLeast(0L)
+        // Маска 0xFFFFFFFFL защищает от знакопеременного инвертирования 32-битного счетчика в Long
+        val rawHead = runCatching { t.playbackHeadPosition.toLong() and 0xFFFFFFFFL }.getOrDefault(0L)
+        // Корректный учет асинхронного сброса HAL: если rawHead < headOffset, HAL обнулил регистр
+        val relativeHead = if (rawHead >= headOffset) rawHead - headOffset else rawHead
+        return (framesWritten - relativeHead).coerceAtLeast(0L)
     }
 
     fun isRenderingAudio(): Boolean = pendingPlaybackFrames() > 0
@@ -546,17 +550,23 @@ class AndroidAudioEngine @Inject constructor(
                     if (t.state == AudioTrack.STATE_INITIALIZED) {
                         t.pause()
                         t.flush()
+                        val rawHead = runCatching { t.playbackHeadPosition.toLong() and 0xFFFFFFFFL }.getOrDefault(0L)
+                        headOffset = rawHead
+                        framesWritten = 0L
                         t.play()
                     }
                 }
             }
-            framesWritten = 0L
         }
         _outLevel.value = 0f
     }
 
     fun resetClock() {
-        synchronized(trackLock) { framesWritten = 0L }
+        synchronized(trackLock) {
+            val rawHead = runCatching { audioTrack?.playbackHeadPosition?.toLong()?.and(0xFFFFFFFFL) }.getOrNull() ?: 0L
+            headOffset = rawHead
+            framesWritten = 0L
+        }
     }
 
     suspend fun releaseAll() {
