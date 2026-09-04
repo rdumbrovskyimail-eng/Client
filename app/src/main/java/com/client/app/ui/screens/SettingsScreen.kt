@@ -50,6 +50,7 @@ fun SettingsScreen(
     var micGainDraft by remember(settings.micGain) { mutableFloatStateOf(settings.micGain) }
 
     val coreVoices = listOf("Charon", "Puck", "Kore", "Fenrir", "Aoede")
+    val liveModels = listOf("gemini-3.1-flash-live-preview", "gemini-2.5-flash-native-audio-latest")
     val visionModels = listOf(VocabularyExtractor.DEFAULT_MODEL, "gemini-2.5-flash")
 
     Scaffold(
@@ -99,16 +100,26 @@ fun SettingsScreen(
 
                 Spacer(Modifier.height(12.dp))
 
-                OutlinedTextField(
-                    value = settings.model,
-                    onValueChange = viewModel::setModel,
-                    label = { Text("Голосовая модель Gemini Live") },
-                    placeholder = { Text("gemini-3.1-flash-live-preview") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(10.dp),
-                    colors = darkFieldColors()
-                )
+                Text("Голосовая модель Gemini Live (дуплекс):", color = Color(0xFFA1A1AA), fontSize = 12.sp)
+                Spacer(Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    liveModels.forEach { m ->
+                        FilterChip(
+                            selected = settings.model == m,
+                            onClick = { viewModel.setModel(m) },
+                            label = { Text(m, fontSize = 12.sp) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = Color(0xFF064E3B),
+                                selectedLabelColor = Color(0xFF6EE7B7),
+                                containerColor = Color(0xFF18181B),
+                                labelColor = Color(0xFFA1A1AA)
+                            )
+                        )
+                    }
+                }
 
                 Spacer(Modifier.height(12.dp))
 
