@@ -392,7 +392,13 @@ class SessionManager @Inject constructor(
             return
         }
 
-        val model = prefs[KEY_MODEL]?.ifBlank { null } ?: "gemini-3.1-flash-live-preview"
+        val rawModel = prefs[KEY_MODEL]?.trim().orEmpty()
+        // Защита от 1008: гарантируем, что в Live-клиент не попадет обычная модель (например, 3.8-flash)
+        val model = if (rawModel.contains("live", ignoreCase = true) || rawModel.contains("native-audio", ignoreCase = true)) {
+            rawModel
+        } else {
+            "gemini-3.1-flash-live-preview"
+        }
         val voice = prefs[KEY_VOICE]?.ifBlank { null } ?: "Charon"
         val enableForvo = prefs[KEY_ENABLE_FORVO] ?: false
 
