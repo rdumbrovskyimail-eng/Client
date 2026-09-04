@@ -47,16 +47,11 @@ data class ToolResponse(val name: String, val id: String, val resultJson: String
 /** Кадр PCM 24 кГц с защитой от устаревших сессий через epoch */
 class AudioFrame(val pcm: ByteArray, val epoch: Long)
 
-enum class ThinkingLevel(val wire: String) {
-    MINIMAL("minimal"), LOW("low"), MEDIUM("medium"), HIGH("high")
-}
-
 data class LiveConfig(
     val apiKey: String,
     val model: String,
     val systemInstruction: String,
     val voiceName: String = "Charon",
-    val thinkingLevel: ThinkingLevel = ThinkingLevel.MINIMAL,
     val temperature: Double = 0.5,
     val toolsJson: JsonArray? = null,
     val resumptionHandle: String? = null,
