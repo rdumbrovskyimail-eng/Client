@@ -77,7 +77,7 @@ class AndroidAudioEngine @Inject constructor(
     private val _micOutput = Channel<ByteArray>(128, BufferOverflow.DROP_OLDEST)
     val micOutput: ReceiveChannel<ByteArray> = _micOutput
 
-    /** Событие локального перебивания (срабатывает за <40 мс) */
+    /** Событие локального перебивания (срабатывает за ~100 мс: окно подтверждения 5 чанков по 20 мс) */
     private val _bargeIn = MutableSharedFlow<Unit>(
         replay = 0, extraBufferCapacity = 4, onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
@@ -483,7 +483,7 @@ class AndroidAudioEngine @Inject constructor(
                 )
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .setBufferSizeInBytes(minBuf * 2)
-                // Аппаратный чистый FastTrack на Snapdragon 8 Gen 2
+                // Запрос минимальной задержки буферизации AudioFlinger на голосовом DSP-тракте
                 .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                 .build()
         } catch (e: Exception) {
