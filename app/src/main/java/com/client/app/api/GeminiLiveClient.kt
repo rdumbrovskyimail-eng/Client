@@ -77,7 +77,7 @@ class GeminiLiveClient @Inject constructor(
         const val WS_PATH =
             "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
-        /** Порог очереди: 64 КБ (~2 сек звука). Исключает говорение в пустоту при обрыве сети */
+        /** Порог очереди: 64 КБ (~1.4 сек звука с учетом оверхеда Base64 и JSON). Предотвращает накопление устаревшей речи */
         private const val MAX_QUEUE_BYTES = 64L * 1024
         private const val MAX_HISTORY_TURNS = 24
     }
