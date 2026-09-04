@@ -74,8 +74,8 @@ class ForvoRepository @Inject constructor(
 
         /** 90 минут кэша строго в рамках 2-часового окна жизни ссылок Forvo CDN */
         const val URL_TTL_MS = 90L * 60 * 1000
-        /** Отрицательный кэш: не тратим квоту на повторный поиск отсутствующих слов */
-        private const val MISS_TTL_MS = 12L * 60 * 60 * 1000
+        /** Отрицательный кэш: защита от повторных кликов в сессии (30 минут вместо 12 часов) */
+        private const val MISS_TTL_MS = 30L * 60 * 1000
 
         private const val MAX_PARALLEL = 3
         private const val MAX_RETRIES = 2
@@ -200,6 +200,10 @@ class ForvoRepository @Inject constructor(
 
     fun clearCache() {
         hits.clear()
+        misses.clear()
+    }
+
+    fun clearMisses() {
         misses.clear()
     }
 
