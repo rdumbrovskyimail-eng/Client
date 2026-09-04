@@ -100,7 +100,7 @@ jobs:
             ### 🚀 Gemini Live Ultra (Оптимизировано для Samsung S23 Ultra)
             - **Коммит:** `${{ github.sha }}`
             - **Размер APK:** ${{ steps.apk_info.outputs.apk_size }}
-            - **Движок:** Gemini 3.1 Flash Live (`v1beta`) + Sub-40ms Barge-In (Локальный VAD)
+            - **Движок:** Gemini 3.1 Flash Live (`v1beta`) + 100ms Barge-In (Локальный VAD)
             - **Лингвистика:** Автономный Forvo API + Двухуровневый разбор лексики Vision
             
             **Установка:** Скачайте `.apk` ниже и установите на устройство.
