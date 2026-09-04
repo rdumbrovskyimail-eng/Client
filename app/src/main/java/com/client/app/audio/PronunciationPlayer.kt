@@ -5,10 +5,12 @@ import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.media.audiofx.LoudnessEnhancer
 import com.client.app.forvo.ForvoRepository
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
@@ -30,11 +32,12 @@ class PronunciationPlayer @Inject constructor(
      * 
      * @param boostMb Усиление в миллибелах: 600 mB = +6 дБ (комфортный подъем без клиппинга).
      */
-    suspend fun play(url: String, boostMb: Int = 600): Boolean = suspendCancellableCoroutine { cont ->
-        synchronized(lock) {
-            releasePlayerInternal()
-            _isPlaying.value = true
-        }
+    suspend fun play(url: String, boostMb: Int = 600): Boolean = withContext(Dispatchers.Main.immediate) {
+        suspendCancellableCoroutine { cont ->
+            synchronized(lock) {
+                releasePlayerInternal()
+                _isPlaying.value = true
+            }
 
         // Честный учет воспроизведения по лицензии Forvo
         forvoRepo.registerPlayback()
@@ -100,6 +103,7 @@ class PronunciationPlayer @Inject constructor(
             finish(false)
         }
     }
+}
 
     /**
      * Принудительная остановка воспроизведения и мгновенный сброс ресурсов
