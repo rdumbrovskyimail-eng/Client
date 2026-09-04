@@ -276,8 +276,10 @@ class ForvoRepository @Inject constructor(
                     delay(500L * attempt)
                     continue
                 }
-                logger.e("Forvo query error: $word", e)
-                return ForvoResult.Failed(e.localizedMessage ?: "Сбой сети")
+                val rawMsg = e.localizedMessage ?: "Сбой сети"
+                val safeMessage = if (apiKey.isNotEmpty()) rawMsg.replace(apiKey, "******") else rawMsg
+                logger.e("Forvo query error: $word ($safeMessage)")
+                return ForvoResult.Failed(safeMessage)
             }
         }
     }
