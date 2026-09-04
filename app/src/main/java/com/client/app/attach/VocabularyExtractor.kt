@@ -209,9 +209,12 @@ class VocabularyExtractor @Inject constructor(
             client.newCall(req).execute().use { resp ->
                 val raw = resp.body?.string().orEmpty()
 
-                // Откат при недоступности модели (404) или неприятии параметров (400)
-                if (resp.code in setOf(400, 404) && !isFallbackAttempt && modelId != FALLBACK_MODEL) {
-                    logger.w("VocabularyExtractor: $modelId вернул ${resp.code}, откат на $FALLBACK_MODEL")
+                // Откат при отсутствии модели (404) или несовместимости ее параметров (400)
+                val isModelOrParamUnsupported = resp.code == 404 || 
+                    (resp.code == 400 && (raw.contains("mediaResolution", ignoreCase = true) || raw.contains("not supported", ignoreCase = true)))
+
+                if (isModelOrParamUnsupported && !isFallbackAttempt && modelId != FALLBACK_MODEL) {
+                    logger.w("VocabularyExtractor: $modelId вернул ${resp.code} (несовместимость параметров), откат на $FALLBACK_MODEL")
                     return@withContext callOnce(
                         apiKey, FALLBACK_MODEL, images, plainText,
                         forLanguageLearning, langHint, isFallbackAttempt = true
