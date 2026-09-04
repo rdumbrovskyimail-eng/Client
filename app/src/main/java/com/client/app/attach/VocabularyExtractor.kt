@@ -42,7 +42,7 @@ data class MaterialAnalysis(
 )
 
 sealed interface AnalysisResult {
-    data class Success(val analysis: MaterialAnalysis) : AnalysisResult
+    data class Success(val analysis: MaterialAnalysis, val modelUsed: String = "") : AnalysisResult
     data class Failure(val reason: String) : AnalysisResult
 }
 
@@ -53,8 +53,8 @@ class VocabularyExtractor @Inject constructor(
     companion object {
         private const val ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 
-        /** Передовая модель с глубоким OCR */
-        const val DEFAULT_MODEL = "gemini-3.8-flash"
+        /** Общедоступная проверенная модель с глубоким OCR по умолчанию */
+        const val DEFAULT_MODEL = "gemini-2.5-flash"
         /** Проверенный вседоступный fallback */
         private const val FALLBACK_MODEL = "gemini-2.5-flash"
 
@@ -89,7 +89,7 @@ class VocabularyExtractor @Inject constructor(
 
         val merged = mutableListOf<MaterialAnalysis>()
         val failures = mutableListOf<String>()
-        val effectiveModel = model.ifBlank { DEFAULT_MODEL }
+        var effectiveModel = model.ifBlank { DEFAULT_MODEL }
 
         batches.forEachIndexed { index, batch ->
             coroutineContext.ensureActive()
@@ -98,7 +98,12 @@ class VocabularyExtractor @Inject constructor(
             else "Стр. ${index * MAX_IMAGES_PER_CALL + 1}–${minOf((index + 1) * MAX_IMAGES_PER_CALL, images.size)}"
 
             when (val r = callOnce(apiKey, effectiveModel, batch, textPart, forLanguageLearning, targetLanguageHint)) {
-                is AnalysisResult.Success -> merged.add(r.analysis)
+                is AnalysisResult.Success -> {
+                    merged.add(r.analysis)
+                    if (r.modelUsed.isNotBlank()) {
+                        effectiveModel = r.modelUsed
+                    }
+                }
                 is AnalysisResult.Failure -> {
                     failures.add("$pageRange: ${r.reason}")
                 }
@@ -220,7 +225,12 @@ class VocabularyExtractor @Inject constructor(
                     }.getOrNull()
                     return@withContext AnalysisResult.Failure("Ошибка (${resp.code}): ${msg.orEmpty()}".trim())
                 }
-                parseResponse(raw)
+                val parsed = parseResponse(raw)
+                if (parsed is AnalysisResult.Success) {
+                    parsed.copy(modelUsed = modelId)
+                } else {
+                    parsed
+                }
             }
         } catch (e: Exception) {
             coroutineContext.ensureActive()
