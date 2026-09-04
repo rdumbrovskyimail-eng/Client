@@ -127,6 +127,7 @@ class SessionManager @Inject constructor(
     @Volatile private var reconnectAttempts = 0
     @Volatile private var userStopped = false
     @Volatile private var conservativeSetup = false
+    @Volatile private var pendingGoAway = false
 
     /** Запоминает намерение пользователя: включён ли микрофон вручную */
     @Volatile private var userMicDesired = true
@@ -385,6 +386,7 @@ class SessionManager @Inject constructor(
     }
 
     private suspend fun startInternal(resume: Boolean) {
+        pendingGoAway = false
         val prefs = dataStore.data.first()
         val apiKey = prefs[KEY_API]?.trim().orEmpty()
         if (apiKey.isEmpty()) {
@@ -464,6 +466,7 @@ class SessionManager @Inject constructor(
         listOfNotNull("ru", materialLanguage?.takeIf { it != "ru" }).distinct()
 
     private suspend fun stopInternal(full: Boolean) {
+        pendingGoAway = false
         reconnectJob?.cancel()
         stopMic(userInitiated = false)
         client.disconnect()
@@ -578,8 +581,17 @@ class SessionManager @Inject constructor(
                 is GeminiEvent.ResumptionHandle -> resumptionHandle = event.handle
 
                 is GeminiEvent.GoAway -> {
-                    logger.w("goAway через ${event.millisLeft} мс — упреждающий реконнект")
-                    scheduleReconnect("плановый разрыв")
+                    logger.w("goAway через ${event.millisLeft} мс — подготовка бесшовного реконнекта")
+                    pendingGoAway = true
+                    // Страховочный таймер: если пауза в речи не наступит, реконнект за 2 сек до дедлайна
+                    scope.launch {
+                        val waitMs = maxOf(event.millisLeft - 2000L, 1000L)
+                        delay(waitMs)
+                        if (pendingGoAway && !userStopped) {
+                            pendingGoAway = false
+                            scheduleReconnect("дедлайн goAway")
+                        }
+                    }
                 }
 
                 is GeminiEvent.Interrupted -> {
@@ -595,6 +607,11 @@ class SessionManager @Inject constructor(
                         delay(audioEngine.pendingPlaybackMs() + 60)
                         if (!audioEngine.isRenderingAudio()) {
                             _state.update { it.copy(isAiSpeaking = false) }
+                        }
+                        // Бесшовный реконнект: модель договорила фразу, переключаем сокет во время естественной паузы
+                        if (pendingGoAway && !userStopped) {
+                            pendingGoAway = false
+                            scheduleReconnect("плановый переход goAway")
                         }
                     }
                 }
