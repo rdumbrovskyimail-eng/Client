@@ -108,6 +108,7 @@ class AndroidAudioEngine @Inject constructor(
     /* ── Метрики воспроизведения и VAD ── */
     @Volatile private var framesWritten: Long = 0L
     @Volatile private var headOffset: Long = 0L
+    @Volatile private var flushEpoch: Long = 0L
     @Volatile private var noiseFloor: Float = VAD_FLOOR_MIN
     @Volatile private var referencePlaybackRms: Float = 0f
     @Volatile private var speechRun: Int = 0
@@ -512,24 +513,26 @@ class AndroidAudioEngine @Inject constructor(
 
                         var offset = 0
                         while (offset < buf.size && isActive) {
-                            val n = synchronized(trackLock) {
-                                val t = audioTrack
-                                if (t == null || t.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                                    -1
+                            val t = synchronized(trackLock) {
+                                val track = audioTrack
+                                if (track == null || track.playState != AudioTrack.PLAYSTATE_PLAYING) null else track
+                            } ?: break
+
+                            val startEpoch = flushEpoch
+                            val n = runInterruptible {
+                                t.write(buf, offset, buf.size - offset, AudioTrack.WRITE_BLOCKING)
+                            }
+                            if (n <= 0) break
+
+                            synchronized(trackLock) {
+                                if (flushEpoch == startEpoch) {
+                                    framesWritten += n / 2L
+                                    offset += n
                                 } else {
-                                    val written = t.write(
-                                        buf, offset, buf.size - offset,
-                                        AudioTrack.WRITE_NON_BLOCKING
-                                    )
-                                    if (written > 0) {
-                                        framesWritten += written / 2L
-                                    }
-                                    written
+                                    // Сброс во время блокирующего вывода — отбрасываем остаток чанка
+                                    offset = buf.size
                                 }
                             }
-                            if (n < 0) break
-                            if (n == 0) { delay(4); continue }
-                            offset += n
                         }
                     }
                 }
@@ -550,6 +553,7 @@ class AndroidAudioEngine @Inject constructor(
         while (playbackChannel.tryReceive().isSuccess) { /* drain */ }
         referencePlaybackRms = 0f
         synchronized(trackLock) {
+            flushEpoch++
             audioTrack?.let { t ->
                 runCatching {
                     if (t.state == AudioTrack.STATE_INITIALIZED) {
@@ -584,6 +588,7 @@ class AndroidAudioEngine @Inject constructor(
         runCatching { withTimeoutOrNull(400L) { pJob?.cancelAndJoin() } }
 
         synchronized(trackLock) {
+            flushEpoch++
             audioTrack?.let { t ->
                 runCatching { t.pause(); t.flush(); t.stop(); t.release() }
             }
