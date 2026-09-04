@@ -8,10 +8,8 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import com.client.app.util.AppLogger
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.json.*
@@ -94,11 +92,22 @@ class ForvoRepository @Inject constructor(
     private val hits = ConcurrentHashMap<String, Pronunciation>()
     private val misses = ConcurrentHashMap<String, Long>()
 
+    @Volatile private var currentDay: String = forvoDayKey()
     private val _quota = MutableStateFlow(ForvoQuota(0, DEFAULT_QUOTA_LIMIT))
     val quota: StateFlow<ForvoQuota> = _quota.asStateFlow()
 
+    private val quotaSyncTrigger = MutableSharedFlow<Unit>(
+        extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+
+    @OptIn(FlowPreview::class)
     init {
         ioScope.launch { refreshQuota() }
+        ioScope.launch {
+            quotaSyncTrigger.debounce(500).collect {
+                persistQuota()
+            }
+        }
     }
 
     /* ═════════════════════════ ПУБЛИЧНОЕ API ═════════════════════════ */
@@ -297,6 +306,7 @@ class ForvoRepository @Inject constructor(
     private suspend fun refreshQuota() {
         val prefs = dataStore.data.first()
         val today = forvoDayKey()
+        currentDay = today
         val storedDay = prefs[KEY_QUOTA_DAY]
         val limit = prefs[KEY_QUOTA_LIMIT] ?: DEFAULT_QUOTA_LIMIT
 
@@ -305,22 +315,39 @@ class ForvoRepository @Inject constructor(
                 it[KEY_QUOTA_DAY] = today
                 it[KEY_QUOTA_USED] = 0
             }
-            _quota.value = ForvoQuota(0, limit)
+            _quota.update { ForvoQuota(0, limit) }
         } else {
             val onDisk = prefs[KEY_QUOTA_USED] ?: 0
-            val maxUsed = maxOf(onDisk, _quota.value.used)
-            _quota.value = ForvoQuota(maxUsed, limit)
+            _quota.update { current ->
+                ForvoQuota(maxOf(onDisk, current.used), limit)
+            }
         }
     }
 
     private fun bump(n: Int) {
-        val cur = _quota.value
-        _quota.value = cur.copy(used = cur.used + n)
-        ioScope.launch {
-            runCatching {
-                dataStore.edit { prefs ->
-                    prefs[KEY_QUOTA_DAY] = forvoDayKey()
-                    prefs[KEY_QUOTA_USED] = (prefs[KEY_QUOTA_USED] ?: 0) + n
+        val today = forvoDayKey()
+        _quota.update { cur ->
+            if (currentDay != today) {
+                currentDay = today
+                ForvoQuota(n, cur.limit)
+            } else {
+                cur.copy(used = cur.used + n)
+            }
+        }
+        quotaSyncTrigger.tryEmit(Unit)
+    }
+
+    private suspend fun persistQuota() {
+        runCatching {
+            val today = forvoDayKey()
+            val snapshotUsed = _quota.value.used
+            dataStore.edit { prefs ->
+                val storedDay = prefs[KEY_QUOTA_DAY]
+                if (storedDay != today) {
+                    prefs[KEY_QUOTA_DAY] = today
+                    prefs[KEY_QUOTA_USED] = snapshotUsed
+                } else {
+                    prefs[KEY_QUOTA_USED] = maxOf(prefs[KEY_QUOTA_USED] ?: 0, snapshotUsed)
                 }
             }
         }
