@@ -116,15 +116,16 @@ class AndroidAudioEngine @Inject constructor(
     private var focusRequest: AudioFocusRequest? = null
 
     /**
-     * Потокобезопасный опрос позиции головки воспроизведения без synchronized-блока.
+     * Потокобезопасный атомарный опрос позиции головки воспроизведения.
      */
-    fun pendingPlaybackFrames(): Long {
+    fun pendingPlaybackFrames(): Long = synchronized(trackLock) {
         val t = audioTrack ?: return 0L
-        // Маска 0xFFFFFFFFL защищает от знакопеременного инвертирования 32-битного счетчика в Long
+        if (t.state != AudioTrack.STATE_INITIALIZED || t.playState != AudioTrack.PLAYSTATE_PLAYING) {
+            return 0L
+        }
         val rawHead = runCatching { t.playbackHeadPosition.toLong() and 0xFFFFFFFFL }.getOrDefault(0L)
-        // Корректный учет асинхронного сброса HAL: если rawHead < headOffset, HAL обнулил регистр
         val relativeHead = if (rawHead >= headOffset) rawHead - headOffset else rawHead
-        return (framesWritten - relativeHead).coerceAtLeast(0L)
+        (framesWritten - relativeHead).coerceAtLeast(0L)
     }
 
     fun isRenderingAudio(): Boolean = pendingPlaybackFrames() > 0
@@ -516,16 +517,19 @@ class AndroidAudioEngine @Inject constructor(
                                 if (t == null || t.playState != AudioTrack.PLAYSTATE_PLAYING) {
                                     -1
                                 } else {
-                                    t.write(
+                                    val written = t.write(
                                         buf, offset, buf.size - offset,
                                         AudioTrack.WRITE_NON_BLOCKING
                                     )
+                                    if (written > 0) {
+                                        framesWritten += written / 2L
+                                    }
+                                    written
                                 }
                             }
                             if (n < 0) break
                             if (n == 0) { delay(4); continue }
                             offset += n
-                            framesWritten += n / 2L
                         }
                     }
                 }
@@ -585,6 +589,7 @@ class AndroidAudioEngine @Inject constructor(
             }
             audioTrack = null
             framesWritten = 0L
+            headOffset = 0L
         }
 
         abandonFocus()
