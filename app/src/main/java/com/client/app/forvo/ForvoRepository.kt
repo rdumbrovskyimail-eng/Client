@@ -12,6 +12,7 @@ import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.FlowPreview
 import kotlinx.serialization.json.*
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -55,6 +56,7 @@ data class ForvoQuota(val used: Int, val limit: Int) {
     val isExhausted: Boolean get() = used >= limit
 }
 
+@OptIn(FlowPreview::class)
 @Singleton
 class ForvoRepository @Inject constructor(
     private val dataStore: DataStore<Preferences>,
@@ -100,7 +102,6 @@ class ForvoRepository @Inject constructor(
         extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
 
-    @OptIn(FlowPreview::class)
     init {
         ioScope.launch { refreshQuota() }
         ioScope.launch {
