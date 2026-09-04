@@ -44,10 +44,11 @@ class AndroidAudioEngine @Inject constructor(
         /* ── Пороги локального VAD (10/10 Reference-Based) ── */
         private const val VAD_FLOOR_MIN = 0.012f
         private const val VAD_RATIO_IDLE = 3.0f
-        private const val VAD_RATIO_DUCK = 4.5f
-        /** Коэффициент просачивания звука из динамиков в микрофон (AEC Leakage) */
-        private const val ECHO_LEAKAGE_FACTOR = 0.28f
-        private const val VAD_HANGOVER_CHUNKS = 2
+        private const val VAD_RATIO_DUCK = 3.8f
+        /** Коэффициент просачивания с учетом аппаратного Qualcomm AEC (остаточное эхо ~5% + запас) */
+        private const val ECHO_LEAKAGE_FACTOR = 0.10f
+        /** Окно подтверждения устойчивой речи: 5 чанков по 20 мс = 100 мс (фильтрация кликов и шорохов) */
+        private const val VAD_HANGOVER_CHUNKS = 5
         private const val BARGE_IN_DEBOUNCE_MS = 600L
     }
 
