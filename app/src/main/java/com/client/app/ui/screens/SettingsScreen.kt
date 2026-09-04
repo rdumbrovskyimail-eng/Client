@@ -51,7 +51,7 @@ fun SettingsScreen(
 
     val coreVoices = listOf("Charon", "Puck", "Kore", "Fenrir", "Aoede")
     val liveModels = listOf("gemini-3.1-flash-live-preview", "gemini-2.5-flash-native-audio-latest")
-    val visionModels = listOf(VocabularyExtractor.DEFAULT_MODEL, "gemini-2.5-flash")
+    val visionModels = listOf("gemini-2.5-flash", "gemini-3.8-flash")
 
     Scaffold(
         containerColor = Color(0xFF09090B),
