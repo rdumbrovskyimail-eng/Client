@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import com.client.app.util.AppLogger
+import com.client.app.util.CryptoManager
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
@@ -61,7 +62,8 @@ data class ForvoQuota(val used: Int, val limit: Int) {
 @Singleton
 class ForvoRepository @Inject constructor(
     private val dataStore: DataStore<Preferences>,
-    private val logger: AppLogger
+    private val logger: AppLogger,
+    private val cryptoManager: CryptoManager
 ) {
     companion object {
         val KEY_FORVO_API = stringPreferencesKey("forvo_api_key")
@@ -371,7 +373,7 @@ class ForvoRepository @Inject constructor(
     }
 
     private suspend fun readApiKey(): String =
-        dataStore.data.first()[KEY_FORVO_API]?.trim().orEmpty()
+        cryptoManager.decrypt(dataStore.data.first()[KEY_FORVO_API]?.trim().orEmpty())
 
     private suspend fun readHost(): String =
         dataStore.data.first()[KEY_FORVO_HOST]?.trim()?.ifBlank { HOST_FREE } ?: HOST_FREE
