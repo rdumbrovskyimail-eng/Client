@@ -13,7 +13,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Query Latest Stack & Generate Config
+      - name: Query Latest Stack & Generate Files
         shell: bash
         run: |
           python3 - << 'EOF'
@@ -22,6 +22,7 @@ jobs:
           import xml.etree.ElementTree as ET
           import os
           from pathlib import Path
+          import textwrap
 
           def get_latest_maven(group, artifact):
               path = group.replace('.', '/') + '/' + artifact
@@ -50,7 +51,7 @@ jobs:
               except Exception as e:
                   return f"error: {e}"
 
-          # Сбор актуальных версий
+          # Сбор версий
           gradle_ver = get_latest_gradle()
           kotlin_ver = get_latest_maven("org.jetbrains.kotlin", "kotlin-stdlib")
           coroutines_ver = get_latest_maven("org.jetbrains.kotlinx", "kotlinx-coroutines-core")
@@ -58,8 +59,9 @@ jobs:
           ktor_ver = get_latest_maven("io.ktor", "ktor-client-core")
           genai_ver = get_latest_maven("com.google.genai", "google-genai")
 
-          # Содержимое для gradle/libs.versions.toml
-          toml_content = f"""[versions]
+          # 1. Содержимое libs.versions.toml
+          toml_content = textwrap.dedent(f"""\
+          [versions]
           kotlin = "{kotlin_ver}"
           coroutines = "{coroutines_ver}"
           serialization = "{serialization_ver}"
@@ -80,15 +82,11 @@ jobs:
           [plugins]
           kotlin-jvm = {{ id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }}
           kotlin-serialization = {{ id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }}
-          """
+          """)
 
-          # Генерация файла для артефакта
-          Path("generated").mkdir(parents=True, exist_ok=True)
-          with open("generated/libs.versions.toml", "w", encoding="utf-8") as f:
-              f.write(toml_content.strip())
-
-          # Формирование визуального отчета для GitHub Summary
-          summary = f"""# 🚀 Новейший стек для Kotlin Gemini 3.8 Flash Client
+          # 2. Содержимое SUMMARY.md
+          summary_content = textwrap.dedent(f"""\
+          # 🚀 Новейший стек для Kotlin Gemini 3.8 Flash Client
 
           | Инструмент / Библиотека | Назначение | Актуальная версия |
           | :--- | :--- | :--- |
@@ -104,20 +102,32 @@ jobs:
           ./gradlew wrapper --gradle-version {gradle_ver} --distribution-type all
           ```
 
-          ### 📄 Содержимое сгенерированного `libs.versions.toml`:
+          ---
+          ### 📄 Содержимое сгенерированного libs.versions.toml:
           ```toml
-          {toml_content.strip()}
+          {toml_content}
           ```
-          """
+          """)
 
+          # Создаем папку и сохраняем оба файла
+          out_dir = Path("generated")
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          with open(out_dir / "libs.versions.toml", "w", encoding="utf-8") as f:
+              f.write(toml_content)
+
+          with open(out_dir / "SUMMARY.md", "w", encoding="utf-8") as f:
+              f.write(summary_content)
+
+          # Также дублируем в GitHub Step Summary
           summary_path = os.getenv('GITHUB_STEP_SUMMARY')
           if summary_path:
               with open(summary_path, 'a', encoding='utf-8') as f:
-                  f.write(summary)
+                  f.write(summary_content)
           EOF
 
-      - name: Upload libs.versions.toml as artifact
+      - name: Upload configuration and summary as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libs.versions.toml
-          path: generated/libs.versions.toml
+          name: kotlin-gemini-stack-report
+          path: generated/
