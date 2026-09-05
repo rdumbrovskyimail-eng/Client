@@ -308,7 +308,7 @@ class SessionManager @Inject constructor(
                         append("[Материал: ")
                         append(a.title ?: processed.accepted.joinToString())
                         append(", язык: ").append(a.language).append("]\n\n")
-                        append(a.fullText.take(30_000))
+                        append(truncateTextSafely(a.fullText, 30_000))
                         if (a.vocabulary.isNotEmpty()) {
                             append("\n\nКлючевая лексика (")
                             append(a.vocabulary.size).append("): ")
@@ -325,6 +325,26 @@ class SessionManager @Inject constructor(
         } finally {
             _state.update { it.copy(isAnalyzing = false) }
         }
+    }
+
+    private fun truncateTextSafely(text: String, maxChars: Int): String {
+        if (text.length <= maxChars) return text
+        val slice = text.take(maxChars)
+        val lastNewline = slice.lastIndexOf('\n')
+        val lastPeriod = slice.lastIndexOf(". ")
+        val lastSpace = slice.lastIndexOf(' ')
+        val cutIndex = maxOf(lastNewline, lastPeriod, lastSpace)
+
+        val cleanSlice = if (cutIndex > maxChars - 4000 && cutIndex > 0) {
+            slice.substring(0, cutIndex).trimEnd()
+        } else {
+            if (slice.isNotEmpty() && Character.isHighSurrogate(slice.last())) {
+                slice.dropLast(1).trimEnd()
+            } else {
+                slice.trimEnd()
+            }
+        }
+        return "$cleanSlice\n\n[... Внимание ассистента: исходный материал усечён до лимита сессии (показаны первые ${cleanSlice.length} из ${text.length} символов)]"
     }
 
     /* ═════════════════════════ FORVO ═════════════════════════ */
