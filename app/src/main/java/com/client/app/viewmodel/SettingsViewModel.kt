@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import com.client.app.attach.VocabularyExtractor
 import com.client.app.forvo.ForvoRepository
 import com.client.app.session.SessionManager
+import com.client.app.util.CryptoManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.*
@@ -30,7 +31,8 @@ data class AppSettingsState(
 @OptIn(FlowPreview::class)
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
-    private val dataStore: DataStore<Preferences>
+    private val dataStore: DataStore<Preferences>,
+    private val cryptoManager: CryptoManager
 ) : ViewModel() {
 
     private val _settings = MutableStateFlow(AppSettingsState())
@@ -44,7 +46,7 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch {
             dataStore.data.first().let { p ->
                 _settings.value = AppSettingsState(
-                    apiKey = p[SessionManager.KEY_API].orEmpty(),
+                    apiKey = cryptoManager.decrypt(p[SessionManager.KEY_API].orEmpty()),
                     model = p[SessionManager.KEY_MODEL] ?: "gemini-3.1-flash-live-preview",
                     analyzerModel = p[SessionManager.KEY_ANALYZER_MODEL] ?: VocabularyExtractor.DEFAULT_MODEL,
                     voice = p[SessionManager.KEY_VOICE] ?: "Charon",
@@ -52,14 +54,15 @@ class SettingsViewModel @Inject constructor(
                     volume = p[SessionManager.KEY_VOLUME] ?: 1.0f,
                     micGain = p[SessionManager.KEY_MIC_GAIN] ?: 1.0f,
                     enableForvo = p[SessionManager.KEY_ENABLE_FORVO] ?: false,
-                    forvoApiKey = p[ForvoRepository.KEY_FORVO_API].orEmpty()
+                    forvoApiKey = cryptoManager.decrypt(p[ForvoRepository.KEY_FORVO_API].orEmpty())
                 )
             }
         }
 
         viewModelScope.launch {
             apiKeyDebounce.debounce(350).collect { k ->
-                dataStore.edit { it[SessionManager.KEY_API] = k.trim() }
+                val encrypted = cryptoManager.encrypt(k.trim())
+                dataStore.edit { it[SessionManager.KEY_API] = encrypted }
             }
         }
         viewModelScope.launch {
@@ -69,7 +72,8 @@ class SettingsViewModel @Inject constructor(
         }
         viewModelScope.launch {
             forvoKeyDebounce.debounce(350).collect { k ->
-                dataStore.edit { it[ForvoRepository.KEY_FORVO_API] = k.trim() }
+                val encrypted = cryptoManager.encrypt(k.trim())
+                dataStore.edit { it[ForvoRepository.KEY_FORVO_API] = encrypted }
             }
         }
     }
