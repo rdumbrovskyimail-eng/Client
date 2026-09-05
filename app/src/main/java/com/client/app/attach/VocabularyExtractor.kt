@@ -2,6 +2,7 @@
 package com.client.app.attach
 
 import android.util.Base64
+import android.util.Base64OutputStream
 import com.client.app.util.AppLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
@@ -10,7 +11,9 @@ import kotlinx.serialization.json.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody
+import okio.BufferedSink
+import java.io.FilterOutputStream
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -150,35 +153,12 @@ class VocabularyExtractor @Inject constructor(
         val modelId = model.removePrefix("models/").trim()
         val url = "$ENDPOINT/$modelId:generateContent?key=${apiKey.trim()}"
 
-        val body = buildJsonObject {
-            put("contents", buildJsonArray {
-                add(buildJsonObject {
-                    put("role", "user")
-                    put("parts", buildJsonArray {
-                        images.forEach { bytes ->
-                            add(buildJsonObject {
-                                put("inlineData", buildJsonObject {
-                                    put("mimeType", "image/jpeg")
-                                    put("data", Base64.encodeToString(bytes, Base64.NO_WRAP))
-                                })
-                            })
-                        }
-                        if (plainText.isNotBlank()) {
-                            add(buildJsonObject { put("text", plainText.take(200_000)) })
-                        }
-                        add(buildJsonObject {
-                            put("text", buildInstruction(forLanguageLearning, langHint))
-                        })
-                    })
-                })
-            })
-
+        val configObj = buildJsonObject {
             put("generationConfig", buildJsonObject {
                 put("responseMimeType", "application/json")
                 put("responseSchema", schema(forLanguageLearning))
                 put("temperature", 0.1)
                 put("maxOutputTokens", 32768)
-                // Запрашиваем высокое разрешение (1120 токенов на изображение) для глубокого OCR страниц учебников
                 if (!isFallbackAttempt) {
                     put("mediaResolution", "MEDIA_RESOLUTION_HIGH")
                 }
@@ -198,12 +178,38 @@ class VocabularyExtractor @Inject constructor(
                 }
             })
         }
+        val configRemainderJson = configObj.toString().removePrefix("{")
+        val instructionJson = json.encodeToString(buildInstruction(forLanguageLearning, langHint))
+        val textJson = if (plainText.isNotBlank()) json.encodeToString(plainText.take(200_000)) else null
+
+        val streamingBody = object : RequestBody() {
+            override fun contentType() = jsonMedia
+
+            override fun writeTo(sink: BufferedSink) {
+                sink.writeUtf8("""{"contents":[{"role":"user","parts":[""")
+                images.forEach { bytes ->
+                    sink.writeUtf8("""{"inlineData":{"mimeType":"image/jpeg","data":"""")
+                    val nonClosingStream = object : FilterOutputStream(sink.outputStream()) {
+                        override fun close() = flush()
+                    }
+                    Base64OutputStream(nonClosingStream, Base64.NO_WRAP).use { out ->
+                        out.write(bytes)
+                    }
+                    sink.writeUtf8("""}},""")
+                }
+                if (textJson != null) {
+                    sink.writeUtf8("""{"text":$textJson},""")
+                }
+                sink.writeUtf8("""{"text":$instructionJson}]}],""")
+                sink.writeUtf8(configRemainderJson)
+            }
+        }
 
         try {
             coroutineContext.ensureActive()
             val req = Request.Builder()
                 .url(url)
-                .post(body.toString().toRequestBody(jsonMedia))
+                .post(streamingBody)
                 .build()
 
             client.newCall(req).execute().use { resp ->
