@@ -20,6 +20,7 @@ import com.client.app.forvo.ForvoResult
 import com.client.app.service.LiveSessionForegroundService
 import com.client.app.util.AppLogger
 import com.client.app.util.AttachmentProcessor
+import com.client.app.util.CryptoManager
 import com.client.app.viewmodel.SettingsViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.*
@@ -85,6 +86,7 @@ class SessionManager @Inject constructor(
     private val attachmentProcessor: AttachmentProcessor,
     private val extractor: VocabularyExtractor,
     private val dataStore: DataStore<Preferences>,
+    private val cryptoManager: CryptoManager,
     private val logger: AppLogger
 ) {
     companion object {
@@ -264,7 +266,7 @@ class SessionManager @Inject constructor(
         try {
             val processed = attachmentProcessor.process(uris)
             val prefs = dataStore.data.first()
-            val apiKey = prefs[KEY_API]?.trim().orEmpty()
+            val apiKey = cryptoManager.decrypt(prefs[KEY_API]?.trim().orEmpty())
             val forvoOn = prefs[KEY_ENABLE_FORVO] ?: false
             val analyzerModel = prefs[KEY_ANALYZER_MODEL]?.ifBlank { null }
                 ?: VocabularyExtractor.DEFAULT_MODEL
@@ -412,7 +414,7 @@ class SessionManager @Inject constructor(
     private suspend fun startInternal(resume: Boolean) {
         pendingGoAway = false
         val prefs = dataStore.data.first()
-        val apiKey = prefs[KEY_API]?.trim().orEmpty()
+        val apiKey = cryptoManager.decrypt(prefs[KEY_API]?.trim().orEmpty())
         if (apiKey.isEmpty()) {
             _state.update { it.copy(error = "Укажите Gemini API Key в Настройках", link = LinkState.IDLE) }
             return
