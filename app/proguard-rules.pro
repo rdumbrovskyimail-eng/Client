@@ -1,22 +1,28 @@
+# >>> FILE: app/proguard-rules.pro
 -keepattributes *Annotation*, InnerClasses, Signature, Exceptions, EnclosingMethod
 -dontobfuscate
 
-# Сохранение нативных точек входа JNI
+# 1. Защита нативных точек входа C++ JNI (libclient_core.so)
 -keepclasseswithmembernames class * {
     native <methods>;
 }
 -keep class com.client.app.audio.NativeAudioBridge { *; }
 
-# Google Protobuf Lite
+# 2. Google Protobuf Lite (генерация схем Bidi Streaming)
 -keep class com.google.protobuf.** { *; }
 -dontwarn com.google.protobuf.**
 -keep class com.google.ai.generativelanguage.v1beta.** { *; }
 
-# Microsoft ONNX Runtime (QNN HTP & CPU)
+# 3. Microsoft ONNX Runtime (Snapdragon NPU / Hexagon HTP v73)
 -keep class ai.onnxruntime.** { *; }
 -dontwarn ai.onnxruntime.**
 
-# Сериализация Kotlinx
+# 4. Системные медиа-сессии (защита от засыпания One UI App Freezer)
+-keep class android.support.v4.media.** { *; }
+-keep class androidx.media.** { *; }
+-keep class androidx.media.app.** { *; }
+
+# 5. Сериализация Kotlinx
 -dontnote kotlinx.serialization.AnnotationsKt
 -keepclassmembers class kotlinx.serialization.json.** { *** Companion; }
 -keepclasseswithmembers class kotlinx.serialization.json.** {
@@ -27,20 +33,20 @@
     @kotlinx.serialization.SerialName *;
 }
 
-# Корутины
+# 6. Корутины и каналы
 -keepnames class kotlinx.coroutines.internal.MainDispatcherFactory {}
 -keepnames class kotlinx.coroutines.CoroutineExceptionHandler {}
 -keepclassmembernames class kotlinx.** {
     volatile <fields>;
 }
 
-# OkHttp & Okio
+# 7. OkHttp & Okio
 -dontwarn okhttp3.**
 -dontwarn okio.**
 -keep class okhttp3.** { *; }
 -keep interface okhttp3.** { *; }
 
-# Dagger Hilt
+# 8. Dagger Hilt
 -keep class dagger.hilt.** { *; }
 -keep class javax.inject.** { *; }
 -keep @dagger.hilt.android.lifecycle.HiltViewModel class * { <init>(...); }
@@ -48,13 +54,17 @@
     @javax.inject.Inject <init>(...);
 }
 
-# Compose Runtime
+# 9. Jetpack Compose Runtime
 -keep class androidx.compose.runtime.** { *; }
 -keep class androidx.compose.ui.** { *; }
 -keepclassmembers class androidx.compose.** {
     <init>(...);
 }
 
-# Доменная модель сессии
+# 10. Доменные сущности приложения
 -keep class com.client.app.session.** { *; }
 -keep class com.client.app.api.** { *; }
+-keep class com.client.app.audio.** { *; }
+-keep class com.client.app.vad.** { *; }
+-keep class com.client.app.haptics.** { *; }
+-keep class com.client.app.ui.display.** { *; }
