@@ -40,7 +40,11 @@ message BidiGenerateContentSetup {
   SessionResumption session_resumption = 5;
   repeated SafetySetting safety_settings = 6;
   string cached_content = 7;
+  AudioTranscriptionConfig input_audio_transcription = 8;
+  AudioTranscriptionConfig output_audio_transcription = 9;
 }
+
+message AudioTranscriptionConfig {}
 
 message GenerationConfig {
   repeated string response_modalities = 1;
@@ -78,7 +82,7 @@ message SafetySetting {
 
 // Передача сырого звука и текста в реальном времени
 message BidiGenerateContentRealtimeInput {
-  Blob audio = 1;                          // Официальный одиночный аудио поток (вместо media_chunks)
+  Blob audio = 1;
   bool audio_stream_end = 2;
   string text = 3;
   repeated Blob media_chunks = 4 [deprecated = true];
@@ -129,7 +133,7 @@ message CodeExecution {}
 message FunctionDeclaration {
   string name = 1;
   string description = 2;
-  google.protobuf.Struct parameters = 3; // Структурированная JSON-схема вместо плоской строки
+  google.protobuf.Struct parameters = 3;
 }
 
 message BidiGenerateContentToolCall {
@@ -153,7 +157,7 @@ message BidiGenerateContentToolResponse {
 message FunctionResponse {
   string id = 1;
   string name = 2;
-  google.protobuf.Struct response = 3; // Официальный типизированный Struct вместо string
+  google.protobuf.Struct response = 3;
 }
 
 // Служебные метаданные сессии
