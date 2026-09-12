@@ -4,6 +4,7 @@
 #include <android/log.h>
 #include <algorithm>
 #include <cstring>
+#include <dlfcn.h>
 
 #define LOG_TAG "NativeAudioEngine"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -37,7 +38,17 @@ bool AAudioEngine::init() {
     AAudioStreamBuilder_setSampleRate(inBuilder, SAMPLE_RATE_IN);
     AAudioStreamBuilder_setChannelCount(inBuilder, CHANNEL_COUNT_MONO);
     AAudioStreamBuilder_setFormat(inBuilder, AAUDIO_FORMAT_PCM_I16);
+
+#if __ANDROID_API__ >= 28
     AAudioStreamBuilder_setInputPreset(inBuilder, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
+#else
+    typedef void (*set_input_preset_fn)(AAudioStreamBuilder*, int32_t);
+    auto setPresetFn = reinterpret_cast<set_input_preset_fn>(dlsym(RTLD_DEFAULT, "AAudioStreamBuilder_setInputPreset"));
+    if (setPresetFn) {
+        setPresetFn(inBuilder, 2 /* AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION */);
+    }
+#endif
+
     AAudioStreamBuilder_setDataCallback(inBuilder, captureCallback, this);
 
     aaudio_result_t res = AAudioStreamBuilder_openStream(inBuilder, &captureStream_);
@@ -61,7 +72,17 @@ bool AAudioEngine::init() {
     AAudioStreamBuilder_setSampleRate(outBuilder, SAMPLE_RATE_OUT);
     AAudioStreamBuilder_setChannelCount(outBuilder, CHANNEL_COUNT_MONO);
     AAudioStreamBuilder_setFormat(outBuilder, AAUDIO_FORMAT_PCM_I16);
+
+#if __ANDROID_API__ >= 28
     AAudioStreamBuilder_setUsage(outBuilder, AAUDIO_USAGE_VOICE_COMMUNICATION);
+#else
+    typedef void (*set_usage_fn)(AAudioStreamBuilder*, int32_t);
+    auto setUsageFn = reinterpret_cast<set_usage_fn>(dlsym(RTLD_DEFAULT, "AAudioStreamBuilder_setUsage"));
+    if (setUsageFn) {
+        setUsageFn(outBuilder, 2 /* AAUDIO_USAGE_VOICE_COMMUNICATION */);
+    }
+#endif
+
     AAudioStreamBuilder_setDataCallback(outBuilder, playbackCallback, this);
 
     res = AAudioStreamBuilder_openStream(outBuilder, &playbackStream_);
