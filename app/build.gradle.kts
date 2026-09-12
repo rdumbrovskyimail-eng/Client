@@ -1,3 +1,4 @@
+// >>> FILE: app/build.gradle.kts
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -14,7 +15,7 @@ android {
 
     defaultConfig {
         applicationId = "com.client.app"
-        minSdk = 26
+        minSdk = 28 // Требуется для нативных API аппаратного эхоподавления AAudio
         targetSdk = 36
         versionCode = 1
         versionName = "1.0.0"
@@ -29,9 +30,8 @@ android {
             cmake {
                 arguments += listOf(
                     "-DANDROID_STL=c++_shared",
-                    "-DANDROID_PLATFORM=android-26"
+                    "-DANDROID_PLATFORM=android-28" // API 28+ для поддержки AAudio Voice Communication
                 )
-                // Глобальные флаги без привязки к конкретному CPU (архитектурные флаги заданы в CMakeLists.txt)
                 cppFlags += listOf(
                     "-std=c++20",
                     "-O3",
@@ -143,7 +143,7 @@ dependencies {
     // Markdown
     implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.27.0")
 
-    // Этап 1: Protobuf Lite & ONNX Runtime (Qualcomm HTP NPU & ARMv9 NEON)
+    // Protobuf Lite & ONNX Runtime (Qualcomm HTP NPU & ARMv9 NEON)
     implementation("com.google.protobuf:protobuf-javalite:3.25.5")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.0")
 }
