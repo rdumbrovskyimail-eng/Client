@@ -35,6 +35,12 @@ Java_com_client_app_audio_NativeAudioBridge_stopAudio(JNIEnv * /* env */, jobjec
     AAudioEngine::getInstance().stop();
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_client_app_audio_NativeAudioBridge_setVolume(
+    JNIEnv * /* env */, jobject /* this */, jfloat volume) {
+    AAudioEngine::getInstance().setVolume(static_cast<float>(volume));
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackDirect(
     JNIEnv *env, jobject /* this */, jobject byteBuffer, jint offsetBytes, jint lengthBytes) {
