@@ -1,4 +1,3 @@
-# >>> FILE: app/proguard-rules.pro
 -keepattributes *Annotation*, InnerClasses, Signature, Exceptions, EnclosingMethod
 -dontobfuscate
 
