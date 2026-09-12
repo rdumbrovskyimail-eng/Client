@@ -23,6 +23,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material3.*
@@ -47,7 +48,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.client.app.session.ChatMessage
 import com.client.app.session.ForvoWord
-import com.client.app.ui.components.NeoVoiceVisualizer
+import com.client.app.ui.components.AgslVoiceVisualizer
 import com.client.app.viewmodel.ClientViewModel
 import com.mikepenz.markdown.m3.Markdown
 import com.mikepenz.markdown.m3.markdownColor
@@ -60,7 +61,6 @@ fun ClientScreen(
     viewModel: ClientViewModel = hiltViewModel()
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    val amplitude by viewModel.amplitude.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
     var chatInput by remember { mutableStateOf("") }
@@ -71,7 +71,6 @@ fun ClientScreen(
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris -> attachedUris = (attachedUris + uris).distinct().take(8) }
 
-    // Деликатный запрос только обязательных разрешений
     val permissionsLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
@@ -190,24 +189,7 @@ fun ClientScreen(
                 }
             }
 
-            // Индикатор разбора материала через Vision
-            AnimatedVisibility(visible = state.isAnalyzing) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color(0xFF172554))
-                        .padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = Color(0xFF60A5FA))
-                    Spacer(Modifier.width(10.dp))
-                    Text("Распознаём текст и лексику учебника...", color = Color(0xFF93C5FD), fontSize = 12.sp)
-                }
-            }
-
-            // Панель произношений Forvo с атрибуцией и защитой ключей
+            // Панель произношений Forvo
             AnimatedVisibility(visible = state.forvoWords.isNotEmpty()) {
                 Column(
                     modifier = Modifier
@@ -227,11 +209,7 @@ fun ClientScreen(
                             }
                         )
                         Spacer(Modifier.width(8.dp))
-                        Text(
-                            "(${state.forvoUsed}/${state.forvoLimit})",
-                            color = Color(0xFF71717A),
-                            fontSize = 11.sp
-                        )
+                        Text("(${state.forvoUsed}/${state.forvoLimit})", color = Color(0xFF71717A), fontSize = 11.sp)
                         Spacer(Modifier.weight(1f))
                         IconButton(onClick = { viewModel.clearForvo() }, modifier = Modifier.size(20.dp)) {
                             Icon(Icons.Filled.Close, null, tint = Color(0xFFA1A1AA), modifier = Modifier.size(14.dp))
@@ -249,19 +227,15 @@ fun ClientScreen(
                 }
             }
 
-            // Центральная зона: Визуализатор или Чат
+            // Центральная зона: 120 FPS AGSL SDF Визуализатор или Чат
             Box(
                 modifier = Modifier.weight(1f).fillMaxWidth()
             ) {
                 if (state.messages.isEmpty()) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        NeoVoiceVisualizer(
-                            amplitude = amplitude,
-                            isConnected = state.isConnected,
-                            isConnecting = state.isConnecting,
-                            isAiSpeaking = state.isAiSpeaking,
-                            isMicActive = state.isMicActive,
-                            hasError = state.error != null && !state.isConnected,
+                        AgslVoiceVisualizer(
+                            nativeEngine = viewModel.nativeAudioEngine,
+                            state = state,
                             onClick = {
                                 if (hasRecordPermission()) {
                                     if (!state.isConnected && !state.isConnecting) {
@@ -272,26 +246,15 @@ fun ClientScreen(
                                 } else {
                                     handleConnectClick()
                                 }
-                            }
+                            },
+                            size = 230.dp
                         )
                     }
                 } else {
                     val listState = rememberLazyListState()
 
-                    val isAtBottom by remember {
-                        derivedStateOf {
-                            val layoutInfo = listState.layoutInfo
-                            val visibleItems = layoutInfo.visibleItemsInfo
-                            if (visibleItems.isEmpty()) true
-                            else {
-                                val lastVisible = visibleItems.last()
-                                lastVisible.index >= layoutInfo.totalItemsCount - 2
-                            }
-                        }
-                    }
-
                     LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.text?.length) {
-                        if (state.messages.isNotEmpty() && isAtBottom) {
+                        if (state.messages.isNotEmpty()) {
                             listState.animateScrollToItem(state.messages.lastIndex)
                         }
                     }
@@ -316,7 +279,7 @@ fun ClientScreen(
                 }
             }
 
-            // Нижняя панель ввода и вложений
+            // Нижняя панель ввода
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -358,7 +321,7 @@ fun ClientScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = { filePicker.launch(arrayOf("*/*")) }, modifier = Modifier.size(38.dp)) {
-                        Icon(Icons.Filled.Add, "Прикрепить документ или фото", tint = Color(0xFFA1A1AA), modifier = Modifier.size(20.dp))
+                        Icon(Icons.Filled.Add, "Прикрепить документ", tint = Color(0xFFA1A1AA), modifier = Modifier.size(20.dp))
                     }
 
                     BasicTextField(
@@ -414,7 +377,6 @@ fun ClientScreen(
             }
         }
 
-        // Шторка системного промпта
         if (isSheetOpen) {
             ModalBottomSheet(
                 onDismissRequest = { isSheetOpen = false },
@@ -422,9 +384,6 @@ fun ClientScreen(
                 dragHandle = { BottomSheetDefaults.DragHandle(color = Color(0xFF3F3F46)) }
             ) {
                 var tempPrompt by remember { mutableStateOf(state.activePrompt) }
-                LaunchedEffect(isSheetOpen) {
-                    tempPrompt = state.activePrompt
-                }
 
                 Column(
                     modifier = Modifier
@@ -443,7 +402,6 @@ fun ClientScreen(
                         value = tempPrompt,
                         onValueChange = { tempPrompt = it },
                         modifier = Modifier.fillMaxWidth().height(150.dp),
-                        placeholder = { Text("Опишите роль ассистента или тему урока...", color = Color(0xFF71717A), fontSize = 13.sp) },
                         shape = RoundedCornerShape(12.dp),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = Color(0xFF60A5FA),
@@ -503,7 +461,7 @@ private fun ForvoWordChip(
             CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 1.5.dp, color = Color(0xFF60A5FA))
             Spacer(Modifier.width(6.dp))
         } else if (isAvailable) {
-            Icon(Icons.Filled.VolumeUp, null, tint = Color(0xFF60A5FA), modifier = Modifier.size(15.dp))
+            Icon(Icons.AutoMirrored.Filled.VolumeUp, null, tint = Color(0xFF60A5FA), modifier = Modifier.size(15.dp))
             Spacer(Modifier.width(6.dp))
         }
 
@@ -515,11 +473,7 @@ private fun ForvoWordChip(
 
         if (item.translation != null) {
             Spacer(Modifier.width(6.dp))
-            Text(
-                text = "· ${item.translation}",
-                color = Color(0xFFA1A1AA),
-                fontSize = 12.sp
-            )
+            Text(text = "· ${item.translation}", color = Color(0xFFA1A1AA), fontSize = 12.sp)
         }
     }
 }
@@ -582,7 +536,6 @@ private fun ChatBubble(
                         lineHeight = 20.sp
                     )
                 } else if (isStreaming) {
-                    // Высокопроизводительный нативный текст во время стриминга (120 FPS)
                     Text(
                         text = msg.text,
                         color = Color(0xFFFAFAFA),
@@ -590,7 +543,6 @@ private fun ChatBubble(
                         lineHeight = 20.sp
                     )
                 } else {
-                    // Форматированный Markdown рендеринг для завершённого ответа
                     Markdown(
                         content = msg.text,
                         colors = markdownColor(
