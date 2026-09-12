@@ -11,6 +11,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.client.app.ui.display.DisplayRateManager
 import com.client.app.ui.screens.ClientScreen
 import com.client.app.ui.screens.SettingsScreen
 import dagger.hilt.android.AndroidEntryPoint
@@ -33,9 +34,14 @@ private val S23UltraDarkScheme = darkColorScheme(
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Аппаратная фиксация 120.000 Гц на дисплейном контроллере S23 Ultra
+        DisplayRateManager.setHighRefreshRate(window, true)
+
         setContent {
             MaterialTheme(colorScheme = S23UltraDarkScheme) {
                 val nav = rememberNavController()
@@ -49,5 +55,15 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        DisplayRateManager.setHighRefreshRate(window, true)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        DisplayRateManager.setHighRefreshRate(window, false)
     }
 }
