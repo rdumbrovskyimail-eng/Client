@@ -3,7 +3,8 @@ package com.client.app.audio
 
 import android.media.AudioAttributes
 import android.media.MediaPlayer
-import android.media.audiofx.LoudnessEnhancer
+import android.media.audiofx.DynamicsProcessing
+import android.os.Build
 import com.client.app.forvo.ForvoRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -15,99 +16,107 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
 
+private enum class PlayerState { IDLE, PREPARING, PLAYING, RELEASED }
+
 @Singleton
 class PronunciationPlayer @Inject constructor(
     private val forvoRepo: ForvoRepository
 ) {
     private val lock = Any()
     private var mediaPlayer: MediaPlayer? = null
-    private var enhancer: LoudnessEnhancer? = null
+    private var dynamicsProcessing: DynamicsProcessing? = null
+    private var currentState = PlayerState.IDLE
 
     private val _isPlaying = MutableStateFlow(false)
     val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
 
-    /**
-     * Приостанавливает корутину строго на время сетевой буферизации и воспроизведения.
-     * Возвращает true при успешном завершении или false при ошибке сети/формата.
-     * 
-     * @param boostMb Усиление в миллибелах: 600 mB = +6 дБ (комфортный подъем без клиппинга).
-     */
-    suspend fun play(url: String, boostMb: Int = 600): Boolean = withContext(Dispatchers.Main.immediate) {
+    suspend fun play(url: String): Boolean = withContext(Dispatchers.Main.immediate) {
         suspendCancellableCoroutine { cont ->
             synchronized(lock) {
                 releasePlayerInternal()
                 _isPlaying.value = true
+                currentState = PlayerState.PREPARING
             }
 
-        // Честный учет воспроизведения по лицензии Forvo
-        forvoRepo.registerPlayback()
+            forvoRepo.registerPlayback()
+            val mp = MediaPlayer()
 
-        val mp = MediaPlayer()
-        synchronized(lock) {
-            mediaPlayer = mp
-        }
-
-        var isResumed = false
-        fun finish(success: Boolean) {
             synchronized(lock) {
-                if (mediaPlayer == mp) {
-                    releasePlayerInternal()
-                }
+                mediaPlayer = mp
             }
-            if (!isResumed && cont.isActive) {
-                isResumed = true
-                cont.resume(success)
-            }
-        }
 
-        cont.invokeOnCancellation {
-            synchronized(lock) {
-                if (mediaPlayer == mp) {
-                    releasePlayerInternal()
-                }
-            }
-        }
-
-        try {
-            mp.setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
-            mp.setOnPreparedListener { player ->
+            var isResumed = false
+            fun finish(success: Boolean) {
                 synchronized(lock) {
-                    if (mediaPlayer != player) {
-                        runCatching { player.release() }
-                        return@setOnPreparedListener
+                    if (mediaPlayer == mp) {
+                        releasePlayerInternal()
                     }
-                    runCatching {
-                        enhancer = LoudnessEnhancer(player.audioSessionId).apply {
-                            setTargetGain(boostMb.coerceIn(0, 1500))
-                            enabled = true
-                        }
-                    }
-                    player.start()
+                }
+                if (!isResumed && cont.isActive) {
+                    isResumed = true
+                    cont.resume(success)
                 }
             }
-            mp.setOnCompletionListener {
-                finish(true)
+
+            cont.invokeOnCancellation {
+                synchronized(lock) {
+                    if (mediaPlayer == mp) {
+                        // Безопасное снятие коллбэков исключает дедлоки в mediaserver
+                        mp.setOnPreparedListener(null)
+                        mp.setOnCompletionListener(null)
+                        mp.setOnErrorListener(null)
+                        releasePlayerInternal()
+                    }
+                }
             }
-            mp.setOnErrorListener { _, _, _ ->
+
+            try {
+                mp.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+
+                mp.setOnPreparedListener { player ->
+                    synchronized(lock) {
+                        if (mediaPlayer != player || currentState == PlayerState.RELEASED) {
+                            runCatching { player.release() }
+                            return@setOnPreparedListener
+                        }
+                        currentState = PlayerState.PLAYING
+
+                        // Защита от акустического клиппинга: Peak Limiter вместо сырого LoudnessEnhancer
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            runCatching {
+                                val config = DynamicsProcessing.Config.Builder(
+                                    DynamicsProcessing.CONFIG_OPT_VARIANT_FAVOR_FREQUENCY_RESOLUTION,
+                                    1, true, 0, false, 0, false, 0, true
+                                ).build()
+                                dynamicsProcessing = DynamicsProcessing(0, player.audioSessionId, config).apply {
+                                    val limiter = DynamicsProcessing.Limiter(
+                                        true, true, 0, 1.0f, 50.0f, 10.0f, -0.5f, 0.0f
+                                    )
+                                    setLimiter(0, limiter)
+                                    enabled = true
+                                }
+                            }
+                        }
+                        player.start()
+                    }
+                }
+
+                mp.setOnCompletionListener { finish(true) }
+                mp.setOnErrorListener { _, _, _ -> finish(false); true }
+
+                mp.setDataSource(url)
+                mp.prepareAsync()
+            } catch (_: Exception) {
                 finish(false)
-                true
             }
-            mp.setDataSource(url)
-            mp.prepareAsync()
-        } catch (_: Exception) {
-            finish(false)
         }
     }
-}
 
-    /**
-     * Принудительная остановка воспроизведения и мгновенный сброс ресурсов
-     */
     fun stop() {
         synchronized(lock) {
             releasePlayerInternal()
@@ -116,11 +125,15 @@ class PronunciationPlayer @Inject constructor(
 
     private fun releasePlayerInternal() {
         _isPlaying.value = false
-        runCatching { enhancer?.release() }
-        enhancer = null
+        currentState = PlayerState.RELEASED
+        runCatching { dynamicsProcessing?.release() }
+        dynamicsProcessing = null
         mediaPlayer?.let { mp ->
-            runCatching { if (mp.isPlaying) mp.stop() }
-            runCatching { mp.release() }
+            runCatching {
+                if (mp.isPlaying) mp.stop()
+                mp.reset()
+                mp.release()
+            }
         }
         mediaPlayer = null
     }
