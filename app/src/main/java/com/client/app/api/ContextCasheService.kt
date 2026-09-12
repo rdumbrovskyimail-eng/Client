@@ -24,10 +24,14 @@ class ContextCacheService @Inject constructor(
     private val logger: AppLogger
 ) {
     companion object {
-        private const val BASE_URL = "https://aiplatform.googleapis.com/v1"
+        // Канонический эндпоинт Google AI Studio REST v1beta
+        private const val BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
         val KEY_CACHED_CONTENT_ID = stringPreferencesKey("cached_content_id")
         val KEY_CACHED_CONTENT_HASH = stringPreferencesKey("cached_content_hash")
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
+
+        // Минимальный порог токенов Google для активации скидки Context Caching
+        private const val MIN_TOKENS_FOR_CACHE = 32768
     }
 
     private val httpClient = OkHttpClient.Builder()
@@ -37,36 +41,34 @@ class ContextCacheService @Inject constructor(
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
-    /**
-     * Создает или возвращает существующий серверный кэш для системного промпта.
-     * Время жизни кэша (TTL): 4 часа.
-     */
     suspend fun getOrCreateCache(
         apiKey: String,
         systemPrompt: String,
-        modelName: String = "gemini-2.5-flash-native-audio-latest"
+        modelName: String = "gemini-2.5-flash"
     ): String? = withContext(Dispatchers.IO) {
         if (apiKey.isBlank() || systemPrompt.isBlank()) return@withContext null
+
+        // Кэширование активируется только если промпт достаточно объемный
+        if (systemPrompt.length < MIN_TOKENS_FOR_CACHE * 2) {
+            return@withContext null
+        }
 
         val promptHash = systemPrompt.hashCode().toString()
         val prefs = dataStore.data.first()
         val existingId = prefs[KEY_CACHED_CONTENT_ID]
         val existingHash = prefs[KEY_CACHED_CONTENT_HASH]
 
-        // Если кэш уже создан и системный промпт не изменился
         if (!existingId.isNullOrBlank() && existingHash == promptHash) {
             return@withContext existingId
         }
 
-        // Удаляем старый кэш, если промпт изменился
         if (!existingId.isNullOrBlank()) {
             deleteCache(apiKey, existingId)
         }
 
-        // Создаем новый кэш через Vertex AI REST API
-        val modelPath = if (modelName.startsWith("publishers/")) modelName else "publishers/google/models/$modelName"
+        val cleanModel = if (modelName.startsWith("models/")) modelName else "models/$modelName"
         val payload = buildJsonObject {
-            put("model", modelPath)
+            put("model", cleanModel)
             put("displayName", "gemini_voice_session_cache")
             put("systemInstruction", buildJsonObject {
                 put("parts", buildJsonArray {
@@ -79,7 +81,6 @@ class ContextCacheService @Inject constructor(
         val url = "$BASE_URL/cachedContents?key=${apiKey.trim()}"
         val request = Request.Builder()
             .url(url)
-            .header("x-goog-api-key", apiKey.trim())
             .header("Content-Type", "application/json")
             .post(payload.toRequestBody(JSON_MEDIA))
             .build()
@@ -95,11 +96,11 @@ class ContextCacheService @Inject constructor(
                             it[KEY_CACHED_CONTENT_ID] = cacheName
                             it[KEY_CACHED_CONTENT_HASH] = promptHash
                         }
-                        logger.d("ContextCacheService: Создан серверный KV-кэш: $cacheName (Скидка 75%, TTFT ~110 мс)")
+                        logger.d("ContextCacheService: Создан KV-кэш: $cacheName (Скидка 75%, TTFT ~110 мс)")
                         return@withContext cacheName
                     }
                 } else {
-                    logger.w("ContextCacheService: Создание кэша отклонено (${response.code}): $body")
+                    logger.w("ContextCacheService: Сервер отклонил кэш (${response.code}): $body")
                 }
             }
         }.onFailure {
@@ -109,9 +110,6 @@ class ContextCacheService @Inject constructor(
         null
     }
 
-    /**
-     * Удаляет серверный кэш по истечении сессии или смене темы.
-     */
     suspend fun deleteCache(apiKey: String, cacheId: String) = withContext(Dispatchers.IO) {
         if (apiKey.isBlank() || cacheId.isBlank()) return@withContext
         val cleanId = cacheId.removePrefix("cachedContents/")
@@ -119,7 +117,6 @@ class ContextCacheService @Inject constructor(
 
         val request = Request.Builder()
             .url(url)
-            .header("x-goog-api-key", apiKey.trim())
             .delete()
             .build()
 
@@ -130,7 +127,6 @@ class ContextCacheService @Inject constructor(
                         it.remove(KEY_CACHED_CONTENT_ID)
                         it.remove(KEY_CACHED_CONTENT_HASH)
                     }
-                    logger.d("ContextCacheService: Серверный кэш успешно удален")
                 }
             }
         }
