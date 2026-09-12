@@ -29,5 +29,6 @@ local.properties
 *.log
 *.hprof
 
-# Игнорируем ВСЕ бинарные jar (CI генерирует wrapper.jar динамически)
+# Игнорируем бинарные jar, кроме официального Gradle Wrapper
 *.jar
+!gradle/wrapper/gradle-wrapper.jar
