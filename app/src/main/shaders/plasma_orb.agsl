@@ -5,7 +5,6 @@ uniform float u_State;    // 0=IDLE, 1=LISTENING, 2=THINKING, 3=SPEAKING, 4=BARG
 uniform float4 u_Spectrum; // x=SubBass, y=Bass, z=Mid, w=Presence
 uniform float4 u_Dynamics; // x=Air, y=MicRms, z=OutRms, w=Damping
 
-// Быстрый аналитический 3D шум без текстурных выборок для Adreno 740
 float hash3D(float3 p) {
     p = fract(p * 0.3183099 + 0.1);
     p *= 17.0;
@@ -30,16 +29,13 @@ float noise3D(float3 x) {
                mix(mix(e, f, u.x), mix(g, h, u.x), u.y), u.z);
 }
 
-// Поле расстояний деформированной метасферы (Signed Distance Field)
 float mapSDF(float3 p) {
     float bassEnergy = u_Spectrum.x * 1.1 + u_Spectrum.y * 0.7;
     float midEnergy  = u_Spectrum.z * 0.5;
 
-    // Базовый радиус с органическим дыханием
     float r = 0.70 + bassEnergy * 0.22;
     r += sin(u_Time * 2.2) * 0.015;
 
-    // Две октавы турбулентного движения Симплекс-шума
     float n1 = noise3D(p * 2.1 + float3(0.0, u_Time * 0.75, 0.0));
     float n2 = noise3D(p * 4.2 - float3(u_Time * 1.1, 0.0, u_Time * 0.6));
     float displacement = (n1 * 0.62 + n2 * 0.38 - 0.5) * (0.18 + midEnergy * 0.40);
@@ -47,7 +43,6 @@ float mapSDF(float3 p) {
     return length(p) - r + displacement;
 }
 
-// Тетраэдрический расчет нормалей (4 выборки SDF вместо 6)
 float3 calcNormal(float3 p) {
     float2 e = float2(1.0, -1.0) * 0.005;
     return normalize(e.xyy * mapSDF(p + e.xyy) +
@@ -57,17 +52,14 @@ float3 calcNormal(float3 p) {
 }
 
 half4 main(float2 fragCoord) {
-    // Приведение к нормализованным координатам от центра [-1.0 ... 1.0]
     float2 uv = (fragCoord - 0.5 * u_Resolution) / min(u_Resolution.x, u_Resolution.y);
 
-    // Палитра состояний интеллекта
-    float3 colIdle      = float3(0.96, 0.62, 0.05); // Янтарный (Ожидание)
-    float3 colListening = float3(0.23, 0.51, 0.96); // Ультрамарин (Слушает)
-    float3 colThinking  = float3(0.55, 0.36, 0.96); // Индиго/Фиолет (Рассуждает)
-    float3 colSpeaking  = float3(0.06, 0.72, 0.51); // Изумруд/Бирюза (Говорит)
-    float3 colBargeIn   = float3(0.94, 0.27, 0.27); // Коралл/Красный (Перебивание)
+    float3 colIdle      = float3(0.96, 0.62, 0.05);
+    float3 colListening = float3(0.23, 0.51, 0.96);
+    float3 colThinking  = float3(0.55, 0.36, 0.96);
+    float3 colSpeaking  = float3(0.06, 0.72, 0.51);
+    float3 colBargeIn   = float3(0.94, 0.27, 0.27);
 
-    // Плавная интерполяция базового цвета ядра
     float3 coreColor = colIdle;
     if (u_State < 1.5) {
         coreColor = mix(colIdle, colListening, clamp(u_State, 0.0, 1.0));
@@ -79,24 +71,20 @@ half4 main(float2 fragCoord) {
         coreColor = mix(colSpeaking, colBargeIn, clamp(u_State - 3.0, 0.0, 1.0));
     }
 
-    // Камера и луч
     float3 ro = float3(0.0, 0.0, -2.4);
     float3 rd = normalize(float3(uv, 1.25));
 
-    // Константный цикл трассировки (N=22) для 120 FPS
+    // Устранение варп-дивергенции: ровно 16 фиксированных шагов без раннего break
     float t = 0.0;
-    float d = 0.0;
-    for (int i = 0; i < 22; i++) {
+    for (int i = 0; i < 16; i++) {
         float3 p = ro + rd * t;
-        d = mapSDF(p);
-        if (d < 0.002 || t > 3.8) break;
-        t += d * 1.12; // Ускоренный шаг трассировки
+        float d = mapSDF(p);
+        t += d * 1.22;
     }
 
     float3 finalColor = float3(0.0);
     float alpha = 0.0;
 
-    // Внешняя интерференционная аура (Bloom)
     float distToCenter = length(uv);
     float aura = 0.032 / (distToCenter - 0.44 + 0.07);
     aura = clamp(aura, 0.0, 0.85);
@@ -106,20 +94,13 @@ half4 main(float2 fragCoord) {
     if (t <= 3.8) {
         float3 p = ro + rd * t;
         float3 n = calcNormal(p);
-
-        // Диффузное освещение + Блик Блинна-Фонга
         float3 lightDir = normalize(float3(0.45, 0.75, -1.0));
         float diff = max(dot(n, lightDir), 0.0);
         float3 h = normalize(lightDir - rd);
         float spec = pow(max(dot(n, h), 0.0), 28.0) * 0.45;
-
-        // Эффект Френеля (радужная кайма на краях)
         float fresnel = pow(1.0 - max(dot(-rd, n), 0.0), 2.8);
-
-        // Аналитическое подповерхностное рассеивание (SSS)
         float sss = pow(max(dot(rd, lightDir), 0.0), 2.2) * 0.55;
 
-        // Синтез освещения плазмы
         float3 surfaceColor = coreColor * (diff * 0.55 + 0.45) + sss * coreColor;
         surfaceColor += float3(spec) + fresnel * (coreColor + float3(0.2, 0.2, 0.35));
 
@@ -127,7 +108,6 @@ half4 main(float2 fragCoord) {
         alpha = 1.0;
     }
 
-    // Высокочастотный треугольный дизеринг против бандинга на 10-битном AMOLED
     float dither = (fract(sin(dot(fragCoord, float2(12.9898, 78.233))) * 43758.5453) - 0.5) / 255.0;
     finalColor += dither;
 
