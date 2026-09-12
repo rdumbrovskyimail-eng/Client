@@ -1,3 +1,4 @@
+# >>> FILE: app/src/main/cpp/CMakeLists.txt
 cmake_minimum_required(VERSION 3.22.1)
 
 project("client_core" LANGUAGES CXX)
@@ -23,7 +24,6 @@ if(${ANDROID_ABI} STREQUAL "arm64-v8a")
     )
 endif()
 
-# Пути инклюдов относительно директории CMakeLists.txt
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/audio
@@ -32,9 +32,10 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/jni
 )
 
-# Точный путь к файлу реализации JNI
 add_library(client_core SHARED
     ${CMAKE_CURRENT_SOURCE_DIR}/jni/NativeBridge.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/audio/AAudioEngine.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dsp/FastFft.cpp
 )
 
 find_library(log-lib log)
