@@ -75,7 +75,8 @@ data class SessionState(
 @Singleton
 class SessionManager @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val client: GeminiLiveClient,
+    private val client: GeminiProtobufLiveClient,
+    private val contextCacheService: ContextCacheService,
     private val audioEngine: NativeAudioEngine,
     private val forvoRepo: ForvoRepository,
     private val forvoPlayer: PronunciationPlayer,
@@ -120,9 +121,9 @@ class SessionManager @Inject constructor(
     private var reconnectJob: Job? = null
     @Volatile private var streamingRole: String? = null
     @Volatile private var resumptionHandle: String? = null
+    @Volatile private var cachedContentId: String? = null
     @Volatile private var reconnectAttempts = 0
     @Volatile private var userStopped = false
-    @Volatile private var conservativeSetup = false
     @Volatile private var pendingGoAway = false
     @Volatile private var userMicDesired = true
 
@@ -171,6 +172,7 @@ class SessionManager @Inject constructor(
         scope.launch {
             mutex.withLock {
                 resumptionHandle = null
+                cachedContentId = null
                 stopInternal(full = false)
                 startInternal(resume = false)
             }
@@ -346,7 +348,6 @@ class SessionManager @Inject constructor(
         }
 
         val voice = prefs[KEY_VOICE]?.ifBlank { null } ?: "Charon"
-        val enableForvo = prefs[KEY_ENABLE_FORVO] ?: false
 
         audioEngine.setVolume(prefs[KEY_VOLUME] ?: 1.0f)
         audioEngine.setMicGain(prefs[KEY_MIC_GAIN] ?: 1.0f)
@@ -358,39 +359,21 @@ class SessionManager @Inject constructor(
         audioEngine.start()
         startForegroundService()
 
+        // Создание или получение идентификатора Explicit KV-кэша платного тира
+        if (!resume && cachedContentId == null) {
+            cachedContentId = contextCacheService.getOrCreateCache(apiKey, _state.value.activePrompt, model)
+        }
+
         client.connect(
             LiveConfig(
                 apiKey = apiKey,
                 model = model,
                 systemInstruction = _state.value.activePrompt,
                 voiceName = voice,
-                toolsJson = if (enableForvo) buildForvoToolsSchema() else null,
                 resumptionHandle = if (resume) resumptionHandle else null,
-                initialHistory = if (resume) emptyList() else recentHistory(),
-                conservative = conservativeSetup
+                cachedContentId = cachedContentId
             )
         )
-    }
-
-    private fun recentHistory(): List<Pair<String, String>> {
-        val raw = _state.value.messages.filter { !it.interim && it.text.isNotBlank() }
-        if (raw.isEmpty()) return emptyList()
-
-        val merged = mutableListOf<Pair<String, String>>()
-        for (msg in raw) {
-            val role = if (msg.role == "model") "model" else "user"
-            val last = merged.lastOrNull()
-            if (last != null && last.first == role) {
-                merged[merged.size - 1] = role to "${last.second}\n\n${msg.text.trim()}"
-            } else {
-                merged.add(role to msg.text.trim())
-            }
-        }
-        var slice = merged.takeLast(20)
-        while (slice.isNotEmpty() && slice.first().first != "user") {
-            slice = slice.drop(1)
-        }
-        return slice
     }
 
     private suspend fun stopInternal(full: Boolean) {
@@ -443,7 +426,7 @@ class SessionManager @Inject constructor(
             for (chunk in audioEngine.micOutput) {
                 if (!isActive) break
                 if (!forvoPlayer.isPlaying.value) {
-                    client.sendAudio(chunk)
+                    client.sendAudioPcm(chunk)
                 }
             }
         }
@@ -602,28 +585,6 @@ class SessionManager @Inject constructor(
     private fun addMessage(msg: ChatMessage) {
         streamingRole = null
         _state.update { it.copy(messages = (it.messages + msg).takeLast(MAX_MESSAGES)) }
-    }
-
-    private fun buildForvoToolsSchema(): JsonArray = buildJsonArray {
-        add(buildJsonObject {
-            put("functionDeclarations", buildJsonArray {
-                add(buildJsonObject {
-                    put("name", "lookup_pronunciation")
-                    put("description", "Озвучивание слов носителями языка с Forvo")
-                    put("parameters", buildJsonObject {
-                        put("type", "OBJECT")
-                        put("properties", buildJsonObject {
-                            put("words", buildJsonObject {
-                                put("type", "ARRAY")
-                                put("items", buildJsonObject { put("type", "STRING") })
-                            })
-                            put("language", buildJsonObject { put("type", "STRING") })
-                        })
-                        put("required", buildJsonArray { add(JsonPrimitive("words")) })
-                    })
-                })
-            })
-        })
     }
 
     private fun observeSettings() = scope.launch {
