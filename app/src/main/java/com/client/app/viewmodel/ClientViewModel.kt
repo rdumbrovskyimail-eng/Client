@@ -3,6 +3,7 @@ package com.client.app.viewmodel
 
 import android.net.Uri
 import androidx.lifecycle.ViewModel
+import com.client.app.audio.NativeAudioEngine
 import com.client.app.session.ForvoWord
 import com.client.app.session.SessionManager
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -10,7 +11,8 @@ import javax.inject.Inject
 
 @HiltViewModel
 class ClientViewModel @Inject constructor(
-    private val sessionManager: SessionManager
+    private val sessionManager: SessionManager,
+    val nativeAudioEngine: NativeAudioEngine
 ) : ViewModel() {
 
     val state = sessionManager.state
