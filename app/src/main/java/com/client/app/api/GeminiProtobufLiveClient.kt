@@ -183,9 +183,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         webSocket?.send(jsonMessage)
     }
 
-    /**
-     * Закрывает ERR-008: сериализует functionResponses строго как типизированный JSON Object (Struct).
-     */
     fun sendToolResponses(responses: List<ToolResponse>) {
         val ws = webSocket ?: return
 
@@ -213,9 +210,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         ws.send(jsonMessage)
     }
 
-    /**
-     * Закрывает ERR-009 (декларация Forvo Tool) и ERR-010 (пустые объекты активации транскрипций).
-     */
     private fun buildSetupMessage(cfg: LiveConfig): String {
         val cleanModel = if (cfg.model.startsWith("models/")) cfg.model else "models/${cfg.model}"
 
@@ -235,7 +229,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }
 
-                // ERR-010: Активация транскрипций входного и выходного аудиопотоков
                 putJsonObject("inputAudioTranscription") {}
                 putJsonObject("outputAudioTranscription") {}
 
@@ -251,7 +244,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }
 
-                // ERR-009: Регистрация инструментов модели (Google Search + Forvo Pronunciation)
                 putJsonArray("tools") {
                     addJsonObject { putJsonObject("googleSearch") {} }
                     addJsonObject {
@@ -374,12 +366,37 @@ class GeminiProtobufLiveClient @Inject constructor(
                     _events.tryEmit(GeminiEvent.TurnComplete)
                 }
 
+                // ERR-011: Промежуточная транскрипция микрофона пользователя
+                sc["interimInputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let { interimText ->
+                    if (interimText.isNotBlank()) {
+                        _events.tryEmit(GeminiEvent.InputTranscript(interimText, interim = true))
+                    }
+                }
+
+                // ERR-011: Финализированная транскрипция реплики пользователя
+                sc["inputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let { finalText ->
+                    if (finalText.isNotBlank()) {
+                        _events.tryEmit(GeminiEvent.InputTranscript(finalText, interim = false))
+                    }
+                }
+
+                // ERR-011: Текстовая транскрипция ответа модели
+                sc["outputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let { outputText ->
+                    if (outputText.isNotBlank()) {
+                        _events.tryEmit(GeminiEvent.OutputTranscript(outputText))
+                    }
+                }
+
                 sc["modelTurn"]?.jsonObject?.get("parts")?.jsonArray?.forEach { partEl ->
                     val part = partEl.jsonObject
 
-                    part["text"]?.jsonPrimitive?.contentOrNull?.let { text ->
-                        if (text.isNotBlank()) {
-                            _events.tryEmit(GeminiEvent.ModelText(text))
+                    // ERR-012: Исключаем внутренние мысли модели из публичного текста
+                    val isThought = part["thought"]?.jsonPrimitive?.booleanOrNull == true
+                    if (!isThought) {
+                        part["text"]?.jsonPrimitive?.contentOrNull?.let { text ->
+                            if (text.isNotBlank()) {
+                                _events.tryEmit(GeminiEvent.ModelText(text))
+                            }
                         }
                     }
 
