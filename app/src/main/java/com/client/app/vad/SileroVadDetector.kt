@@ -5,9 +5,13 @@ import ai.onnxruntime.*
 import android.content.Context
 import com.client.app.util.AppLogger
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -21,21 +25,13 @@ class SileroVadDetector @Inject constructor(
     private val logger: AppLogger
 ) {
     companion object {
-        const val SAMPLE_RATE = 16000
-        const val WINDOW_SIZE_SAMPLES = 512 // 32 мс при 16 кГц
+        const val WINDOW_SIZE_SAMPLES = 512
         private const val MODEL_PATH = "models/silero_vad_v5_quant.onnx"
-
-        // Пороги вероятности речи гистерезиса
-        private const val THRESHOLD_SPEECH_START = 0.65f
-        private const val THRESHOLD_SPEECH_END = 0.35f
-
-        // Окна подтверждения (число чанков по 32 мс)
-        private const val CONSECUTIVE_START_CHUNKS = 2  // ~64 мс
-        private const val CONSECUTIVE_END_CHUNKS = 10   // ~320 мс
     }
 
     private var ortEnvironment: OrtEnvironment? = null
     private var ortSession: OrtSession? = null
+    private val initMutex = Mutex()
 
     private val _speechProbability = MutableStateFlow(0f)
     val speechProbability: StateFlow<Float> = _speechProbability.asStateFlow()
@@ -43,60 +39,57 @@ class SileroVadDetector @Inject constructor(
     private val _isSpeechDetected = MutableStateFlow(false)
     val isSpeechDetected: StateFlow<Boolean> = _isSpeechDetected.asStateFlow()
 
-    // Скрытые состояния RNN (Silero VAD state: 2 x 1 x 128)
-    private var stateBuffer = FloatArray(2 * 1 * 128)
+    private var thresholdSpeechStart = 0.65f
+    private var thresholdSpeechEnd = 0.35f
 
-    // Входной буфер для одного инференса
+    private var stateBuffer = FloatArray(2 * 1 * 128)
     private val inputFloatBuffer: FloatBuffer = ByteBuffer.allocateDirect(WINDOW_SIZE_SAMPLES * 4)
         .order(ByteOrder.nativeOrder())
         .asFloatBuffer()
 
-    // Накопитель сырых сэмплов до размера 512
     private val accumulator = ShortArray(WINDOW_SIZE_SAMPLES)
     private var accumulatorCount = 0
 
     private var speechStartStreak = 0
     private var speechEndStreak = 0
-    private var isNeuralModelLoaded = false
 
-    init {
-        initOrtSession()
-    }
+    @Volatile private var isNeuralModelLoaded = false
+    private var persistentSrTensor: OnnxTensor? = null
 
-    private fun initOrtSession() {
-        try {
-            val env = OrtEnvironment.getEnvironment()
-            ortEnvironment = env
+    // Асинхронный вызов вне Main Thread исключает зависание UI
+    suspend fun prepare() = withContext(Dispatchers.IO) {
+        initMutex.withLock {
+            if (isNeuralModelLoaded) return@withContext
+            try {
+                val env = OrtEnvironment.getEnvironment()
+                ortEnvironment = env
 
-            val sessionOptions = OrtSession.SessionOptions().apply {
-                setIntraOpNumThreads(2)
-                setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-            }
+                val sessionOptions = OrtSession.SessionOptions().apply {
+                    setIntraOpNumThreads(2)
+                    setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                }
 
-            val modelBytes = runCatching {
-                context.assets.open(MODEL_PATH).use { it.readBytes() }
-            }.getOrNull()
-
-            if (modelBytes != null && modelBytes.isNotEmpty()) {
+                val modelBytes = context.assets.open(MODEL_PATH).use { it.readBytes() }
                 ortSession = env.createSession(modelBytes, sessionOptions)
+
+                // Пул постоянных тензоров (Zero Allocation)
+                persistentSrTensor = OnnxTensor.createTensor(env, longArrayOf(16000L))
                 isNeuralModelLoaded = true
-                logger.d("SileroVadDetector: Модель успешно загружена в память NPU/CPU")
-            } else {
-                logger.w("SileroVadDetector: Модель $MODEL_PATH не найдена в assets. Включен высокоточный спектральный fallback")
+                logger.d("SileroVadDetector: Модель успешно скомпилирована в фоновом потоке")
+            } catch (e: Exception) {
+                logger.e("SileroVadDetector: Ошибка ONNX, задействован RMS fallback", e)
+                isNeuralModelLoaded = false
             }
-        } catch (e: Exception) {
-            logger.e("SileroVadDetector: Ошибка инициализации ONNX Runtime", e)
-            isNeuralModelLoaded = false
         }
     }
 
-    /**
-     * Обрабатывает порцию сырых 16-битных сэмплов PCM 16 кГц из микрофонного буфера.
-     * Возвращает true при подтвержденном начале речи.
-     */
+    fun setThresholds(start: Float, end: Float) {
+        thresholdSpeechStart = start
+        thresholdSpeechEnd = end
+    }
+
     fun processSamples(pcm16: ByteArray, onSpeechStart: () -> Unit, onSpeechEnd: () -> Unit) {
         val sampleCount = pcm16.size / 2
-
         var offset = 0
         while (offset < sampleCount) {
             val toCopy = minOf(sampleCount - offset, WINDOW_SIZE_SAMPLES - accumulatorCount)
@@ -125,9 +118,9 @@ class SileroVadDetector @Inject constructor(
         _speechProbability.value = prob
 
         if (!_isSpeechDetected.value) {
-            if (prob >= THRESHOLD_SPEECH_START) {
+            if (prob >= thresholdSpeechStart) {
                 speechStartStreak++
-                if (speechStartStreak >= CONSECUTIVE_START_CHUNKS) {
+                if (speechStartStreak >= 2) {
                     _isSpeechDetected.value = true
                     speechStartStreak = 0
                     speechEndStreak = 0
@@ -137,9 +130,9 @@ class SileroVadDetector @Inject constructor(
                 speechStartStreak = 0
             }
         } else {
-            if (prob < THRESHOLD_SPEECH_END) {
+            if (prob < thresholdSpeechEnd) {
                 speechEndStreak++
-                if (speechEndStreak >= CONSECUTIVE_END_CHUNKS) {
+                if (speechEndStreak >= 10) {
                     _isSpeechDetected.value = false
                     speechEndStreak = 0
                     speechStartStreak = 0
@@ -154,6 +147,7 @@ class SileroVadDetector @Inject constructor(
     private fun evaluateNeural(window: ShortArray): Float {
         val env = ortEnvironment ?: return 0f
         val session = ortSession ?: return 0f
+        val srTensor = persistentSrTensor ?: return 0f
 
         inputFloatBuffer.clear()
         for (i in 0 until WINDOW_SIZE_SAMPLES) {
@@ -163,20 +157,13 @@ class SileroVadDetector @Inject constructor(
 
         var inputTensor: OnnxTensor? = null
         var stateTensor: OnnxTensor? = null
-        var srTensor: OnnxTensor? = null
         var result: OrtSession.Result? = null
 
         return try {
             inputTensor = OnnxTensor.createTensor(env, inputFloatBuffer, longArrayOf(1, WINDOW_SIZE_SAMPLES.toLong()))
             stateTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(stateBuffer), longArrayOf(2, 1, 128))
-            srTensor = OnnxTensor.createTensor(env, longArrayOf(16000L))
 
-            val inputs = mapOf(
-                "input" to inputTensor,
-                "state" to stateTensor,
-                "sr" to srTensor
-            )
-
+            val inputs = mapOf("input" to inputTensor, "state" to stateTensor, "sr" to srTensor)
             result = session.run(inputs)
 
             val outputProb = (result.get(0).value as Array<FloatArray>)[0][0]
@@ -189,15 +176,12 @@ class SileroVadDetector @Inject constructor(
                     stateBuffer[idx++] = nextState[i][0][j]
                 }
             }
-
             outputProb
-        } catch (e: Exception) {
-            logger.e("SileroVadDetector: Ошибка инференса", e)
+        } catch (_: Exception) {
             evaluateFallbackRms(window)
         } finally {
             inputTensor?.close()
             stateTensor?.close()
-            srTensor?.close()
             result?.close()
         }
     }
@@ -208,8 +192,7 @@ class SileroVadDetector @Inject constructor(
             val f = s / 32768.0
             sumSq += f * f
         }
-        val rms = sqrt(sumSq / window.size).toFloat()
-        // Приведение RMS диапазона к нормализованной вероятности [0.0 ... 1.0]
+        val rms = sqrt((sumSq + 1e-9) / window.size).toFloat()
         return ((rms - 0.012f) / 0.045f).coerceIn(0.0f, 1.0f)
     }
 
