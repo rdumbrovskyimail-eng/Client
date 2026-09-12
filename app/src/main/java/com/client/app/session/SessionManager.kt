@@ -101,6 +101,15 @@ class SessionManager @Inject constructor(
             "Отвечай лаконично, точно и структурированно, без шаблонных вводных слов. " +
             "Говори естественным, уверенным тоном."
 
+        // ERR-013: Единый канонический default для Live-сессий
+        const val DEFAULT_LIVE_MODEL = "gemini-3.1-flash-live-preview"
+
+        // ERR-014: Строгий whitelist поддерживаемых Bidi Live моделей
+        private val SUPPORTED_LIVE_MODELS = setOf(
+            "gemini-3.1-flash-live-preview",
+            "gemini-2.5-flash-native-audio-preview-12-2025"
+        )
+
         private const val MAX_MESSAGES = 200
         private const val MAX_RECONNECT_ATTEMPTS = 5
     }
@@ -340,11 +349,12 @@ class SessionManager @Inject constructor(
             return
         }
 
+        // ERR-013 & ERR-014: Строгая валидация идентификатора модели по белому списку
         val rawModel = prefs[KEY_MODEL]?.trim().orEmpty()
-        val model = if (rawModel.contains("live", ignoreCase = true) || rawModel.contains("native-audio", ignoreCase = true)) {
+        val model = if (rawModel in SUPPORTED_LIVE_MODELS) {
             rawModel
         } else {
-            "gemini-2.5-flash-native-audio-latest"
+            DEFAULT_LIVE_MODEL
         }
 
         val voice = prefs[KEY_VOICE]?.ifBlank { null } ?: "Charon"
@@ -359,7 +369,6 @@ class SessionManager @Inject constructor(
         audioEngine.start()
         startForegroundService()
 
-        // Создание или получение идентификатора Explicit KV-кэша платного тира
         if (!resume && cachedContentId == null) {
             cachedContentId = contextCacheService.getOrCreateCache(apiKey, _state.value.activePrompt, model)
         }
