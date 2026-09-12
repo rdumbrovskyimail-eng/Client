@@ -1,4 +1,3 @@
-// >>> FILE: app/build.gradle.kts
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -20,8 +19,10 @@ android {
         versionCode = 1
         versionName = "1.0.0"
 
+        // Строго 64-битная архитектура чипсета Snapdragon 8 Gen 2 на S23 Ultra
         ndk {
-            abiFilters.addAll(listOf("arm64-v8a", "x86_64"))
+            abiFilters.clear()
+            abiFilters.add("arm64-v8a")
         }
 
         externalNativeBuild {
@@ -30,10 +31,10 @@ android {
                     "-DANDROID_STL=c++_shared",
                     "-DANDROID_PLATFORM=android-26"
                 )
+                // Глобальные флаги без привязки к конкретному CPU (архитектурные флаги заданы в CMakeLists.txt)
                 cppFlags += listOf(
                     "-std=c++20",
                     "-O3",
-                    "-march=armv8.2-a+fp16+dotprod",
                     "-fvisibility=hidden",
                     "-flto",
                     "-ffast-math"
@@ -142,7 +143,7 @@ dependencies {
     // Markdown
     implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.27.0")
 
-    // Этап 1: Protobuf Lite & ONNX Runtime (Snapdragon HTP / QNN / NEON)
+    // Этап 1: Protobuf Lite & ONNX Runtime (Qualcomm HTP NPU & ARMv9 NEON)
     implementation("com.google.protobuf:protobuf-javalite:3.25.5")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.0")
 }
