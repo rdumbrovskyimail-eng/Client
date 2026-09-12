@@ -12,29 +12,29 @@ if(${ANDROID_ABI} STREQUAL "arm64-v8a")
         -O3
         -march=armv8.2-a+fp16+dotprod
         -fvisibility=hidden
-        -flto
         -ffast-math
         -fno-rtti
         -fexceptions
     )
     # Выравнивание страниц под стандарт Android 15/16 Baklava (16 KB Page Alignment)
     add_link_options(
-        -flto
         -Wl,--gc-sections
         -Wl,-z,max-page-size=16384
     )
 endif()
 
+# Пути инклюдов относительно директории CMakeLists.txt
 include_directories(
-    src/main/cpp
-    src/main/cpp/audio
-    src/main/cpp/vad
-    src/main/cpp/dsp
-    src/main/cpp/jni
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/audio
+    ${CMAKE_CURRENT_SOURCE_DIR}/vad
+    ${CMAKE_CURRENT_SOURCE_DIR}/dsp
+    ${CMAKE_CURRENT_SOURCE_DIR}/jni
 )
 
+# Точный путь к файлу реализации JNI
 add_library(client_core SHARED
-    src/main/cpp/jni/NativeBridge.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/jni/NativeBridge.cpp
 )
 
 find_library(log-lib log)
