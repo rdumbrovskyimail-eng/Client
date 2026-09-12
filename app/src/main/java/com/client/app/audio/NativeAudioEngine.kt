@@ -180,6 +180,14 @@ class NativeAudioEngine @Inject constructor(
         _outLevel.value = 0f
     }
 
+    fun setVolume(volume: Float) {
+        bridge.setVolume(volume.coerceIn(0f, 1f))
+    }
+
+    fun setMicGain(gain: Float) {
+        bridge.setMicGain(gain.coerceIn(0.5f, 2.0f))
+    }
+
     fun enqueuePlayback(pcm: ByteArray) {
         if (pcm.isEmpty() || !_isPlaying.value) return
         val directBuf = ByteBuffer.allocateDirect(pcm.size).order(ByteOrder.LITTLE_ENDIAN)
