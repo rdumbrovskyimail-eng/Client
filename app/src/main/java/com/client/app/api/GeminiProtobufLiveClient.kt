@@ -74,7 +74,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         val myEpoch = epochGen.incrementAndGet()
         epoch = myEpoch
 
-        // Авторизация строго через URL query-параметр для корректного WebSocket Upgrade
         val encodedKey = URLEncoder.encode(cfg.apiKey.trim(), "UTF-8")
         val url = "wss://$WS_HOST/$WS_PATH?key=$encodedKey"
 
@@ -125,10 +124,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         })
     }
 
-    /**
-     * Потоковая передача 40-мс блоков PCM-аудио.
-     * Используется одиночный объект audio вместо устаревшего mediaChunks.
-     */
     fun sendAudioPcm(pcm: ByteArray) {
         val ws = webSocket ?: return
         if (!isReady) return
@@ -188,6 +183,9 @@ class GeminiProtobufLiveClient @Inject constructor(
         webSocket?.send(jsonMessage)
     }
 
+    /**
+     * Закрывает ERR-008: сериализует functionResponses строго как типизированный JSON Object (Struct).
+     */
     fun sendToolResponses(responses: List<ToolResponse>) {
         val ws = webSocket ?: return
 
@@ -198,18 +196,14 @@ class GeminiProtobufLiveClient @Inject constructor(
                         addJsonObject {
                             put("id", resp.id)
                             put("name", resp.name)
-                            // response строго JSON Object (Struct), а не строковый литерал
-                            val parsedResponse = runCatching {
-                                json.parseToJsonElement(resp.resultJson)
-                            }.getOrNull()
 
-                            if (parsedResponse is JsonObject) {
-                                put("response", parsedResponse)
-                            } else {
-                                putJsonObject("response") {
-                                    put("output", resp.resultJson)
-                                }
+                            val responseStruct = runCatching {
+                                json.parseToJsonElement(resp.resultJson).jsonObject
+                            }.getOrElse {
+                                buildJsonObject { put("output", resp.resultJson) }
                             }
+
+                            put("response", responseStruct)
                         }
                     }
                 }
@@ -219,6 +213,9 @@ class GeminiProtobufLiveClient @Inject constructor(
         ws.send(jsonMessage)
     }
 
+    /**
+     * Закрывает ERR-009 (декларация Forvo Tool) и ERR-010 (пустые объекты активации транскрипций).
+     */
     private fun buildSetupMessage(cfg: LiveConfig): String {
         val cleanModel = if (cfg.model.startsWith("models/")) cfg.model else "models/${cfg.model}"
 
@@ -238,6 +235,10 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }
 
+                // ERR-010: Активация транскрипций входного и выходного аудиопотоков
+                putJsonObject("inputAudioTranscription") {}
+                putJsonObject("outputAudioTranscription") {}
+
                 cfg.cachedContentId?.takeIf { it.isNotBlank() }?.let {
                     put("cachedContent", it)
                 }
@@ -250,8 +251,34 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }
 
+                // ERR-009: Регистрация инструментов модели (Google Search + Forvo Pronunciation)
                 putJsonArray("tools") {
                     addJsonObject { putJsonObject("googleSearch") {} }
+                    addJsonObject {
+                        putJsonArray("functionDeclarations") {
+                            addJsonObject {
+                                put("name", "lookup_pronunciation")
+                                put("description", "Поиск эталонного произношения слов и фраз носителями языка в базе Forvo")
+                                putJsonObject("parameters") {
+                                    put("type", "OBJECT")
+                                    putJsonObject("properties") {
+                                        putJsonObject("words") {
+                                            put("type", "ARRAY")
+                                            putJsonObject("items") { put("type", "STRING") }
+                                            put("description", "Список слов или лексем для поиска аудио-произношения")
+                                        }
+                                        putJsonObject("language") {
+                                            put("type", "STRING")
+                                            put("description", "ISO 639-1 двухбуквенный код языка (например, 'de', 'en', 'fr')")
+                                        }
+                                    }
+                                    putJsonArray("required") {
+                                        add("words")
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 cfg.resumptionHandle?.takeIf { it.isNotBlank() }?.let { handle ->
