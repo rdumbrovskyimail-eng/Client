@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package google.ai.generativelanguage.v1beta;
 
+import "google/protobuf/struct.proto";
+
 option java_package = "com.google.ai.generativelanguage.v1beta";
 option java_multiple_files = true;
 option java_outer_classname = "GeminiLiveProto";
@@ -76,9 +78,10 @@ message SafetySetting {
 
 // Передача сырого звука и текста в реальном времени
 message BidiGenerateContentRealtimeInput {
-  repeated Blob media_chunks = 1;
+  Blob audio = 1;                          // Официальный одиночный аудио поток (вместо media_chunks)
   bool audio_stream_end = 2;
   string text = 3;
+  repeated Blob media_chunks = 4 [deprecated = true];
 }
 
 message Blob {
@@ -126,7 +129,7 @@ message CodeExecution {}
 message FunctionDeclaration {
   string name = 1;
   string description = 2;
-  string parameters_json_schema = 3;
+  google.protobuf.Struct parameters = 3; // Структурированная JSON-схема вместо плоской строки
 }
 
 message BidiGenerateContentToolCall {
@@ -136,7 +139,7 @@ message BidiGenerateContentToolCall {
 message FunctionCall {
   string id = 1;
   string name = 2;
-  map<string, string> args = 3;
+  google.protobuf.Struct args = 3;
 }
 
 message BidiGenerateContentToolCallCancellation {
@@ -150,7 +153,7 @@ message BidiGenerateContentToolResponse {
 message FunctionResponse {
   string id = 1;
   string name = 2;
-  string response = 3;
+  google.protobuf.Struct response = 3; // Официальный типизированный Struct вместо string
 }
 
 // Служебные метаданные сессии
