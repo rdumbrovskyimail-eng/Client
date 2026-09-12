@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/cpp/audio/AAudioEngine.cpp
 #include "AAudioEngine.h"
 #include "dsp/NeonDspUtils.h"
 #include <android/log.h>
@@ -209,6 +210,15 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
 
     auto* engine = static_cast<AAudioEngine*>(userData);
     auto* samples = static_cast<int16_t*>(audioData);
+
+    // Применение программного усиления микрофона с аппаратным насыщением (clamping)
+    float gain = engine->micGain_.load(std::memory_order_relaxed);
+    if (std::abs(gain - 1.0f) > 0.001f) {
+        for (int32_t i = 0; i < numFrames; ++i) {
+            int32_t amplified = static_cast<int32_t>(std::round(samples[i] * gain));
+            samples[i] = static_cast<int16_t>(std::clamp(amplified, -32768, 32767));
+        }
+    }
 
     engine->captureBuffer_.write(samples, numFrames);
     float rms = dsp::calculateRms(samples, numFrames);
