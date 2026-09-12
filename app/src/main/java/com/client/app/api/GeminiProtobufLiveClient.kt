@@ -1,6 +1,7 @@
 // >>> FILE: app/src/main/java/com/client/app/api/GeminiProtobufLiveClient.kt
 package com.client.app.api
 
+import com.client.app.audio.NativeAudioBridge
 import com.client.app.util.AppLogger
 import com.google.ai.generativelanguage.v1beta.*
 import kotlinx.coroutines.channels.BufferOverflow
@@ -14,6 +15,7 @@ import kotlinx.coroutines.sync.withLock
 import okhttp3.*
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
@@ -22,18 +24,18 @@ import javax.net.SocketFactory
 
 @Singleton
 class GeminiProtobufLiveClient @Inject constructor(
+    private val nativeBridge: NativeAudioBridge,
     private val logger: AppLogger
 ) {
     companion object {
         const val WS_HOST = "generativelanguage.googleapis.com"
         const val WS_PATH = "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-
-        // Ограничение сетевой очереди: 64 КБ (~1.4 сек звука) для защиты от устаревшей речи
         private const val MAX_QUEUE_BYTES = 64L * 1024
+        private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280 // 40 мс @ 16 кГц (640 сэмплов)
     }
 
     private val httpClient = OkHttpClient.Builder()
-        .socketFactory(TunedSocketFactory(SocketFactory.getDefault(), logger))
+        .socketFactory(TunedSocketFactory(SocketFactory.getDefault(), nativeBridge, logger))
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .writeTimeout(0, TimeUnit.MILLISECONDS)
@@ -56,31 +58,33 @@ class GeminiProtobufLiveClient @Inject constructor(
     val audio: ReceiveChannel<AudioFrame> = _audio
 
     @Volatile var isReady: Boolean = false; private set
-    @Volatile var droppedAudioFrames: Long = 0L; private set
+
+    // Буфер склейки 10-мс квантов в 40-мс батчи (сокращение сериализации в 4 раза)
+    private val audioBatchBuffer = ByteArrayOutputStream(AUDIO_BATCH_THRESHOLD_BYTES * 2)
+    private val batchLock = Any()
 
     suspend fun connect(cfg: LiveConfig) = wsMutex.withLock {
         closeInternal()
         isReady = false
 
-        while (_audio.tryReceive().isSuccess) { /* сброс очереди */ }
+        while (_audio.tryReceive().isSuccess) { /* очистка */ }
 
         val myEpoch = epochGen.incrementAndGet()
         epoch = myEpoch
 
-        val url = "wss://$WS_HOST/$WS_PATH?key=${cfg.apiKey.trim()}"
+        // Безопасность OWASP: Ключ передается в заголовке x-goog-api-key, а не в открытом URL query
+        val url = "wss://$WS_HOST/$WS_PATH"
         val req = Request.Builder()
             .url(url)
             .header("x-goog-api-key", cfg.apiKey.trim())
-            .header("X-Accel-Buffering", "no")   // Мгновенный сброс буфера Envoy
-            .header("Cache-Control", "no-cache") // Запрет кэширования
+            .header("X-Accel-Buffering", "no")
+            .header("Cache-Control", "no-cache")
             .build()
 
         webSocket = httpClient.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 if (myEpoch != epoch) { ws.close(1000, "stale"); return }
                 _events.tryEmit(GeminiEvent.Connected)
-
-                // Отправляем бинарный Protobuf Setup
                 val setupMessage = buildSetupMessage(cfg)
                 ws.send(setupMessage.toByteArray().toByteString())
             }
@@ -106,26 +110,39 @@ class GeminiProtobufLiveClient @Inject constructor(
                 isReady = false
                 val http = response?.code
                 val fatal = http == 400 || http == 401 || http == 403
-                _events.tryEmit(GeminiEvent.Error("Ошибка ($http): ${t.localizedMessage}", fatal))
+                _events.tryEmit(GeminiEvent.Error("Сетевой сбой ($http): ${t.localizedMessage}", fatal))
                 _events.tryEmit(GeminiEvent.Disconnected(http ?: 1006, t.message.orEmpty(), myEpoch))
             }
         })
     }
 
     /**
-     * Потоковая отправка сырых PCM 16 кГц байтов через бинарный Protobuf (Zero-Copy).
+     * Потоковая батчированная передача 40-мс блоков звука без микро-дропов.
      */
     fun sendAudioPcm(pcm: ByteArray) {
         val ws = webSocket ?: return
         if (!isReady) return
+
+        var toSend: ByteArray? = null
+        synchronized(batchLock) {
+            audioBatchBuffer.write(pcm)
+            if (audioBatchBuffer.size() >= AUDIO_BATCH_THRESHOLD_BYTES) {
+                toSend = audioBatchBuffer.toByteArray()
+                audioBatchBuffer.reset()
+            }
+        }
+
+        val payload = toSend ?: return
+
+        // Защита от перегрузки очереди: завершаем ход штатно, а не режем синусоиду
         if (ws.queueSize() > MAX_QUEUE_BYTES) {
-            droppedAudioFrames++
+            sendAudioStreamEnd()
             return
         }
 
         val blob = Blob.newBuilder()
             .setMimeType("audio/pcm;rate=16000")
-            .setData(com.google.protobuf.ByteString.copyFrom(pcm))
+            .setData(com.google.protobuf.ByteString.copyFrom(payload))
             .build()
 
         val realtimeInput = BidiGenerateContentRealtimeInput.newBuilder()
@@ -156,6 +173,8 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     fun sendAudioStreamEnd() {
         if (!isReady) return
+        synchronized(batchLock) { audioBatchBuffer.reset() }
+
         val realtimeInput = BidiGenerateContentRealtimeInput.newBuilder()
             .setAudioStreamEnd(true)
             .build()
@@ -203,7 +222,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             )
             .setThinkingConfig(
                 ThinkingConfig.newBuilder()
-                    .setThinkingLevel("LOW") // Мгновенный разговорный отклик
+                    .setThinkingLevel("LOW")
                     .setIncludeThoughts(true)
                     .build()
             )
@@ -213,12 +232,10 @@ class GeminiProtobufLiveClient @Inject constructor(
             .setModel(modelPath)
             .setGenerationConfig(generationConfig)
 
-        // Подключение Explicit KV-кэша, если он сформирован
         cfg.cachedContentId?.takeIf { it.isNotBlank() }?.let {
             setupBuilder.setCachedContent(it)
         }
 
-        // Подключение системного промпта
         if (cfg.systemInstruction.isNotBlank()) {
             setupBuilder.setSystemInstruction(
                 Content.newBuilder()
@@ -228,18 +245,14 @@ class GeminiProtobufLiveClient @Inject constructor(
             )
         }
 
-        // Активация Google Search
-        val tool = Tool.newBuilder()
-            .setGoogleSearch(GoogleSearch.getDefaultInstance())
-            .build()
-        setupBuilder.addTools(tool)
+        setupBuilder.addTools(
+            Tool.newBuilder().setGoogleSearch(GoogleSearch.getDefaultInstance()).build()
+        )
 
-        // Session Resumption маркер
         cfg.resumptionHandle?.takeIf { it.isNotBlank() }?.let {
             setupBuilder.setSessionResumption(SessionResumption.newBuilder().setHandle(it).build())
         }
 
-        // Фильтры безопасности
         listOf(
             "HARM_CATEGORY_HARASSMENT",
             "HARM_CATEGORY_HATE_SPEECH",
@@ -267,41 +280,30 @@ class GeminiProtobufLiveClient @Inject constructor(
                 isReady = true
                 _events.tryEmit(GeminiEvent.SetupComplete)
             }
-
             if (serverMsg.hasUsageMetadata()) {
                 _events.tryEmit(GeminiEvent.Usage(serverMsg.usageMetadata.totalTokenCount))
             }
-
             if (serverMsg.hasGoAway()) {
                 _events.tryEmit(GeminiEvent.GoAway(serverMsg.goAway.timeLeftMs))
             }
-
             if (serverMsg.hasSessionResumptionUpdate()) {
                 val update = serverMsg.sessionResumptionUpdate
                 if (update.resumable && update.newHandle.isNotBlank()) {
                     _events.tryEmit(GeminiEvent.ResumptionHandle(update.newHandle))
                 }
             }
-
             if (serverMsg.hasToolCall()) {
                 val calls = serverMsg.toolCall.functionCallsList.map { fc ->
-                    FunctionCall(
-                        name = fc.name,
-                        id = fc.id,
-                        args = fc.argsMap
-                    )
+                    FunctionCall(fc.name, fc.id, fc.argsMap)
                 }
                 if (calls.isNotEmpty()) _events.tryEmit(GeminiEvent.ToolCall(calls))
             }
-
             if (serverMsg.hasToolCallCancellation()) {
                 val ids = serverMsg.toolCallCancellation.idsList
                 if (ids.isNotEmpty()) _events.tryEmit(GeminiEvent.ToolCallCancelled(ids))
             }
-
             if (serverMsg.hasServerContent()) {
                 val sc = serverMsg.serverContent
-
                 if (sc.interrupted) _events.tryEmit(GeminiEvent.Interrupted)
                 if (sc.generationComplete) _events.tryEmit(GeminiEvent.GenerationComplete)
                 if (sc.turnComplete) _events.tryEmit(GeminiEvent.TurnComplete)
@@ -314,15 +316,14 @@ class GeminiProtobufLiveClient @Inject constructor(
                         if (part.hasInlineData()) {
                             val mime = part.inlineData.mimeType
                             if (mime.startsWith("audio/pcm")) {
-                                val pcmBytes = part.inlineData.data.toByteArray()
-                                _audio.trySend(AudioFrame(pcmBytes, myEpoch))
+                                _audio.trySend(AudioFrame(part.inlineData.data.toByteArray(), myEpoch))
                             }
                         }
                     }
                 }
             }
         } catch (e: Exception) {
-            logger.e("GeminiProtobufLiveClient: Сбой парсинга Protobuf сообщения", e)
+            logger.e("GeminiProtobufLiveClient: Ошибка разбора сообщения", e)
         }
     }
 
@@ -330,7 +331,8 @@ class GeminiProtobufLiveClient @Inject constructor(
         val ws = webSocket
         webSocket = null
         isReady = false
-        runCatching { ws?.close(1000, "client close") }
+        synchronized(batchLock) { audioBatchBuffer.reset() }
+        runCatching { ws?.close(1000, "close") }
         runCatching { ws?.cancel() }
     }
 
