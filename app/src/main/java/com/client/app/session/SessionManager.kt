@@ -219,6 +219,18 @@ class SessionManager @Inject constructor(
         }
     }
 
+    fun refetchAllForvo() {
+        val words = _state.value.forvoWords
+        if (words.isEmpty()) return
+        forvoRepo.clearMisses()
+        scope.launch {
+            resolveForvo(
+                words.map { VocabItem(it.word, it.query, it.translation) },
+                words.first().language
+            )
+        }
+    }
+
     fun clearForvo() {
         forvoRepo.clearMisses()
         _state.update { it.copy(forvoWords = emptyList()) }
@@ -226,6 +238,44 @@ class SessionManager @Inject constructor(
 
     fun clearError() = _state.update { it.copy(error = null) }
     fun clearChat() = _state.update { it.copy(messages = emptyList()) }
+
+    private suspend fun resolveForvo(items: List<VocabItem>, lang: String) {
+        _state.update { s ->
+            s.copy(forvoWords = items.map {
+                ForvoWord(
+                    word = it.lemma,
+                    query = it.forvoQuery,
+                    language = lang,
+                    translation = it.translation,
+                    isLoading = true
+                )
+            })
+        }
+        syncQuota()
+
+        forvoRepo.lookupBatch(items.map { it.forvoQuery }, lang) { query, res ->
+            _state.update { s ->
+                s.copy(forvoWords = s.forvoWords.map { w ->
+                    if (!w.query.equals(query, ignoreCase = true)) w
+                    else when (res) {
+                        is ForvoResult.Found -> w.copy(
+                            audioUrl = res.pronunciation.mp3Url,
+                            isLoading = false, notFound = false
+                        )
+                        is ForvoResult.NotFound -> w.copy(isLoading = false, notFound = true)
+                        else -> w.copy(isLoading = false, notFound = true)
+                    }
+                })
+            }
+            if (res is ForvoResult.QuotaExceeded) {
+                _state.update { it.copy(error = "Дневной лимит Forvo исчерпан (сброс в 22:00 UTC)") }
+            }
+            if (res is ForvoResult.NoApiKey) {
+                _state.update { it.copy(error = "Укажите Forvo API Key в настройках") }
+            }
+        }
+        syncQuota()
+    }
 
     private suspend fun handleAttachments(text: String, uris: List<Uri>) {
         _state.update { it.copy(isAnalyzing = true, error = null) }
@@ -245,8 +295,12 @@ class SessionManager @Inject constructor(
             )
 
             if (result is AnalysisResult.Success) {
+                val a = result.analysis
+                if (forvoOn && a.vocabulary.isNotEmpty()) {
+                    scope.launch { resolveForvo(a.vocabulary, a.language) }
+                }
                 if (!ensureLive()) return
-                client.sendRealtimeText(result.analysis.fullText.take(15000))
+                client.sendRealtimeText(a.fullText.take(15000))
             }
         } catch (e: Exception) {
             logger.e("Attachment error", e)
@@ -411,7 +465,6 @@ class SessionManager @Inject constructor(
         }
     }
 
-    // Подписка на нативный нейросетевой Barge-In
     private fun observeBargeIn() = scope.launch {
         audioEngine.bargeInEvents.collect {
             _state.update { it.copy(isAiSpeaking = false) }
@@ -459,6 +512,7 @@ class SessionManager @Inject constructor(
                 is GeminiEvent.OutputTranscript -> appendTranscript("model", event.text, false)
                 is GeminiEvent.ModelText -> appendTranscript("model", event.text, false)
                 is GeminiEvent.Usage -> _state.update { it.copy(tokensUsed = event.totalTokens) }
+                is GeminiEvent.ToolCall -> handleToolCall(event.calls)
                 is GeminiEvent.Error -> {
                     _state.update { it.copy(error = event.message) }
                     if (event.fatal) {
@@ -473,6 +527,55 @@ class SessionManager @Inject constructor(
                 else -> Unit
             }
         }
+    }
+
+    private fun handleToolCall(calls: List<FunctionCall>) = scope.launch {
+        val responses = calls.map { call ->
+            if (call.name == "lookup_pronunciation") {
+                val raw = call.args["words"].orEmpty()
+                val lang = call.args["language"]?.ifBlank { null } ?: "de"
+
+                val list = runCatching {
+                    Json.parseToJsonElement(raw).jsonArray.map { it.jsonPrimitive.content }
+                }.getOrElse { raw.split(",").map { it.trim() } }
+                    .filter { it.isNotBlank() }
+                    .distinctBy { it.lowercase() }
+                    .take(40)
+
+                if (list.isNotEmpty()) {
+                    val existing = _state.value.forvoWords.map { it.query.lowercase() }.toSet()
+                    val fresh = list.filter { it.lowercase() !in existing }
+                    if (fresh.isNotEmpty()) {
+                        _state.update { s ->
+                            s.copy(forvoWords = s.forvoWords + fresh.map {
+                                ForvoWord(word = it, query = it, language = lang)
+                            })
+                        }
+                        scope.launch {
+                            forvoRepo.lookupBatch(fresh, lang) { q, res ->
+                                _state.update { s ->
+                                    s.copy(forvoWords = s.forvoWords.map { w ->
+                                        if (!w.query.equals(q, true)) w
+                                        else when (res) {
+                                            is ForvoResult.Found -> w.copy(
+                                                audioUrl = res.pronunciation.mp3Url,
+                                                isLoading = false
+                                            )
+                                            else -> w.copy(isLoading = false, notFound = true)
+                                        }
+                                    })
+                                }
+                            }
+                            syncQuota()
+                        }
+                    }
+                }
+                ToolResponse(call.name, call.id, """{"status":"ok","accepted":${list.size}}""")
+            } else {
+                ToolResponse(call.name, call.id, """{"error":"unknown_tool"}""")
+            }
+        }
+        client.sendToolResponses(responses)
     }
 
     private fun appendTranscript(role: String, text: String, interim: Boolean) {
