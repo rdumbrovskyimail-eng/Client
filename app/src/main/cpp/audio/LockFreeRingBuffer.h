@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/cpp/audio/LockFreeRingBuffer.h
 #pragma once
 
 #include <atomic>
@@ -17,12 +16,14 @@ public:
     LockFreeRingBuffer() : buffer_(Capacity) {
         head_.store(0, std::memory_order_relaxed);
         tail_.store(0, std::memory_order_relaxed);
+        flushRequested_.store(false, std::memory_order_relaxed);
     }
 
     size_t write(const T* data, size_t count) {
         const size_t current_tail = tail_.load(std::memory_order_relaxed);
         const size_t current_head = head_.load(std::memory_order_acquire);
 
+        // Беззнаковое вычисление корректно при переполнении счетчиков
         const size_t free_space = Capacity - (current_tail - current_head);
         const size_t to_write = std::min(count, free_space);
 
@@ -42,6 +43,14 @@ public:
     }
 
     size_t read(T* data, size_t count) {
+        // Проверка атомарного запроса сброса строго в потоке-читателе (SPSC invariant)
+        if (flushRequested_.load(std::memory_order_acquire)) {
+            const size_t t = tail_.load(std::memory_order_relaxed);
+            head_.store(t, std::memory_order_release);
+            flushRequested_.store(false, std::memory_order_release);
+            return 0;
+        }
+
         const size_t current_head = head_.load(std::memory_order_relaxed);
         const size_t current_tail = tail_.load(std::memory_order_acquire);
 
@@ -63,23 +72,24 @@ public:
         return to_read;
     }
 
+    // Потокобезопасный запрос сброса из любого потока без нарушения SPSC инварианта
+    void requestFlush() {
+        flushRequested_.store(true, std::memory_order_release);
+    }
+
     size_t availableRead() const {
         const size_t h = head_.load(std::memory_order_relaxed);
         const size_t t = tail_.load(std::memory_order_acquire);
-        return (t >= h) ? (t - h) : 0;
-    }
-
-    void clear() {
-        const size_t t = tail_.load(std::memory_order_relaxed);
-        head_.store(t, std::memory_order_release);
+        return (t - h);
     }
 
 private:
     std::vector<T> buffer_;
 
-    // Выравнивание по 64 байтам исключает False Sharing в L1/L2 кэшах CPU
+    // Выравнивание по 64 байтам исключает False Sharing в кэш-линиях CPU
     alignas(64) std::atomic<size_t> head_{0};
     alignas(64) std::atomic<size_t> tail_{0};
+    alignas(64) std::atomic<bool> flushRequested_{false};
 };
 
 } // namespace client::audio
