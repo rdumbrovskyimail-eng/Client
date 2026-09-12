@@ -101,16 +101,15 @@ fun ClientScreen(
         }
     }
 
-    fun hasRecordPermission(): Boolean =
-        ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-
+    // Исключение двойных паддингов: сброс внутренних insets Scaffold
     Scaffold(
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         containerColor = Color(0xFF09090B),
         topBar = {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .statusBarsPadding()
+                    .windowInsetsPadding(WindowInsets.statusBars)
                     .padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -169,67 +168,12 @@ fun ClientScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .imePadding()
         ) {
-            // Плашка ошибки
-            AnimatedVisibility(visible = state.error != null) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color(0xFF450A0A))
-                        .padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(state.error.orEmpty(), color = Color(0xFFFCA5A5), fontSize = 13.sp, modifier = Modifier.weight(1f))
-                    IconButton(onClick = { viewModel.clearError() }, modifier = Modifier.size(20.dp)) {
-                        Icon(Icons.Filled.Close, null, tint = Color(0xFFFCA5A5), modifier = Modifier.size(14.dp))
-                    }
-                }
-            }
-
-            // Панель произношений Forvo
-            AnimatedVisibility(visible = state.forvoWords.isNotEmpty()) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 6.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Произношение", color = Color(0xFFA1A1AA), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                        Spacer(Modifier.width(4.dp))
-                        Text(
-                            "от Forvo.com",
-                            color = Color(0xFF60A5FA),
-                            fontSize = 11.sp,
-                            textDecoration = TextDecoration.Underline,
-                            modifier = Modifier.clickable {
-                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://forvo.com")))
-                            }
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text("(${state.forvoUsed}/${state.forvoLimit})", color = Color(0xFF71717A), fontSize = 11.sp)
-                        Spacer(Modifier.weight(1f))
-                        IconButton(onClick = { viewModel.clearForvo() }, modifier = Modifier.size(20.dp)) {
-                            Icon(Icons.Filled.Close, null, tint = Color(0xFFA1A1AA), modifier = Modifier.size(14.dp))
-                        }
-                    }
-                    Spacer(Modifier.height(6.dp))
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        items(
-                            items = state.forvoWords,
-                            key = { "${it.query.lowercase().trim()}_${it.language}" }
-                        ) { item ->
-                            ForvoWordChip(item = item, onClick = { viewModel.playForvo(item) })
-                        }
-                    }
-                }
-            }
-
-            // Центральная зона: 120 FPS AGSL SDF Визуализатор или Чат
+            // Центральная зона
             Box(
-                modifier = Modifier.weight(1f).fillMaxWidth()
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
             ) {
                 if (state.messages.isEmpty()) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -237,7 +181,7 @@ fun ClientScreen(
                             nativeEngine = viewModel.nativeAudioEngine,
                             state = state,
                             onClick = {
-                                if (hasRecordPermission()) {
+                                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                                     if (!state.isConnected && !state.isConnecting) {
                                         viewModel.toggleConnection()
                                     } else {
@@ -265,52 +209,23 @@ fun ClientScreen(
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         contentPadding = PaddingValues(vertical = 12.dp)
                     ) {
-                        items(
-                            items = state.messages,
-                            key = { it.id }
-                        ) { msg ->
+                        items(items = state.messages, key = { it.id }) { msg ->
                             val isLast = msg.id == state.messages.lastOrNull()?.id
-                            ChatBubble(
-                                msg = msg,
-                                isStreaming = isLast && state.isAiSpeaking
-                            )
+                            ChatBubble(msg = msg, isStreaming = isLast && state.isAiSpeaking)
                         }
                     }
                 }
             }
 
-            // Нижняя панель ввода
+            // Нижняя панель ввода с изоляцией клавиатурных и навигационных Insets
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(Color(0xFF09090B))
+                    .windowInsetsPadding(WindowInsets.ime)
+                    .windowInsetsPadding(WindowInsets.navigationBars)
                     .padding(horizontal = 16.dp, vertical = 8.dp)
             ) {
-                if (attachedUris.isNotEmpty()) {
-                    LazyRow(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier.padding(bottom = 6.dp)
-                    ) {
-                        items(attachedUris) { uri ->
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(Color(0xFF18181B))
-                                    .padding(horizontal = 8.dp, vertical = 4.dp)
-                            ) {
-                                Icon(Icons.Filled.AttachFile, null, tint = Color(0xFFA1A1AA), modifier = Modifier.size(12.dp))
-                                Spacer(Modifier.width(4.dp))
-                                Text(getUriDisplayName(context, uri), fontSize = 11.sp, color = Color(0xFFFAFAFA))
-                                Spacer(Modifier.width(4.dp))
-                                Icon(Icons.Filled.Close, null, tint = Color(0xFFA1A1AA), modifier = Modifier.size(13.dp).clickable {
-                                    attachedUris = attachedUris - uri
-                                })
-                            }
-                        }
-                    }
-                }
-
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -354,7 +269,7 @@ fun ClientScreen(
                     } else {
                         IconButton(
                             onClick = {
-                                if (hasRecordPermission()) {
+                                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                                     viewModel.toggleMic()
                                 } else {
                                     handleConnectClick()
@@ -376,115 +291,12 @@ fun ClientScreen(
                 }
             }
         }
-
-        if (isSheetOpen) {
-            ModalBottomSheet(
-                onDismissRequest = { isSheetOpen = false },
-                containerColor = Color(0xFF18181B),
-                dragHandle = { BottomSheetDefaults.DragHandle(color = Color(0xFF3F3F46)) }
-            ) {
-                var tempPrompt by remember { mutableStateOf(state.activePrompt) }
-
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 20.dp)
-                        .padding(bottom = 24.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Системный промпт сессии", color = Color(0xFFFAFAFA), fontSize = 17.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        TextButton(onClick = { tempPrompt = "" }) {
-                            Text("Очистить", color = Color(0xFFEF4444), fontSize = 13.sp)
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = tempPrompt,
-                        onValueChange = { tempPrompt = it },
-                        modifier = Modifier.fillMaxWidth().height(150.dp),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = Color(0xFF60A5FA),
-                            unfocusedBorderColor = Color(0xFF27272A),
-                            focusedContainerColor = Color(0xFF09090B),
-                            unfocusedContainerColor = Color(0xFF09090B),
-                            focusedTextColor = Color(0xFFFAFAFA),
-                            unfocusedTextColor = Color(0xFFFAFAFA)
-                        )
-                    )
-                    Spacer(Modifier.height(16.dp))
-                    Button(
-                        onClick = {
-                            viewModel.applyPrompt(tempPrompt)
-                            isSheetOpen = false
-                        },
-                        modifier = Modifier.fillMaxWidth().height(48.dp),
-                        shape = RoundedCornerShape(24.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFAFAFA), contentColor = Color(0xFF09090B))
-                    ) {
-                        Text("Применить к модели", fontWeight = FontWeight.SemiBold)
-                    }
-                }
-            }
-        }
-    }
-}
-
-private fun getUriDisplayName(context: Context, uri: Uri): String {
-    return runCatching {
-        context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-            if (cursor.moveToFirst()) cursor.getString(0) else null
-        }
-    }.getOrNull() ?: uri.lastPathSegment.orEmpty().takeLast(14)
-}
-
-@Composable
-private fun ForvoWordChip(
-    item: ForvoWord,
-    onClick: () -> Unit
-) {
-    val isAvailable = item.audioUrl != null && !item.isLoading
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .clip(RoundedCornerShape(8.dp))
-            .background(if (item.notFound) Color(0xFF141416) else Color(0xFF18181B))
-            .border(
-                0.5.dp,
-                if (item.notFound) Color(0xFF27272A) else Color(0xFF3F3F46),
-                RoundedCornerShape(8.dp)
-            )
-            .clickable(enabled = isAvailable, onClick = onClick)
-            .padding(horizontal = 10.dp, vertical = 6.dp)
-    ) {
-        if (item.isLoading) {
-            CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 1.5.dp, color = Color(0xFF60A5FA))
-            Spacer(Modifier.width(6.dp))
-        } else if (isAvailable) {
-            Icon(Icons.AutoMirrored.Filled.VolumeUp, null, tint = Color(0xFF60A5FA), modifier = Modifier.size(15.dp))
-            Spacer(Modifier.width(6.dp))
-        }
-
-        Text(
-            text = item.word,
-            color = if (item.notFound) Color(0xFF71717A) else Color(0xFFF4F4F5),
-            fontSize = 13.sp
-        )
-
-        if (item.translation != null) {
-            Spacer(Modifier.width(6.dp))
-            Text(text = "· ${item.translation}", color = Color(0xFFA1A1AA), fontSize = 12.sp)
-        }
     }
 }
 
 @Composable
-private fun ChatBubble(
-    msg: ChatMessage,
-    isStreaming: Boolean
-) {
+private fun ChatBubble(msg: ChatMessage, isStreaming: Boolean) {
     if (msg.text.isBlank()) return
-
     val isUser = msg.role == "user"
     val clipboard = LocalClipboardManager.current
 
@@ -495,63 +307,22 @@ private fun ChatBubble(
         Box(
             modifier = Modifier
                 .fillMaxWidth(if (isUser) 0.85f else 0.95f)
-                .clip(
-                    RoundedCornerShape(
-                        topStart = 16.dp, topEnd = 16.dp,
-                        bottomStart = if (isUser) 16.dp else 2.dp,
-                        bottomEnd = if (isUser) 2.dp else 16.dp
-                    )
-                )
-                .background(
-                    when {
-                        msg.interim -> Color(0xFF18181B).copy(alpha = 0.65f)
-                        isUser -> Color(0xFF27272A)
-                        else -> Color(0xFF141416)
-                    }
-                )
-                .border(
-                    0.5.dp,
-                    if (isUser) Color(0xFF3F3F46) else Color(0xFF27272A),
-                    RoundedCornerShape(16.dp)
-                )
+                .clip(RoundedCornerShape(16.dp))
+                .background(if (isUser) Color(0xFF27272A) else Color(0xFF141416))
+                .border(0.5.dp, if (isUser) Color(0xFF3F3F46) else Color(0xFF27272A), RoundedCornerShape(16.dp))
                 .clickable { clipboard.setText(AnnotatedString(msg.text)) }
                 .padding(horizontal = 14.dp, vertical = 10.dp)
         ) {
             Column {
-                if (msg.attachmentNames.isNotEmpty()) {
-                    Text(
-                        text = "📎 ${msg.attachmentNames.joinToString()}",
-                        color = Color(0xFF60A5FA),
-                        fontSize = 11.sp,
-                        modifier = Modifier.padding(bottom = 4.dp)
-                    )
-                }
-
                 if (isUser) {
-                    Text(
-                        text = msg.text,
-                        color = if (msg.interim) Color(0xFFA1A1AA) else Color(0xFFFAFAFA),
-                        fontStyle = if (msg.interim) FontStyle.Italic else FontStyle.Normal,
-                        fontSize = 14.sp,
-                        lineHeight = 20.sp
-                    )
+                    Text(text = msg.text, color = Color(0xFFFAFAFA), fontSize = 14.sp, lineHeight = 20.sp)
                 } else if (isStreaming) {
-                    Text(
-                        text = msg.text,
-                        color = Color(0xFFFAFAFA),
-                        fontSize = 14.sp,
-                        lineHeight = 20.sp
-                    )
+                    Text(text = msg.text, color = Color(0xFFFAFAFA), fontSize = 14.sp, lineHeight = 20.sp)
                 } else {
                     Markdown(
                         content = msg.text,
-                        colors = markdownColor(
-                            text = Color(0xFFFAFAFA),
-                            codeBackground = Color(0xFF18181B)
-                        ),
-                        typography = markdownTypography(
-                            text = TextStyle(fontSize = 14.sp, lineHeight = 20.sp, color = Color(0xFFFAFAFA))
-                        )
+                        colors = markdownColor(text = Color(0xFFFAFAFA), codeBackground = Color(0xFF18181B)),
+                        typography = markdownTypography(text = TextStyle(fontSize = 14.sp, lineHeight = 20.sp, color = Color(0xFFFAFAFA)))
                     )
                 }
             }
