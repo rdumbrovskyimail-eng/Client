@@ -1,0 +1,170 @@
+syntax = "proto3";
+
+package google.ai.generativelanguage.v1beta;
+
+option java_package = "com.google.ai.generativelanguage.v1beta";
+option java_multiple_files = true;
+option java_outer_classname = "GeminiLiveProto";
+
+// Сообщение Клиент -> Сервер (Верхний уровень)
+message BidiGenerateContentClientMessage {
+  oneof message {
+    BidiGenerateContentSetup setup = 1;
+    BidiGenerateContentRealtimeInput realtime_input = 2;
+    BidiGenerateContentClientContent client_content = 3;
+    BidiGenerateContentToolResponse tool_response = 4;
+  }
+}
+
+// Сообщение Сервер -> Клиент (Верхний уровень)
+message BidiGenerateContentServerMessage {
+  oneof message {
+    BidiGenerateContentServerContent server_content = 1;
+    BidiGenerateContentToolCall tool_call = 2;
+    BidiGenerateContentToolCallCancellation tool_call_cancellation = 3;
+    BidiGenerateContentGoAway go_away = 4;
+    BidiGenerateContentSessionResumptionUpdate session_resumption_update = 5;
+    BidiGenerateContentSetupComplete setup_complete = 6;
+    BidiGenerateContentUsageMetadata usage_metadata = 7;
+  }
+}
+
+// Конфигурация сессии (Setup)
+message BidiGenerateContentSetup {
+  string model = 1;
+  GenerationConfig generation_config = 2;
+  Content system_instruction = 3;
+  repeated Tool tools = 4;
+  SessionResumption session_resumption = 5;
+  repeated SafetySetting safety_settings = 6;
+  string cached_content = 7;
+}
+
+message GenerationConfig {
+  repeated string response_modalities = 1;
+  SpeechConfig speech_config = 2;
+  float temperature = 3;
+  int32 max_output_tokens = 4;
+  ThinkingConfig thinking_config = 5;
+}
+
+message ThinkingConfig {
+  string thinking_level = 1;
+  bool include_thoughts = 2;
+}
+
+message SpeechConfig {
+  VoiceConfig voice_config = 1;
+}
+
+message VoiceConfig {
+  PrebuiltVoiceConfig prebuilt_voice_config = 1;
+}
+
+message PrebuiltVoiceConfig {
+  string voice_name = 1;
+}
+
+message SessionResumption {
+  string handle = 1;
+}
+
+message SafetySetting {
+  string category = 1;
+  string threshold = 2;
+}
+
+// Передача сырого звука и текста в реальном времени
+message BidiGenerateContentRealtimeInput {
+  repeated Blob media_chunks = 1;
+  bool audio_stream_end = 2;
+  string text = 3;
+}
+
+message Blob {
+  string mime_type = 1;
+  bytes data = 2;
+}
+
+// Затравка истории и завершение хода
+message BidiGenerateContentClientContent {
+  repeated Content turns = 1;
+  bool turn_complete = 2;
+}
+
+message Content {
+  string role = 1;
+  repeated Part parts = 2;
+}
+
+message Part {
+  oneof data {
+    string text = 1;
+    Blob inline_data = 2;
+    bool thought = 3;
+  }
+}
+
+// Серверные события речи модели
+message BidiGenerateContentServerContent {
+  Content model_turn = 1;
+  bool turn_complete = 2;
+  bool interrupted = 3;
+  bool generation_complete = 4;
+}
+
+// Вызовы инструментов
+message Tool {
+  repeated FunctionDeclaration function_declarations = 1;
+  GoogleSearch google_search = 2;
+  CodeExecution code_execution = 3;
+}
+
+message GoogleSearch {}
+message CodeExecution {}
+
+message FunctionDeclaration {
+  string name = 1;
+  string description = 2;
+  string parameters_json_schema = 3;
+}
+
+message BidiGenerateContentToolCall {
+  repeated FunctionCall function_calls = 1;
+}
+
+message FunctionCall {
+  string id = 1;
+  string name = 2;
+  map<string, string> args = 3;
+}
+
+message BidiGenerateContentToolCallCancellation {
+  repeated string ids = 1;
+}
+
+message BidiGenerateContentToolResponse {
+  repeated FunctionResponse function_responses = 1;
+}
+
+message FunctionResponse {
+  string id = 1;
+  string name = 2;
+  string response = 3;
+}
+
+// Служебные метаданные сессии
+message BidiGenerateContentSetupComplete {}
+
+message BidiGenerateContentGoAway {
+  int64 time_left_ms = 1;
+}
+
+message BidiGenerateContentSessionResumptionUpdate {
+  string new_handle = 1;
+  bool resumable = 2;
+}
+
+message BidiGenerateContentUsageMetadata {
+  int32 total_token_count = 1;
+}
