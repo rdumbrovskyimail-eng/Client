@@ -18,6 +18,7 @@ class NativeAudioBridge @Inject constructor() {
     external fun startAudio(): Boolean
     external fun stopAudio()
     external fun setVolume(volume: Float)
+    external fun setMicGain(gain: Float)
     external fun writePlaybackDirect(byteBuffer: ByteBuffer, offsetBytes: Int, lengthBytes: Int): Int
     external fun readCaptureDirect(byteBuffer: ByteBuffer, capacityBytes: Int): Int
     external fun flushPlayback()
