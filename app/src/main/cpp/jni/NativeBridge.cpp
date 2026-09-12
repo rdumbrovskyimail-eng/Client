@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/cpp/jni/NativeBridge.cpp
 #include <jni.h>
 #include <string>
 #include <android/log.h>
@@ -39,6 +40,12 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_client_app_audio_NativeAudioBridge_setVolume(
     JNIEnv * /* env */, jobject /* this */, jfloat volume) {
     AAudioEngine::getInstance().setVolume(static_cast<float>(volume));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_client_app_audio_NativeAudioBridge_setMicGain(
+    JNIEnv * /* env */, jobject /* this */, jfloat gain) {
+    AAudioEngine::getInstance().setMicGain(static_cast<float>(gain));
 }
 
 extern "C" JNIEXPORT jint JNICALL
