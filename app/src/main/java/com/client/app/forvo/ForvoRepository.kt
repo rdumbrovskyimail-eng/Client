@@ -17,8 +17,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.net.URLEncoder
 import java.text.Normalizer
-import java.time.Instant
-import java.time.ZoneOffset
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
@@ -79,6 +77,16 @@ class ForvoRepository @Inject constructor(
 
     private val _quota = MutableStateFlow(ForvoQuota(0, DEFAULT_QUOTA_LIMIT))
     val quota: StateFlow<ForvoQuota> = _quota.asStateFlow()
+
+    suspend fun freshUrl(rawWord: String, lang: String): String? = withContext(Dispatchers.IO) {
+        val apiKey = readApiKey()
+        if (apiKey.isEmpty()) return@withContext null
+
+        when (val result = lookupInternal(rawWord, lang, apiKey)) {
+            is ForvoResult.Found -> result.pronunciation.mp3Url
+            else -> null
+        }
+    }
 
     suspend fun lookupBatch(
         words: List<String>,
