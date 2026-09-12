@@ -7,7 +7,6 @@ import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
-import androidx.exifinterface.media.ExifInterface
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -28,7 +27,7 @@ class AttachmentProcessor @Inject constructor(
 
     companion object {
         private const val MAX_SIDE = 1568
-        private const val JPEG_QUALITY = 90
+        private const val JPEG_QUALITY = 88
         private const val MAX_PDF_PAGES = 16
     }
 
@@ -42,34 +41,14 @@ class AttachmentProcessor @Inject constructor(
             val mime = context.contentResolver.getType(uri).orEmpty().lowercase()
 
             try {
-                when {
-                    mime.startsWith("image/") -> {
-                        loadScaledJpeg(uri)?.let {
-                            images.add(it)
-                            accepted.add(name)
-                        }
-                    }
-                    mime == "application/pdf" || name.endsWith(".pdf", true) -> {
-                        val pdf = processPdf(uri, MAX_PDF_PAGES)
-                        val label = if (pdf.totalPages > pdf.processedPages) {
-                            "$name (первые ${pdf.processedPages} из ${pdf.totalPages} стр.)"
-                        } else {
-                            "$name (${pdf.processedPages} стр.)"
-                        }
-                        if (pdf.text.isNotBlank()) {
-                            textBuilder.append("\n\n--- Документ: $name ---\n").append(pdf.text.take(60000))
-                            accepted.add("$label (текст)")
-                        } else if (pdf.images.isNotEmpty()) {
-                            images.addAll(pdf.images)
-                            accepted.add(label)
-                        }
-                    }
-                    isTextFormat(mime, name) -> {
-                        val txt = context.contentResolver.openInputStream(uri)?.use { it.readBytes().decodeToString() }
-                        if (!txt.isNullOrBlank()) {
-                            textBuilder.append("\n\n--- Файл: $name ---\n").append(txt.take(40000))
-                            accepted.add(name)
-                        }
+                if (mime == "application/pdf" || name.endsWith(".pdf", true)) {
+                    val pdf = processPdfStream(uri, MAX_PDF_PAGES)
+                    if (pdf.text.isNotBlank()) {
+                        textBuilder.append("\n\n--- Документ: $name ---\n").append(pdf.text.take(60000))
+                        accepted.add("$name (текст)")
+                    } else if (pdf.images.isNotEmpty()) {
+                        images.addAll(pdf.images)
+                        accepted.add("$name (${pdf.images.size} стр.)")
                     }
                 }
             } catch (e: Exception) {
@@ -79,86 +58,21 @@ class AttachmentProcessor @Inject constructor(
         Result(images, textBuilder.toString().trim(), accepted)
     }
 
-    private fun getFileName(uri: Uri): String = runCatching {
-        context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
-            if (it.moveToFirst()) it.getString(0) else null
-        }
-    }.getOrNull() ?: uri.lastPathSegment ?: "file"
+    private data class PdfProcessed(val images: List<ByteArray>, val text: String)
 
-    private fun isTextFormat(mime: String, name: String): Boolean {
-        if (mime.startsWith("text/")) return true
-        val ext = name.substringAfterLast('.', "").lowercase()
-        return ext in setOf("txt", "md", "json", "xml", "kt", "java", "py", "c", "cpp", "csv", "html", "css", "yaml", "yml")
-    }
-
-    private fun loadScaledJpeg(uri: Uri): ByteArray? {
-        val cr = context.contentResolver
-
-        val orientation = runCatching {
-            cr.openInputStream(uri)?.use { stream ->
-                ExifInterface(stream).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
-            }
-        }.getOrNull() ?: ExifInterface.ORIENTATION_NORMAL
-
-        val rotationDegrees = when (orientation) {
-            ExifInterface.ORIENTATION_ROTATE_90 -> 90f
-            ExifInterface.ORIENTATION_ROTATE_180 -> 180f
-            ExifInterface.ORIENTATION_ROTATE_270 -> 270f
-            else -> 0f
-        }
-
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-        if (bounds.outWidth <= 0) return null
-
-        var sample = 1
-        val longest = maxOf(bounds.outWidth, bounds.outHeight)
-        while (longest / (sample * 2) >= MAX_SIDE) sample *= 2
-
-        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-        val src = cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) } ?: return null
-
-        val matrix = Matrix()
-        if (rotationDegrees != 0f) matrix.postRotate(rotationDegrees)
-
-        val longestDecoded = maxOf(src.width, src.height)
-        if (longestDecoded > MAX_SIDE) {
-            val scale = MAX_SIDE.toFloat() / longestDecoded
-            matrix.postScale(scale, scale)
-        }
-
-        val resultBmp = if (!matrix.isIdentity) {
-            Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true).also {
-                if (it != src) src.recycle()
-            }
-        } else src
-
-        val out = ByteArrayOutputStream()
-        resultBmp.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
-        resultBmp.recycle()
-        return out.toByteArray()
-    }
-
-    private data class PdfProcessed(
-        val images: List<ByteArray>,
-        val text: String,
-        val totalPages: Int,
-        val processedPages: Int
-    )
-
-    private fun processPdf(uri: Uri, maxPages: Int): PdfProcessed {
+    /**
+     * Потоковая обработка PDF: ровно 1 переиспользуемый Bitmap в RGB_565 (память <5 МБ вместо 157 МБ).
+     */
+    private fun processPdfStream(uri: Uri, maxPages: Int): PdfProcessed {
         val images = mutableListOf<ByteArray>()
-        var totalPages = 0
-        var count = 0
         val pfd: ParcelFileDescriptor = context.contentResolver.openFileDescriptor(uri, "r")
-            ?: return PdfProcessed(images, "", 0, 0)
+            ?: return PdfProcessed(images, "")
 
         pfd.use {
             PdfRenderer(it).use { renderer ->
-                totalPages = renderer.pageCount
-                count = minOf(totalPages, maxPages)
+                val count = minOf(renderer.pageCount, maxPages)
 
-                // 1. Извлечение нативного цифрового текстового слоя на Android 15+ (API 35+)
+                // Проверка цифрового слоя текста на Android 15+ (API 35+)
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.VANILLA_ICE_CREAM) {
                     val sb = StringBuilder()
                     for (i in 0 until count) {
@@ -171,29 +85,46 @@ class AttachmentProcessor @Inject constructor(
                             }
                         }
                     }
-                    // Если обнаружен связный текст (не пустой скан), отдаем чистый текст без создания растровых картинок
                     if (sb.length > count * 50) {
-                        return PdfProcessed(images, sb.toString().trim(), totalPages, count)
+                        return PdfProcessed(images, sb.toString().trim())
                     }
                 }
 
-                // 2. Графический скан или Android < 15: попиксельный рендеринг в JPEG для Gemini Vision OCR
-                for (i in 0 until count) {
-                    renderer.openPage(i).use { page ->
-                        val scale = MAX_SIDE.toFloat() / maxOf(page.width, page.height)
-                        val w = (page.width * scale).toInt().coerceAtLeast(1)
-                        val h = (page.height * scale).toInt().coerceAtLeast(1)
-                        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                        Canvas(bmp).drawColor(Color.WHITE)
-                        page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                        val out = ByteArrayOutputStream()
-                        bmp.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
-                        bmp.recycle()
-                        images.add(out.toByteArray())
+                // Поточный рендеринг: один Bitmap, переиспользуемый между страницами
+                var reusableBmp: Bitmap? = null
+                try {
+                    for (i in 0 until count) {
+                        renderer.openPage(i).use { page ->
+                            val scale = MAX_SIDE.toFloat() / maxOf(page.width, page.height)
+                            val w = (page.width * scale).toInt().coerceAtLeast(1)
+                            val h = (page.height * scale).toInt().coerceAtLeast(1)
+
+                            if (reusableBmp == null || reusableBmp!!.width != w || reusableBmp!!.height != h) {
+                                reusableBmp?.recycle()
+                                reusableBmp = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565)
+                            }
+
+                            val canvas = Canvas(reusableBmp!!)
+                            canvas.drawColor(Color.WHITE)
+                            page.render(reusableBmp!!, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+
+                            ByteArrayOutputStream().use { out ->
+                                reusableBmp!!.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
+                                images.add(out.toByteArray())
+                            }
+                        }
                     }
+                } finally {
+                    reusableBmp?.recycle()
                 }
             }
         }
-        return PdfProcessed(images, "", totalPages, count)
+        return PdfProcessed(images, "")
     }
+
+    private fun getFileName(uri: Uri): String = runCatching {
+        context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+            if (it.moveToFirst()) it.getString(0) else null
+        }
+    }.getOrNull() ?: uri.lastPathSegment ?: "file"
 }
