@@ -1,7 +1,8 @@
-// >>> FILE: app/src/main/cpp/jni/NativeBridge.cpp
 #include <jni.h>
 #include <string>
 #include <android/log.h>
+#include <sys/socket.h>
+#include <netinet/tcp.h>
 #include "audio/AAudioEngine.h"
 
 #define LOG_TAG "NativeCoreBridge"
@@ -11,13 +12,17 @@ using namespace client::audio;
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_client_app_audio_NativeAudioBridge_getHardwareCoreInfo(JNIEnv *env, jobject /* this */) {
-    std::string info = "Qualcomm Snapdragon 8 Gen 2 (kalama) Native Engine [C++20/ARMv9] - AAudio Pipeline Active";
+    bool isMmap = AAudioEngine::getInstance().isMmapActive();
+    std::string info = isMmap
+        ? "Qualcomm SD8 Gen2 - AAudio MMAP Exclusive [4.2ms Direct]"
+        : "Qualcomm SD8 Gen2 - AAudio Low-Latency Shared [CMF Buds 2 Active]";
     return env->NewStringUTF(info.c_str());
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_client_app_audio_NativeAudioBridge_probeMmapSupport(JNIEnv * /* env */, jobject /* this */) {
-    return static_cast<jboolean>(AAudioEngine::getInstance().init());
+Java_com_client_app_audio_NativeAudioBridge_initAudioRoute(
+    JNIEnv * /* env */, jobject /* this */, jboolean isBluetooth, jint sampleRate) {
+    return static_cast<jboolean>(AAudioEngine::getInstance().init(isBluetooth, sampleRate));
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -60,13 +65,23 @@ Java_com_client_app_audio_NativeAudioBridge_flushPlayback(JNIEnv * /* env */, jo
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_client_app_audio_NativeAudioBridge_setVolume(JNIEnv * /* env */, jobject /* this */, jfloat volume) {
-    AAudioEngine::getInstance().setVolume(volume);
+Java_com_client_app_audio_NativeAudioBridge_triggerBargeInEarcon(JNIEnv * /* env */, jobject /* this */) {
+    AAudioEngine::getInstance().triggerBargeInEarcon();
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_client_app_audio_NativeAudioBridge_setMicGain(JNIEnv * /* env */, jobject /* this */, jfloat gain) {
-    AAudioEngine::getInstance().setMicGain(gain);
+Java_com_client_app_audio_NativeAudioBridge_tuneNativeSocket(JNIEnv * /* env */, jobject /* this */, jint fd) {
+    if (fd <= 0) return;
+
+    int flag = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+    // Ликвидация Bufferbloat ядра Linux: TCP_NOTSENT_LOWAT = 16 КБ
+    int lowat = 16384;
+    setsockopt(fd, IPPROTO_TCP, 25 /* TCP_NOTSENT_LOWAT */, &lowat, sizeof(lowat));
+
+    int quickack = 1;
+    setsockopt(fd, IPPROTO_TCP, 12 /* TCP_QUICKACK */, &quickack, sizeof(quickack));
 }
 
 extern "C" JNIEXPORT void JNICALL
