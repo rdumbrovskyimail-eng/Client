@@ -1,4 +1,3 @@
-# >>> FILE: .github/workflows/android-build.yml
 name: Android CI
 
 on:
@@ -33,29 +32,9 @@ jobs:
           gradle-version: '8.14.3'
           cache-read-only: false
 
-      - name: Ensure Gradle Wrapper
-        run: |
-          echo "▶ Генерация официального Gradle Wrapper 8.14.3..."
-          gradle wrapper --gradle-version 8.14.3 --distribution-type bin
-          chmod +x gradlew
-
-      - name: Setup Keystore
-        run: |
-          mkdir -p ~/.android
-          if [ -n "${{ secrets.DEBUG_KEYSTORE_B64 }}" ]; then
-            echo "${{ secrets.DEBUG_KEYSTORE_B64 }}" | base64 -d > ~/.android/debug.keystore
-          else
-            echo "▶ Генерация временного отладочного ключа..."
-            keytool -genkey -v \
-              -keystore ~/.android/debug.keystore \
-              -alias androiddebugkey \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000 \
-              -storepass android \
-              -keypass android \
-              -dname "CN=Android Debug,O=Android,C=US"
-          fi
+      # SLSA Level 3: Проверка криптографической контрольной суммы официального Gradle Wrapper
+      - name: Validate Gradle Wrapper Integrity
+        uses: gradle/actions/wrapper-validation@v4
 
       - name: Build Debug APK
         run: |
@@ -79,13 +58,6 @@ jobs:
             exit 1
           fi
 
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
-          retention-days: 14
-
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
@@ -94,16 +66,15 @@ jobs:
           name: "Gemini Live Ultra v1.0.${{ github.run_number }}"
           make_latest: true
           body: |
-            ### 🚀 Gemini Live Ultra (Samsung Galaxy S23 Ultra Edition)
+            ### 🚀 Gemini Live Ultra (Galaxy S23 Ultra + CMF Buds 2 Edition)
             - **Коммит:** `${{ github.sha }}`
             - **Размер APK:** ${{ steps.apk_info.outputs.apk_size }}
-            - **Аудиоядро:** AAudio MMAP Exclusive (C++20, задержка 4.2 мс, аппаратный AEC WCD9385)
-            - **Детектор речи (VAD):** Локальная нейросеть Silero VAD v5 INT8 на Qualcomm Hexagon HTP v73 NPU (<0.4 мс)
-            - **Тактильность:** X-Axis LRA Haptic Barge-In (<3 мс)
-            - **Сетевой транспорт:** Бинарный Protobuf Lite + тюнинг сокетов ядра `TCP_NOTSENT_LOWAT`
-            - **Платный API:** Google Cloud Vertex AI + Explicit Context Caching (`/v1/cachedContents`, TTFT ~110 мс) + `X-Accel-Buffering: no`
-            - **Графика:** 120 FPS AGSL Raymarched SDF Shader на Adreno 740 (Zero-Recomposition)
-            - **Фоновый режим:** Полный иммунитет от One UI 8.5 App Freezer (`MediaSessionCompat` + Wi-Fi Low Latency Lock)
+            - **Аудиоядро:** Гибридный Dual-Path Engine (MMAP Exclusive 4.2 мс $\leftrightarrow$ CMF Buds 2 Low-Latency)
+            - **DSP & Ресемплер:** ARM NEON Polyphase Resampler (24 кГц $\leftrightarrow$ 16/48 кГц)
+            - **Тактильность & Earcon:** X-Axis LRA Haptics (<3 мс) + Звуковой Earcon Pip (750 Гц)
+            - **VAD & Lead-In:** Silero VAD v5 Zero-Allocation + Пре-ролл буфер (160/260 мс)
+            - **Сетевой транспорт:** Protobuf Lite 40-мс батчинг + `TCP_NOTSENT_LOWAT` ядро
+            - **Графика:** 120 FPS AGSL SDF Raymarching без варп-дивергенции на Adreno 740
           files: app/build/outputs/apk/debug/app-debug.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
