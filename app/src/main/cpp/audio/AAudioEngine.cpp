@@ -20,7 +20,8 @@ AAudioEngine& AAudioEngine::getInstance() {
 AAudioEngine::AAudioEngine()
     : fftProcessor_(std::make_unique<dsp::FastFft>()),
       fftAccumulator_(FFT_SIZE, 0.0f),
-      resampleScratchBuffer_(BURST_10MS_24K * 4, 0) {
+      resampleScratchBuffer_(BURST_10MS_24K * 4, 0),
+      captureDecimateBuffer_(4096, 0) {
     dsp::enableHardwareFtz();
 }
 
@@ -253,13 +254,14 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
         }
     }
 
-    // E-07: Если HAL захватывает на 48 кГц — децимируем 3:1 в 16 кГц
+    // ERR-04: Если HAL захватывает на 48 кГц — безопасно децимируем 3:1 в предвыделенный буфер
     int32_t capRate = engine->actualCaptureSampleRate_.load(std::memory_order_relaxed);
     if (capRate == 48000) {
-        int16_t downsampled[BURST_10MS_16K * 2];
-        size_t processed = engine->captureDecimator48To16_.process(samples, numFrames, downsampled);
-        engine->captureBuffer_.write(downsampled, processed);
-        engine->micRms_.store(dsp::calculateRms(downsampled, processed), std::memory_order_relaxed);
+        int16_t* decBuf = engine->captureDecimateBuffer_.data();
+        size_t decCap = engine->captureDecimateBuffer_.size();
+        size_t processed = engine->captureDecimator48To16_.process(samples, numFrames, decBuf, decCap);
+        engine->captureBuffer_.write(decBuf, processed);
+        engine->micRms_.store(dsp::calculateRms(decBuf, processed), std::memory_order_relaxed);
     } else {
         engine->captureBuffer_.write(samples, numFrames);
         engine->micRms_.store(dsp::calculateRms(samples, numFrames), std::memory_order_relaxed);
