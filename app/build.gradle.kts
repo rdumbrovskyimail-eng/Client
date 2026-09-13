@@ -1,4 +1,3 @@
-// >>> FILE: app/build.gradle.kts
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -63,7 +62,6 @@ android {
                 keyAlias = System.getenv("KEY_ALIAS") ?: "androiddebugkey"
                 keyPassword = System.getenv("KEY_PASSWORD") ?: "android"
             } else {
-                // E-05: Fallback для локальной отладки сборки
                 initWith(getByName("debug"))
             }
         }
@@ -123,11 +121,13 @@ kotlin {
 }
 
 dependencies {
+    // Базовые AndroidX библиотеки и Lifecycle
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity-compose:1.10.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
 
+    // Jetpack Compose (BOM 2025.02.00)
     val composeBom = platform("androidx.compose:compose-bom:2025.02.00")
     implementation(composeBom)
     implementation("androidx.compose.ui:ui")
@@ -137,10 +137,31 @@ dependencies {
     implementation("androidx.compose.animation:animation")
     implementation("androidx.navigation:navigation-compose:2.8.5")
 
+    // Внедрение зависимостей Dagger Hilt
     implementation("com.google.dagger:hilt-android:2.57.2")
     ksp("com.google.dagger:hilt-android-compiler:2.57.2")
     implementation("androidx.hilt:hilt-navigation-compose:1.2.0")
 
+    // Сеть и асинхронный рантайм
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
+
+    // Хранилище настроек Jetpack DataStore
+    implementation("androidx.datastore:datastore-preferences:1.1.2")
+
+    // Логирование Timber
+    implementation("com.jakewharton.timber:timber:5.0.1")
+
+    // Нейросетевой рантайм Silero VAD (ONNX)
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.1")
+
+    // Рендеринг разметки Markdown в Compose
+    implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.31.0")
+
+    // Фоновые медиа-сессии (защита от засыпания сервиса)
+    implementation("androidx.media:media:1.7.0")
+
+    // Google Protobuf Java Lite Runtime
+    implementation("com.google.protobuf:protobuf-javalite:3.25.5")
+}
