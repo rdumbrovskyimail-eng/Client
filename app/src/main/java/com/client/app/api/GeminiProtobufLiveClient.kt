@@ -196,7 +196,7 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         tailPayload?.let { sendAudioPayload(ws, it) }
 
-        // 2. Отправляем завершение хода через clientContent.turnComplete: true
+        // 2. Отправляем признак завершения речевого хода модели через clientContent.turnComplete
         val jsonMessage = buildJsonObject {
             putJsonObject("clientContent") {
                 put("turnComplete", true)
@@ -231,6 +231,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         ws.send(jsonMessage)
     }
 
+    // E-29 & Ошибка №26 [NET/PROTO]: Исключение googleSearch из Live сетапа
     private fun buildSetupMessage(cfg: LiveConfig): String {
         val cleanModel = if (cfg.model.startsWith("models/")) cfg.model else "models/${cfg.model}"
 
@@ -265,9 +266,11 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }
 
-                putJsonArray("tools") {
-                    addJsonObject { putJsonObject("googleSearch") {} }
-                    cfg.toolsJson?.forEach { add(it) }
+                // Ошибка №26 [NET/PROTO]: Live API поддерживает исключительно functionDeclarations
+                if (cfg.toolsJson != null && cfg.toolsJson.isNotEmpty()) {
+                    putJsonArray("tools") {
+                        cfg.toolsJson.forEach { add(it) }
+                    }
                 }
 
                 cfg.resumptionHandle?.takeIf { it.isNotBlank() }?.let { handle ->
