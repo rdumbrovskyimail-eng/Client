@@ -14,6 +14,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -24,13 +25,12 @@ class ContextCacheService @Inject constructor(
     private val logger: AppLogger
 ) {
     companion object {
-        // Канонический эндпоинт Google AI Studio REST v1beta
         private const val BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
         val KEY_CACHED_CONTENT_ID = stringPreferencesKey("cached_content_id")
         val KEY_CACHED_CONTENT_HASH = stringPreferencesKey("cached_content_hash")
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
-        // Минимальный порог токенов Google для активации скидки Context Caching
+        // E-28: Минимальный порог токенов Google Context Caching (32 768 токенов)
         private const val MIN_TOKENS_FOR_CACHE = 32768
     }
 
@@ -41,19 +41,27 @@ class ContextCacheService @Inject constructor(
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
+    // E-15: SHA-256 fingerprint от полного набора параметров кэша
+    private fun generateCacheFingerprint(model: String, prompt: String): String {
+        val input = "model:$model\u0000prompt:$prompt"
+        val md = MessageDigest.getInstance("SHA-256")
+        return md.digest(input.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    }
+
     suspend fun getOrCreateCache(
         apiKey: String,
         systemPrompt: String,
-        modelName: String = "gemini-2.5-flash"
+        modelName: String = "gemini-3.1-flash-live-preview"
     ): String? = withContext(Dispatchers.IO) {
         if (apiKey.isBlank() || systemPrompt.isBlank()) return@withContext null
 
-        // Кэширование активируется только если промпт достаточно объемный
-        if (systemPrompt.length < MIN_TOKENS_FOR_CACHE * 2) {
+        // E-28: Эвристическая оценка токенов (~4 символа на токен)
+        val estimatedTokens = systemPrompt.length / 4
+        if (estimatedTokens < MIN_TOKENS_FOR_CACHE) {
             return@withContext null
         }
 
-        val promptHash = systemPrompt.hashCode().toString()
+        val promptHash = generateCacheFingerprint(modelName, systemPrompt)
         val prefs = dataStore.data.first()
         val existingId = prefs[KEY_CACHED_CONTENT_ID]
         val existingHash = prefs[KEY_CACHED_CONTENT_HASH]
@@ -75,7 +83,7 @@ class ContextCacheService @Inject constructor(
                     add(buildJsonObject { put("text", systemPrompt) })
                 })
             })
-            put("ttl", "14400s") // 4 часа
+            put("ttl", "14400s")
         }.toString()
 
         val url = "$BASE_URL/cachedContents?key=${apiKey.trim()}"
@@ -96,7 +104,7 @@ class ContextCacheService @Inject constructor(
                             it[KEY_CACHED_CONTENT_ID] = cacheName
                             it[KEY_CACHED_CONTENT_HASH] = promptHash
                         }
-                        logger.d("ContextCacheService: Создан KV-кэш: $cacheName (Скидка 75%, TTFT ~110 мс)")
+                        logger.d("ContextCacheService: Создан KV-кэш: $cacheName")
                         return@withContext cacheName
                     }
                 } else {
@@ -115,13 +123,8 @@ class ContextCacheService @Inject constructor(
         val cleanId = cacheId.removePrefix("cachedContents/")
         val url = "$BASE_URL/cachedContents/$cleanId?key=${apiKey.trim()}"
 
-        val request = Request.Builder()
-            .url(url)
-            .delete()
-            .build()
-
         runCatching {
-            httpClient.newCall(request).execute().use { response ->
+            httpClient.newCall(Request.Builder().url(url).delete().build()).execute().use { response ->
                 if (response.isSuccessful) {
                     dataStore.edit {
                         it.remove(KEY_CACHED_CONTENT_ID)
