@@ -4,12 +4,17 @@
 #include <vector>
 #include <android/log.h>
 #include <sys/socket.h>
+#include <netinet/in.h> // Обязательный заголовок для IPPROTO_TCP в Android NDK
 #include <netinet/tcp.h>
 #include "audio/AAudioEngine.h"
 
 #define LOG_TAG "NativeCoreBridge"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+#ifndef TCP_NOTSENT_LOWAT
+#define TCP_NOTSENT_LOWAT 25
+#endif
 
 using namespace client::audio;
 
@@ -61,7 +66,6 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
 
     size_t frames = length / sizeof(int16_t);
 
-    // Thread-local буфер исключает реаллокации памяти в куче на каждый аудиоблок
     thread_local std::vector<int16_t> playbackJniBuffer;
     if (playbackJniBuffer.size() < frames) {
         playbackJniBuffer.resize(frames);
@@ -133,7 +137,7 @@ Java_com_client_app_audio_NativeAudioBridge_tuneNativeSocket(JNIEnv * /* env */,
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
     int lowat = 16384;
-    setsockopt(fd, IPPROTO_TCP, 25 /* TCP_NOTSENT_LOWAT */, &lowat, sizeof(lowat));
+    setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
 }
 
 // E-03: Потокобезопасная передача полного снимка в UI
