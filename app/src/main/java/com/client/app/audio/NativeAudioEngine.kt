@@ -10,6 +10,8 @@ import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.ArrayDeque
@@ -49,7 +51,7 @@ class NativeAudioEngine @Inject constructor(
     private val _micOutput = Channel<ByteArray>(256, BufferOverflow.DROP_OLDEST)
     val micOutput: ReceiveChannel<ByteArray> = _micOutput
 
-    // ERR-11: Изоляция исключений аудиотракта от системного краша JVM
+    // Изоляция исключений аудиотракта от системного краша JVM
     private val coroutineExceptionHandler = CoroutineExceptionHandler { _, throwable ->
         logger.e("Unhandled coroutine exception in NativeAudioEngine", throwable)
     }
@@ -57,14 +59,17 @@ class NativeAudioEngine @Inject constructor(
     private var captureJob: Job? = null
     private var spectrumJob: Job? = null
 
-    // E-04: Conflated-канал для защиты от гонок при множественных событиях Bluetooth
+    // Ошибка №9 [CONCURRENCY]: Мьютекс взаимного исключения для предотвращения гонок инициализации C++ ядра
+    private val audioLifecycleMutex = Mutex()
+
+    // Conflated-канал для защиты от гонок при множественных событиях Bluetooth
     private val routeTransitionChannel = Channel<RouteProfile>(Channel.CONFLATED)
 
     private val captureDirectBuffer: ByteBuffer = ByteBuffer.allocateDirect(BURST_BYTES * 4)
         .order(ByteOrder.LITTLE_ENDIAN)
 
     private val spectrumRawData = FloatArray(7)
-    // E-05, ERR-10: Атомарная ссылка исключает Torn Reads между фоновым DSP и 120 FPS RenderThread
+    // Атомарная ссылка исключает Torn Reads между фоновым DSP и 120 FPS RenderThread
     val spectrumUniforms = AtomicReference(FloatArray(5))
 
     private val bufferPool = ArrayDeque<ByteArray>(16).apply {
@@ -83,35 +88,38 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    suspend fun start(): Boolean = withContext(Dispatchers.IO) {
-        if (_isCapturing.value) return@withContext true
+    // Ошибка №9 [CONCURRENCY]: Сериализация старта через audioLifecycleMutex
+    suspend fun start(): Boolean = audioLifecycleMutex.withLock {
+        withContext(Dispatchers.IO) {
+            if (_isCapturing.value) return@withContext true
 
-        vadDetector.prepare()
-        vadDetector.resetState()
+            vadDetector.prepare()
+            vadDetector.resetState()
 
-        router.start { profile ->
-            routeTransitionChannel.trySend(profile)
+            router.start { profile ->
+                routeTransitionChannel.trySend(profile)
+            }
+
+            val profile = router.currentProfile.value
+            val inited = bridge.initAudioRoute(
+                isBluetooth = profile.path == AudioRoutePath.CMF_BUDS_WIRELESS,
+                sampleRate = profile.sampleRateOut
+            )
+            if (!inited) return@withContext false
+
+            vadDetector.setThresholds(profile.vadThresholdStart, profile.vadThresholdEnd)
+
+            if (!bridge.startAudio()) {
+                logger.e("NativeAudioEngine: Сбой запуска AAudio")
+                return@withContext false
+            }
+
+            _isCapturing.value = true
+            _isPlaying.value = true
+
+            startLoops()
+            true
         }
-
-        val profile = router.currentProfile.value
-        val inited = bridge.initAudioRoute(
-            isBluetooth = profile.path == AudioRoutePath.CMF_BUDS_WIRELESS,
-            sampleRate = profile.sampleRateOut
-        )
-        if (!inited) return@withContext false
-
-        vadDetector.setThresholds(profile.vadThresholdStart, profile.vadThresholdEnd)
-
-        if (!bridge.startAudio()) {
-            logger.e("NativeAudioEngine: Сбой запуска AAudio")
-            return@withContext false
-        }
-
-        _isCapturing.value = true
-        _isPlaying.value = true
-
-        startLoops()
-        true
     }
 
     private fun startLoops() {
@@ -127,16 +135,17 @@ class NativeAudioEngine @Inject constructor(
                     captureDirectBuffer.position(0)
                     captureDirectBuffer.get(frame, 0, bytesRead)
 
-                    // E-27: Динамический пре-ролл
+                    // Ошибка №10 [PERF]: Устранение GC Thrashing — использование пула вместо copyOf()
                     val maxPreRoll = router.currentProfile.value.leadInBufferSizeFrames / 160
                     synchronized(poolLock) {
-                        leadInBuffer.addLast(frame.copyOf(bytesRead))
+                        val preRollBuf = obtainBuffer()
+                        System.arraycopy(frame, 0, preRollBuf, 0, bytesRead)
+                        leadInBuffer.addLast(preRollBuf)
                         while (leadInBuffer.size > maxPreRoll) {
                             recycleBuffer(leadInBuffer.removeFirst())
                         }
                     }
 
-                    // E-08: Исключение дублирования кадра флагом speechTriggeredThisBurst
                     var speechTriggeredThisBurst = false
                     vadDetector.processSamples(
                         pcm16 = frame,
@@ -162,9 +171,10 @@ class NativeAudioEngine @Inject constructor(
                         }
                     )
 
-                    if (isSpeechActive && !speechTriggeredThisBurst) {
+                    // Ошибка №11 [DEFECT]: Исключение утечки пула bufferPool при фиксации речи
+                    if (isSpeechActive) {
                         _micOutput.trySend(frame)
-                    } else if (!isSpeechActive) {
+                    } else {
                         recycleBuffer(frame)
                     }
                 } else {
@@ -186,16 +196,19 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    private suspend fun applyRouteInternal(profile: RouteProfile) = withContext(Dispatchers.IO) {
-        bridge.stopAudio()
-        val success = bridge.initAudioRoute(
-            isBluetooth = profile.path == AudioRoutePath.CMF_BUDS_WIRELESS,
-            sampleRate = profile.sampleRateOut
-        )
-        if (success) {
-            vadDetector.setThresholds(profile.vadThresholdStart, profile.vadThresholdEnd)
-            if (_isCapturing.value) {
-                bridge.startAudio()
+    // Ошибка №9 [CONCURRENCY]: Сериализация смены аудиомаршрута через audioLifecycleMutex
+    private suspend fun applyRouteInternal(profile: RouteProfile) = audioLifecycleMutex.withLock {
+        withContext(Dispatchers.IO) {
+            bridge.stopAudio()
+            val success = bridge.initAudioRoute(
+                isBluetooth = profile.path == AudioRoutePath.CMF_BUDS_WIRELESS,
+                sampleRate = profile.sampleRateOut
+            )
+            if (success) {
+                vadDetector.setThresholds(profile.vadThresholdStart, profile.vadThresholdEnd)
+                if (_isCapturing.value) {
+                    bridge.startAudio()
+                }
             }
         }
     }
@@ -222,10 +235,22 @@ class NativeAudioEngine @Inject constructor(
     fun setVolume(volume: Float) = bridge.setVolume(volume.coerceIn(0f, 1f))
     fun setMicGain(gain: Float) = bridge.setMicGain(gain.coerceIn(0.5f, 2.0f))
 
-    // E-09: Прямой вызов без единого allocateDirect
+    // Ошибка №12 [DEFECT]: Гарантированная досылка сэмплов речи при переполнении буфера вывода
     fun enqueuePlayback(pcm: ByteArray) {
         if (pcm.isEmpty() || !_isPlaying.value) return
-        bridge.writePlaybackByteArray(pcm, 0, pcm.size)
+        var offset = 0
+        var remaining = pcm.size
+        var attempts = 0
+        while (remaining > 0 && attempts < 4) {
+            val written = bridge.writePlaybackByteArray(pcm, offset, remaining)
+            if (written >= remaining) break
+            if (written > 0) {
+                offset += written
+                remaining -= written
+            }
+            attempts++
+            Thread.sleep(2)
+        }
     }
 
     fun flushPlayback() {
