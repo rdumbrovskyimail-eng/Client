@@ -30,12 +30,12 @@ android {
                     "-DANDROID_STL=c++_shared",
                     "-DANDROID_PLATFORM=android-28"
                 )
+                // Ошибка №18 [BUILD]: Удален флаг -ffast-math для корректной работы std::isnan() и устойчивости DSP
                 cppFlags += listOf(
                     "-std=c++20",
                     "-O3",
                     "-fvisibility=hidden",
-                    "-flto",
-                    "-ffast-math"
+                    "-flto"
                 )
             }
         }
