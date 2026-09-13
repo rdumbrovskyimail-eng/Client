@@ -1,6 +1,7 @@
 // >>> FILE: app/src/main/cpp/jni/NativeBridge.cpp
 #include <jni.h>
 #include <string>
+#include <vector>
 #include <android/log.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
@@ -49,7 +50,7 @@ Java_com_client_app_audio_NativeAudioBridge_setMicGain(
     AAudioEngine::getInstance().setMicGain(static_cast<float>(gain));
 }
 
-// E-09: Прямая передача массива без выделения DirectBuffer в JVM
+// E-09: Потокобезопасная передача массива без блокировки ART GC и риска дедлоков
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     JNIEnv *env, jobject /* this */, jbyteArray byteArray, jint offset, jint length) {
@@ -58,15 +59,19 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     jsize arrayLen = env->GetArrayLength(byteArray);
     if (offset + length > arrayLen) return 0;
 
-    void* data = env->GetPrimitiveArrayCritical(byteArray, nullptr);
-    if (!data) return 0;
-
-    auto* startPtr = reinterpret_cast<const int16_t*>(static_cast<const char*>(data) + offset);
     size_t frames = length / sizeof(int16_t);
 
-    size_t written = AAudioEngine::getInstance().writePlaybackPcm(startPtr, frames);
-    env->ReleasePrimitiveArrayCritical(byteArray, data, JNI_ABORT);
+    // Thread-local буфер исключает реаллокации памяти в куче на каждый аудиоблок
+    thread_local std::vector<int16_t> playbackJniBuffer;
+    if (playbackJniBuffer.size() < frames) {
+        playbackJniBuffer.resize(frames);
+    }
 
+    env->GetByteArrayRegion(
+        byteArray, offset, length, reinterpret_cast<jbyte*>(playbackJniBuffer.data())
+    );
+
+    size_t written = AAudioEngine::getInstance().writePlaybackPcm(playbackJniBuffer.data(), frames);
     return static_cast<jint>(written * sizeof(int16_t));
 }
 
