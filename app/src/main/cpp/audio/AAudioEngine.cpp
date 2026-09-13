@@ -57,7 +57,7 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
     AAudioStreamBuilder_setChannelCount(inBuilder, CHANNEL_COUNT_MONO);
     AAudioStreamBuilder_setFormat(inBuilder, AAUDIO_FORMAT_PCM_I16);
 
-    // Ошибка №2 [ACOUSTIC]: Активация аппаратного AEC (VOICE_COMMUNICATION) для встроенного динамика
+    // Активация аппаратного AEC (VOICE_COMMUNICATION) для встроенного динамика
     if (isBluetoothMode) {
         AAudioStreamBuilder_setSharingMode(inBuilder, AAUDIO_SHARING_MODE_SHARED);
         AAudioStreamBuilder_setInputPreset(inBuilder, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
@@ -150,8 +150,12 @@ bool AAudioEngine::start() {
     return true;
 }
 
+// Ошибка №27 [CONCURRENCY/CRASH]: Защита мьютексом от параллельного Double Free
 void AAudioEngine::stop() {
-    isRunning_.store(false);
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    if (!isRunning_.exchange(false)) {
+        return;
+    }
 
     if (captureStream_) {
         AAudioStream_requestStop(captureStream_);
@@ -166,7 +170,7 @@ void AAudioEngine::stop() {
     }
 
     {
-        std::lock_guard<std::mutex> lock(playbackWriteMutex_);
+        std::lock_guard<std::mutex> pLock(playbackWriteMutex_);
         resampler24To16_.reset();
         resampler24To48_.reset();
         captureDecimator48To16_.reset();
