@@ -15,8 +15,8 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 enum class AudioRoutePath {
-    SPEAKER_EXCLUSIVE, // S23 Ultra: MMAP Exclusive, WCD9385, 4.2 мс
-    CMF_BUDS_WIRELESS  // CMF Buds 2: Low-Latency Shared Mode, mSBC / LC3
+    SPEAKER_EXCLUSIVE, // S23 Ultra MMAP Exclusive
+    CMF_BUDS_WIRELESS  // Bluetooth Voice Communication
 }
 
 data class RouteProfile(
@@ -67,21 +67,20 @@ class AudioDeviceRouter @Inject constructor(
 
     fun evaluateActiveRoute() {
         val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-        val btDevice = devices.firstOrNull { dev ->
-            dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-            dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-            dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+
+        // E-20: Исключаем A2DP из голосовой связи (принимаем строго BLE или SCO гарнитуры)
+        val btVoiceDevice = devices.firstOrNull { dev ->
+            dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET || dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
         }
 
-        val newProfile = if (btDevice != null) {
-            bindBluetoothCommunication(btDevice)
+        val newProfile = if (btVoiceDevice != null && bindBluetoothCommunication(btVoiceDevice)) {
             RouteProfile(
                 path = AudioRoutePath.CMF_BUDS_WIRELESS,
-                sampleRateOut = if (btDevice.type == AudioDeviceInfo.TYPE_BLE_HEADSET) 24000 else 16000,
-                leadInBufferSizeFrames = 260 * 16, // 260 мс пре-ролл для компенсации BT джиттера
-                vadThresholdStart = 0.55f,         // Адаптированный порог под Nothing Clear Voice ENC
+                sampleRateOut = if (btVoiceDevice.type == AudioDeviceInfo.TYPE_BLE_HEADSET) 24000 else 16000,
+                leadInBufferSizeFrames = 260 * 16,
+                vadThresholdStart = 0.55f,
                 vadThresholdEnd = 0.30f,
-                deviceName = btDevice.productName.toString().ifBlank { "CMF Buds 2" }
+                deviceName = btVoiceDevice.productName.toString().ifBlank { "Bluetooth Headset" }
             )
         } else {
             bindSpeakerCommunication()
@@ -90,20 +89,21 @@ class AudioDeviceRouter @Inject constructor(
 
         if (_currentProfile.value != newProfile) {
             _currentProfile.value = newProfile
-            logger.d("AudioDeviceRouter: Маршрут изменен -> ${newProfile.path} (${newProfile.deviceName})")
+            logger.d("AudioDeviceRouter: Маршрут -> ${newProfile.path} (${newProfile.deviceName})")
             onRouteChangedListener?.invoke(newProfile)
         }
     }
 
-    private fun bindBluetoothCommunication(device: AudioDeviceInfo) {
+    private fun bindBluetoothCommunication(device: AudioDeviceInfo): Boolean {
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             audioManager.setCommunicationDevice(device)
         } else {
             @Suppress("DEPRECATION")
             audioManager.isBluetoothScoOn = true
             @Suppress("DEPRECATION")
             audioManager.startBluetoothSco()
+            true
         }
     }
 
@@ -121,7 +121,7 @@ class AudioDeviceRouter @Inject constructor(
     private fun createSpeakerProfile() = RouteProfile(
         path = AudioRoutePath.SPEAKER_EXCLUSIVE,
         sampleRateOut = 24000,
-        leadInBufferSizeFrames = 160 * 16, // 160 мс пре-ролл для WCD9385
+        leadInBufferSizeFrames = 160 * 16,
         vadThresholdStart = 0.65f,
         vadThresholdEnd = 0.35f,
         deviceName = "Samsung S23 Ultra Native MMAP"
