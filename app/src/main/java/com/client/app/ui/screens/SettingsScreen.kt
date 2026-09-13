@@ -30,7 +30,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.client.app.attach.VocabularyExtractor
 import com.client.app.viewmodel.SettingsViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -45,12 +44,16 @@ fun SettingsScreen(
     var showGeminiKey by remember { mutableStateOf(false) }
     var showForvoKey by remember { mutableStateOf(false) }
 
-    // Локальные состояния слайдеров для ультраплавного отклика без дискового флуда
     var volumeDraft by remember(settings.volume) { mutableFloatStateOf(settings.volume) }
     var micGainDraft by remember(settings.micGain) { mutableFloatStateOf(settings.micGain) }
 
     val coreVoices = listOf("Charon", "Puck", "Kore", "Fenrir", "Aoede")
-    val liveModels = listOf("gemini-3.1-flash-live-preview", "gemini-2.5-flash-native-audio-latest")
+    // E-14: Синхронизировано с белым списком SessionManager
+    val liveModels = listOf(
+        "gemini-3.1-flash-live-preview",
+        "gemini-2.5-flash-native-audio-latest",
+        "gemini-2.5-flash-native-audio-preview-12-2025"
+    )
     val visionModels = listOf("gemini-2.5-flash", "gemini-3.8-flash")
 
     Scaffold(
@@ -75,7 +78,6 @@ fun SettingsScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // КЛЮЧИ И СЕРВЕРНЫЕ МОДЕЛИ
             SettingsCard(title = "КЛЮЧИ И СЕРВЕР GEMINI") {
                 OutlinedTextField(
                     value = settings.apiKey,
@@ -145,7 +147,6 @@ fun SettingsScreen(
                 }
             }
 
-            // ГОЛОС И АУДИОСТЕК S23 ULTRA
             SettingsCard(title = "ГОЛОС И ЗВУКОВАЯ СИСТЕМА S23 ULTRA") {
                 Text("Голос модели (TTS):", color = Color(0xFFA1A1AA), fontSize = 12.sp)
                 Spacer(Modifier.height(6.dp))
@@ -202,15 +203,8 @@ fun SettingsScreen(
                         inactiveTrackColor = Color(0xFF27272A)
                     )
                 )
-
-                Text(
-                    text = "* Смена голоса и моделей применится при следующем подключении",
-                    color = Color(0xFF71717A),
-                    fontSize = 11.sp
-                )
             }
 
-            // СИСТЕМНЫЙ ПРОМПТ ПО УМОЛЧАНИЮ
             SettingsCard(title = "СИСТЕМНЫЙ ПРОМПТ ПО УМОЛЧАНИЮ") {
                 OutlinedTextField(
                     value = settings.systemPrompt,
@@ -223,7 +217,6 @@ fun SettingsScreen(
                 )
             }
 
-            // ИНТЕГРАЦИЯ С FORVO
             SettingsCard(title = "ИНТЕГРАЦИЯ С FORVO") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -262,11 +255,10 @@ fun SettingsScreen(
                 }
             }
 
-            // ОПТИМИЗАЦИЯ ПИТАНИЯ SAMSUNG ONE UI
             SettingsCard(title = "ФОНОВАЯ РАБОТА НА SAMSUNG ONE UI") {
                 Text(
                     text = "Samsung One UI может усыплять микрофонный сервис через 10–15 минут сна экрана. " +
-                            "Нажмите кнопку ниже, найдите в системном списке «Gemini Live Ultra» и выберите «Не оптимизировать» (Работа без ограничений).",
+                            "Выберите «Не оптимизировать» (Работа без ограничений).",
                     color = Color(0xFFA1A1AA),
                     fontSize = 12.sp,
                     lineHeight = 17.sp
