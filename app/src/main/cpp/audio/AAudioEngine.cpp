@@ -20,9 +20,9 @@ AAudioEngine& AAudioEngine::getInstance() {
 
 AAudioEngine::AAudioEngine()
     : fftProcessor_(std::make_unique<dsp::FastFft>()),
-      fftAccumulator_(FFT_SIZE, 0.0f),
-      resampleScratchBuffer_(16384, 0), // ERR-07: Однократное предвыделение 16К сэмплов (32 КБ)
-      captureDecimateBuffer_(4096, 0) {  // ERR-04: Однократное предвыделение 4К сэмплов (8 КБ)
+      fftAccumulator_(FFT_SIZE * 2, 0.0f),
+      resampleScratchBuffer_(16384, 0),
+      captureDecimateBuffer_(4096, 0) {
     dsp::enableHardwareFtz();
 }
 
@@ -31,10 +31,9 @@ AAudioEngine::~AAudioEngine() {
 }
 
 bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) {
-    stop(); // E-12: Всегда полностью закрываем предыдущие потоки
+    stop();
 
     {
-        // ERR-07: Потокобезопасный сброс ресемплеров
         std::lock_guard<std::mutex> lock(playbackWriteMutex_);
         resampler24To16_.reset();
         resampler24To48_.reset();
@@ -42,7 +41,6 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
         resetEarcon();
     }
 
-    // ERR-08: Синхронная очистка буферов в состоянии покоя
     captureBuffer_.clear();
     playbackBuffer_.clear();
 
@@ -59,12 +57,13 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
     AAudioStreamBuilder_setChannelCount(inBuilder, CHANNEL_COUNT_MONO);
     AAudioStreamBuilder_setFormat(inBuilder, AAUDIO_FORMAT_PCM_I16);
 
+    // Ошибка №2 [ACOUSTIC]: Активация аппаратного AEC (VOICE_COMMUNICATION) для встроенного динамика
     if (isBluetoothMode) {
         AAudioStreamBuilder_setSharingMode(inBuilder, AAUDIO_SHARING_MODE_SHARED);
         AAudioStreamBuilder_setInputPreset(inBuilder, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
     } else {
         AAudioStreamBuilder_setSharingMode(inBuilder, AAUDIO_SHARING_MODE_EXCLUSIVE);
-        AAudioStreamBuilder_setInputPreset(inBuilder, AAUDIO_INPUT_PRESET_UNPROCESSED);
+        AAudioStreamBuilder_setInputPreset(inBuilder, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
     }
 
     AAudioStreamBuilder_setDataCallback(inBuilder, captureCallback, this);
@@ -78,7 +77,6 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
         return false;
     }
 
-    // E-07: Фиксируем реальную частоту микрофона от HAL
     actualCaptureSampleRate_.store(AAudioStream_getSampleRate(captureStream_), std::memory_order_release);
 
     // 2. Конфигурация потока воспроизведения
@@ -134,7 +132,6 @@ bool AAudioEngine::start() {
         if (!init(isBluetoothMode_.load(), playbackSampleRate_.load())) return false;
     }
 
-    // ERR-08: Детерминированный сброс буферов перед запуском потоков вместо отложенного requestFlush
     captureBuffer_.clear();
     playbackBuffer_.clear();
 
@@ -153,7 +150,6 @@ bool AAudioEngine::start() {
     return true;
 }
 
-// E-12: Гарантированное закрытие дескрипторов при любом сценарии
 void AAudioEngine::stop() {
     isRunning_.store(false);
 
@@ -170,7 +166,6 @@ void AAudioEngine::stop() {
     }
 
     {
-        // ERR-07: Изолируем сброс ресемплеров от параллельных сетевых записей
         std::lock_guard<std::mutex> lock(playbackWriteMutex_);
         resampler24To16_.reset();
         resampler24To48_.reset();
@@ -178,7 +173,6 @@ void AAudioEngine::stop() {
         resetEarcon();
     }
 
-    // ERR-08: Синхронное очищение очередей при закрытых потоках исключает Stale Flush Trap
     captureBuffer_.clear();
     playbackBuffer_.clear();
 
@@ -191,7 +185,6 @@ void AAudioEngine::stop() {
 size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
     if (frames == 0) return 0;
 
-    // ERR-07: Потокобезопасная блокировка вызова без динамических аллокаций памяти
     std::lock_guard<std::mutex> lock(playbackWriteMutex_);
 
     int32_t actualRate = actualPlaybackSampleRate_.load(std::memory_order_acquire);
@@ -227,7 +220,6 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
         return playbackBuffer_.write(pcm, frames);
     }
 
-    // ERR-14: Универсальный каузальный ресемплер для 44.1 кГц и нестандартных частот HAL
     const double rateRatio = static_cast<double>(actualRate) / static_cast<double>(SAMPLE_RATE_GEMINI_OUT);
     const size_t targetFrames = static_cast<size_t>(frames * rateRatio);
 
@@ -256,7 +248,6 @@ size_t AAudioEngine::readCapturePcm(int16_t* pcm, size_t maxFrames) {
     return captureBuffer_.read(pcm, maxFrames);
 }
 
-// ERR-08: Динамический сброс при перебивании (Barge-In) на лету
 void AAudioEngine::flushPlayback() {
     playbackBuffer_.requestFlush();
     outRms_.store(0.0f);
@@ -285,7 +276,6 @@ void AAudioEngine::getSpectrumData(dsp::SpectrumSnapshot& outSnapshot) {
 aaudio_data_callback_result_t AAudioEngine::captureCallback(
     AAudioStream* /* stream */, void* userData, void* audioData, int32_t numFrames) {
 
-    // E-26: Активация FTZ непосредственно в потоке захвата
     thread_local bool ftzSet = false;
     if (!ftzSet) {
         dsp::enableHardwareFtz();
@@ -295,7 +285,6 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     auto* engine = static_cast<AAudioEngine*>(userData);
     auto* samples = static_cast<int16_t*>(audioData);
 
-    // Применение усиления
     float gain = engine->micGain_.load(std::memory_order_relaxed);
     if (std::abs(gain - 1.0f) > 0.001f) {
         for (int32_t i = 0; i < numFrames; ++i) {
@@ -304,7 +293,6 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
         }
     }
 
-    // ERR-04: Если HAL захватывает на 48 кГц — безопасно децимируем 3:1 в предвыделенный буфер
     int32_t capRate = engine->actualCaptureSampleRate_.load(std::memory_order_relaxed);
     if (capRate == 48000) {
         int16_t* decBuf = engine->captureDecimateBuffer_.data();
@@ -323,7 +311,6 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
 aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     AAudioStream* /* stream */, void* userData, void* audioData, int32_t numFrames) {
 
-    // E-26: Активация FTZ в потоке воспроизведения
     thread_local bool ftzSet = false;
     if (!ftzSet) {
         dsp::enableHardwareFtz();
@@ -338,7 +325,6 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
         std::memset(samples + read, 0, (numFrames - read) * sizeof(int16_t));
     }
 
-    // E-10: Расчёт Earcon строго от текущей подтвержденной частоты и времени
     int32_t actualRate = engine->actualPlaybackSampleRate_.load(std::memory_order_relaxed);
     size_t earconLimitFrames = static_cast<size_t>(actualRate * (EARCON_DURATION_MS / 1000.0f));
     size_t phase = engine->earconPhase_.load(std::memory_order_acquire);
@@ -364,14 +350,18 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     float outRms = dsp::calculateRms(samples, numFrames);
     engine->outRms_.store(outRms, std::memory_order_relaxed);
 
-    // E-02, ERR-09: Накопление сэмплов с Hop Size = 128 и расчет спектра с реальной частотой actualRate
     float micRms = engine->micRms_.load(std::memory_order_relaxed);
+    const size_t requiredAccum = (actualRate >= 44100) ? (FFT_SIZE * 2) : FFT_SIZE;
+    const size_t hopSize = (actualRate >= 44100) ? (FFT_HOP_SIZE * 2) : FFT_HOP_SIZE;
+
     for (int32_t i = 0; i < numFrames; ++i) {
-        engine->fftAccumulator_[engine->fftAccumulatorPos_++] = samples[i] * (1.0f / 32768.0f);
-        if (engine->fftAccumulatorPos_ >= FFT_SIZE) {
-            engine->fftProcessor_->process(engine->fftAccumulator_.data(), FFT_SIZE, micRms, outRms, actualRate);
-            std::memmove(&engine->fftAccumulator_[0], &engine->fftAccumulator_[FFT_HOP_SIZE], (FFT_SIZE - FFT_HOP_SIZE) * sizeof(float));
-            engine->fftAccumulatorPos_ = FFT_SIZE - FFT_HOP_SIZE;
+        if (engine->fftAccumulatorPos_ < engine->fftAccumulator_.size()) {
+            engine->fftAccumulator_[engine->fftAccumulatorPos_++] = samples[i] * (1.0f / 32768.0f);
+        }
+        if (engine->fftAccumulatorPos_ >= requiredAccum) {
+            engine->fftProcessor_->process(engine->fftAccumulator_.data(), requiredAccum, micRms, outRms, actualRate);
+            std::memmove(&engine->fftAccumulator_[0], &engine->fftAccumulator_[hopSize], (requiredAccum - hopSize) * sizeof(float));
+            engine->fftAccumulatorPos_ = requiredAccum - hopSize;
         }
     }
 
@@ -384,8 +374,6 @@ void AAudioEngine::errorCallback(AAudioStream* /* stream */, void* userData, aau
 
     if (error == AAUDIO_ERROR_DISCONNECTED) {
         auto* engine = static_cast<AAudioEngine*>(userData);
-        // Запрещено вызывать AAudioStream_close непосредственно в errorCallback потоке во избежание дедлока.
-        // Запускаем остановку в отдельном отсоединенном потоке.
         std::thread([engine]() {
             LOGI("Asynchronously stopping AAudioEngine after device disconnect.");
             engine->stop();
