@@ -62,6 +62,9 @@ private:
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_CAPTURE> captureBuffer_;
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_PLAYBACK> playbackBuffer_;
 
+    // Ошибка №27 [CONCURRENCY/CRASH]: Мьютекс состояния остановки стримов для исключения Double Free
+    std::mutex stateMutex_;
+
     std::atomic<bool> isRunning_{false};
     std::atomic<bool> isBluetoothMode_{false};
     std::atomic<bool> isMmapExclusiveActive_{false};
