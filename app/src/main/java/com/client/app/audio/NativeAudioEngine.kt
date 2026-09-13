@@ -49,7 +49,11 @@ class NativeAudioEngine @Inject constructor(
     private val _micOutput = Channel<ByteArray>(256, BufferOverflow.DROP_OLDEST)
     val micOutput: ReceiveChannel<ByteArray> = _micOutput
 
-    private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // ERR-11: Изоляция исключений аудиотракта от системного краша JVM
+    private val coroutineExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        logger.e("Unhandled coroutine exception in NativeAudioEngine", throwable)
+    }
+    private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + coroutineExceptionHandler)
     private var captureJob: Job? = null
     private var spectrumJob: Job? = null
 
