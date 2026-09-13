@@ -2,12 +2,9 @@
 package com.client.app.ui.screens
 
 import android.Manifest
-import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
-import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
@@ -16,14 +13,12 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material3.*
@@ -37,9 +32,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -47,7 +40,6 @@ import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.client.app.session.ChatMessage
-import com.client.app.session.ForvoWord
 import com.client.app.ui.components.AgslVoiceVisualizer
 import com.client.app.viewmodel.ClientViewModel
 import com.mikepenz.markdown.m3.Markdown
@@ -67,6 +59,7 @@ fun ClientScreen(
     var attachedUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var isSheetOpen by remember { mutableStateOf(false) }
 
+    // E-31: Ограничение пикера поддерживаемыми типами
     val filePicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris -> attachedUris = (attachedUris + uris).distinct().take(8) }
@@ -101,7 +94,6 @@ fun ClientScreen(
         }
     }
 
-    // Исключение двойных паддингов: сброс внутренних insets Scaffold
     Scaffold(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         containerColor = Color(0xFF09090B),
@@ -169,7 +161,6 @@ fun ClientScreen(
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            // Центральная зона
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -217,13 +208,12 @@ fun ClientScreen(
                 }
             }
 
-            // Нижняя панель ввода с изоляцией клавиатурных и навигационных Insets
+            // E-24: Исключение двойного отступа
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(Color(0xFF09090B))
-                    .windowInsetsPadding(WindowInsets.ime)
-                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
                     .padding(horizontal = 16.dp, vertical = 8.dp)
             ) {
                 Row(
@@ -235,8 +225,11 @@ fun ClientScreen(
                         .padding(horizontal = 6.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = { filePicker.launch(arrayOf("*/*")) }, modifier = Modifier.size(38.dp)) {
-                        Icon(Icons.Filled.Add, "Прикрепить документ", tint = Color(0xFFA1A1AA), modifier = Modifier.size(20.dp))
+                    IconButton(
+                        onClick = { filePicker.launch(arrayOf("application/pdf", "image/*")) },
+                        modifier = Modifier.size(38.dp)
+                    ) {
+                        Icon(Icons.Filled.Add, "Прикрепить", tint = Color(0xFFA1A1AA), modifier = Modifier.size(20.dp))
                     }
 
                     BasicTextField(
@@ -292,6 +285,50 @@ fun ClientScreen(
             }
         }
     }
+
+    // E-21: Полноценный рабочий ModalBottomSheet
+    if (isSheetOpen) {
+        ModalBottomSheet(
+            onDismissRequest = { isSheetOpen = false },
+            containerColor = Color(0xFF141416),
+            dragHandle = { BottomSheetDefaults.DragHandle(color = Color(0xFF3F3F46)) }
+        ) {
+            var tempPrompt by remember { mutableStateOf(state.activePrompt) }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp)
+                    .padding(bottom = 32.dp)
+                    .windowInsetsPadding(WindowInsets.ime)
+            ) {
+                Text("Системная инструкция роли", color = Color(0xFFFAFAFA), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = tempPrompt,
+                    onValueChange = { tempPrompt = it },
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp, max = 240.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = Color(0xFF60A5FA),
+                        unfocusedBorderColor = Color(0xFF27272A),
+                        focusedTextColor = Color(0xFFFAFAFA),
+                        unfocusedTextColor = Color(0xFFFAFAFA)
+                    )
+                )
+                Spacer(Modifier.height(16.dp))
+                Button(
+                    onClick = {
+                        viewModel.applyPrompt(tempPrompt)
+                        isSheetOpen = false
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
+                ) {
+                    Text("Применить роль", color = Color.White)
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -314,9 +351,7 @@ private fun ChatBubble(msg: ChatMessage, isStreaming: Boolean) {
                 .padding(horizontal = 14.dp, vertical = 10.dp)
         ) {
             Column {
-                if (isUser) {
-                    Text(text = msg.text, color = Color(0xFFFAFAFA), fontSize = 14.sp, lineHeight = 20.sp)
-                } else if (isStreaming) {
+                if (isUser || isStreaming) {
                     Text(text = msg.text, color = Color(0xFFFAFAFA), fontSize = 14.sp, lineHeight = 20.sp)
                 } else {
                     Markdown(
