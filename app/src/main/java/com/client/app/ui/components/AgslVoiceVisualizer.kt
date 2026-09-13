@@ -28,6 +28,7 @@ import com.client.app.session.LinkState
 import com.client.app.session.SessionState
 
 private const val AGSL_SHADER_SRC = """
+uniform shader u_Content;
 uniform float2 u_Resolution;
 uniform float u_Time;
 uniform float u_State;
