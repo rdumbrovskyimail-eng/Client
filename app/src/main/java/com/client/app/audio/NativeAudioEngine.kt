@@ -25,7 +25,7 @@ class NativeAudioEngine @Inject constructor(
     private val logger: AppLogger
 ) {
     companion object {
-        private const val BURST_BYTES = 160 * 2 // 320 байт = 10 мс @ 16 кГц
+        private const val BURST_BYTES = 160 * 2
     }
 
     private val _isCapturing = MutableStateFlow(false)
@@ -52,20 +52,30 @@ class NativeAudioEngine @Inject constructor(
     private var captureJob: Job? = null
     private var spectrumJob: Job? = null
 
+    // E-04: Conflated-канал для защиты от гонок при множественных событиях Bluetooth
+    private val routeTransitionChannel = Channel<RouteProfile>(Channel.CONFLATED)
+
     private val captureDirectBuffer: ByteBuffer = ByteBuffer.allocateDirect(BURST_BYTES * 4)
         .order(ByteOrder.LITTLE_ENDIAN)
 
     private val spectrumRawData = FloatArray(7)
     val spectrumUniforms = FloatArray(5)
 
-    // Пул буферов (Zero-Allocation Loop)
-    private val bufferPool = ArrayDeque<ByteArray>(8).apply {
-        repeat(8) { add(ByteArray(BURST_BYTES)) }
+    private val bufferPool = ArrayDeque<ByteArray>(16).apply {
+        repeat(16) { add(ByteArray(BURST_BYTES)) }
     }
     private val poolLock = Any()
+    private val leadInBuffer = ArrayDeque<ByteArray>(32)
 
-    // Буфер пре-ролла (Lead-In Ring Buffer) для предотвращения обрезки первых согласных
-    private val leadInBuffer = ArrayDeque<ByteArray>(16)
+    private var isSpeechActive = false
+
+    init {
+        engineScope.launch {
+            for (profile in routeTransitionChannel) {
+                applyRouteInternal(profile)
+            }
+        }
+    }
 
     suspend fun start(): Boolean = withContext(Dispatchers.IO) {
         if (_isCapturing.value) return@withContext true
@@ -74,28 +84,31 @@ class NativeAudioEngine @Inject constructor(
         vadDetector.resetState()
 
         router.start { profile ->
-            bridge.initAudioRoute(
-                isBluetooth = profile.path == AudioRoutePath.CMF_BUDS_WIRELESS,
-                sampleRate = profile.sampleRateOut
-            )
-            vadDetector.setThresholds(profile.vadThresholdStart, profile.vadThresholdEnd)
+            routeTransitionChannel.trySend(profile)
         }
 
         val profile = router.currentProfile.value
-        bridge.initAudioRoute(
+        val inited = bridge.initAudioRoute(
             isBluetooth = profile.path == AudioRoutePath.CMF_BUDS_WIRELESS,
             sampleRate = profile.sampleRateOut
         )
+        if (!inited) return@withContext false
+
         vadDetector.setThresholds(profile.vadThresholdStart, profile.vadThresholdEnd)
 
         if (!bridge.startAudio()) {
-            logger.e("NativeAudioEngine: Сбой запуска нативного AAudio тракта")
+            logger.e("NativeAudioEngine: Сбой запуска AAudio")
             return@withContext false
         }
 
         _isCapturing.value = true
         _isPlaying.value = true
 
+        startLoops()
+        true
+    }
+
+    private fun startLoops() {
         captureJob = engineScope.launch {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
 
@@ -108,41 +121,46 @@ class NativeAudioEngine @Inject constructor(
                     captureDirectBuffer.position(0)
                     captureDirectBuffer.get(frame, 0, bytesRead)
 
+                    // E-27: Динамический пре-ролл
+                    val maxPreRoll = router.currentProfile.value.leadInBufferSizeFrames / 160
                     synchronized(poolLock) {
                         leadInBuffer.addLast(frame.copyOf(bytesRead))
-                        val maxPreRoll = if (router.currentProfile.value.path == AudioRoutePath.CMF_BUDS_WIRELESS) 16 else 10
-                        if (leadInBuffer.size > maxPreRoll) {
+                        while (leadInBuffer.size > maxPreRoll) {
                             recycleBuffer(leadInBuffer.removeFirst())
                         }
                     }
 
+                    // E-08: Исключение дублирования кадра флагом speechTriggeredThisBurst
+                    var speechTriggeredThisBurst = false
                     vadDetector.processSamples(
                         pcm16 = frame,
                         onSpeechStart = {
-                            // 1. Выброс буфера пре-ролла (Lead-In) в сеть для сохранения начала слов
+                            speechTriggeredThisBurst = true
+                            isSpeechActive = true
                             synchronized(poolLock) {
                                 while (leadInBuffer.isNotEmpty()) {
                                     _micOutput.trySend(leadInBuffer.removeFirst())
                                 }
                             }
-
-                            // 2. Обработка перебивания (Barge-In)
                             if (_outLevel.value > 0.05f) {
                                 bridge.flushPlayback()
-
                                 if (router.currentProfile.value.path == AudioRoutePath.CMF_BUDS_WIRELESS) {
-                                    bridge.triggerBargeInEarcon() // Звуковой клип в наушники CMF Buds 2
+                                    bridge.triggerBargeInEarcon()
                                 }
-                                hapticManager.triggerBargeIn()     // Тактильный щелчок мотора S23 Ultra
-
+                                hapticManager.triggerBargeIn()
                                 _bargeInEvents.tryEmit(Unit)
-                                logger.d("NativeAudioEngine: Barge-In сработал")
                             }
                         },
-                        onSpeechEnd = { /* Пауза в речи */ }
+                        onSpeechEnd = {
+                            isSpeechActive = false
+                        }
                     )
 
-                    _micOutput.trySend(frame)
+                    if (isSpeechActive && !speechTriggeredThisBurst) {
+                        _micOutput.trySend(frame)
+                    } else if (!isSpeechActive) {
+                        recycleBuffer(frame)
+                    }
                 } else {
                     delay(2)
                 }
@@ -155,11 +173,23 @@ class NativeAudioEngine @Inject constructor(
                 System.arraycopy(spectrumRawData, 0, spectrumUniforms, 0, 5)
                 _micLevel.value = (spectrumRawData[5] * 3.5f).coerceIn(0f, 1f)
                 _outLevel.value = (spectrumRawData[6] * 3.5f).coerceIn(0f, 1f)
-                delay(8) // 120 FPS
+                delay(8)
             }
         }
+    }
 
-        true
+    private suspend fun applyRouteInternal(profile: RouteProfile) = withContext(Dispatchers.IO) {
+        bridge.stopAudio()
+        val success = bridge.initAudioRoute(
+            isBluetooth = profile.path == AudioRoutePath.CMF_BUDS_WIRELESS,
+            sampleRate = profile.sampleRateOut
+        )
+        if (success) {
+            vadDetector.setThresholds(profile.vadThresholdStart, profile.vadThresholdEnd)
+            if (_isCapturing.value) {
+                bridge.startAudio()
+            }
+        }
     }
 
     fun stop() {
@@ -178,22 +208,16 @@ class NativeAudioEngine @Inject constructor(
 
         _micLevel.value = 0f
         _outLevel.value = 0f
+        isSpeechActive = false
     }
 
-    fun setVolume(volume: Float) {
-        bridge.setVolume(volume.coerceIn(0f, 1f))
-    }
+    fun setVolume(volume: Float) = bridge.setVolume(volume.coerceIn(0f, 1f))
+    fun setMicGain(gain: Float) = bridge.setMicGain(gain.coerceIn(0.5f, 2.0f))
 
-    fun setMicGain(gain: Float) {
-        bridge.setMicGain(gain.coerceIn(0.5f, 2.0f))
-    }
-
+    // E-09: Прямой вызов без единого allocateDirect
     fun enqueuePlayback(pcm: ByteArray) {
         if (pcm.isEmpty() || !_isPlaying.value) return
-        val directBuf = ByteBuffer.allocateDirect(pcm.size).order(ByteOrder.LITTLE_ENDIAN)
-        directBuf.put(pcm)
-        directBuf.flip()
-        bridge.writePlaybackDirect(directBuf, 0, pcm.size)
+        bridge.writePlaybackByteArray(pcm, 0, pcm.size)
     }
 
     fun flushPlayback() {
@@ -206,6 +230,6 @@ class NativeAudioEngine @Inject constructor(
     }
 
     private fun recycleBuffer(buf: ByteArray) = synchronized(poolLock) {
-        if (bufferPool.size < 16) bufferPool.addLast(buf)
+        if (bufferPool.size < 32) bufferPool.addLast(buf)
     }
 }
