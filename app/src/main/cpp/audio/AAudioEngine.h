@@ -16,32 +16,30 @@ class AAudioEngine {
 public:
     static AAudioEngine& getInstance();
 
-    // Инициализация тракта: isBluetoothMode переключает Exclusive MMAP на Shared Low-Latency
     bool init(bool isBluetoothMode = false, int32_t targetPlaybackSampleRate = SAMPLE_RATE_GEMINI_OUT);
     bool start();
     void stop();
 
-    // Запись звука из сети в динамик
+    // E-09: Прямая запись звука без выделения DirectByteBuffer в JVM
     size_t writePlaybackPcm(const int16_t* pcm, size_t frames);
-
-    // Считывание звука микрофона для отправки в Gemini
     size_t readCapturePcm(int16_t* pcm, size_t maxFrames);
 
-    // Мгновенный lock-free сброс буфера при перебивании (Barge-In)
     void flushPlayback();
-
-    // Синтез звукового микро-клика (Earcon) для CMF Buds 2 при перебивании
     void triggerBargeInEarcon();
+    void resetEarcon();
 
     void setVolume(float vol);
     void setMicGain(float gain);
-    void setRouteMode(bool isBluetooth, int32_t targetSampleRate);
 
     float getMicRms() const { return micRms_.load(std::memory_order_relaxed); }
     float getOutRms() const { return outRms_.load(std::memory_order_relaxed); }
     bool isMmapActive() const { return isMmapExclusiveActive_.load(std::memory_order_relaxed); }
 
-    void getSpectrumUniforms(float* out5Bands);
+    int32_t getActualCaptureSampleRate() const { return actualCaptureSampleRate_.load(std::memory_order_relaxed); }
+    int32_t getActualPlaybackSampleRate() const { return actualPlaybackSampleRate_.load(std::memory_order_relaxed); }
+
+    // E-03: Возврат согласованного снимка спектра
+    void getSpectrumData(dsp::SpectrumSnapshot& outSnapshot);
 
 private:
     AAudioEngine();
@@ -63,8 +61,9 @@ private:
     std::atomic<bool> isBluetoothMode_{false};
     std::atomic<bool> isMmapExclusiveActive_{false};
     std::atomic<int32_t> playbackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
-    
-    // ERR-020: Потокобезопасное хранение подтвержденной частоты открытого аппаратного стрима
+
+    // E-07: Подтверждённая HAL частота микрофона и динамика
+    std::atomic<int32_t> actualCaptureSampleRate_{SAMPLE_RATE_GEMINI_IN};
     std::atomic<int32_t> actualPlaybackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
 
     std::atomic<float> playbackVolume_{1.0f};
@@ -73,16 +72,21 @@ private:
     std::atomic<float> micRms_{0.0f};
     std::atomic<float> outRms_{0.0f};
 
-    // Состояние генератора Earcon
-    std::atomic<size_t> earconPhase_{EARCON_DURATION_FRAMES_24K};
+    // E-10: Фаза генератора Earcon
+    std::atomic<size_t> earconPhase_{EARCON_INACTIVE_PHASE};
 
     std::unique_ptr<dsp::FastFft> fftProcessor_;
-    std::vector<float> pcmFloatBuffer_;
+
+    // E-02: Накопитель с перекрытием для БПФ
+    std::vector<float> fftAccumulator_;
+    size_t fftAccumulatorPos_{0};
+
+    // E-25: Статический рабочий буфер для сетевых чанков
     std::vector<int16_t> resampleScratchBuffer_;
 
-    // Stateful-ресемплеры для корректной стыковки сетевых чанков
     PolyphaseResampler24To16 resampler24To16_;
     LinearResampler24To48 resampler24To48_;
+    Decimator48To16 captureDecimator48To16_;
 };
 
 } // namespace client::audio
