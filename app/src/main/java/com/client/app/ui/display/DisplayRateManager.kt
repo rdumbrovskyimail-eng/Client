@@ -2,8 +2,6 @@
 package com.client.app.ui.display
 
 import android.os.Build
-import android.view.Display
-import android.view.Surface
 import android.view.Window
 
 object DisplayRateManager {
@@ -17,12 +15,7 @@ object DisplayRateManager {
             val layoutParams = window.attributes
 
             if (enable) {
-                // 1. Принудительный запрос частоты кадра на уровне Surface
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    window.setFrameRate(120.0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
-                }
-
-                // 2. Поиск и фиксация 120-Гц режима в DisplayModeDirector
+                // Поиск и фиксация 120-Гц режима в DisplayModeDirector
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     val display = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                         window.context.display
@@ -40,9 +33,6 @@ object DisplayRateManager {
                 }
                 layoutParams.preferredRefreshRate = 120.0f
             } else {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    window.setFrameRate(0.0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
-                }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     layoutParams.preferredDisplayModeId = 0
                 }
