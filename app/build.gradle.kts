@@ -139,7 +139,7 @@ dependencies {
     implementation("com.jakewharton.timber:timber:5.0.1")
 
     // Нейросетевой рантайм Silero VAD (ONNX)
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.1")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 
     // Рендеринг разметки Markdown в Compose M3
     implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.31.0")
