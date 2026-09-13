@@ -31,9 +31,10 @@ private:
 
     float smoothedBands_[audio::SPECTRUM_BANDS]{0.0f};
 
-    // ERR-05: Эталонный тройной буфер Дэвида Андерсона
+    // ERR-05 & Ошибка №29: Тройной буфер Дэвида Андерсона с атомарным флагом публикации
     alignas(64) SpectrumSnapshot pool_[3];
     mutable std::atomic<size_t> readyIdx_{0}; // Разделяемый слот готовности
+    mutable std::atomic<bool> hasNewData_{false}; // Флаг наличия свежего расчета БПФ
     size_t writeIdx_{1};                      // Приватный рабочий слот писателя (аудиопоток)
     mutable size_t readIdx_{2};               // Приватный рабочий слот читателя (UI-поток)
 };
