@@ -8,6 +8,7 @@
 
 #define LOG_TAG "NativeCoreBridge"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 using namespace client::audio;
 
@@ -16,7 +17,7 @@ Java_com_client_app_audio_NativeAudioBridge_getHardwareCoreInfo(JNIEnv *env, job
     bool isMmap = AAudioEngine::getInstance().isMmapActive();
     std::string info = isMmap
         ? "Qualcomm SD8 Gen2 - AAudio MMAP Exclusive [4.2ms Direct]"
-        : "Qualcomm SD8 Gen2 - AAudio Low-Latency Shared [CMF Buds 2 Active]";
+        : "Qualcomm SD8 Gen2 - AAudio Low-Latency Shared [BT Active]";
     return env->NewStringUTF(info.c_str());
 }
 
@@ -48,9 +49,39 @@ Java_com_client_app_audio_NativeAudioBridge_setMicGain(
     AAudioEngine::getInstance().setMicGain(static_cast<float>(gain));
 }
 
+// E-09: Прямая передача массива без выделения DirectBuffer в JVM
+extern "C" JNIEXPORT jint JNICALL
+Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
+    JNIEnv *env, jobject /* this */, jbyteArray byteArray, jint offset, jint length) {
+
+    if (!byteArray || offset < 0 || length <= 0) return 0;
+    jsize arrayLen = env->GetArrayLength(byteArray);
+    if (offset + length > arrayLen) return 0;
+
+    void* data = env->GetPrimitiveArrayCritical(byteArray, nullptr);
+    if (!data) return 0;
+
+    auto* startPtr = reinterpret_cast<const int16_t*>(static_cast<const char*>(data) + offset);
+    size_t frames = length / sizeof(int16_t);
+
+    size_t written = AAudioEngine::getInstance().writePlaybackPcm(startPtr, frames);
+    env->ReleasePrimitiveArrayCritical(byteArray, data, JNI_ABORT);
+
+    return static_cast<jint>(written * sizeof(int16_t));
+}
+
+// E-06: Защита от OOB в DirectBuffer
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackDirect(
     JNIEnv *env, jobject /* this */, jobject byteBuffer, jint offsetBytes, jint lengthBytes) {
+
+    if (!byteBuffer || offsetBytes < 0 || lengthBytes <= 0) return 0;
+
+    jlong capacity = env->GetDirectBufferCapacity(byteBuffer);
+    if (capacity < 0 || (offsetBytes + lengthBytes) > capacity) {
+        LOGE("writePlaybackDirect OOB: Cap=%lld, Req=%d", (long long)capacity, offsetBytes + lengthBytes);
+        return 0;
+    }
 
     auto *bufferPtr = static_cast<int16_t*>(env->GetDirectBufferAddress(byteBuffer));
     if (!bufferPtr) return 0;
@@ -64,6 +95,13 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackDirect(
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_readCaptureDirect(
     JNIEnv *env, jobject /* this */, jobject byteBuffer, jint capacityBytes) {
+
+    if (!byteBuffer || capacityBytes <= 0) return 0;
+
+    jlong realCap = env->GetDirectBufferCapacity(byteBuffer);
+    if (realCap < capacityBytes) {
+        capacityBytes = static_cast<jint>(realCap);
+    }
 
     auto *bufferPtr = static_cast<int16_t*>(env->GetDirectBufferAddress(byteBuffer));
     if (!bufferPtr) return 0;
@@ -89,20 +127,24 @@ Java_com_client_app_audio_NativeAudioBridge_tuneNativeSocket(JNIEnv * /* env */,
     int flag = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
-    // Ликвидация Bufferbloat ядра Linux: TCP_NOTSENT_LOWAT = 16 КБ
     int lowat = 16384;
     setsockopt(fd, IPPROTO_TCP, 25 /* TCP_NOTSENT_LOWAT */, &lowat, sizeof(lowat));
-
-    int quickack = 1;
-    setsockopt(fd, IPPROTO_TCP, 12 /* TCP_QUICKACK */, &quickack, sizeof(quickack));
 }
 
+// E-03: Потокобезопасная передача полного снимка в UI
 extern "C" JNIEXPORT void JNICALL
 Java_com_client_app_audio_NativeAudioBridge_getSpectrumData(JNIEnv *env, jobject /* this */, jfloatArray outArray) {
-    float bands[7] = {0.0f};
-    AAudioEngine::getInstance().getSpectrumUniforms(bands);
-    bands[5] = AAudioEngine::getInstance().getMicRms();
-    bands[6] = AAudioEngine::getInstance().getOutRms();
+    if (!outArray) return;
+    jsize len = env->GetArrayLength(outArray);
+    if (len < 7) return;
 
-    env->SetFloatArrayRegion(outArray, 0, 7, bands);
+    client::dsp::SpectrumSnapshot snapshot;
+    AAudioEngine::getInstance().getSpectrumData(snapshot);
+
+    float data[7];
+    for (int i = 0; i < 5; ++i) data[i] = snapshot.bands[i];
+    data[5] = snapshot.micRms;
+    data[6] = snapshot.outRms;
+
+    env->SetFloatArrayRegion(outArray, 0, 7, data);
 }
