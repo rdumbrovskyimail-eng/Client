@@ -32,7 +32,6 @@ jobs:
           gradle-version: '8.14.3'
           cache-read-only: false
 
-      # Гарантируем наличие wrapper.jar и прав исполнения gradlew
       - name: Ensure Gradle Wrapper Exists
         run: |
           if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
@@ -41,7 +40,6 @@ jobs:
           fi
           chmod +x gradlew
 
-      # SLSA Level 3: Проверка криптографической контрольной суммы официального Gradle Wrapper
       - name: Validate Gradle Wrapper Integrity
         uses: gradle/actions/wrapper-validation@v4
 
@@ -82,7 +80,7 @@ jobs:
             - **DSP & Ресемплер:** ARM NEON Polyphase Resampler (24 кГц $\leftrightarrow$ 16/48 кГц)
             - **Тактильность & Earcon:** X-Axis LRA Haptics (<3 мс) + Звуковой Earcon Pip (750 Гц)
             - **VAD & Lead-In:** Silero VAD v5 Zero-Allocation + Пре-ролл буфер (160/260 мс)
-            - **Сетевой транспорт:** Protobuf Lite 40-мс батчинг + `TCP_NOTSENT_LOWAT` ядро
+            - **Сетевой транспорт:** Gemini 3.1 Live WebSocket JSON + 40-мс батчинг + TCP_NOTSENT_LOWAT ядро
             - **Графика:** 120 FPS AGSL SDF Raymarching без варп-дивергенции на Adreno 740
           files: app/build/outputs/apk/debug/app-debug.apk
         env:
