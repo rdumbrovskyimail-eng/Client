@@ -29,4 +29,7 @@ class NativeAudioBridge @Inject constructor() {
     external fun triggerBargeInEarcon()
     external fun tuneNativeSocket(fd: Int)
     external fun getSpectrumData(outArray: FloatArray)
+
+    // E-51: Вычитка нативных логов из Lock-Free C++ очереди NativeLogQueue в JVM
+    external fun drainNativeLogs(): Array<String>?
 }
