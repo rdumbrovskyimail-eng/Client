@@ -109,7 +109,7 @@ class AttachmentProcessor @Inject constructor(
 
                                 if (reusableBmp == null || reusableBmp!!.width != w || reusableBmp!!.height != h) {
                                     reusableBmp?.recycle()
-                                    reusableBmp = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565)
+                                    reusableBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                                 }
 
                                 val canvas = Canvas(reusableBmp!!)
