@@ -6,9 +6,9 @@
 namespace client::dsp {
 
 static constexpr float PI = 3.14159265358979323846f;
-static constexpr size_t N = 256;
+static constexpr size_t N = audio::FFT_SIZE;
 
-FastFft::FastFft() : windowBuffer_(N, 0.0f) {}
+FastFft::FastFft() = default;
 
 void FastFft::computeFft(float* real, float* imag, size_t n) {
     size_t j = 0;
@@ -52,23 +52,20 @@ void FastFft::computeFft(float* real, float* imag, size_t n) {
     }
 }
 
-void FastFft::process(const float* pcmInput, size_t count) {
-    if (count == 0) return;
+void FastFft::process(const float* pcmInput, size_t count, float micRms, float outRms) {
+    if (count < N) return;
 
     alignas(16) float real[N] = {0.0f};
     alignas(16) float imag[N] = {0.0f};
 
-    const size_t copyCount = std::min(count, N);
-    for (size_t i = 0; i < copyCount; ++i) {
-        // Окно Ханна для ликвидации краевых гармоник
+    for (size_t i = 0; i < N; ++i) {
         float hann = 0.5f * (1.0f - std::cos(2.0f * PI * i / (N - 1)));
         real[i] = pcmInput[i] * hann;
     }
 
     computeFft(real, imag, N);
 
-    // Расчет энергии полос (Sample Rate = 24 кГц, разрешение бина = 93.75 Гц)
-    float rawBands[5] = {0.0f};
+    float rawBands[audio::SPECTRUM_BANDS] = {0.0f};
 
     // Sub-Bass (60-150 Гц) -> Бин 1
     rawBands[0] = std::sqrt(real[1] * real[1] + imag[1] * imag[1]) * 1.5f;
@@ -97,11 +94,10 @@ void FastFft::process(const float* pcmInput, size_t count) {
     }
     rawBands[4] *= 0.06f;
 
-    // Асимметричный баллистический фильтр: атака 5 мс, спад 65 мс
     constexpr float alpha_attack = 0.65f;
     constexpr float alpha_decay = 0.12f;
 
-    for (size_t i = 0; i < 5; ++i) {
+    for (size_t i = 0; i < audio::SPECTRUM_BANDS; ++i) {
         float target = std::clamp(rawBands[i], 0.0f, 1.0f);
         if (target > smoothedBands_[i]) {
             smoothedBands_[i] += alpha_attack * (target - smoothedBands_[i]);
@@ -109,10 +105,22 @@ void FastFft::process(const float* pcmInput, size_t count) {
             smoothedBands_[i] -= alpha_decay * (smoothedBands_[i] - target);
         }
     }
+
+    // E-03: Публикация согласованного снимка в тройной буфер (Wait-Free)
+    size_t writeIdx = 3 - readIdx_.load(std::memory_order_relaxed) - readyIdx_.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < audio::SPECTRUM_BANDS; ++i) {
+        pool_[writeIdx].bands[i] = smoothedBands_[i];
+    }
+    pool_[writeIdx].micRms = micRms;
+    pool_[writeIdx].outRms = outRms;
+
+    readyIdx_.store(writeIdx, std::memory_order_release);
 }
 
-std::array<float, 5> FastFft::getBands() const {
-    return smoothedBands_;
+void FastFft::getLatestSnapshot(SpectrumSnapshot& out) const {
+    size_t rIdx = readyIdx_.exchange(readIdx_.load(std::memory_order_relaxed), std::memory_order_acq_rel);
+    readIdx_.store(rIdx, std::memory_order_release);
+    out = pool_[rIdx];
 }
 
 } // namespace client::dsp
