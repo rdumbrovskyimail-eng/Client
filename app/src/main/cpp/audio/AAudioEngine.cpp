@@ -31,6 +31,10 @@ AAudioEngine::~AAudioEngine() {
 bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) {
     if (isRunning_.load()) stop();
 
+    // ERR-020: Сброс внутреннего состояния ресемплеров при инициализации нового маршрута
+    resampler24To16_.reset();
+    resampler24To48_.reset();
+
     isBluetoothMode_.store(isBluetoothMode, std::memory_order_relaxed);
     playbackSampleRate_.store(targetPlaybackSampleRate, std::memory_order_relaxed);
 
@@ -45,11 +49,9 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
     AAudioStreamBuilder_setFormat(inBuilder, AAUDIO_FORMAT_PCM_I16);
 
     if (isBluetoothMode) {
-        // Режим CMF Buds 2: Shared Mode (AudioFlinger BT stack)
         AAudioStreamBuilder_setSharingMode(inBuilder, AAUDIO_SHARING_MODE_SHARED);
         AAudioStreamBuilder_setInputPreset(inBuilder, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
     } else {
-        // Режим S23 Ultra: MMAP Exclusive
         AAudioStreamBuilder_setSharingMode(inBuilder, AAUDIO_SHARING_MODE_EXCLUSIVE);
         AAudioStreamBuilder_setInputPreset(inBuilder, AAUDIO_INPUT_PRESET_UNPROCESSED);
     }
@@ -62,12 +64,6 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
     if (res != AAUDIO_OK) {
         LOGE("Failed to open capture stream: %d", res);
         return false;
-    }
-
-    // Проверка реального режима MMAP
-    aaudio_sharing_mode_t actualCaptureMode = AAudioStream_getSharingMode(captureStream_);
-    if (!isBluetoothMode && actualCaptureMode != AAUDIO_SHARING_MODE_EXCLUSIVE) {
-        LOGI("Capture stream fell back to shared mode. Reopening with fallback...");
     }
 
     // 2. Конфигурация потока воспроизведения
@@ -104,12 +100,16 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
         return false;
     }
 
+    // ERR-020: Фиксируем подтверждённую HAL частоту стрима без гонок при последующем чтении
+    actualPlaybackSampleRate_.store(AAudioStream_getSampleRate(playbackStream_), std::memory_order_release);
+
     isMmapExclusiveActive_.store(
         !isBluetoothMode && (AAudioStream_getSharingMode(playbackStream_) == AAUDIO_SHARING_MODE_EXCLUSIVE),
         std::memory_order_relaxed
     );
 
-    LOGI("AAudio initialized successfully. BT Mode: %d, MMAP: %d", isBluetoothMode, isMmapExclusiveActive_.load());
+    LOGI("AAudio initialized successfully. BT Mode: %d, MMAP: %d, Rate: %d", 
+         isBluetoothMode, isMmapExclusiveActive_.load(), actualPlaybackSampleRate_.load());
     return true;
 }
 
@@ -148,6 +148,10 @@ void AAudioEngine::stop() {
         playbackStream_ = nullptr;
     }
 
+    actualPlaybackSampleRate_.store(SAMPLE_RATE_GEMINI_OUT, std::memory_order_release);
+    resampler24To16_.reset();
+    resampler24To48_.reset();
+
     captureBuffer_.requestFlush();
     playbackBuffer_.requestFlush();
     micRms_.store(0.0f);
@@ -156,17 +160,39 @@ void AAudioEngine::stop() {
     LOGI("AAudio engine stopped");
 }
 
+/**
+ * ERR-019 и ERR-020: Потокобезопасная маршрутизация PCM с динамическим скретч-буфером
+ */
 size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
-    int32_t targetRate = playbackSampleRate_.load(std::memory_order_relaxed);
+    if (frames == 0) return 0;
 
-    // Адаптивный ресемплинг при выводе на CMF Buds 2 в режиме HFP (24k -> 16k)
-    if (targetRate == SAMPLE_RATE_BT_HFP) {
-        size_t resampledFrames = PolyphaseResampler::resample24To16(
+    int32_t actualRate = actualPlaybackSampleRate_.load(std::memory_order_acquire);
+
+    // 1. Поток 16 кГц (Bluetooth HFP mSBC / SCO): 24 кГц -> 16 кГц
+    if (actualRate == SAMPLE_RATE_BT_HFP) {
+        const size_t neededCapacity = frames * 2;
+        if (resampleScratchBuffer_.size() < neededCapacity) {
+            resampleScratchBuffer_.resize(neededCapacity);
+        }
+        size_t resampledFrames = resampler24To16_.process(
             pcm, frames, resampleScratchBuffer_.data()
         );
         return playbackBuffer_.write(resampleScratchBuffer_.data(), resampledFrames);
     }
 
+    // 2. [ERR-020] Поток 48 кГц (Bluetooth A2DP): 24 кГц -> 48 кГц
+    if (actualRate == SAMPLE_RATE_BT_A2DP) {
+        const size_t neededCapacity = frames * 2;
+        if (resampleScratchBuffer_.size() < neededCapacity) {
+            resampleScratchBuffer_.resize(neededCapacity);
+        }
+        size_t resampledFrames = resampler24To48_.process(
+            pcm, frames, resampleScratchBuffer_.data()
+        );
+        return playbackBuffer_.write(resampleScratchBuffer_.data(), resampledFrames);
+    }
+
+    // 3. Поток 24 кГц (Нативный MMAP Exclusive встроенного динамика S23 Ultra / LE Audio LC3)
     return playbackBuffer_.write(pcm, frames);
 }
 
@@ -211,7 +237,7 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     auto* engine = static_cast<AAudioEngine*>(userData);
     auto* samples = static_cast<int16_t*>(audioData);
 
-    // Применение программного усиления микрофона с аппаратным насыщением (clamping)
+    // Применение программного усиления микрофона с насыщением (clamping)
     float gain = engine->micGain_.load(std::memory_order_relaxed);
     if (std::abs(gain - 1.0f) > 0.001f) {
         for (int32_t i = 0; i < numFrames; ++i) {
