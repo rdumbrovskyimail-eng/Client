@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/cpp/dsp/NeonDspUtils.h
 #pragma once
 
 #include <cstdint>
@@ -10,8 +11,8 @@
 
 namespace client::dsp {
 
-// Принудительная активация аппаратных режимов FTZ (Flush-To-Zero) и DAZ в ARMv9
-inline void enableHardwareFtzDaz() {
+// E-26: Активация аппаратного режима Flush-To-Zero (FZ) в ARMv8/ARMv9
+inline void enableHardwareFtz() {
 #if defined(__aarch64__)
     uint64_t fpcr;
     asm volatile("mrs %0, fpcr" : "=r"(fpcr));
@@ -20,7 +21,6 @@ inline void enableHardwareFtzDaz() {
 #endif
 }
 
-// Векторная нормализация PCM16 -> Float32
 inline void pcm16ToFloat(const int16_t* src, float* dst, size_t count, float gain = 1.0f) {
     size_t i = 0;
     const float scale_val = (1.0f / 32768.0f) * gain;
@@ -46,7 +46,6 @@ inline void pcm16ToFloat(const int16_t* src, float* dst, size_t count, float gai
     }
 }
 
-// Защищенный от денормализации расчет RMS с защитным эпсилоном
 inline float calculateRms(const int16_t* src, size_t count) {
     if (count == 0) return 0.0f;
     double sum = 0.0;
@@ -80,7 +79,6 @@ inline float calculateRms(const int16_t* src, size_t count) {
         sum += v * v;
     }
 
-    // Защитный эпсилон против деления на ноль и некорректного извлечения корня
     return static_cast<float>(std::sqrt((sum + 1e-9) / count) / 32768.0);
 }
 
