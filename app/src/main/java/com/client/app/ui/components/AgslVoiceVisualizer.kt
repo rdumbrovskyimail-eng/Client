@@ -230,8 +230,8 @@ private fun AgslOrbInternal(
                     runtimeShader.setFloatUniform("u_Time", timeParam)
                     runtimeShader.setFloatUniform("u_State", animatedState)
 
-                    // 5-полосный спектр речи из ARM NEON FastFft
-                    val spec = nativeEngine.spectrumUniforms
+                    // E-05, ERR-10: Атомарное чтение когерентного спектра без гонок данных
+                    val spec = nativeEngine.spectrumUniforms.get()
                     runtimeShader.setFloatUniform(
                         "u_Spectrum",
                         spec.getOrElse(0) { 0f },
