@@ -1,3 +1,4 @@
+// >>> FILE: app/build.gradle.kts
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -5,7 +6,6 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
     id("com.google.devtools.ksp")
     id("com.google.dagger.hilt.android")
-    id("com.google.protobuf")
 }
 
 android {
@@ -95,21 +95,6 @@ android {
     }
 }
 
-protobuf {
-    protoc {
-        artifact = "com.google.protobuf:protoc:3.25.5"
-    }
-    generateProtoTasks {
-        all().forEach { task ->
-            task.builtins {
-                maybeCreate("java").apply {
-                    option("lite")
-                }
-            }
-        }
-    }
-}
-
 kotlin {
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
@@ -142,12 +127,12 @@ dependencies {
     ksp("com.google.dagger:hilt-android-compiler:2.57.2")
     implementation("androidx.hilt:hilt-navigation-compose:1.2.0")
 
-    // Сеть и асинхронный рантайм
+    // Сетевой стек и асинхронный рантайм
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
 
-    // Хранилище настроек Jetpack DataStore
+    // Хранилище настроек Jetpack DataStore Preferences
     implementation("androidx.datastore:datastore-preferences:1.1.2")
 
     // Логирование Timber
@@ -156,12 +141,9 @@ dependencies {
     // Нейросетевой рантайм Silero VAD (ONNX)
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.1")
 
-    // Рендеринг разметки Markdown в Compose
+    // Рендеринг разметки Markdown в Compose M3
     implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.31.0")
 
-    // Фоновые медиа-сессии (защита от засыпания сервиса)
+    // Фоновые медиа-сессии (защита от засыпания сервиса One UI)
     implementation("androidx.media:media:1.7.0")
-
-    // Google Protobuf Java Lite Runtime
-    implementation("com.google.protobuf:protobuf-javalite:3.25.5")
 }
