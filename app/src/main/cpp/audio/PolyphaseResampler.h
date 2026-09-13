@@ -85,13 +85,19 @@ private:
 /**
  * E-07: Полифазный дециматор 3:1 (48 кГц -> 16 кГц) для входящего микрофонного тракта.
  * ERR-12: Исправлена индексация истории TAPS - (t - i), исключающая пропуск сэмпла x[-1] и фазовые щелчки.
+ * Ошибка №30 [DSP]: Добавлено сохранение остатка offset_ между блоками, устраняющее фазовые щелчки на 100 Гц.
  */
 class Decimator48To16 {
 public:
     static constexpr size_t TAPS = 12;
 
+    Decimator48To16() {
+        reset();
+    }
+
     void reset() {
         std::memset(history_, 0, sizeof(history_));
+        offset_ = 0;
     }
 
     size_t process(const int16_t* in, size_t inFrames, int16_t* out, size_t maxOutFrames) {
@@ -102,8 +108,9 @@ public:
         };
 
         size_t outCount = 0;
-        for (size_t i = 0; i < inFrames; i += 3) {
-            if (i + 3 > inFrames || outCount >= maxOutFrames) break;
+        size_t i = offset_;
+        for (; i < inFrames; i += 3) {
+            if (outCount >= maxOutFrames) break;
 
             int64_t acc = 0;
             for (size_t t = 0; t < TAPS; ++t) {
@@ -112,6 +119,9 @@ public:
             }
             out[outCount++] = static_cast<int16_t>(std::clamp<int32_t>(acc >> 15, -32768, 32767));
         }
+
+        // Сохраняем фазовое смещение для следующего буфера:
+        offset_ = i - inFrames;
 
         size_t toKeep = std::min(inFrames, TAPS);
         if (toKeep < TAPS) {
@@ -123,6 +133,7 @@ public:
 
 private:
     int16_t history_[TAPS]{0};
+    size_t offset_{0};
 };
 
 /**
