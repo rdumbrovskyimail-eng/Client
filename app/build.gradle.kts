@@ -15,12 +15,11 @@ android {
 
     defaultConfig {
         applicationId = "com.client.app"
-        minSdk = 28 // Требуется для нативных API аппаратного эхоподавления AAudio
+        minSdk = 28
         targetSdk = 36
         versionCode = 1
         versionName = "1.0.0"
 
-        // Строго 64-битная архитектура чипсета Snapdragon 8 Gen 2 на S23 Ultra
         ndk {
             abiFilters.clear()
             abiFilters.add("arm64-v8a")
@@ -30,7 +29,7 @@ android {
             cmake {
                 arguments += listOf(
                     "-DANDROID_STL=c++_shared",
-                    "-DANDROID_PLATFORM=android-28" // API 28+ для поддержки AAudio Voice Communication
+                    "-DANDROID_PLATFORM=android-28"
                 )
                 cppFlags += listOf(
                     "-std=c++20",
@@ -55,12 +54,27 @@ android {
         compose = true
     }
 
+    signingConfigs {
+        create("release") {
+            val keystoreFile = file("../release.keystore")
+            if (keystoreFile.exists()) {
+                storeFile = keystoreFile
+                storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "android"
+                keyAlias = System.getenv("KEY_ALIAS") ?: "androiddebugkey"
+                keyPassword = System.getenv("KEY_PASSWORD") ?: "android"
+            } else {
+                // E-05: Fallback для локальной отладки сборки
+                initWith(getByName("debug"))
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
         }
         debug {
             isMinifyEnabled = false
@@ -114,7 +128,6 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
 
-    // Compose Platform
     val composeBom = platform("androidx.compose:compose-bom:2025.02.00")
     implementation(composeBom)
     implementation("androidx.compose.ui:ui")
@@ -124,26 +137,10 @@ dependencies {
     implementation("androidx.compose.animation:animation")
     implementation("androidx.navigation:navigation-compose:2.8.5")
 
-    // Dagger Hilt
     implementation("com.google.dagger:hilt-android:2.57.2")
     ksp("com.google.dagger:hilt-android-compiler:2.57.2")
     implementation("androidx.hilt:hilt-navigation-compose:1.2.0")
 
-    // Network & Serialization
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
-    implementation("androidx.datastore:datastore-preferences:1.1.2")
-    implementation("com.jakewharton.timber:timber:5.0.1")
-
-    // Hardware & Media Stack
-    implementation("androidx.exifinterface:exifinterface:1.3.7")
-    implementation("androidx.media:media:1.7.0")
-
-    // Markdown
-    implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.27.0")
-
-    // Protobuf Lite & ONNX Runtime (Qualcomm HTP NPU & ARMv9 NEON)
-    implementation("com.google.protobuf:protobuf-javalite:3.25.5")
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.0")
-}
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.
