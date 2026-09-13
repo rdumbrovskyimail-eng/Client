@@ -102,11 +102,9 @@ class SessionManager @Inject constructor(
 
         const val DEFAULT_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 
-        // E-14: Синхронизированный Whitelist моделей
+        // E-14: Синхронизированный Whitelist моделей (строго 3.1 по умолчанию)
         val SUPPORTED_LIVE_MODELS = setOf(
-            "gemini-3.1-flash-live-preview",
-            "gemini-2.5-flash-native-audio-latest",
-            "gemini-2.5-flash-native-audio-preview-12-2025"
+            "gemini-3.1-flash-live-preview"
         )
 
         private const val MAX_MESSAGES = 200
@@ -336,7 +334,33 @@ class SessionManager @Inject constructor(
         } == true
     }
 
-    // E-11: Проверка результата старта аудио перед переводом состояния
+    // ERR-11: Построение схемы Function Calling для Forvo по стандарту OpenAPI 3.0 / Gemini Live
+    private fun buildForvoToolDeclaration(): JsonObject = buildJsonObject {
+        putJsonArray("functionDeclarations") {
+            addJsonObject {
+                put("name", "lookup_pronunciation")
+                put("description", "Запрашивает аудиозаписи произношения слов носителями языка из базы Forvo.")
+                putJsonObject("parameters") {
+                    put("type", "OBJECT")
+                    putJsonObject("properties") {
+                        putJsonObject("words") {
+                            put("type", "STRING")
+                            put("description", "Слово или список слов через запятую для поиска произношения.")
+                        }
+                        putJsonObject("language") {
+                            put("type", "STRING")
+                            put("description", "Двухбуквенный код языка ISO 639-1 (например, 'de', 'en', 'fr', 'es'). По умолчанию 'de'.")
+                        }
+                    }
+                    putJsonArray("required") {
+                        add(JsonPrimitive("words"))
+                    }
+                }
+            }
+        }
+    }
+
+    // E-11, ERR-11: Проверка аудиодрайвера и динамическая передача инструмента Forvo по флагу настроек
     private suspend fun startInternal(resume: Boolean) {
         pendingGoAway = false
         val prefs = dataStore.data.first()
@@ -368,12 +392,21 @@ class SessionManager @Inject constructor(
             cachedContentId = contextCacheService.getOrCreateCache(apiKey, _state.value.activePrompt, model)
         }
 
+        // ERR-11: Строгий опрос настройки включения Forvo Tool
+        val forvoEnabled = prefs[KEY_ENABLE_FORVO] ?: false
+        val dynamicTools = if (forvoEnabled) {
+            buildJsonArray { add(buildForvoToolDeclaration()) }
+        } else {
+            null
+        }
+
         client.connect(
             LiveConfig(
                 apiKey = apiKey,
                 model = model,
                 systemInstruction = _state.value.activePrompt,
                 voiceName = voice,
+                toolsJson = dynamicTools, // 👈 Схема инструмента передается строго если Forvo включен!
                 resumptionHandle = if (resume) resumptionHandle else null,
                 cachedContentId = cachedContentId
             )
@@ -516,6 +549,7 @@ class SessionManager @Inject constructor(
         }
     }
 
+    // ERR-11: Корректное разрешение вызова функции с отправкой ответа в Gemini Live
     private fun handleToolCall(calls: List<FunctionCall>) = scope.launch {
         val responses = calls.map { call ->
             if (call.name == "lookup_pronunciation") {
