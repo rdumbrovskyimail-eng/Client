@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.ArrayDeque
+import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -59,7 +60,8 @@ class NativeAudioEngine @Inject constructor(
         .order(ByteOrder.LITTLE_ENDIAN)
 
     private val spectrumRawData = FloatArray(7)
-    val spectrumUniforms = FloatArray(5)
+    // E-05, ERR-10: Атомарная ссылка исключает Torn Reads между фоновым DSP и 120 FPS RenderThread
+    val spectrumUniforms = AtomicReference(FloatArray(5))
 
     private val bufferPool = ArrayDeque<ByteArray>(16).apply {
         repeat(16) { add(ByteArray(BURST_BYTES)) }
@@ -170,7 +172,9 @@ class NativeAudioEngine @Inject constructor(
         spectrumJob = engineScope.launch {
             while (isActive) {
                 bridge.getSpectrumData(spectrumRawData)
-                System.arraycopy(spectrumRawData, 0, spectrumUniforms, 0, 5)
+                val updated = FloatArray(5)
+                System.arraycopy(spectrumRawData, 0, updated, 0, 5)
+                spectrumUniforms.set(updated)
                 _micLevel.value = (spectrumRawData[5] * 3.5f).coerceIn(0f, 1f)
                 _outLevel.value = (spectrumRawData[6] * 3.5f).coerceIn(0f, 1f)
                 delay(8)
