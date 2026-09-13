@@ -1,3 +1,4 @@
+# >>> FILE: app/src/main/cpp/CMakeLists.txt
 cmake_minimum_required(VERSION 3.22.1)
 
 project("client_core" LANGUAGES CXX)
@@ -18,6 +19,7 @@ if(${ANDROID_ABI} STREQUAL "arm64-v8a")
         -fno-rtti
         -fexceptions
         -flto
+        -fno-omit-frame-pointer # Источник 58: сохранение указателя кадра для информативных краш-логов
     )
     # Выравнивание страниц под стандарт Android 15/16 Baklava (16 KB Page Alignment)
     add_link_options(
