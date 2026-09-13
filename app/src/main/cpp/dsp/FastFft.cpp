@@ -10,6 +10,7 @@ static constexpr size_t N = audio::FFT_SIZE;
 
 FastFft::FastFft()
     : readyIdx_(0),
+      hasNewData_(false),
       writeIdx_(1),
       readIdx_(2) {
 }
@@ -63,7 +64,7 @@ void FastFft::process(const float* pcmInput, size_t count, float micRms, float o
     alignas(16) float real[N] = {0.0f};
     alignas(16) float imag[N] = {0.0f};
 
-    // Ошибка №1 [PERF]: Децимация входного PCM 2:1 при высоких частотах дискретизации (>= 44.1 кГц)
+    // Децимация входного PCM 2:1 при высоких частотах дискретизации (>= 44.1 кГц)
     int32_t effectiveSr = sampleRate;
     if (sampleRate >= 44100 && count >= N * 2) {
         effectiveSr = sampleRate / 2;
@@ -135,11 +136,16 @@ void FastFft::process(const float* pcmInput, size_t count, float micRms, float o
     pool_[writeIdx_].micRms = micRms;
     pool_[writeIdx_].outRms = outRms;
 
+    // Ошибка №29 [CONCURRENCY/DSP]: Публикация нового снимка с установкой флага hasNewData_
     writeIdx_ = readyIdx_.exchange(writeIdx_, std::memory_order_acq_rel);
+    hasNewData_.store(true, std::memory_order_release);
 }
 
+// Ошибка №29 [CONCURRENCY/DSP]: Чтение слота Андерсона строго при наличии новых данных
 void FastFft::getLatestSnapshot(SpectrumSnapshot& out) const {
-    readIdx_ = readyIdx_.exchange(readIdx_, std::memory_order_acq_rel);
+    if (hasNewData_.exchange(false, std::memory_order_acq_rel)) {
+        readIdx_ = readyIdx_.exchange(readIdx_, std::memory_order_acq_rel);
+    }
     out = pool_[readIdx_];
 }
 
