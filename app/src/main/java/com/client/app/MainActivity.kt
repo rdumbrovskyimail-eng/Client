@@ -11,10 +11,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.client.app.logging.AppLogManager
 import com.client.app.ui.display.DisplayRateManager
 import com.client.app.ui.screens.ClientScreen
+import com.client.app.ui.screens.LogViewerScreen
 import com.client.app.ui.screens.SettingsScreen
 import dagger.hilt.android.AndroidEntryPoint
+import javax.inject.Inject
 
 private val S23UltraDarkScheme = darkColorScheme(
     primary = Color(0xFF60A5FA),
@@ -35,6 +38,8 @@ private val S23UltraDarkScheme = darkColorScheme(
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
 
+    @Inject lateinit var logManager: AppLogManager
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -47,10 +52,19 @@ class MainActivity : ComponentActivity() {
                 val nav = rememberNavController()
                 NavHost(navController = nav, startDestination = "client") {
                     composable("client") {
-                        ClientScreen(onNavigateSettings = { nav.navigate("settings") })
+                        ClientScreen(
+                            onNavigateSettings = { nav.navigate("settings") },
+                            onNavigateLogs = { nav.navigate("logs") }
+                        )
                     }
                     composable("settings") {
                         SettingsScreen(onBack = { nav.popBackStack() })
+                    }
+                    composable("logs") {
+                        LogViewerScreen(
+                            onBack = { nav.popBackStack() },
+                            logManager = logManager
+                        )
                     }
                 }
             }
