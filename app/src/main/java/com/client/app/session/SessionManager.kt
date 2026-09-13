@@ -387,7 +387,10 @@ class SessionManager @Inject constructor(
             it.copy(link = if (resume) LinkState.RECONNECTING else LinkState.CONNECTING, error = null)
         }
 
-        startForegroundService()
+        // На Android 14+ запрещено дергать startForegroundService из фонового реконнекта
+        if (!resume) {
+            startForegroundService()
+        }
 
         if (!resume && cachedContentId == null) {
             cachedContentId = contextCacheService.getOrCreateCache(apiKey, _state.value.activePrompt, model)
