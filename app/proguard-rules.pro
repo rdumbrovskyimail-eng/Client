@@ -1,3 +1,4 @@
+# >>> FILE: app/proguard-rules.pro
 -keepattributes *Annotation*, InnerClasses, Signature, Exceptions, EnclosingMethod
 -dontobfuscate
 
@@ -62,3 +63,8 @@
 -keep class com.client.app.vad.** { *; }
 -keep class com.client.app.haptics.** { *; }
 -keep class com.client.app.ui.display.** { *; }
+
+# 10. Подсистема сквозного логирования (AppLogManager)
+-keep class com.client.app.logging.** { *; }
+-keepenum class com.client.app.logging.LogLevel { *; }
+-keepattributes SourceFile,LineNumberTable
