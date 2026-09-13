@@ -98,13 +98,12 @@ half4 main(float2 fragCoord) {
     float3 ro = float3(0.0, 0.0, -2.4);
     float3 rd = normalize(float3(uv, 1.25));
 
+    // Ошибка №16 [DEFECT]: Устранение варп-дивергенции на Adreno 740 (Wave64): ровно 16 фиксированных шагов без раннего break
     float t = 0.0;
-    float d = 0.0;
-    for (int i = 0; i < 22; i++) {
+    for (int i = 0; i < 16; i++) {
         float3 p = ro + rd * t;
-        d = mapSDF(p);
-        if (d < 0.002 || t > 3.8) break;
-        t += d * 1.12;
+        float d = mapSDF(p);
+        t += d * 1.22;
     }
 
     float3 finalColor = float3(0.0);
@@ -121,7 +120,7 @@ half4 main(float2 fragCoord) {
         float3 n = calcNormal(p);
         float3 lightDir = normalize(float3(0.45, 0.75, -1.0));
         float diff = max(dot(n, lightDir), 0.0);
-        float3 h = normalize(lightDir - rd);
+        float h = normalize(lightDir - rd);
         float spec = pow(max(dot(n, h), 0.0), 28.0) * 0.45;
         float fresnel = pow(1.0 - max(dot(-rd, n), 0.0), 2.8);
         float sss = pow(max(dot(rd, lightDir), 0.0), 2.2) * 0.55;
@@ -151,7 +150,6 @@ fun AgslVoiceVisualizer(
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         AgslOrbInternal(nativeEngine, state, onClick, modifier, size)
     } else {
-        // Fallback для старых API
         Box(
             modifier = modifier
                 .size(size)
@@ -171,13 +169,12 @@ private fun AgslOrbInternal(
 ) {
     val runtimeShader = remember { RuntimeShader(AGSL_SHADER_SRC) }
 
-    // Расчет числового идентификатора состояния (0..4)
     val targetStateId = when {
-        state.error != null -> 4.0f              // Ошибка / Перебивание
-        state.isAiSpeaking -> 3.0f               // Говорит модель
-        state.link == LinkState.CONNECTING -> 2.0f // Установка / Мысли
-        state.isMicActive -> 1.0f                // Слушает
-        else -> 0.0f                             // Ожидание
+        state.error != null -> 4.0f
+        state.isAiSpeaking -> 3.0f
+        state.link == LinkState.CONNECTING -> 2.0f
+        state.isMicActive -> 1.0f
+        else -> 0.0f
     }
 
     val animatedState by animateFloatAsState(
@@ -186,7 +183,6 @@ private fun AgslOrbInternal(
         label = "state_anim"
     )
 
-    // Бесконечный счетчик времени для анимации шума в 120 FPS
     val infiniteTransition = rememberInfiniteTransition(label = "time_loop")
     val timeParam by infiniteTransition.animateFloat(
         initialValue = 0f,
@@ -221,8 +217,6 @@ private fun AgslOrbInternal(
             modifier = Modifier
                 .size(size)
                 .graphicsLayer {
-                    // Передача uniforms выполняется строго в фазе отрисовки (Draw Phase)
-                    // Это дает честные 120 FPS без единой рекомпозиции UI-дерева Compose
                     val w = this.size.width
                     val h = this.size.height
 
@@ -230,7 +224,6 @@ private fun AgslOrbInternal(
                     runtimeShader.setFloatUniform("u_Time", timeParam)
                     runtimeShader.setFloatUniform("u_State", animatedState)
 
-                    // E-05, ERR-10: Атомарное чтение когерентного спектра без гонок данных
                     val spec = nativeEngine.spectrumUniforms.get()
                     runtimeShader.setFloatUniform(
                         "u_Spectrum",
@@ -252,7 +245,6 @@ private fun AgslOrbInternal(
                         .asComposeRenderEffect()
                 }
         ) {
-            // Фон для шейдерного пост-эффекта
             drawRect(color = Color(0xFF09090B))
         }
     }
