@@ -136,7 +136,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         sendAudioPayload(ws, payload)
     }
 
-    // ERR-10: Отправка полезной нагрузки строго под протокол Gemini 3.1 с защитой очереди
+    // Ошибка №23 [NET/PROTO]: Передача медиа-чанков строго через mediaChunks с объектом Blob
     private fun sendAudioPayload(ws: WebSocket, payload: ByteArray) {
         if (ws.queueSize() > MAX_QUEUE_BYTES) {
             logger.w("GeminiProtobufLiveClient: Очередь сокета переполнена (${ws.queueSize()} байт), пропуск блока для исключения задержки")
@@ -146,9 +146,11 @@ class GeminiProtobufLiveClient @Inject constructor(
         val base64Data = Base64.encodeToString(payload, Base64.NO_WRAP)
         val jsonMessage = buildJsonObject {
             putJsonObject("realtimeInput") {
-                putJsonObject("audio") {
-                    put("mimeType", "audio/pcm;rate=16000")
-                    put("data", base64Data)
+                putJsonArray("mediaChunks") {
+                    addJsonObject {
+                        put("mimeType", "audio/pcm;rate=16000")
+                        put("data", base64Data)
+                    }
                 }
             }
         }.toString()
@@ -156,20 +158,29 @@ class GeminiProtobufLiveClient @Inject constructor(
         ws.send(jsonMessage)
     }
 
+    // Ошибка №24 [NET/PROTO]: Передача текста через clientContent с массивом turns и флагом turnComplete
     fun sendRealtimeText(text: String) {
         val ws = webSocket ?: return
         if (!isReady || text.isBlank()) return
 
         val jsonMessage = buildJsonObject {
-            putJsonObject("realtimeInput") {
-                put("text", text)
+            putJsonObject("clientContent") {
+                putJsonArray("turns") {
+                    addJsonObject {
+                        put("role", "user")
+                        putJsonArray("parts") {
+                            addJsonObject { put("text", text) }
+                        }
+                    }
+                }
+                put("turnComplete", true)
             }
         }.toString()
 
         ws.send(jsonMessage)
     }
 
-    // ERR-10: Гарантированная выгрузка хвоста речи (Zero Tail-Drop) перед сигналом завершения хода
+    // ERR-10 & Ошибка №25 [NET/PROTO]: Гарантированная выгрузка хвоста речи и сигнал turnComplete
     fun sendAudioStreamEnd() {
         if (!isReady) return
         val ws = webSocket ?: return
@@ -185,10 +196,10 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         tailPayload?.let { sendAudioPayload(ws, it) }
 
-        // 2. Отправляем признак завершения речевого хода модели Gemini 3.1
+        // 2. Отправляем завершение хода через clientContent.turnComplete: true
         val jsonMessage = buildJsonObject {
-            putJsonObject("realtimeInput") {
-                put("audioStreamEnd", true)
+            putJsonObject("clientContent") {
+                put("turnComplete", true)
             }
         }.toString()
 
@@ -220,7 +231,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         ws.send(jsonMessage)
     }
 
-    // E-29: Полноценная поддержка параметров LiveConfig для модели Gemini 3.1
     private fun buildSetupMessage(cfg: LiveConfig): String {
         val cleanModel = if (cfg.model.startsWith("models/")) cfg.model else "models/${cfg.model}"
 
