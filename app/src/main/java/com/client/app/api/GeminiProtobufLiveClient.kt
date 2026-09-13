@@ -32,7 +32,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         const val WS_HOST = "generativelanguage.googleapis.com"
         const val WS_PATH = "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         private const val MAX_QUEUE_BYTES = 64L * 1024
-        private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280
+        private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280 // 40 мс @ 16 кГц (640 сэмплов)
     }
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -69,7 +69,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         closeInternal()
         isReady = false
 
-        while (_audio.tryReceive().isSuccess) { /* сброс */ }
+        while (_audio.tryReceive().isSuccess) { /* сброс старых фреймов */ }
 
         val myEpoch = epochGen.incrementAndGet()
         epoch = myEpoch
@@ -121,7 +121,7 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     fun sendAudioPcm(pcm: ByteArray) {
         val ws = webSocket ?: return
-        if (!isReady) return
+        if (!isReady || pcm.isEmpty()) return
 
         var toSend: ByteArray? = null
         synchronized(batchLock) {
@@ -133,8 +133,13 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
 
         val payload = toSend ?: return
+        sendAudioPayload(ws, payload)
+    }
+
+    // ERR-10: Отправка полезной нагрузки строго под протокол Gemini 3.1 с защитой очереди
+    private fun sendAudioPayload(ws: WebSocket, payload: ByteArray) {
         if (ws.queueSize() > MAX_QUEUE_BYTES) {
-            sendAudioStreamEnd()
+            logger.w("GeminiProtobufLiveClient: Очередь сокета переполнена (${ws.queueSize()} байт), пропуск блока для исключения задержки")
             return
         }
 
@@ -164,17 +169,30 @@ class GeminiProtobufLiveClient @Inject constructor(
         ws.send(jsonMessage)
     }
 
+    // ERR-10: Гарантированная выгрузка хвоста речи (Zero Tail-Drop) перед сигналом завершения хода
     fun sendAudioStreamEnd() {
         if (!isReady) return
-        synchronized(batchLock) { audioBatchBuffer.reset() }
+        val ws = webSocket ?: return
 
+        // 1. Извлекаем и отправляем задержанный хвост речи (от 10 до 30 мс звука)
+        var tailPayload: ByteArray? = null
+        synchronized(batchLock) {
+            if (audioBatchBuffer.size() > 0) {
+                tailPayload = audioBatchBuffer.toByteArray()
+                audioBatchBuffer.reset()
+            }
+        }
+
+        tailPayload?.let { sendAudioPayload(ws, it) }
+
+        // 2. Отправляем признак завершения речевого хода модели Gemini 3.1
         val jsonMessage = buildJsonObject {
             putJsonObject("realtimeInput") {
                 put("audioStreamEnd", true)
             }
         }.toString()
 
-        webSocket?.send(jsonMessage)
+        ws.send(jsonMessage)
     }
 
     fun sendToolResponses(responses: List<ToolResponse>) {
@@ -202,7 +220,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         ws.send(jsonMessage)
     }
 
-    // E-29: Полноценная поддержка параметров LiveConfig
+    // E-29: Полноценная поддержка параметров LiveConfig для модели Gemini 3.1
     private fun buildSetupMessage(cfg: LiveConfig): String {
         val cleanModel = if (cfg.model.startsWith("models/")) cfg.model else "models/${cfg.model}"
 
