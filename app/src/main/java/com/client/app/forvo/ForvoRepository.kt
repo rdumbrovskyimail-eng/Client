@@ -17,6 +17,10 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.net.URLEncoder
 import java.text.Normalizer
+import java.time.Duration
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
@@ -56,13 +60,19 @@ class ForvoRepository @Inject constructor(
         val KEY_FORVO_API = stringPreferencesKey("forvo_api_key")
         val KEY_FORVO_HOST = stringPreferencesKey("forvo_host")
         val KEY_QUOTA_LIMIT = intPreferencesKey("forvo_quota_limit")
-        private val KEY_QUOTA_USED = intPreferencesKey("forvo_quota_used")
-        private val KEY_QUOTA_DAY = stringPreferencesKey("forvo_quota_day")
+        val KEY_QUOTA_USED = intPreferencesKey("forvo_quota_used")
+        val KEY_QUOTA_DAY = stringPreferencesKey("forvo_quota_day")
 
         const val HOST_FREE = "https://apifree.forvo.com"
         const val DEFAULT_QUOTA_LIMIT = 500
         const val URL_TTL_MS = 90L * 60 * 1000
         private const val MISS_TTL_MS = 30L * 60 * 1000
+
+        // E-17: Математически выверенная функция границы 22:00 UTC
+        fun calculateForvoDayId(instant: Instant): String {
+            val shifted = instant.minus(Duration.ofHours(22))
+            return DateTimeFormatter.ISO_LOCAL_DATE.withZone(ZoneOffset.UTC).format(shifted)
+        }
     }
 
     private val client = OkHttpClient.Builder()
@@ -77,6 +87,18 @@ class ForvoRepository @Inject constructor(
 
     private val _quota = MutableStateFlow(ForvoQuota(0, DEFAULT_QUOTA_LIMIT))
     val quota: StateFlow<ForvoQuota> = _quota.asStateFlow()
+
+    init {
+        CoroutineScope(Dispatchers.IO).launch {
+            dataStore.data.collect { prefs ->
+                val currentDay = calculateForvoDayId(Instant.now())
+                val savedDay = prefs[KEY_QUOTA_DAY] ?: ""
+                val limit = prefs[KEY_QUOTA_LIMIT] ?: DEFAULT_QUOTA_LIMIT
+                val used = if (savedDay == currentDay) prefs[KEY_QUOTA_USED] ?: 0 else 0
+                _quota.value = ForvoQuota(used, limit)
+            }
+        }
+    }
 
     suspend fun freshUrl(rawWord: String, lang: String): String? = withContext(Dispatchers.IO) {
         val apiKey = readApiKey()
@@ -154,13 +176,22 @@ class ForvoRepository @Inject constructor(
         }
     }
 
-    fun registerPlayback() {
-        _quota.update { it.copy(used = it.used + 1) }
+    // E-17, E-18: Персистентная регистрация успешного воспроизведения
+    fun registerSuccessfulPlayback() {
+        CoroutineScope(Dispatchers.IO).launch {
+            val currentDay = calculateForvoDayId(Instant.now())
+            dataStore.edit { prefs ->
+                val savedDay = prefs[KEY_QUOTA_DAY] ?: ""
+                val currentUsed = if (savedDay == currentDay) prefs[KEY_QUOTA_USED] ?: 0 else 0
+                val newUsed = currentUsed + 1
+                prefs[KEY_QUOTA_DAY] = currentDay
+                prefs[KEY_QUOTA_USED] = newUsed
+                _quota.value = ForvoQuota(newUsed, prefs[KEY_QUOTA_LIMIT] ?: DEFAULT_QUOTA_LIMIT)
+            }
+        }
     }
 
-    fun clearMisses() {
-        misses.clear()
-    }
+    fun clearMisses() = misses.clear()
 
     private suspend fun readApiKey(): String =
         cryptoManager.decrypt(dataStore.data.first()[KEY_FORVO_API]?.trim().orEmpty())
@@ -168,20 +199,13 @@ class ForvoRepository @Inject constructor(
     private suspend fun readHost(): String =
         dataStore.data.first()[KEY_FORVO_HOST]?.trim()?.ifBlank { HOST_FREE } ?: HOST_FREE
 
-    /**
-     * Каноническая нормализация Юникода (NFC) исключает сбои поиска умлаутов (ä, ö, ü).
-     */
     private fun cleanWord(raw: String, lang: String): String {
-        // 1. Приведение NFD к каноническому NFC
         val normalized = Normalizer.normalize(raw.trim(), Normalizer.Form.NFC)
-
-        // 2. Очистка пунктуации с сохранением диакритики
         var w = normalized.replace(Regex("[^\\p{L}\\p{M}\\d\\s\\-'’]"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
         if (w.isEmpty()) return ""
 
-        // 3. Снятие артиклей
         val articles = ARTICLES[lang] ?: emptySet()
         val firstSpace = w.indexOf(' ')
         if (firstSpace > 0) {
@@ -189,7 +213,6 @@ class ForvoRepository @Inject constructor(
             if (head in articles) w = w.substring(firstSpace + 1).trim()
         }
 
-        // 4. Снятие элизии (l'amour -> amour)
         if (lang in setOf("fr", "it", "ca")) {
             w = w.replace(Regex("^(l|d|dell|nell|all|un|qu)['’]", RegexOption.IGNORE_CASE), "").trim()
         }
