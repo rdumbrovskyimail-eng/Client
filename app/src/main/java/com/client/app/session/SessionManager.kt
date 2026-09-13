@@ -102,7 +102,6 @@ class SessionManager @Inject constructor(
 
         const val DEFAULT_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 
-        // E-14: Синхронизированный Whitelist моделей (строго 3.1 по умолчанию)
         val SUPPORTED_LIVE_MODELS = setOf(
             "gemini-3.1-flash-live-preview"
         )
@@ -132,6 +131,9 @@ class SessionManager @Inject constructor(
     @Volatile private var userStopped = false
     @Volatile private var pendingGoAway = false
     @Volatile private var userMicDesired = true
+
+    // ERR-14: Дискриминатор единственного источника текста модели для исключения дублирования в чате
+    @Volatile private var hasReceivedAudioTranscript = false
 
     init {
         observeSettings()
@@ -204,6 +206,7 @@ class SessionManager @Inject constructor(
 
         addMessage(ChatMessage(role = "user", text = trimmed))
         streamingRole = null
+        hasReceivedAudioTranscript = false
 
         if (!ensureLive()) {
             _state.update { it.copy(error = "Нет соединения с сервером") }
@@ -278,7 +281,6 @@ class SessionManager @Inject constructor(
         }
     }
 
-    // E-13, E-32: Поддержка analyzerModel и проброс ошибок
     private suspend fun handleAttachments(text: String, uris: List<Uri>) {
         _state.update { it.copy(isAnalyzing = true, error = null) }
         try {
@@ -334,7 +336,6 @@ class SessionManager @Inject constructor(
         } == true
     }
 
-    // ERR-11: Построение схемы Function Calling для Forvo по стандарту OpenAPI 3.0 / Gemini Live
     private fun buildForvoToolDeclaration(): JsonObject = buildJsonObject {
         putJsonArray("functionDeclarations") {
             addJsonObject {
@@ -360,9 +361,9 @@ class SessionManager @Inject constructor(
         }
     }
 
-    // E-11, ERR-11: Проверка аудиодрайвера и динамическая передача инструмента Forvo по флагу настроек
     private suspend fun startInternal(resume: Boolean) {
         pendingGoAway = false
+        hasReceivedAudioTranscript = false
         val prefs = dataStore.data.first()
         val apiKey = cryptoManager.decrypt(prefs[KEY_API]?.trim().orEmpty())
         if (apiKey.isEmpty()) {
@@ -392,7 +393,6 @@ class SessionManager @Inject constructor(
             cachedContentId = contextCacheService.getOrCreateCache(apiKey, _state.value.activePrompt, model)
         }
 
-        // ERR-11: Строгий опрос настройки включения Forvo Tool
         val forvoEnabled = prefs[KEY_ENABLE_FORVO] ?: false
         val dynamicTools = if (forvoEnabled) {
             buildJsonArray { add(buildForvoToolDeclaration()) }
@@ -406,7 +406,7 @@ class SessionManager @Inject constructor(
                 model = model,
                 systemInstruction = _state.value.activePrompt,
                 voiceName = voice,
-                toolsJson = dynamicTools, // 👈 Схема инструмента передается строго если Forvo включен!
+                toolsJson = dynamicTools,
                 resumptionHandle = if (resume) resumptionHandle else null,
                 cachedContentId = cachedContentId
             )
@@ -415,6 +415,7 @@ class SessionManager @Inject constructor(
 
     private suspend fun stopInternal(full: Boolean) {
         pendingGoAway = false
+        hasReceivedAudioTranscript = false
         reconnectJob?.cancel()
         stopMic(userInitiated = false)
         client.disconnect()
@@ -489,6 +490,7 @@ class SessionManager @Inject constructor(
         audioEngine.bargeInEvents.collect {
             _state.update { it.copy(isAiSpeaking = false) }
             streamingRole = null
+            hasReceivedAudioTranscript = false
         }
     }
 
@@ -515,10 +517,12 @@ class SessionManager @Inject constructor(
                     audioEngine.flushPlayback()
                     _state.update { it.copy(isAiSpeaking = false) }
                     streamingRole = null
+                    hasReceivedAudioTranscript = false
                 }
                 is GeminiEvent.GenerationComplete,
                 is GeminiEvent.TurnComplete -> {
                     streamingRole = null
+                    hasReceivedAudioTranscript = false
                     scope.launch {
                         delay(100)
                         _state.update { it.copy(isAiSpeaking = false) }
@@ -529,8 +533,20 @@ class SessionManager @Inject constructor(
                     }
                 }
                 is GeminiEvent.InputTranscript -> appendTranscript("user", event.text, event.interim)
-                is GeminiEvent.OutputTranscript -> appendTranscript("model", event.text, false)
-                is GeminiEvent.ModelText -> appendTranscript("model", event.text, false)
+                
+                // ERR-14: Канонический источник речи модели (SSOT)
+                is GeminiEvent.OutputTranscript -> {
+                    hasReceivedAudioTranscript = true
+                    appendTranscript("model", event.text, false)
+                }
+                
+                // ERR-14: Фолбэк на текстовые токены, если транскрипция речи отсутствует
+                is GeminiEvent.ModelText -> {
+                    if (!hasReceivedAudioTranscript) {
+                        appendTranscript("model", event.text, false)
+                    }
+                }
+                
                 is GeminiEvent.Usage -> _state.update { it.copy(tokensUsed = event.totalTokens) }
                 is GeminiEvent.ToolCall -> handleToolCall(event.calls)
                 is GeminiEvent.Error -> {
@@ -549,7 +565,6 @@ class SessionManager @Inject constructor(
         }
     }
 
-    // ERR-11: Корректное разрешение вызова функции с отправкой ответа в Gemini Live
     private fun handleToolCall(calls: List<FunctionCall>) = scope.launch {
         val responses = calls.map { call ->
             if (call.name == "lookup_pronunciation") {
@@ -621,6 +636,7 @@ class SessionManager @Inject constructor(
 
     private fun addMessage(msg: ChatMessage) {
         streamingRole = null
+        hasReceivedAudioTranscript = false
         _state.update { it.copy(messages = (it.messages + msg).takeLast(MAX_MESSAGES)) }
     }
 
