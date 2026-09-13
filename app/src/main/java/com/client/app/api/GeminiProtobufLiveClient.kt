@@ -32,7 +32,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         const val WS_HOST = "generativelanguage.googleapis.com"
         const val WS_PATH = "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         private const val MAX_QUEUE_BYTES = 64L * 1024
-        private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280 // 40 мс @ 16 кГц (640 сэмплов PCM16 mono)
+        private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280
     }
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -69,7 +69,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         closeInternal()
         isReady = false
 
-        while (_audio.tryReceive().isSuccess) { /* очистка остатков очереди */ }
+        while (_audio.tryReceive().isSuccess) { /* сброс */ }
 
         val myEpoch = epochGen.incrementAndGet()
         epoch = myEpoch
@@ -87,20 +87,15 @@ class GeminiProtobufLiveClient @Inject constructor(
             override fun onOpen(ws: WebSocket, response: Response) {
                 if (myEpoch != epoch) { ws.close(1000, "stale"); return }
                 _events.tryEmit(GeminiEvent.Connected)
-                val setupJson = buildSetupMessage(cfg)
-                ws.send(setupJson)
+                ws.send(buildSetupMessage(cfg))
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
-                if (myEpoch == epoch) {
-                    parseServerJsonMessage(text, myEpoch)
-                }
+                if (myEpoch == epoch) parseServerJsonMessage(text, myEpoch)
             }
 
             override fun onMessage(ws: WebSocket, bytes: ByteString) {
-                if (myEpoch == epoch) {
-                    parseServerJsonMessage(bytes.utf8(), myEpoch)
-                }
+                if (myEpoch == epoch) parseServerJsonMessage(bytes.utf8(), myEpoch)
             }
 
             override fun onClosing(ws: WebSocket, code: Int, reason: String) {
@@ -138,7 +133,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
 
         val payload = toSend ?: return
-
         if (ws.queueSize() > MAX_QUEUE_BYTES) {
             sendAudioStreamEnd()
             return
@@ -193,13 +187,11 @@ class GeminiProtobufLiveClient @Inject constructor(
                         addJsonObject {
                             put("id", resp.id)
                             put("name", resp.name)
-
                             val responseStruct = runCatching {
                                 json.parseToJsonElement(resp.resultJson).jsonObject
                             }.getOrElse {
                                 buildJsonObject { put("output", resp.resultJson) }
                             }
-
                             put("response", responseStruct)
                         }
                     }
@@ -210,6 +202,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         ws.send(jsonMessage)
     }
 
+    // E-29: Полноценная поддержка параметров LiveConfig
     private fun buildSetupMessage(cfg: LiveConfig): String {
         val cleanModel = if (cfg.model.startsWith("models/")) cfg.model else "models/${cfg.model}"
 
@@ -246,37 +239,11 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 putJsonArray("tools") {
                     addJsonObject { putJsonObject("googleSearch") {} }
-                    addJsonObject {
-                        putJsonArray("functionDeclarations") {
-                            addJsonObject {
-                                put("name", "lookup_pronunciation")
-                                put("description", "Поиск эталонного произношения слов и фраз носителями языка в базе Forvo")
-                                putJsonObject("parameters") {
-                                    put("type", "OBJECT")
-                                    putJsonObject("properties") {
-                                        putJsonObject("words") {
-                                            put("type", "ARRAY")
-                                            putJsonObject("items") { put("type", "STRING") }
-                                            put("description", "Список слов или лексем для поиска аудио-произношения")
-                                        }
-                                        putJsonObject("language") {
-                                            put("type", "STRING")
-                                            put("description", "ISO 639-1 двухбуквенный код языка (например, 'de', 'en', 'fr')")
-                                        }
-                                    }
-                                    putJsonArray("required") {
-                                        add("words")
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    cfg.toolsJson?.forEach { add(it) }
                 }
 
                 cfg.resumptionHandle?.takeIf { it.isNotBlank() }?.let { handle ->
-                    putJsonObject("sessionResumption") {
-                        put("handle", handle)
-                    }
+                    putJsonObject("sessionResumption") { put("handle", handle) }
                 }
 
                 putJsonArray("safetySettings") {
@@ -294,7 +261,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                 }
             }
         }
-
         return setupObj.toString()
     }
 
@@ -343,60 +309,35 @@ class GeminiProtobufLiveClient @Inject constructor(
                     FunctionCall(name, id, argsMap)
                 } ?: emptyList()
 
-                if (calls.isNotEmpty()) {
-                    _events.tryEmit(GeminiEvent.ToolCall(calls))
-                }
+                if (calls.isNotEmpty()) _events.tryEmit(GeminiEvent.ToolCall(calls))
             }
 
             root["toolCallCancellation"]?.jsonObject?.get("ids")?.jsonArray?.let { idsArr ->
                 val ids = idsArr.mapNotNull { it.jsonPrimitive.contentOrNull }
-                if (ids.isNotEmpty()) {
-                    _events.tryEmit(GeminiEvent.ToolCallCancelled(ids))
-                }
+                if (ids.isNotEmpty()) _events.tryEmit(GeminiEvent.ToolCallCancelled(ids))
             }
 
             root["serverContent"]?.jsonObject?.let { sc ->
-                if (sc["interrupted"]?.jsonPrimitive?.booleanOrNull == true) {
-                    _events.tryEmit(GeminiEvent.Interrupted)
-                }
-                if (sc["generationComplete"]?.jsonPrimitive?.booleanOrNull == true) {
-                    _events.tryEmit(GeminiEvent.GenerationComplete)
-                }
-                if (sc["turnComplete"]?.jsonPrimitive?.booleanOrNull == true) {
-                    _events.tryEmit(GeminiEvent.TurnComplete)
-                }
+                if (sc["interrupted"]?.jsonPrimitive?.booleanOrNull == true) _events.tryEmit(GeminiEvent.Interrupted)
+                if (sc["generationComplete"]?.jsonPrimitive?.booleanOrNull == true) _events.tryEmit(GeminiEvent.GenerationComplete)
+                if (sc["turnComplete"]?.jsonPrimitive?.booleanOrNull == true) _events.tryEmit(GeminiEvent.TurnComplete)
 
-                // ERR-011: Промежуточная транскрипция микрофона пользователя
-                sc["interimInputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let { interimText ->
-                    if (interimText.isNotBlank()) {
-                        _events.tryEmit(GeminiEvent.InputTranscript(interimText, interim = true))
-                    }
+                sc["interimInputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let {
+                    if (it.isNotBlank()) _events.tryEmit(GeminiEvent.InputTranscript(it, interim = true))
                 }
-
-                // ERR-011: Финализированная транскрипция реплики пользователя
-                sc["inputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let { finalText ->
-                    if (finalText.isNotBlank()) {
-                        _events.tryEmit(GeminiEvent.InputTranscript(finalText, interim = false))
-                    }
+                sc["inputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let {
+                    if (it.isNotBlank()) _events.tryEmit(GeminiEvent.InputTranscript(it, interim = false))
                 }
-
-                // ERR-011: Текстовая транскрипция ответа модели
-                sc["outputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let { outputText ->
-                    if (outputText.isNotBlank()) {
-                        _events.tryEmit(GeminiEvent.OutputTranscript(outputText))
-                    }
+                sc["outputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let {
+                    if (it.isNotBlank()) _events.tryEmit(GeminiEvent.OutputTranscript(it))
                 }
 
                 sc["modelTurn"]?.jsonObject?.get("parts")?.jsonArray?.forEach { partEl ->
                     val part = partEl.jsonObject
-
-                    // ERR-012: Исключаем внутренние мысли модели из публичного текста
                     val isThought = part["thought"]?.jsonPrimitive?.booleanOrNull == true
                     if (!isThought) {
                         part["text"]?.jsonPrimitive?.contentOrNull?.let { text ->
-                            if (text.isNotBlank()) {
-                                _events.tryEmit(GeminiEvent.ModelText(text))
-                            }
+                            if (text.isNotBlank()) _events.tryEmit(GeminiEvent.ModelText(text))
                         }
                     }
 
@@ -411,7 +352,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                 }
             }
         } catch (e: Exception) {
-            logger.e("GeminiLiveClient: Ошибка разбора JSON сообщения", e)
+            logger.e("GeminiLiveClient: Ошибка разбора сообщения", e)
         }
     }
 
