@@ -63,16 +63,26 @@ void FastFft::process(const float* pcmInput, size_t count, float micRms, float o
     alignas(16) float real[N] = {0.0f};
     alignas(16) float imag[N] = {0.0f};
 
-    for (size_t i = 0; i < N; ++i) {
-        float hann = 0.5f * (1.0f - std::cos(2.0f * PI * i / (N - 1)));
-        real[i] = pcmInput[i] * hann;
+    // Ошибка №1 [PERF]: Децимация входного PCM 2:1 при высоких частотах дискретизации (>= 44.1 кГц)
+    int32_t effectiveSr = sampleRate;
+    if (sampleRate >= 44100 && count >= N * 2) {
+        effectiveSr = sampleRate / 2;
+        for (size_t i = 0; i < N; ++i) {
+            float hann = 0.5f * (1.0f - std::cos(2.0f * PI * i / (N - 1)));
+            real[i] = pcmInput[i * 2] * hann;
+        }
+    } else {
+        for (size_t i = 0; i < N; ++i) {
+            float hann = 0.5f * (1.0f - std::cos(2.0f * PI * i / (N - 1)));
+            real[i] = pcmInput[i] * hann;
+        }
     }
 
     computeFft(real, imag, N);
 
-    // ERR-09: Динамический маппинг физических частот (Гц) в индексы бинов БПФ
-    auto freqToBin = [sampleRate](float freq) -> size_t {
-        float binF = std::round((freq * static_cast<float>(N)) / static_cast<float>(sampleRate));
+    // Расчет бинов ведется строго от effectiveSr, предотвращая схлопывание Sub-Bass
+    auto freqToBin = [effectiveSr](float freq) -> size_t {
+        float binF = std::round((freq * static_cast<float>(N)) / static_cast<float>(effectiveSr));
         return static_cast<size_t>(std::clamp(binF, 1.0f, static_cast<float>(N / 2 - 1)));
     };
 
@@ -82,7 +92,6 @@ void FastFft::process(const float* pcmInput, size_t count, float micRms, float o
         float gain;
     };
 
-    // Калиброванные целевые психоакустические диапазоны и весовые коэффициенты
     static const BandDef BANDS[audio::SPECTRUM_BANDS] = {
         {   60.0f,   150.0f, 1.50f }, // Sub-Bass
         {  150.0f,   350.0f, 1.60f }, // Bass
@@ -104,7 +113,6 @@ void FastFft::process(const float* pcmInput, size_t count, float micRms, float o
         }
 
         size_t binCount = endBin - startBin + 1;
-        // ERR-13: Масштабирование на (N * 0.25) с учетом когерентного усиления окна Ханна
         constexpr float fftNormFactor = static_cast<float>(N) * 0.25f;
         rawBands[i] = (sumMag / (static_cast<float>(binCount) * fftNormFactor)) * BANDS[i].gain;
     }
@@ -121,19 +129,16 @@ void FastFft::process(const float* pcmInput, size_t count, float micRms, float o
         }
     }
 
-    // ERR-05: Запись в изолированный рабочий буфер писателя (полное отсутствие гонок)
     for (size_t i = 0; i < audio::SPECTRUM_BANDS; ++i) {
         pool_[writeIdx_].bands[i] = smoothedBands_[i];
     }
     pool_[writeIdx_].micRms = micRms;
     pool_[writeIdx_].outRms = outRms;
 
-    // Неделимая публикация свежего буфера по алгоритму Андерсона
     writeIdx_ = readyIdx_.exchange(writeIdx_, std::memory_order_acq_rel);
 }
 
 void FastFft::getLatestSnapshot(SpectrumSnapshot& out) const {
-    // Неделимое получение свежего буфера по алгоритму Андерсона
     readIdx_ = readyIdx_.exchange(readIdx_, std::memory_order_acq_rel);
     out = pool_[readIdx_];
 }
