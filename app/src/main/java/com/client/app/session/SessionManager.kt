@@ -110,7 +110,6 @@ class SessionManager @Inject constructor(
         private const val MAX_RECONNECT_ATTEMPTS = 5
     }
 
-    // ERR-11: Изоляция необработанных исключений корутин от системного обработчика крашей ОС
     private val coroutineExceptionHandler = CoroutineExceptionHandler { _, throwable ->
         logger.e("Unhandled coroutine exception in SessionManager", throwable)
     }
@@ -136,7 +135,6 @@ class SessionManager @Inject constructor(
     @Volatile private var pendingGoAway = false
     @Volatile private var userMicDesired = true
 
-    // ERR-14: Дискриминатор единственного источника текста модели для исключения дублирования в чате
     @Volatile private var hasReceivedAudioTranscript = false
 
     init {
@@ -391,7 +389,6 @@ class SessionManager @Inject constructor(
             it.copy(link = if (resume) LinkState.RECONNECTING else LinkState.CONNECTING, error = null)
         }
 
-        // ERR-09: На Android 14+ запрещено дергать startForegroundService из фонового реконнекта
         if (!resume) {
             startForegroundService()
         }
@@ -541,17 +538,15 @@ class SessionManager @Inject constructor(
                 }
                 is GeminiEvent.InputTranscript -> appendTranscript("user", event.text, event.interim)
                 
-                // ERR-14: Канонический источник речи модели (SSOT)
+                // Ошибка №3 [DEFECT]: Истинный единственный источник истины (SSOT)
                 is GeminiEvent.OutputTranscript -> {
                     hasReceivedAudioTranscript = true
                     appendTranscript("model", event.text, false)
                 }
                 
-                // ERR-14: Фолбэк на текстовые токены, если транскрипция речи отсутствует
+                // В дуплекс-режиме игнорируем сырые фрагменты ModelText во избежание дублирования ответа
                 is GeminiEvent.ModelText -> {
-                    if (!hasReceivedAudioTranscript) {
-                        appendTranscript("model", event.text, false)
-                    }
+                    // Игнорируем промежуточные токены, дожидаясь канонического OutputTranscript
                 }
                 
                 is GeminiEvent.Usage -> _state.update { it.copy(tokensUsed = event.totalTokens) }
