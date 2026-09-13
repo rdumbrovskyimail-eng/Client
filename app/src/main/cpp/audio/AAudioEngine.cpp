@@ -41,6 +41,10 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
         resetEarcon();
     }
 
+    // ERR-08: Синхронная очистка буферов в состоянии покоя
+    captureBuffer_.clear();
+    playbackBuffer_.clear();
+
     isBluetoothMode_.store(isBluetoothMode, std::memory_order_relaxed);
     playbackSampleRate_.store(targetPlaybackSampleRate, std::memory_order_relaxed);
 
@@ -127,8 +131,9 @@ bool AAudioEngine::start() {
         if (!init(isBluetoothMode_.load(), playbackSampleRate_.load())) return false;
     }
 
-    captureBuffer_.requestFlush();
-    playbackBuffer_.requestFlush();
+    // ERR-08: Детерминированный сброс буферов перед запуском потоков вместо отложенного requestFlush
+    captureBuffer_.clear();
+    playbackBuffer_.clear();
 
     if (AAudioStream_requestStart(captureStream_) != AAUDIO_OK) {
         stop();
@@ -170,8 +175,10 @@ void AAudioEngine::stop() {
         resetEarcon();
     }
 
-    captureBuffer_.requestFlush();
-    playbackBuffer_.requestFlush();
+    // ERR-08: Синхронное очищение очередей при закрытых потоках исключает Stale Flush Trap
+    captureBuffer_.clear();
+    playbackBuffer_.clear();
+
     micRms_.store(0.0f);
     outRms_.store(0.0f);
     isMmapExclusiveActive_.store(false);
@@ -220,6 +227,7 @@ size_t AAudioEngine::readCapturePcm(int16_t* pcm, size_t maxFrames) {
     return captureBuffer_.read(pcm, maxFrames);
 }
 
+// ERR-08: Динамический сброс при перебивании (Barge-In) на лету
 void AAudioEngine::flushPlayback() {
     playbackBuffer_.requestFlush();
     outRms_.store(0.0f);
@@ -274,71 +282,3 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
         size_t decCap = engine->captureDecimateBuffer_.size();
         size_t processed = engine->captureDecimator48To16_.process(samples, numFrames, decBuf, decCap);
         engine->captureBuffer_.write(decBuf, processed);
-        engine->micRms_.store(dsp::calculateRms(decBuf, processed), std::memory_order_relaxed);
-    } else {
-        engine->captureBuffer_.write(samples, numFrames);
-        engine->micRms_.store(dsp::calculateRms(samples, numFrames), std::memory_order_relaxed);
-    }
-
-    return AAUDIO_CALLBACK_RESULT_CONTINUE;
-}
-
-aaudio_data_callback_result_t AAudioEngine::playbackCallback(
-    AAudioStream* /* stream */, void* userData, void* audioData, int32_t numFrames) {
-
-    // E-26: Активация FTZ в потоке воспроизведения
-    thread_local bool ftzSet = false;
-    if (!ftzSet) {
-        dsp::enableHardwareFtz();
-        ftzSet = true;
-    }
-
-    auto* engine = static_cast<AAudioEngine*>(userData);
-    auto* samples = static_cast<int16_t*>(audioData);
-
-    size_t read = engine->playbackBuffer_.read(samples, numFrames);
-    if (read < static_cast<size_t>(numFrames)) {
-        std::memset(samples + read, 0, (numFrames - read) * sizeof(int16_t));
-    }
-
-    // E-10: Расчёт Earcon строго от текущей подтвержденной частоты и времени
-    int32_t actualRate = engine->actualPlaybackSampleRate_.load(std::memory_order_relaxed);
-    size_t earconLimitFrames = static_cast<size_t>(actualRate * (EARCON_DURATION_MS / 1000.0f));
-    size_t phase = engine->earconPhase_.load(std::memory_order_acquire);
-
-    if (phase < earconLimitFrames) {
-        for (int32_t i = 0; i < numFrames && phase < earconLimitFrames; ++i, ++phase) {
-            float t = static_cast<float>(phase) / static_cast<float>(actualRate);
-            float env = std::cos((3.14159265f * phase) / (2.0f * earconLimitFrames));
-            env *= env;
-            int16_t pip = static_cast<int16_t>(std::sin(2.0f * 3.14159265f * EARCON_FREQ_HZ * t) * env * 12000.0f);
-            samples[i] = std::clamp(samples[i] + pip, -32768, 32767);
-        }
-        engine->earconPhase_.store(phase, std::memory_order_release);
-    }
-
-    float vol = engine->playbackVolume_.load(std::memory_order_relaxed);
-    if (vol < 0.999f) {
-        for (int32_t i = 0; i < numFrames; ++i) {
-            samples[i] = static_cast<int16_t>(samples[i] * vol);
-        }
-    }
-
-    float outRms = dsp::calculateRms(samples, numFrames);
-    engine->outRms_.store(outRms, std::memory_order_relaxed);
-
-    // E-02: Накопление сэмплов с Hop Size = 128
-    float micRms = engine->micRms_.load(std::memory_order_relaxed);
-    for (int32_t i = 0; i < numFrames; ++i) {
-        engine->fftAccumulator_[engine->fftAccumulatorPos_++] = samples[i] * (1.0f / 32768.0f);
-        if (engine->fftAccumulatorPos_ >= FFT_SIZE) {
-            engine->fftProcessor_->process(engine->fftAccumulator_.data(), FFT_SIZE, micRms, outRms);
-            std::memmove(&engine->fftAccumulator_[0], &engine->fftAccumulator_[FFT_HOP_SIZE], (FFT_SIZE - FFT_HOP_SIZE) * sizeof(float));
-            engine->fftAccumulatorPos_ = FFT_SIZE - FFT_HOP_SIZE;
-        }
-    }
-
-    return AAUDIO_CALLBACK_RESULT_CONTINUE;
-}
-
-} // namespace client::audio
