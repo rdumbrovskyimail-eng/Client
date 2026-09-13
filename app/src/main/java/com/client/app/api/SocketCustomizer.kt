@@ -1,22 +1,18 @@
-// >>> FILE: app/src/main/java/com/client/app/api/SocketCustomizer.kt
 package com.client.app.api
 
 import android.os.ParcelFileDescriptor
 import com.client.app.audio.NativeAudioBridge
-import com.client.app.util.AppLogger
+import com.client.app.logging.AppLogManager
 import java.io.FileDescriptor
 import java.lang.reflect.Field
 import java.net.InetAddress
 import java.net.Socket
 import javax.net.SocketFactory
 
-/**
- * SocketFactory с рекурсивной распаковкой Conscrypt / OkHttp оберток и прямым POSIX-тюнингом.
- */
 class TunedSocketFactory(
     private val delegate: SocketFactory,
     private val nativeBridge: NativeAudioBridge,
-    private val logger: AppLogger
+    private val logManager: AppLogManager
 ) : SocketFactory() {
 
     override fun createSocket(): Socket = configure(delegate.createSocket())
@@ -30,27 +26,26 @@ class TunedSocketFactory(
     private fun configure(socket: Socket): Socket {
         runCatching {
             socket.tcpNoDelay = true
-
             val fd = extractUnderlyingFileDescriptor(socket)
             if (fd != null && fd.valid()) {
                 val nativeFd = getNativeFdInt(fd)
                 if (nativeFd > 0) {
                     nativeBridge.tuneNativeSocket(nativeFd)
+                    logManager.net("SocketCustomizer", "Успешно применены опции TCP_NOTSENT_LOWAT & TCP_NODELAY (fd=$nativeFd)")
                 } else {
-                    // Безопасный фолбэк: дубликат закрывается детерминированно
-                    // сразу после применения setsockopt через pfd.close() (без detachFd)
                     runCatching {
                         ParcelFileDescriptor.dup(fd).use { pfd ->
                             val dupFd = pfd.fd
                             if (dupFd > 0) {
                                 nativeBridge.tuneNativeSocket(dupFd)
+                                logManager.net("SocketCustomizer", "Применены TCP опции через dupFd=$dupFd")
                             }
                         }
                     }
                 }
             }
         }.onFailure {
-            logger.w("SocketCustomizer: Не удалось настроить TCP опции: ${it.message}")
+            logManager.w("SocketCustomizer", "Сбой конфигурации TCP опций: ${it.message}")
         }
         return socket
     }
@@ -58,16 +53,11 @@ class TunedSocketFactory(
     private fun extractUnderlyingFileDescriptor(target: Any?): FileDescriptor? {
         if (target == null) return null
         var current: Any = target
-
-        // Разворачиваем возможные обертки ConscryptEngineSocket / OpenSSLSocketImpl
         for (i in 0..5) {
             if (current is FileDescriptor) return current
             if (current is Socket) {
                 val impl = getFieldValue(current, "impl")
-                if (impl != null) {
-                    current = impl
-                    continue
-                }
+                if (impl != null) { current = impl; continue }
             }
             val fd = getFieldValue(current, "fd")
             if (fd is FileDescriptor) return fd
