@@ -31,6 +31,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -40,6 +41,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.client.app.R
 import com.client.app.session.ChatMessage
 import com.client.app.ui.components.AgslVoiceVisualizer
 import com.client.app.viewmodel.ClientViewModel
@@ -56,7 +58,6 @@ fun ClientScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
-    // Ошибка №19 [DEFECT]: Использование rememberSaveable для сохранения черновика при навигации
     var chatInput by rememberSaveable { mutableStateOf("") }
     var attachedUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var isSheetOpen by remember { mutableStateOf(false) }
@@ -106,11 +107,21 @@ fun ClientScreen(
                     .padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                // Ошибка №21 [A11Y] & №22 [I18N]: Сенсорная зона >= 48dp и строковый ресурс
                 IconButton(
                     onClick = onNavigateSettings,
-                    modifier = Modifier.size(42.dp).clip(CircleShape).background(Color(0xFF18181B))
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .size(42.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xFF18181B))
                 ) {
-                    Icon(Icons.Filled.Tune, "Настройки", tint = Color(0xFFFAFAFA), modifier = Modifier.size(20.dp))
+                    Icon(
+                        imageVector = Icons.Filled.Tune,
+                        contentDescription = stringResource(R.string.settings_title),
+                        tint = Color(0xFFFAFAFA),
+                        modifier = Modifier.size(20.dp)
+                    )
                 }
 
                 Spacer(Modifier.width(8.dp))
@@ -128,7 +139,7 @@ fun ClientScreen(
                     Icon(Icons.Filled.AutoAwesome, null, tint = Color(0xFF60A5FA), modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = state.activePrompt.ifBlank { "Задать системную роль..." },
+                        text = state.activePrompt.ifBlank { stringResource(R.string.default_role_placeholder) },
                         color = Color(0xFFE4E4E7),
                         fontSize = 13.sp,
                         maxLines = 1,
@@ -140,16 +151,18 @@ fun ClientScreen(
 
                 Spacer(Modifier.width(8.dp))
 
+                // Ошибка №21 [A11Y] & №22 [I18N]: Сенсорная зона >= 48dp и локализация описания кнопки
                 IconButton(
                     onClick = { handleConnectClick() },
                     modifier = Modifier
+                        .minimumInteractiveComponentSize()
                         .size(42.dp)
                         .clip(CircleShape)
                         .background(if (state.isConnected) Color(0xFF064E3B) else Color(0xFF18181B))
                 ) {
                     Icon(
                         imageVector = if (state.isConnected) Icons.Filled.PowerSettingsNew else Icons.Filled.PlayArrow,
-                        contentDescription = "Статус сессии",
+                        contentDescription = stringResource(R.string.session_status_desc),
                         tint = if (state.isConnected) Color(0xFF34D399) else Color(0xFFFAFAFA),
                         modifier = Modifier.size(22.dp)
                     )
@@ -225,11 +238,19 @@ fun ClientScreen(
                         .padding(horizontal = 6.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    // Ошибка №21 [A11Y] & №22 [I18N]: Сенсорная зона 48dp для вложений
                     IconButton(
                         onClick = { filePicker.launch(arrayOf("application/pdf", "image/*")) },
-                        modifier = Modifier.size(38.dp)
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .size(38.dp)
                     ) {
-                        Icon(Icons.Filled.Add, "Прикрепить", tint = Color(0xFFA1A1AA), modifier = Modifier.size(20.dp))
+                        Icon(
+                            imageVector = Icons.Filled.Add,
+                            contentDescription = stringResource(R.string.attach_file),
+                            tint = Color(0xFFA1A1AA),
+                            modifier = Modifier.size(20.dp)
+                        )
                     }
 
                     BasicTextField(
@@ -239,14 +260,18 @@ fun ClientScreen(
                         textStyle = LocalTextStyle.current.copy(color = Color(0xFFFAFAFA), fontSize = 15.sp),
                         cursorBrush = SolidColor(Color(0xFF60A5FA)),
                         decorationBox = { inner ->
-                            if (chatInput.isEmpty()) Text("Спросить или дать команду...", color = Color(0xFF71717A), fontSize = 15.sp)
+                            if (chatInput.isEmpty()) {
+                                Text(stringResource(R.string.prompt_hint), color = Color(0xFF71717A), fontSize = 15.sp)
+                            }
                             inner()
                         }
                     )
 
                     if (chatInput.isNotBlank() || attachedUris.isNotEmpty()) {
+                        // Ошибка №21 [A11Y] & №22 [I18N]: Сенсорная зона 48dp для отправки
                         Box(
                             modifier = Modifier
+                                .minimumInteractiveComponentSize()
                                 .size(36.dp)
                                 .clip(CircleShape)
                                 .background(Color(0xFFFAFAFA))
@@ -257,9 +282,15 @@ fun ClientScreen(
                                 },
                             contentAlignment = Alignment.Center
                         ) {
-                            Icon(Icons.Filled.ArrowUpward, "Отправить", tint = Color(0xFF09090B), modifier = Modifier.size(18.dp))
+                            Icon(
+                                imageVector = Icons.Filled.ArrowUpward,
+                                contentDescription = stringResource(R.string.send_message),
+                                tint = Color(0xFF09090B),
+                                modifier = Modifier.size(18.dp)
+                            )
                         }
                     } else {
+                        // Ошибка №21 [A11Y] & №22 [I18N]: Сенсорная зона 48dp для микрофона
                         IconButton(
                             onClick = {
                                 if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
@@ -269,13 +300,14 @@ fun ClientScreen(
                                 }
                             },
                             modifier = Modifier
+                                .minimumInteractiveComponentSize()
                                 .size(36.dp)
                                 .clip(CircleShape)
                                 .background(if (state.isMicActive) Color(0xFF1E3A8A) else Color.Transparent)
                         ) {
                             Icon(
                                 imageVector = if (state.isMicActive) Icons.Filled.Mic else Icons.Outlined.Mic,
-                                contentDescription = "Микрофон",
+                                contentDescription = stringResource(R.string.mic_content_desc),
                                 tint = if (state.isMicActive) Color(0xFF60A5FA) else Color(0xFFA1A1AA),
                                 modifier = Modifier.size(20.dp)
                             )
@@ -300,7 +332,12 @@ fun ClientScreen(
                     .padding(bottom = 32.dp)
                     .windowInsetsPadding(WindowInsets.ime)
             ) {
-                Text("Системная инструкция роли", color = Color(0xFFFAFAFA), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    text = stringResource(R.string.system_role_instruction),
+                    color = Color(0xFFFAFAFA),
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold
+                )
                 Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
                     value = tempPrompt,
@@ -323,7 +360,7 @@ fun ClientScreen(
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
                 ) {
-                    Text("Применить роль", color = Color.White)
+                    Text(stringResource(R.string.apply_role), color = Color.White)
                 }
             }
         }
