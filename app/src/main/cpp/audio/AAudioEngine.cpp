@@ -1,5 +1,6 @@
 // >>> FILE: app/src/main/cpp/audio/AAudioEngine.cpp
 #include "AAudioEngine.h"
+#include "NativeLogQueue.h"
 #include "dsp/NeonDspUtils.h"
 #include <android/log.h>
 #include <algorithm>
@@ -8,8 +9,23 @@
 #include <thread>
 
 #define LOG_TAG "NativeAudioEngine"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// Неблокирующее логирование: отправка в Android Logcat + NativeLogQueue
+#undef LOGI
+#undef LOGE
+#define LOGI(...) do { \
+    char _buf[256]; \
+    snprintf(_buf, sizeof(_buf), __VA_ARGS__); \
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", _buf); \
+    client::logging::NativeLogQueue::getInstance().push(4, LOG_TAG, _buf); \
+} while(0)
+
+#define LOGE(...) do { \
+    char _buf[256]; \
+    snprintf(_buf, sizeof(_buf), __VA_ARGS__); \
+    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "%s", _buf); \
+    client::logging::NativeLogQueue::getInstance().push(6, LOG_TAG, _buf); \
+} while(0)
 
 namespace client::audio {
 
@@ -47,9 +63,14 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
     isBluetoothMode_.store(isBluetoothMode, std::memory_order_relaxed);
     playbackSampleRate_.store(targetPlaybackSampleRate, std::memory_order_relaxed);
 
-    // 1. Конфигурация потока захвата
+    LOGI("AAudioEngine::init: BT=%d, targetRate=%d. Configuring capture stream...", (int)isBluetoothMode, targetPlaybackSampleRate);
+
+    // 1. Конфигурация потока захвата (микрофон)
     AAudioStreamBuilder* inBuilder = nullptr;
-    if (AAudio_createStreamBuilder(&inBuilder) != AAUDIO_OK) return false;
+    if (AAudio_createStreamBuilder(&inBuilder) != AAUDIO_OK) {
+        LOGE("Failed to create capture stream builder");
+        return false;
+    }
 
     AAudioStreamBuilder_setDirection(inBuilder, AAUDIO_DIRECTION_INPUT);
     AAudioStreamBuilder_setPerformanceMode(inBuilder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
@@ -57,7 +78,7 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
     AAudioStreamBuilder_setChannelCount(inBuilder, CHANNEL_COUNT_MONO);
     AAudioStreamBuilder_setFormat(inBuilder, AAUDIO_FORMAT_PCM_I16);
 
-    // Активация аппаратного AEC (VOICE_COMMUNICATION) для встроенного динамика
+    // Активация аппаратного AEC (VOICE_COMMUNICATION)
     if (isBluetoothMode) {
         AAudioStreamBuilder_setSharingMode(inBuilder, AAUDIO_SHARING_MODE_SHARED);
         AAudioStreamBuilder_setInputPreset(inBuilder, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
@@ -73,15 +94,16 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
     AAudioStreamBuilder_delete(inBuilder);
 
     if (res != AAUDIO_OK) {
-        LOGE("Failed to open capture stream: %d", res);
+        LOGE("Failed to open capture stream: %d (%s)", res, AAudio_convertResultToText(res));
         return false;
     }
 
     actualCaptureSampleRate_.store(AAudioStream_getSampleRate(captureStream_), std::memory_order_release);
 
-    // 2. Конфигурация потока воспроизведения
+    // 2. Конфигурация потока воспроизведения (динамик/наушники)
     AAudioStreamBuilder* outBuilder = nullptr;
     if (AAudio_createStreamBuilder(&outBuilder) != AAUDIO_OK) {
+        LOGE("Failed to create playback stream builder");
         AAudioStream_close(captureStream_);
         captureStream_ = nullptr;
         return false;
@@ -108,7 +130,7 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
     AAudioStreamBuilder_delete(outBuilder);
 
     if (res != AAUDIO_OK) {
-        LOGE("Failed to open playback stream: %d", res);
+        LOGE("Failed to open playback stream: %d (%s)", res, AAudio_convertResultToText(res));
         AAudioStream_close(captureStream_);
         captureStream_ = nullptr;
         return false;
@@ -129,33 +151,39 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
 bool AAudioEngine::start() {
     if (isRunning_.load()) return true;
     if (!captureStream_ || !playbackStream_) {
+        LOGI("start() called with null streams, reinitializing...");
         if (!init(isBluetoothMode_.load(), playbackSampleRate_.load())) return false;
     }
 
     captureBuffer_.clear();
     playbackBuffer_.clear();
 
-    if (AAudioStream_requestStart(captureStream_) != AAUDIO_OK) {
+    aaudio_result_t res = AAudioStream_requestStart(captureStream_);
+    if (res != AAUDIO_OK) {
+        LOGE("AAudioStream_requestStart(capture) failed: %d (%s)", res, AAudio_convertResultToText(res));
         stop();
         return false;
     }
 
-    if (AAudioStream_requestStart(playbackStream_) != AAUDIO_OK) {
+    res = AAudioStream_requestStart(playbackStream_);
+    if (res != AAUDIO_OK) {
+        LOGE("AAudioStream_requestStart(playback) failed: %d (%s)", res, AAudio_convertResultToText(res));
         stop();
         return false;
     }
 
     isRunning_.store(true);
-    LOGI("AAudio engine started");
+    LOGI("AAudio engine started successfully");
     return true;
 }
 
-// Ошибка №27 [CONCURRENCY/CRASH]: Защита мьютексом от параллельного Double Free
 void AAudioEngine::stop() {
     std::lock_guard<std::mutex> lock(stateMutex_);
     if (!isRunning_.exchange(false)) {
         return;
     }
+
+    LOGI("Stopping AAudioEngine...");
 
     if (captureStream_) {
         AAudioStream_requestStop(captureStream_);
@@ -184,6 +212,8 @@ void AAudioEngine::stop() {
     outRms_.store(0.0f);
     isMmapExclusiveActive_.store(false);
     fftAccumulatorPos_ = 0;
+
+    LOGI("AAudioEngine stopped");
 }
 
 size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
@@ -255,10 +285,12 @@ size_t AAudioEngine::readCapturePcm(int16_t* pcm, size_t maxFrames) {
 void AAudioEngine::flushPlayback() {
     playbackBuffer_.requestFlush();
     outRms_.store(0.0f);
+    LOGI("AAudioEngine: flushPlayback executed");
 }
 
 void AAudioEngine::triggerBargeInEarcon() {
     earconPhase_.store(0, std::memory_order_release);
+    LOGI("AAudioEngine: triggerBargeInEarcon (750 Hz pip)");
 }
 
 void AAudioEngine::resetEarcon() {
@@ -373,13 +405,12 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
 }
 
 void AAudioEngine::errorCallback(AAudioStream* /* stream */, void* userData, aaudio_result_t error) {
-    LOGE("AAudio stream error callback invoked. Error code: %d (%s)", 
-         error, AAudio_convertResultToText(error));
+    LOGE("AAudio stream error callback: code %d (%s)", error, AAudio_convertResultToText(error));
 
     if (error == AAUDIO_ERROR_DISCONNECTED) {
         auto* engine = static_cast<AAudioEngine*>(userData);
         std::thread([engine]() {
-            LOGI("Asynchronously stopping AAudioEngine after device disconnect.");
+            LOGI("Asynchronously stopping AAudioEngine after AAUDIO_ERROR_DISCONNECTED.");
             engine->stop();
         }).detach();
     }
