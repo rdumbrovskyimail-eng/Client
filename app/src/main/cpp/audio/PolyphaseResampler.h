@@ -84,7 +84,7 @@ private:
 
 /**
  * E-07: Полифазный дециматор 3:1 (48 кГц -> 16 кГц) для входящего микрофонного тракта.
- * Защищен от переполнения буфера параметром maxOutFrames и безопасным сдвигом истории.
+ * ERR-12: Исправлена индексация истории TAPS - (t - i), исключающая пропуск сэмпла x[-1] и фазовые щелчки.
  */
 class Decimator48To16 {
 public:
@@ -107,7 +107,7 @@ public:
 
             int64_t acc = 0;
             for (size_t t = 0; t < TAPS; ++t) {
-                int32_t sample = (i >= t) ? in[i - t] : history_[TAPS - 1 - (t - i)];
+                int32_t sample = (i >= t) ? in[i - t] : history_[TAPS - (t - i)];
                 acc += COEFFS[t] * sample;
             }
             out[outCount++] = static_cast<int16_t>(std::clamp<int32_t>(acc >> 15, -32768, 32767));
