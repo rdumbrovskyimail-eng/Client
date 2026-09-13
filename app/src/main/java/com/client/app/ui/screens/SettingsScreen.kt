@@ -22,6 +22,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -30,6 +31,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.client.app.R
 import com.client.app.viewmodel.SettingsViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -48,7 +50,6 @@ fun SettingsScreen(
     var micGainDraft by remember(settings.micGain) { mutableFloatStateOf(settings.micGain) }
 
     val coreVoices = listOf("Charon", "Puck", "Kore", "Fenrir", "Aoede")
-    // E-14: Синхронизировано с белым списком SessionManager
     val liveModels = listOf(
         "gemini-3.1-flash-live-preview",
         "gemini-2.5-flash-native-audio-latest",
@@ -60,7 +61,7 @@ fun SettingsScreen(
         containerColor = Color(0xFF09090B),
         topBar = {
             TopAppBar(
-                title = { Text("Настройки", color = Color(0xFFFAFAFA), fontSize = 18.sp, fontWeight = FontWeight.SemiBold) },
+                title = { Text(stringResource(R.string.settings_title), color = Color(0xFFFAFAFA), fontSize = 18.sp, fontWeight = FontWeight.SemiBold) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Color(0xFFFAFAFA))
@@ -78,11 +79,11 @@ fun SettingsScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            SettingsCard(title = "КЛЮЧИ И СЕРВЕР GEMINI") {
+            SettingsCard(title = stringResource(R.string.settings_keys_header)) {
                 OutlinedTextField(
                     value = settings.apiKey,
                     onValueChange = viewModel::setApiKey,
-                    label = { Text("Gemini API Key") },
+                    label = { Text(stringResource(R.string.gemini_api_key_label)) },
                     singleLine = true,
                     visualTransformation = if (showGeminiKey) VisualTransformation.None else PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
@@ -90,7 +91,7 @@ fun SettingsScreen(
                         IconButton(onClick = { showGeminiKey = !showGeminiKey }) {
                             Icon(
                                 imageVector = if (showGeminiKey) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                                contentDescription = "Показать ключ",
+                                contentDescription = stringResource(R.string.show_key_desc),
                                 tint = Color(0xFFA1A1AA)
                             )
                         }
@@ -102,7 +103,7 @@ fun SettingsScreen(
 
                 Spacer(Modifier.height(12.dp))
 
-                Text("Голосовая модель Gemini Live (дуплекс):", color = Color(0xFFA1A1AA), fontSize = 12.sp)
+                Text(stringResource(R.string.live_model_label), color = Color(0xFFA1A1AA), fontSize = 12.sp)
                 Spacer(Modifier.height(6.dp))
                 Row(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -125,7 +126,7 @@ fun SettingsScreen(
 
                 Spacer(Modifier.height(12.dp))
 
-                Text("Модель разбора материалов (Vision OCR):", color = Color(0xFFA1A1AA), fontSize = 12.sp)
+                Text(stringResource(R.string.analyzer_model_label), color = Color(0xFFA1A1AA), fontSize = 12.sp)
                 Spacer(Modifier.height(6.dp))
                 Row(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -147,8 +148,8 @@ fun SettingsScreen(
                 }
             }
 
-            SettingsCard(title = "ГОЛОС И ЗВУКОВАЯ СИСТЕМА S23 ULTRA") {
-                Text("Голос модели (TTS):", color = Color(0xFFA1A1AA), fontSize = 12.sp)
+            SettingsCard(title = stringResource(R.string.settings_audio_header)) {
+                Text(stringResource(R.string.tts_voice_label), color = Color(0xFFA1A1AA), fontSize = 12.sp)
                 Spacer(Modifier.height(6.dp))
                 Row(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -171,7 +172,11 @@ fun SettingsScreen(
 
                 Spacer(Modifier.height(14.dp))
 
-                Text("Громкость динамика: ${(volumeDraft * 100).toInt()}%", color = Color(0xFFE4E4E7), fontSize = 13.sp)
+                Text(
+                    text = stringResource(R.string.speaker_volume, (volumeDraft * 100).toInt()),
+                    color = Color(0xFFE4E4E7),
+                    fontSize = 13.sp
+                )
                 Slider(
                     value = volumeDraft,
                     onValueChange = { volumeDraft = it },
@@ -187,8 +192,8 @@ fun SettingsScreen(
                 Spacer(Modifier.height(8.dp))
 
                 Text(
-                    text = "Чувствительность микрофона: ${(micGainDraft * 100).toInt()}%" +
-                            if (micGainDraft > 1.0f) " (Усиление для тихой речи)" else "",
+                    text = stringResource(R.string.mic_sensitivity, (micGainDraft * 100).toInt()) +
+                            if (micGainDraft > 1.0f) stringResource(R.string.mic_quiet_boost) else "",
                     color = Color(0xFFE4E4E7),
                     fontSize = 13.sp
                 )
@@ -205,11 +210,11 @@ fun SettingsScreen(
                 )
             }
 
-            SettingsCard(title = "СИСТЕМНЫЙ ПРОМПТ ПО УМОЛЧАНИЮ") {
+            SettingsCard(title = stringResource(R.string.settings_prompt_header)) {
                 OutlinedTextField(
                     value = settings.systemPrompt,
                     onValueChange = viewModel::setSystemPrompt,
-                    label = { Text("Базовая инструкция ассистента") },
+                    label = { Text(stringResource(R.string.system_prompt_label)) },
                     modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp, max = 220.dp),
                     maxLines = 8,
                     shape = RoundedCornerShape(10.dp),
@@ -217,15 +222,15 @@ fun SettingsScreen(
                 )
             }
 
-            SettingsCard(title = "ИНТЕГРАЦИЯ С FORVO") {
+            SettingsCard(title = stringResource(R.string.settings_forvo_header)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("Включить Forvo Tool", color = Color(0xFFFAFAFA), fontSize = 14.sp)
-                        Text("Озвучка слов носителями языка с Forvo.com", color = Color(0xFF71717A), fontSize = 12.sp)
+                        Text(stringResource(R.string.forvo_enable_title), color = Color(0xFFFAFAFA), fontSize = 14.sp)
+                        Text(stringResource(R.string.forvo_enable_desc), color = Color(0xFF71717A), fontSize = 12.sp)
                     }
                     Switch(checked = settings.enableForvo, onCheckedChange = viewModel::setEnableForvo)
                 }
@@ -235,7 +240,7 @@ fun SettingsScreen(
                     OutlinedTextField(
                         value = settings.forvoApiKey,
                         onValueChange = viewModel::setForvoApiKey,
-                        label = { Text("Forvo API Key") },
+                        label = { Text(stringResource(R.string.forvo_api_key_label)) },
                         singleLine = true,
                         visualTransformation = if (showForvoKey) VisualTransformation.None else PasswordVisualTransformation(),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
@@ -243,7 +248,7 @@ fun SettingsScreen(
                             IconButton(onClick = { showForvoKey = !showForvoKey }) {
                                 Icon(
                                     imageVector = if (showForvoKey) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                                    contentDescription = "Показать Forvo ключ",
+                                    contentDescription = stringResource(R.string.show_forvo_key_desc),
                                     tint = Color(0xFFA1A1AA)
                                 )
                             }
@@ -255,10 +260,9 @@ fun SettingsScreen(
                 }
             }
 
-            SettingsCard(title = "ФОНОВАЯ РАБОТА НА SAMSUNG ONE UI") {
+            SettingsCard(title = stringResource(R.string.settings_battery_header)) {
                 Text(
-                    text = "Samsung One UI может усыплять микрофонный сервис через 10–15 минут сна экрана. " +
-                            "Выберите «Не оптимизировать» (Работа без ограничений).",
+                    text = stringResource(R.string.battery_opt_desc),
                     color = Color(0xFFA1A1AA),
                     fontSize = 12.sp,
                     lineHeight = 17.sp
@@ -269,7 +273,7 @@ fun SettingsScreen(
                         runCatching {
                             context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
                         }.onFailure {
-                            Toast.makeText(context, "Откройте: Настройки -> Приложения -> Батарея -> Без ограничений", Toast.LENGTH_LONG).show()
+                            Toast.makeText(context, context.getString(R.string.battery_toast_fallback), Toast.LENGTH_LONG).show()
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
@@ -278,7 +282,7 @@ fun SettingsScreen(
                 ) {
                     Icon(Icons.Filled.BatteryChargingFull, null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("Настройки батареи устройства", fontSize = 13.sp)
+                    Text(stringResource(R.string.battery_opt_button), fontSize = 13.sp)
                 }
             }
         }
