@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -55,11 +56,11 @@ fun ClientScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
-    var chatInput by remember { mutableStateOf("") }
+    // Ошибка №19 [DEFECT]: Использование rememberSaveable для сохранения черновика при навигации
+    var chatInput by rememberSaveable { mutableStateOf("") }
     var attachedUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var isSheetOpen by remember { mutableStateOf(false) }
 
-    // E-31: Ограничение пикера поддерживаемыми типами
     val filePicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris -> attachedUris = (attachedUris + uris).distinct().take(8) }
@@ -208,7 +209,6 @@ fun ClientScreen(
                 }
             }
 
-            // E-24: Исключение двойного отступа
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -286,7 +286,6 @@ fun ClientScreen(
         }
     }
 
-    // E-21: Полноценный рабочий ModalBottomSheet
     if (isSheetOpen) {
         ModalBottomSheet(
             onDismissRequest = { isSheetOpen = false },
