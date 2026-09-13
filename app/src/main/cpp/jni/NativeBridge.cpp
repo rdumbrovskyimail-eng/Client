@@ -4,13 +4,29 @@
 #include <vector>
 #include <android/log.h>
 #include <sys/socket.h>
-#include <netinet/in.h> // Обязательный заголовок для IPPROTO_TCP в Android NDK
+#include <netinet/in.h>
 #include <netinet/tcp.h>
 #include "audio/AAudioEngine.h"
+#include "audio/NativeLogQueue.h"
 
 #define LOG_TAG "NativeCoreBridge"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// Перехват логов: вывод в logcat + фиксация в Lock-Free кольцевой очереди логов
+#undef LOGI
+#undef LOGE
+#define LOGI(...) do { \
+    char _buf[256]; \
+    snprintf(_buf, sizeof(_buf), __VA_ARGS__); \
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", _buf); \
+    client::logging::NativeLogQueue::getInstance().push(4, LOG_TAG, _buf); \
+} while(0)
+
+#define LOGE(...) do { \
+    char _buf[256]; \
+    snprintf(_buf, sizeof(_buf), __VA_ARGS__); \
+    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "%s", _buf); \
+    client::logging::NativeLogQueue::getInstance().push(6, LOG_TAG, _buf); \
+} while(0)
 
 #ifndef TCP_NOTSENT_LOWAT
 #define TCP_NOTSENT_LOWAT 25
@@ -30,16 +46,19 @@ Java_com_client_app_audio_NativeAudioBridge_getHardwareCoreInfo(JNIEnv *env, job
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_client_app_audio_NativeAudioBridge_initAudioRoute(
     JNIEnv * /* env */, jobject /* this */, jboolean isBluetooth, jint sampleRate) {
+    LOGI("initAudioRoute called: isBluetooth=%d, sampleRate=%d", (int)isBluetooth, (int)sampleRate);
     return static_cast<jboolean>(AAudioEngine::getInstance().init(isBluetooth, sampleRate));
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_client_app_audio_NativeAudioBridge_startAudio(JNIEnv * /* env */, jobject /* this */) {
+    LOGI("startAudio called");
     return static_cast<jboolean>(AAudioEngine::getInstance().start());
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_client_app_audio_NativeAudioBridge_stopAudio(JNIEnv * /* env */, jobject /* this */) {
+    LOGI("stopAudio called");
     AAudioEngine::getInstance().stop();
 }
 
@@ -55,7 +74,6 @@ Java_com_client_app_audio_NativeAudioBridge_setMicGain(
     AAudioEngine::getInstance().setMicGain(static_cast<float>(gain));
 }
 
-// E-09: Потокобезопасная передача массива без блокировки ART GC и риска дедлоков
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     JNIEnv *env, jobject /* this */, jbyteArray byteArray, jint offset, jint length) {
@@ -79,7 +97,6 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     return static_cast<jint>(written * sizeof(int16_t));
 }
 
-// E-06: Защита от OOB в DirectBuffer
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackDirect(
     JNIEnv *env, jobject /* this */, jobject byteBuffer, jint offsetBytes, jint lengthBytes) {
@@ -134,13 +151,14 @@ Java_com_client_app_audio_NativeAudioBridge_tuneNativeSocket(JNIEnv * /* env */,
     if (fd <= 0) return;
 
     int flag = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    int res1 = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
     int lowat = 16384;
-    setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
+    int res2 = setsockopt(fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
+
+    LOGI("tuneNativeSocket applied for fd=%d: TCP_NODELAY res=%d, TCP_NOTSENT_LOWAT res=%d", fd, res1, res2);
 }
 
-// E-03: Потокобезопасная передача полного снимка в UI
 extern "C" JNIEXPORT void JNICALL
 Java_com_client_app_audio_NativeAudioBridge_getSpectrumData(JNIEnv *env, jobject /* this */, jfloatArray outArray) {
     if (!outArray) return;
@@ -156,4 +174,53 @@ Java_com_client_app_audio_NativeAudioBridge_getSpectrumData(JNIEnv *env, jobject
     data[6] = snapshot.outRms;
 
     env->SetFloatArrayRegion(outArray, 0, 7, data);
+}
+
+/**
+ * E-51: Вычитка логов из C++ Lock-Free очереди NativeLogQueue в Java.
+ * Защита от переполнения JNI Local References Table (лимит 512):
+ * строгий вызов DeleteLocalRef на каждой итерации и ограничение пачки до 64 записей.
+ */
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_com_client_app_audio_NativeAudioBridge_drainNativeLogs(JNIEnv *env, jobject /* this */) {
+    std::vector<client::logging::NativeLogItem> drained;
+    drained.reserve(64);
+
+    client::logging::NativeLogItem item;
+    while (drained.size() < 64 && client::logging::NativeLogQueue::getInstance().pop(item)) {
+        drained.push_back(item);
+    }
+
+    if (drained.empty()) {
+        return nullptr;
+    }
+
+    jclass stringClass = env->FindClass("java/lang/String");
+    if (!stringClass) return nullptr;
+
+    const jsize totalElements = static_cast<jsize>(drained.size() * 3);
+    jobjectArray resultArray = env->NewObjectArray(totalElements, stringClass, nullptr);
+    if (!resultArray) {
+        env->DeleteLocalRef(stringClass);
+        return nullptr;
+    }
+
+    for (size_t i = 0; i < drained.size(); ++i) {
+        jstring jLevel = env->NewStringUTF(std::to_string(drained[i].level).c_str());
+        jstring jTag = env->NewStringUTF(drained[i].tag);
+        jstring jMsg = env->NewStringUTF(drained[i].message);
+
+        jsize baseIdx = static_cast<jsize>(i * 3);
+        env->SetObjectArrayElement(resultArray, baseIdx + 0, jLevel);
+        env->SetObjectArrayElement(resultArray, baseIdx + 1, jTag);
+        env->SetObjectArrayElement(resultArray, baseIdx + 2, jMsg);
+
+        // Освобождаем локальные ссылки для предотвращения JNI Local Reference Table Overflow
+        env->DeleteLocalRef(jLevel);
+        env->DeleteLocalRef(jTag);
+        env->DeleteLocalRef(jMsg);
+    }
+
+    env->DeleteLocalRef(stringClass);
+    return resultArray;
 }
