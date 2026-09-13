@@ -53,9 +53,11 @@ import com.mikepenz.markdown.m3.markdownTypography
 @Composable
 fun ClientScreen(
     onNavigateSettings: () -> Unit,
+    onNavigateLogs: () -> Unit,
     viewModel: ClientViewModel = hiltViewModel()
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val errorCount by viewModel.errorCount.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
     var chatInput by rememberSaveable { mutableStateOf("") }
@@ -107,7 +109,7 @@ fun ClientScreen(
                     .padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Ошибка №21 [A11Y] & №22 [I18N]: Сенсорная зона >= 48dp и строковый ресурс
+                // Кнопка настроек
                 IconButton(
                     onClick = onNavigateSettings,
                     modifier = Modifier
@@ -126,6 +128,38 @@ fun ClientScreen(
 
                 Spacer(Modifier.width(8.dp))
 
+                // Кнопка перехода в системный логгер с индикатором ошибок
+                IconButton(
+                    onClick = onNavigateLogs,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .size(42.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xFF18181B))
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Filled.Terminal,
+                            contentDescription = "Системный лог",
+                            tint = if (errorCount > 0) Color(0xFFF87171) else Color(0xFF60A5FA),
+                            modifier = Modifier.size(20.dp)
+                        )
+                        if (errorCount > 0) {
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .offset(x = 2.dp, y = (-2).dp)
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFFEF4444))
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.width(8.dp))
+
+                // Селектор системной роли ассистента
                 Row(
                     modifier = Modifier
                         .weight(1f)
@@ -151,7 +185,7 @@ fun ClientScreen(
 
                 Spacer(Modifier.width(8.dp))
 
-                // Ошибка №21 [A11Y] & №22 [I18N]: Сенсорная зона >= 48dp и локализация описания кнопки
+                // Кнопка подключения / завершения сессии
                 IconButton(
                     onClick = { handleConnectClick() },
                     modifier = Modifier
@@ -238,7 +272,6 @@ fun ClientScreen(
                         .padding(horizontal = 6.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // Ошибка №21 [A11Y] & №22 [I18N]: Сенсорная зона 48dp для вложений
                     IconButton(
                         onClick = { filePicker.launch(arrayOf("application/pdf", "image/*")) },
                         modifier = Modifier
@@ -268,7 +301,6 @@ fun ClientScreen(
                     )
 
                     if (chatInput.isNotBlank() || attachedUris.isNotEmpty()) {
-                        // Ошибка №21 [A11Y] & №22 [I18N]: Сенсорная зона 48dp для отправки
                         Box(
                             modifier = Modifier
                                 .minimumInteractiveComponentSize()
@@ -290,7 +322,6 @@ fun ClientScreen(
                             )
                         }
                     } else {
-                        // Ошибка №21 [A11Y] & №22 [I18N]: Сенсорная зона 48dp для микрофона
                         IconButton(
                             onClick = {
                                 if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
