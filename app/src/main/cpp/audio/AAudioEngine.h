@@ -52,6 +52,10 @@ private:
     static aaudio_data_callback_result_t playbackCallback(
         AAudioStream* stream, void* userData, void* audioData, int32_t numFrames);
 
+    // Обработчик системных ошибок стрима и потери Bluetooth-маршрута (AAUDIO_ERROR_DISCONNECTED)
+    static void errorCallback(
+        AAudioStream* stream, void* userData, aaudio_result_t error);
+
     AAudioStream* captureStream_{nullptr};
     AAudioStream* playbackStream_{nullptr};
 
