@@ -104,7 +104,9 @@ void FastFft::process(const float* pcmInput, size_t count, float micRms, float o
         }
 
         size_t binCount = endBin - startBin + 1;
-        rawBands[i] = (sumMag / static_cast<float>(binCount)) * BANDS[i].gain;
+        // ERR-13: Масштабирование на (N * 0.25) с учетом когерентного усиления окна Ханна
+        constexpr float fftNormFactor = static_cast<float>(N) * 0.25f;
+        rawBands[i] = (sumMag / (static_cast<float>(binCount) * fftNormFactor)) * BANDS[i].gain;
     }
 
     constexpr float alpha_attack = 0.65f;
