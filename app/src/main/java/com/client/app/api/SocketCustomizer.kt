@@ -36,6 +36,17 @@ class TunedSocketFactory(
                 val nativeFd = getNativeFdInt(fd)
                 if (nativeFd > 0) {
                     nativeBridge.tuneNativeSocket(nativeFd)
+                } else {
+                    // Безопасный фолбэк: дубликат закрывается детерминированно
+                    // сразу после применения setsockopt через pfd.close() (без detachFd)
+                    runCatching {
+                        ParcelFileDescriptor.dup(fd).use { pfd ->
+                            val dupFd = pfd.fd
+                            if (dupFd > 0) {
+                                nativeBridge.tuneNativeSocket(dupFd)
+                            }
+                        }
+                    }
                 }
             }
         }.onFailure {
@@ -84,10 +95,6 @@ class TunedSocketFactory(
             val descriptorField = FileDescriptor::class.java.getDeclaredField("descriptor")
             descriptorField.isAccessible = true
             descriptorField.getInt(fd)
-        }.getOrElse {
-            runCatching {
-                ParcelFileDescriptor.dup(fd).use { it.detachFd() }
-            }.getOrDefault(-1)
-        }
+        }.getOrElse { -1 }
     }
 }
