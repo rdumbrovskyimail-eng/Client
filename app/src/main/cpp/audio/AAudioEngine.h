@@ -84,6 +84,9 @@ private:
     // E-25: Статический рабочий буфер для сетевых чанков
     std::vector<int16_t> resampleScratchBuffer_;
 
+    // ERR-04: Предвыделенный буфер децимации для исключения Stack Buffer Overflow
+    std::vector<int16_t> captureDecimateBuffer_;
+
     PolyphaseResampler24To16 resampler24To16_;
     LinearResampler24To48 resampler24To48_;
     Decimator48To16 captureDecimator48To16_;
