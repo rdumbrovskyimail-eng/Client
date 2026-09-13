@@ -75,6 +75,9 @@ class ForvoRepository @Inject constructor(
         }
     }
 
+    // Ошибка №13 [PERF]: Единый контролируемый скоуп репозитория с SupervisorJob для исключения утечек корутин
+    private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(8, TimeUnit.SECONDS)
@@ -89,7 +92,7 @@ class ForvoRepository @Inject constructor(
     val quota: StateFlow<ForvoQuota> = _quota.asStateFlow()
 
     init {
-        CoroutineScope(Dispatchers.IO).launch {
+        repositoryScope.launch {
             dataStore.data.collect { prefs ->
                 val currentDay = calculateForvoDayId(Instant.now())
                 val savedDay = prefs[KEY_QUOTA_DAY] ?: ""
@@ -186,9 +189,9 @@ class ForvoRepository @Inject constructor(
         }
     }
 
-    // E-17, E-18: Персистентная регистрация успешного выполнения запроса
+    // Ошибка №13 [PERF]: Запуск в рамках контролируемого repositoryScope
     fun registerSuccessfulPlayback() {
-        CoroutineScope(Dispatchers.IO).launch {
+        repositoryScope.launch {
             val currentDay = calculateForvoDayId(Instant.now())
             dataStore.edit { prefs ->
                 val savedDay = prefs[KEY_QUOTA_DAY] ?: ""
