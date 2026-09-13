@@ -49,7 +49,7 @@ float noise3D(float3 x) {
     float b = hash3D(p + float3(1.0, 0.0, 0.0));
     float c = hash3D(p + float3(0.0, 1.0, 0.0));
     float d = hash3D(p + float3(1.0, 1.0, 0.0));
-    float e = hash3D(p + float3(0.0, 0.0, 1.0));
+    e = hash3D(p + float3(0.0, 0.0, 1.0));
     float f = hash3D(p + float3(1.0, 0.0, 1.0));
     float g = hash3D(p + float3(0.0, 1.0, 1.0));
     float h = hash3D(p + float3(1.0, 1.0, 1.0));
@@ -184,11 +184,12 @@ private fun AgslOrbInternal(
     )
 
     val infiniteTransition = rememberInfiniteTransition(label = "time_loop")
+    // Ошибка №17 [PERF]: Задаем строго 50 полных периодов 2*PI во избежание визуального скачка геометрии каждые 200 секунд
     val timeParam by infiniteTransition.animateFloat(
         initialValue = 0f,
-        targetValue = 1000f,
+        targetValue = 6.2831853f * 50f, // ровно 50 периодов 2*PI
         animationSpec = infiniteRepeatable(
-            animation = tween(200000, easing = LinearEasing),
+            animation = tween(100000, easing = LinearEasing),
             repeatMode = RepeatMode.Restart
         ),
         label = "time"
