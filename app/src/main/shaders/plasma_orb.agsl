@@ -109,7 +109,7 @@ half4 main(float2 fragCoord) {
     }
 
     float dither = (fract(sin(dot(fragCoord, float2(12.9898, 78.233))) * 43758.5453) - 0.5) / 255.0;
-    finalColor += dither;
+    finalColor += float3(dither);
 
     return half4(finalColor, alpha);
 }
