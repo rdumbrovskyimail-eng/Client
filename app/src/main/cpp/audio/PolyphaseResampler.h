@@ -84,6 +84,7 @@ private:
 
 /**
  * E-07: Полифазный дециматор 3:1 (48 кГц -> 16 кГц) для входящего микрофонного тракта.
+ * Защищен от переполнения буфера параметром maxOutFrames и безопасным сдвигом истории.
  */
 class Decimator48To16 {
 public:
@@ -93,8 +94,8 @@ public:
         std::memset(history_, 0, sizeof(history_));
     }
 
-    size_t process(const int16_t* in, size_t inFrames, int16_t* out) {
-        if (inFrames == 0) return 0;
+    size_t process(const int16_t* in, size_t inFrames, int16_t* out, size_t maxOutFrames) {
+        if (inFrames == 0 || maxOutFrames == 0) return 0;
 
         static const int32_t COEFFS[12] = {
             -180, -320, 450, 2400, 5800, 8234, 8234, 5800, 2400, 450, -320, -180
@@ -102,7 +103,7 @@ public:
 
         size_t outCount = 0;
         for (size_t i = 0; i < inFrames; i += 3) {
-            if (i + 3 > inFrames) break;
+            if (i + 3 > inFrames || outCount >= maxOutFrames) break;
 
             int64_t acc = 0;
             for (size_t t = 0; t < TAPS; ++t) {
@@ -113,7 +114,10 @@ public:
         }
 
         size_t toKeep = std::min(inFrames, TAPS);
-        std::memcpy(history_, in + inFrames - toKeep, toKeep * sizeof(int16_t));
+        if (toKeep < TAPS) {
+            std::memmove(history_, history_ + toKeep, (TAPS - toKeep) * sizeof(int16_t));
+        }
+        std::memcpy(history_ + (TAPS - toKeep), in + inFrames - toKeep, toKeep * sizeof(int16_t));
         return outCount;
     }
 
