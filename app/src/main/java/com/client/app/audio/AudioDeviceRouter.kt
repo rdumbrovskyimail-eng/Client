@@ -65,22 +65,39 @@ class AudioDeviceRouter @Inject constructor(
         audioManager.mode = AudioManager.MODE_NORMAL
     }
 
+    // Ошибка №31 [AUDIO/HAL]: Корректный селектор Bluetooth-устройств с поддержкой A2DP и API 31+
     fun evaluateActiveRoute() {
         val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
 
-        // E-20: Исключаем A2DP из голосовой связи (принимаем строго BLE или SCO гарнитуры)
-        val btVoiceDevice = devices.firstOrNull { dev ->
-            dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET || dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+        val commDevices = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.availableCommunicationDevices
+        } else {
+            emptyList()
+        }
+
+        val btVoiceDevice = commDevices.firstOrNull { dev ->
+            dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+            dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+        } ?: devices.firstOrNull { dev ->
+            dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+            dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
         }
 
         val newProfile = if (btVoiceDevice != null && bindBluetoothCommunication(btVoiceDevice)) {
+            val sampleRate = when (btVoiceDevice.type) {
+                AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> 48000
+                AudioDeviceInfo.TYPE_BLE_HEADSET -> 24000
+                else -> 16000
+            }
             RouteProfile(
                 path = AudioRoutePath.CMF_BUDS_WIRELESS,
-                sampleRateOut = if (btVoiceDevice.type == AudioDeviceInfo.TYPE_BLE_HEADSET) 24000 else 16000,
+                sampleRateOut = sampleRate,
                 leadInBufferSizeFrames = 260 * 16,
                 vadThresholdStart = 0.55f,
                 vadThresholdEnd = 0.30f,
-                deviceName = btVoiceDevice.productName.toString().ifBlank { "Bluetooth Headset" }
+                deviceName = btVoiceDevice.productName.toString().ifBlank { "CMF Buds / BT Headset" }
             )
         } else {
             bindSpeakerCommunication()
