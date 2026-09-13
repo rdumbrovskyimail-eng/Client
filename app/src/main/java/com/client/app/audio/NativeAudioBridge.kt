@@ -19,8 +19,12 @@ class NativeAudioBridge @Inject constructor() {
     external fun stopAudio()
     external fun setVolume(volume: Float)
     external fun setMicGain(gain: Float)
+
+    // E-09: Прямой массив для Zero-Allocation воспроизведения
+    external fun writePlaybackByteArray(pcmArray: ByteArray, offsetBytes: Int, lengthBytes: Int): Int
     external fun writePlaybackDirect(byteBuffer: ByteBuffer, offsetBytes: Int, lengthBytes: Int): Int
     external fun readCaptureDirect(byteBuffer: ByteBuffer, capacityBytes: Int): Int
+
     external fun flushPlayback()
     external fun triggerBargeInEarcon()
     external fun tuneNativeSocket(fd: Int)
