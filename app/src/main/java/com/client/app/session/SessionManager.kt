@@ -98,15 +98,14 @@ class SessionManager @Inject constructor(
 
         const val DEFAULT_SYSTEM_PROMPT =
             "Ты — интеллектуальный персональный голосовой ассистент с академической культурой речи. " +
-            "Отвечай лаконично, точно и структурированно, без шаблонных вводных слов. " +
-            "Говори естественным, уверенным тоном."
+            "Отвечай лаконично, точно и структурированно, без шаблонных вводных слов."
 
-        // ERR-013: Единый канонический default для Live-сессий
         const val DEFAULT_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 
-        // ERR-014: Строгий whitelist поддерживаемых Bidi Live моделей
-        private val SUPPORTED_LIVE_MODELS = setOf(
+        // E-14: Синхронизированный Whitelist моделей
+        val SUPPORTED_LIVE_MODELS = setOf(
             "gemini-3.1-flash-live-preview",
+            "gemini-2.5-flash-native-audio-latest",
             "gemini-2.5-flash-native-audio-preview-12-2025"
         )
 
@@ -141,6 +140,13 @@ class SessionManager @Inject constructor(
         observeEvents()
         observeAudio()
         observeBargeIn()
+        observeForvoQuota()
+    }
+
+    private fun observeForvoQuota() = scope.launch {
+        forvoRepo.quota.collect { q ->
+            _state.update { it.copy(forvoUsed = q.used, forvoLimit = q.limit) }
+        }
     }
 
     fun toggleConnection() = scope.launch {
@@ -159,11 +165,7 @@ class SessionManager @Inject constructor(
     }
 
     fun toggleMic() = scope.launch {
-        if (_state.value.isMicActive) {
-            stopMic(userInitiated = true)
-        } else {
-            startMic()
-        }
+        if (_state.value.isMicActive) stopMic(userInitiated = true) else startMic()
     }
 
     fun stopSession() = scope.launch {
@@ -222,7 +224,6 @@ class SessionManager @Inject constructor(
         if (wasMic) stopMic(userInitiated = false)
 
         forvoPlayer.play(url)
-        syncQuota()
 
         if (wasMic && userMicDesired && !userStopped) {
             delay(200)
@@ -262,7 +263,6 @@ class SessionManager @Inject constructor(
                 )
             })
         }
-        syncQuota()
 
         forvoRepo.lookupBatch(items.map { it.forvoQuery }, lang) { query, res ->
             _state.update { s ->
@@ -273,21 +273,14 @@ class SessionManager @Inject constructor(
                             audioUrl = res.pronunciation.mp3Url,
                             isLoading = false, notFound = false
                         )
-                        is ForvoResult.NotFound -> w.copy(isLoading = false, notFound = true)
                         else -> w.copy(isLoading = false, notFound = true)
                     }
                 })
             }
-            if (res is ForvoResult.QuotaExceeded) {
-                _state.update { it.copy(error = "Дневной лимит Forvo исчерпан (сброс в 22:00 UTC)") }
-            }
-            if (res is ForvoResult.NoApiKey) {
-                _state.update { it.copy(error = "Укажите Forvo API Key в настройках") }
-            }
         }
-        syncQuota()
     }
 
+    // E-13, E-32: Поддержка analyzerModel и проброс ошибок
     private suspend fun handleAttachments(text: String, uris: List<Uri>) {
         _state.update { it.copy(isAnalyzing = true, error = null) }
         try {
@@ -295,6 +288,7 @@ class SessionManager @Inject constructor(
             val prefs = dataStore.data.first()
             val apiKey = cryptoManager.decrypt(prefs[KEY_API]?.trim().orEmpty())
             val forvoOn = prefs[KEY_ENABLE_FORVO] ?: false
+            val analyzerModel = prefs[KEY_ANALYZER_MODEL] ?: VocabularyExtractor.DEFAULT_MODEL
 
             addMessage(ChatMessage(role = "user", text = text.ifEmpty { "Изучи приложенный документ." }, attachmentNames = processed.accepted))
 
@@ -302,27 +296,29 @@ class SessionManager @Inject constructor(
                 apiKey = apiKey,
                 images = processed.images,
                 plainText = processed.extractedText,
-                forLanguageLearning = forvoOn
+                forLanguageLearning = forvoOn,
+                model = analyzerModel
             )
 
-            if (result is AnalysisResult.Success) {
-                val a = result.analysis
-                if (forvoOn && a.vocabulary.isNotEmpty()) {
-                    scope.launch { resolveForvo(a.vocabulary, a.language) }
+            when (result) {
+                is AnalysisResult.Success -> {
+                    val a = result.analysis
+                    if (forvoOn && a.vocabulary.isNotEmpty()) {
+                        scope.launch { resolveForvo(a.vocabulary, a.language) }
+                    }
+                    if (!ensureLive()) return
+                    client.sendRealtimeText(a.fullText.take(15000))
                 }
-                if (!ensureLive()) return
-                client.sendRealtimeText(a.fullText.take(15000))
+                is AnalysisResult.Failure -> {
+                    _state.update { it.copy(error = "Ошибка анализа: ${result.reason}") }
+                }
             }
         } catch (e: Exception) {
             logger.e("Attachment error", e)
+            _state.update { it.copy(error = "Сбой обработки файлов: ${e.localizedMessage}") }
         } finally {
             _state.update { it.copy(isAnalyzing = false) }
         }
-    }
-
-    private fun syncQuota() {
-        val q = forvoRepo.quota.value
-        _state.update { it.copy(forvoUsed = q.used, forvoLimit = q.limit) }
     }
 
     private suspend fun ensureLive(): Boolean {
@@ -340,6 +336,7 @@ class SessionManager @Inject constructor(
         } == true
     }
 
+    // E-11: Проверка результата старта аудио перед переводом состояния
     private suspend fun startInternal(resume: Boolean) {
         pendingGoAway = false
         val prefs = dataStore.data.first()
@@ -349,24 +346,22 @@ class SessionManager @Inject constructor(
             return
         }
 
-        // ERR-013 & ERR-014: Строгая валидация идентификатора модели по белому списку
         val rawModel = prefs[KEY_MODEL]?.trim().orEmpty()
-        val model = if (rawModel in SUPPORTED_LIVE_MODELS) {
-            rawModel
-        } else {
-            DEFAULT_LIVE_MODEL
-        }
-
+        val model = if (rawModel in SUPPORTED_LIVE_MODELS) rawModel else DEFAULT_LIVE_MODEL
         val voice = prefs[KEY_VOICE]?.ifBlank { null } ?: "Charon"
 
         audioEngine.setVolume(prefs[KEY_VOLUME] ?: 1.0f)
         audioEngine.setMicGain(prefs[KEY_MIC_GAIN] ?: 1.0f)
 
+        if (!audioEngine.start()) {
+            _state.update { it.copy(error = "Сбой инициализации аудиодрайвера", link = LinkState.IDLE) }
+            return
+        }
+
         _state.update {
             it.copy(link = if (resume) LinkState.RECONNECTING else LinkState.CONNECTING, error = null)
         }
 
-        audioEngine.start()
         startForegroundService()
 
         if (!resume && cachedContentId == null) {
@@ -558,7 +553,6 @@ class SessionManager @Inject constructor(
                                     })
                                 }
                             }
-                            syncQuota()
                         }
                     }
                 }
