@@ -49,9 +49,6 @@ class CryptoManager @Inject constructor() {
         return keyGenerator.generateKey()
     }
 
-    /**
-     * Безопасное аппаратное шифрование: при сбое выбрасывает исключение, запрещая сохранение плейнтекста.
-     */
     fun encrypt(plainText: String): String {
         if (plainText.isBlank()) return ""
 
@@ -69,14 +66,13 @@ class CryptoManager @Inject constructor() {
         return Base64.encodeToString(combined, Base64.NO_WRAP)
     }
 
+    // E-19: Возврат пустой строки при сбое дешифрования во избежание передачи шифротекста в API
     fun decrypt(encryptedText: String): String {
         if (encryptedText.isBlank()) return ""
 
         return try {
             val combined = Base64.decode(encryptedText, Base64.NO_WRAP)
-            if (combined.size < MIN_CIPHERTEXT_LENGTH_BYTES) {
-                return encryptedText // Плавная миграция старых данных
-            }
+            if (combined.size < MIN_CIPHERTEXT_LENGTH_BYTES) return ""
 
             val iv = combined.copyOfRange(0, GCM_IV_LENGTH_BYTES)
             val cipherText = combined.copyOfRange(GCM_IV_LENGTH_BYTES, combined.size)
@@ -85,10 +81,9 @@ class CryptoManager @Inject constructor() {
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv))
 
-            val decrypted = cipher.doFinal(cipherText)
-            String(decrypted, Charsets.UTF_8)
+            String(cipher.doFinal(cipherText), Charsets.UTF_8)
         } catch (_: Exception) {
-            encryptedText
+            ""
         }
     }
 }
