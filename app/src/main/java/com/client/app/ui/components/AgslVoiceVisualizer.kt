@@ -49,7 +49,7 @@ float noise3D(float3 x) {
     float b = hash3D(p + float3(1.0, 0.0, 0.0));
     float c = hash3D(p + float3(0.0, 1.0, 0.0));
     float d = hash3D(p + float3(1.0, 1.0, 0.0));
-    e = hash3D(p + float3(0.0, 0.0, 1.0));
+    float e = hash3D(p + float3(0.0, 0.0, 1.0));
     float f = hash3D(p + float3(1.0, 0.0, 1.0));
     float g = hash3D(p + float3(0.0, 1.0, 1.0));
     float h = hash3D(p + float3(1.0, 1.0, 1.0));
@@ -98,7 +98,7 @@ half4 main(float2 fragCoord) {
     float3 ro = float3(0.0, 0.0, -2.4);
     float3 rd = normalize(float3(uv, 1.25));
 
-    // Ошибка №16 [DEFECT]: Устранение варп-дивергенции на Adreno 740 (Wave64): ровно 16 фиксированных шагов без раннего break
+    // Устранение варп-дивергенции на Adreno 740 (Wave64): ровно 16 фиксированных шагов без раннего break
     float t = 0.0;
     for (int i = 0; i < 16; i++) {
         float3 p = ro + rd * t;
@@ -120,7 +120,7 @@ half4 main(float2 fragCoord) {
         float3 n = calcNormal(p);
         float3 lightDir = normalize(float3(0.45, 0.75, -1.0));
         float diff = max(dot(n, lightDir), 0.0);
-        float h = normalize(lightDir - rd);
+        float3 h = normalize(lightDir - rd);
         float spec = pow(max(dot(n, h), 0.0), 28.0) * 0.45;
         float fresnel = pow(1.0 - max(dot(-rd, n), 0.0), 2.8);
         float sss = pow(max(dot(rd, lightDir), 0.0), 2.2) * 0.55;
@@ -133,7 +133,7 @@ half4 main(float2 fragCoord) {
     }
 
     float dither = (fract(sin(dot(fragCoord, float2(12.9898, 78.233))) * 43758.5453) - 0.5) / 255.0;
-    finalColor += dither;
+    finalColor += float3(dither);
 
     return half4(finalColor, alpha);
 }
@@ -184,7 +184,6 @@ private fun AgslOrbInternal(
     )
 
     val infiniteTransition = rememberInfiniteTransition(label = "time_loop")
-    // Ошибка №17 [PERF]: Задаем строго 50 полных периодов 2*PI во избежание визуального скачка геометрии каждые 200 секунд
     val timeParam by infiniteTransition.animateFloat(
         initialValue = 0f,
         targetValue = 6.2831853f * 50f, // ровно 50 периодов 2*PI
