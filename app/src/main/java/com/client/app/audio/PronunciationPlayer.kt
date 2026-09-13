@@ -38,19 +38,13 @@ class PronunciationPlayer @Inject constructor(
                 currentState = PlayerState.PREPARING
             }
 
-            forvoRepo.registerPlayback()
             val mp = MediaPlayer()
-
-            synchronized(lock) {
-                mediaPlayer = mp
-            }
+            synchronized(lock) { mediaPlayer = mp }
 
             var isResumed = false
             fun finish(success: Boolean) {
                 synchronized(lock) {
-                    if (mediaPlayer == mp) {
-                        releasePlayerInternal()
-                    }
+                    if (mediaPlayer == mp) releasePlayerInternal()
                 }
                 if (!isResumed && cont.isActive) {
                     isResumed = true
@@ -61,7 +55,6 @@ class PronunciationPlayer @Inject constructor(
             cont.invokeOnCancellation {
                 synchronized(lock) {
                     if (mediaPlayer == mp) {
-                        // Безопасное снятие коллбэков исключает дедлоки в mediaserver
                         mp.setOnPreparedListener(null)
                         mp.setOnCompletionListener(null)
                         mp.setOnErrorListener(null)
@@ -86,7 +79,9 @@ class PronunciationPlayer @Inject constructor(
                         }
                         currentState = PlayerState.PLAYING
 
-                        // Защита от акустического клиппинга: Peak Limiter вместо сырого LoudnessEnhancer
+                        // E-18: Списание квоты происходит ТОЛЬКО при успешной загрузке
+                        forvoRepo.registerSuccessfulPlayback()
+
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                             runCatching {
                                 val config = DynamicsProcessing.Config.Builder(
@@ -118,9 +113,7 @@ class PronunciationPlayer @Inject constructor(
     }
 
     fun stop() {
-        synchronized(lock) {
-            releasePlayerInternal()
-        }
+        synchronized(lock) { releasePlayerInternal() }
     }
 
     private fun releasePlayerInternal() {
