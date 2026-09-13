@@ -67,7 +67,7 @@ class VocabularyExtractor @Inject constructor(
         images: List<ByteArray>,
         plainText: String,
         forLanguageLearning: Boolean,
-        model: String = DEFAULT_MODEL, // E-13: Поддержка передаваемой модели
+        model: String = DEFAULT_MODEL,
         targetLanguageHint: String? = null
     ): AnalysisResult = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) return@withContext AnalysisResult.Failure("Нет Gemini API Key")
@@ -230,8 +230,14 @@ class VocabularyExtractor @Inject constructor(
             }?.joinToString("")?.trim()
             ?: return AnalysisResult.Failure("Отсутствует текстовая часть ответа")
 
+        // Ошибка №4 [DEFECT]: Регулярное выражение для надежного снятия любых markdown-ограждений
+        val cleanedJson = payload
+            .replace(Regex("^```(?:json)?\\s*", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\s*```$"), "")
+            .trim()
+
         val obj = runCatching {
-            json.parseToJsonElement(payload.removeSurrounding("```json", "```").trim()).jsonObject
+            json.parseToJsonElement(cleanedJson).jsonObject
         }.getOrElse {
             return AnalysisResult.Failure("Модель вернула невалидный JSON")
         }
