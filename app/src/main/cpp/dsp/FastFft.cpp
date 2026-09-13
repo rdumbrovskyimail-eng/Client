@@ -56,8 +56,9 @@ void FastFft::computeFft(float* real, float* imag, size_t n) {
     }
 }
 
-void FastFft::process(const float* pcmInput, size_t count, float micRms, float outRms) {
+void FastFft::process(const float* pcmInput, size_t count, float micRms, float outRms, int32_t sampleRate) {
     if (count < N) return;
+    if (sampleRate <= 0) sampleRate = audio::SAMPLE_RATE_GEMINI_OUT;
 
     alignas(16) float real[N] = {0.0f};
     alignas(16) float imag[N] = {0.0f};
@@ -69,34 +70,42 @@ void FastFft::process(const float* pcmInput, size_t count, float micRms, float o
 
     computeFft(real, imag, N);
 
+    // ERR-09: Динамический маппинг физических частот (Гц) в индексы бинов БПФ
+    auto freqToBin = [sampleRate](float freq) -> size_t {
+        float binF = std::round((freq * static_cast<float>(N)) / static_cast<float>(sampleRate));
+        return static_cast<size_t>(std::clamp(binF, 1.0f, static_cast<float>(N / 2 - 1)));
+    };
+
+    struct BandDef {
+        float lowFreq;
+        float highFreq;
+        float gain;
+    };
+
+    // Калиброванные целевые психоакустические диапазоны и весовые коэффициенты
+    static const BandDef BANDS[audio::SPECTRUM_BANDS] = {
+        {   60.0f,   150.0f, 1.50f }, // Sub-Bass
+        {  150.0f,   350.0f, 1.60f }, // Bass
+        {  350.0f,  2000.0f, 2.16f }, // Mid
+        { 2000.0f,  5000.0f, 2.56f }, // Presence
+        { 5000.0f, 12000.0f, 4.44f }  // Air
+    };
+
     float rawBands[audio::SPECTRUM_BANDS] = {0.0f};
 
-    // Sub-Bass (60-150 Гц) -> Бин 1
-    rawBands[0] = std::sqrt(real[1] * real[1] + imag[1] * imag[1]) * 1.5f;
+    for (size_t i = 0; i < audio::SPECTRUM_BANDS; ++i) {
+        size_t startBin = freqToBin(BANDS[i].lowFreq);
+        size_t endBin = freqToBin(BANDS[i].highFreq);
+        if (endBin < startBin) endBin = startBin;
 
-    // Bass (150-350 Гц) -> Бины 2-3
-    for (size_t b = 2; b <= 3; ++b) {
-        rawBands[1] += std::sqrt(real[b] * real[b] + imag[b] * imag[b]);
-    }
-    rawBands[1] *= 0.8f;
+        float sumMag = 0.0f;
+        for (size_t b = startBin; b <= endBin; ++b) {
+            sumMag += std::sqrt(real[b] * real[b] + imag[b] * imag[b]);
+        }
 
-    // Mid (350-2000 Гц) -> Бины 4-21
-    for (size_t b = 4; b <= 21; ++b) {
-        rawBands[2] += std::sqrt(real[b] * real[b] + imag[b] * imag[b]);
+        size_t binCount = endBin - startBin + 1;
+        rawBands[i] = (sumMag / static_cast<float>(binCount)) * BANDS[i].gain;
     }
-    rawBands[2] *= 0.12f;
-
-    // Presence (2000-5000 Гц) -> Бины 22-53
-    for (size_t b = 22; b <= 53; ++b) {
-        rawBands[3] += std::sqrt(real[b] * real[b] + imag[b] * imag[b]);
-    }
-    rawBands[3] *= 0.08f;
-
-    // Air (5000-12000 Гц) -> Бины 54-127
-    for (size_t b = 54; b < 128; ++b) {
-        rawBands[4] += std::sqrt(real[b] * real[b] + imag[b] * imag[b]);
-    }
-    rawBands[4] *= 0.06f;
 
     constexpr float alpha_attack = 0.65f;
     constexpr float alpha_decay = 0.12f;
@@ -117,14 +126,12 @@ void FastFft::process(const float* pcmInput, size_t count, float micRms, float o
     pool_[writeIdx_].micRms = micRms;
     pool_[writeIdx_].outRms = outRms;
 
-    // Неделимая публикация свежего буфера по алгоритму Андерсона:
-    // Писатель передает writeIdx_ в readyIdx_ и забирает освободившийся слот
+    // Неделимая публикация свежего буфера по алгоритму Андерсона
     writeIdx_ = readyIdx_.exchange(writeIdx_, std::memory_order_acq_rel);
 }
 
 void FastFft::getLatestSnapshot(SpectrumSnapshot& out) const {
-    // Неделимое получение свежего буфера по алгоритму Андерсона:
-    // Читатель забирает readyIdx_ в readIdx_ и возвращает старый прочитанный слот в пул
+    // Неделимое получение свежего буфера по алгоритму Андерсона
     readIdx_ = readyIdx_.exchange(readIdx_, std::memory_order_acq_rel);
     out = pool_[readIdx_];
 }
