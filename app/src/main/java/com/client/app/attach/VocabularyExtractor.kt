@@ -19,14 +19,8 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.coroutineContext
 
-/* ═══════════════════════════════════════════════════════════════════════════
- *  МОДЕЛИ ДАННЫХ ИЗВЛЕЧЕНИЯ ЛЕКСИКИ
- * ═══════════════════════════════════════════════════════════════════════════ */
-
 data class VocabItem(
-    /** Словарная форма в норме языка (например, "der Tisch") */
     val lemma: String,
-    /** Очищенная форма для поиска в Forvo (например, "Tisch") */
     val forvoQuery: String,
     val translation: String? = null,
     val partOfSpeech: String? = null,
@@ -34,13 +28,11 @@ data class VocabItem(
 )
 
 data class MaterialAnalysis(
-    /** ISO 639-1 код языка материала */
     val language: String,
     val title: String?,
     val fullText: String,
     val summary: String?,
     val vocabulary: List<VocabItem>,
-    /** Список предупреждений (например, о страницах, которые не удалось разобрать) */
     val warnings: List<String> = emptyList()
 )
 
@@ -55,12 +47,8 @@ class VocabularyExtractor @Inject constructor(
 ) {
     companion object {
         private const val ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
-
-        /** Общедоступная проверенная модель с глубоким OCR по умолчанию */
         const val DEFAULT_MODEL = "gemini-2.5-flash"
-        /** Проверенный вседоступный fallback */
         private const val FALLBACK_MODEL = "gemini-2.5-flash"
-
         private const val MAX_IMAGES_PER_CALL = 4
         private const val MAX_VOCAB = 250
     }
@@ -79,7 +67,7 @@ class VocabularyExtractor @Inject constructor(
         images: List<ByteArray>,
         plainText: String,
         forLanguageLearning: Boolean,
-        model: String = DEFAULT_MODEL,
+        model: String = DEFAULT_MODEL, // E-13: Поддержка передаваемой модели
         targetLanguageHint: String? = null
     ): AnalysisResult = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) return@withContext AnalysisResult.Failure("Нет Gemini API Key")
@@ -87,9 +75,7 @@ class VocabularyExtractor @Inject constructor(
             return@withContext AnalysisResult.Failure("Вложение пустое")
         }
 
-        val batches = if (images.isEmpty()) listOf(emptyList())
-        else images.chunked(MAX_IMAGES_PER_CALL)
-
+        val batches = if (images.isEmpty()) listOf(emptyList()) else images.chunked(MAX_IMAGES_PER_CALL)
         val merged = mutableListOf<MaterialAnalysis>()
         val failures = mutableListOf<String>()
         var effectiveModel = model.ifBlank { DEFAULT_MODEL }
@@ -103,29 +89,20 @@ class VocabularyExtractor @Inject constructor(
             when (val r = callOnce(apiKey, effectiveModel, batch, textPart, forLanguageLearning, targetLanguageHint)) {
                 is AnalysisResult.Success -> {
                     merged.add(r.analysis)
-                    if (r.modelUsed.isNotBlank()) {
-                        effectiveModel = r.modelUsed
-                    }
+                    if (r.modelUsed.isNotBlank()) effectiveModel = r.modelUsed
                 }
-                is AnalysisResult.Failure -> {
-                    failures.add("$pageRange: ${r.reason}")
-                }
+                is AnalysisResult.Failure -> failures.add("$pageRange: ${r.reason}")
             }
         }
 
         if (merged.isEmpty()) {
-            return@withContext AnalysisResult.Failure(
-                "Не удалось извлечь содержимое:\n${failures.joinToString("\n")}"
-            )
+            return@withContext AnalysisResult.Failure("Не удалось извлечь содержимое:\n${failures.joinToString("\n")}")
         }
 
-        // Дедупликация лексики по forvoQuery без учёта регистра
         val seen = LinkedHashMap<String, VocabItem>()
         merged.flatMap { it.vocabulary }.forEach { item ->
             val key = item.forvoQuery.lowercase().trim()
-            if (key.isNotEmpty() && !seen.containsKey(key)) {
-                seen[key] = item
-            }
+            if (key.isNotEmpty() && !seen.containsKey(key)) seen[key] = item
         }
 
         AnalysisResult.Success(
@@ -133,8 +110,7 @@ class VocabularyExtractor @Inject constructor(
                 language = merged.firstOrNull { it.language.isNotBlank() }?.language ?: "de",
                 title = merged.firstNotNullOfOrNull { it.title?.takeIf(String::isNotBlank) },
                 fullText = merged.joinToString("\n\n") { it.fullText }.trim(),
-                summary = merged.mapNotNull { it.summary?.takeIf(String::isNotBlank) }
-                    .joinToString(" ").takeIf { it.isNotBlank() },
+                summary = merged.mapNotNull { it.summary?.takeIf(String::isNotBlank) }.joinToString(" ").takeIf { it.isNotBlank() },
                 vocabulary = seen.values.take(MAX_VOCAB),
                 warnings = failures
             )
@@ -159,9 +135,7 @@ class VocabularyExtractor @Inject constructor(
                 put("responseSchema", schema(forLanguageLearning))
                 put("temperature", 0.1)
                 put("maxOutputTokens", 32768)
-                if (!isFallbackAttempt) {
-                    put("mediaResolution", "MEDIA_RESOLUTION_HIGH")
-                }
+                if (!isFallbackAttempt) put("mediaResolution", "MEDIA_RESOLUTION_HIGH")
             })
 
             put("safetySettings", buildJsonArray {
@@ -197,9 +171,7 @@ class VocabularyExtractor @Inject constructor(
                     }
                     sink.writeUtf8("""}},""")
                 }
-                if (textJson != null) {
-                    sink.writeUtf8("""{"text":$textJson},""")
-                }
+                if (textJson != null) sink.writeUtf8("""{"text":$textJson},""")
                 sink.writeUtf8("""{"text":$instructionJson}]}],""")
                 sink.writeUtf8(configRemainderJson)
             }
@@ -207,20 +179,15 @@ class VocabularyExtractor @Inject constructor(
 
         try {
             coroutineContext.ensureActive()
-            val req = Request.Builder()
-                .url(url)
-                .post(streamingBody)
-                .build()
+            val req = Request.Builder().url(url).post(streamingBody).build()
 
             client.newCall(req).execute().use { resp ->
                 val raw = resp.body?.string().orEmpty()
-
-                // Откат при отсутствии модели (404) или несовместимости ее параметров (400)
-                val isModelOrParamUnsupported = resp.code == 404 || 
+                val isModelOrParamUnsupported = resp.code == 404 ||
                     (resp.code == 400 && (raw.contains("mediaResolution", ignoreCase = true) || raw.contains("not supported", ignoreCase = true)))
 
                 if (isModelOrParamUnsupported && !isFallbackAttempt && modelId != FALLBACK_MODEL) {
-                    logger.w("VocabularyExtractor: $modelId вернул ${resp.code} (несовместимость параметров), откат на $FALLBACK_MODEL")
+                    logger.w("VocabularyExtractor: $modelId вернул ${resp.code}, откат на $FALLBACK_MODEL")
                     return@withContext callOnce(
                         apiKey, FALLBACK_MODEL, images, plainText,
                         forLanguageLearning, langHint, isFallbackAttempt = true
@@ -235,11 +202,7 @@ class VocabularyExtractor @Inject constructor(
                     return@withContext AnalysisResult.Failure("Ошибка (${resp.code}): ${msg.orEmpty()}".trim())
                 }
                 val parsed = parseResponse(raw)
-                if (parsed is AnalysisResult.Success) {
-                    parsed.copy(modelUsed = modelId)
-                } else {
-                    parsed
-                }
+                if (parsed is AnalysisResult.Success) parsed.copy(modelUsed = modelId) else parsed
             }
         } catch (e: Exception) {
             coroutineContext.ensureActive()
@@ -264,9 +227,7 @@ class VocabularyExtractor @Inject constructor(
                 val o = p.jsonObject
                 if (o["thought"]?.jsonPrimitive?.booleanOrNull == true) null
                 else o["text"]?.jsonPrimitive?.contentOrNull
-            }
-            ?.joinToString("")
-            ?.trim()
+            }?.joinToString("")?.trim()
             ?: return AnalysisResult.Failure("Отсутствует текстовая часть ответа")
 
         val obj = runCatching {
@@ -281,8 +242,7 @@ class VocabularyExtractor @Inject constructor(
             if (lemma.isEmpty()) return@mapNotNull null
             VocabItem(
                 lemma = lemma,
-                forvoQuery = o["forvo_query"]?.jsonPrimitive?.contentOrNull
-                    ?.trim()?.takeIf { it.isNotEmpty() } ?: lemma,
+                forvoQuery = o["forvo_query"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() } ?: lemma,
                 translation = o["translation"]?.jsonPrimitive?.contentOrNull,
                 partOfSpeech = o["part_of_speech"]?.jsonPrimitive?.contentOrNull,
                 example = o["example"]?.jsonPrimitive?.contentOrNull
@@ -291,8 +251,7 @@ class VocabularyExtractor @Inject constructor(
 
         return AnalysisResult.Success(
             MaterialAnalysis(
-                language = obj["language"]?.jsonPrimitive?.contentOrNull
-                    ?.lowercase()?.take(2).orEmpty().ifBlank { "de" },
+                language = obj["language"]?.jsonPrimitive?.contentOrNull?.lowercase()?.take(2).orEmpty().ifBlank { "de" },
                 title = obj["title"]?.jsonPrimitive?.contentOrNull,
                 fullText = obj["full_text"]?.jsonPrimitive?.contentOrNull.orEmpty(),
                 summary = obj["summary"]?.jsonPrimitive?.contentOrNull,
@@ -312,28 +271,19 @@ class VocabularyExtractor @Inject constructor(
         if (!forLanguageLearning) return base + "Поле vocabulary оставь пустым списком."
 
         return base + """
-            Это учебный языковой материал. Сформируй в поле vocabulary список ключевой
-            и наиболее значимой лексики и выражений из текста (важные существительные,
-            глаголы, прилагательные, устойчивые фразы и идиомы). Исключай элементарные
-            базовые слова уровня A1/A2, если они не несут особого контекстного смысла.
-            Ограничься списком до 35–45 наиболее ценных для изучения лексических единиц.
-            
-            Требования к полям каждого элемента:
-            • lemma — словарная форма (для немецких существительных укажи артикль: "der Tisch", для глаголов — инфинитив).
-            • forvo_query — СТРОГО то же слово БЕЗ артикля и пометок, предназначенное для точного аудиопоиска в базе Forvo (например: "Tisch").
+            Это учебный языковой материал. Сформируй в поле vocabulary список ключевой лексики.
+            • lemma — словарная форма (с артиклем для сущ.: 'der Tisch').
+            • forvo_query — строго слово БЕЗ артикля ('Tisch').
             • translation — перевод на русский язык.
             • part_of_speech — часть речи.
-            • example — короткое предложение из текста с этим словом.
+            • example — короткое предложение из текста.
         """.trimIndent()
     }
 
     private fun schema(forLanguageLearning: Boolean): JsonObject = buildJsonObject {
         put("type", "OBJECT")
         put("properties", buildJsonObject {
-            put("language", buildJsonObject {
-                put("type", "STRING")
-                put("description", "ISO 639-1 код языка документа")
-            })
+            put("language", buildJsonObject { put("type", "STRING") })
             put("title", buildJsonObject { put("type", "STRING") })
             put("full_text", buildJsonObject { put("type", "STRING") })
             put("summary", buildJsonObject { put("type", "STRING") })
@@ -352,13 +302,6 @@ class VocabularyExtractor @Inject constructor(
                         add(JsonPrimitive("lemma"))
                         add(JsonPrimitive("forvo_query"))
                     })
-                    put("propertyOrdering", buildJsonArray {
-                        add(JsonPrimitive("lemma"))
-                        add(JsonPrimitive("forvo_query"))
-                        add(JsonPrimitive("translation"))
-                        add(JsonPrimitive("part_of_speech"))
-                        add(JsonPrimitive("example"))
-                    })
                 })
             })
         })
@@ -366,13 +309,6 @@ class VocabularyExtractor @Inject constructor(
             add(JsonPrimitive("language"))
             add(JsonPrimitive("full_text"))
             if (forLanguageLearning) add(JsonPrimitive("vocabulary"))
-        })
-        put("propertyOrdering", buildJsonArray {
-            add(JsonPrimitive("language"))
-            add(JsonPrimitive("title"))
-            add(JsonPrimitive("full_text"))
-            add(JsonPrimitive("summary"))
-            add(JsonPrimitive("vocabulary"))
         })
     }
 }
