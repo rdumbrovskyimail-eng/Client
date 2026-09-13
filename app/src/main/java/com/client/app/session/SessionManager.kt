@@ -110,7 +110,11 @@ class SessionManager @Inject constructor(
         private const val MAX_RECONNECT_ATTEMPTS = 5
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    // ERR-11: Изоляция необработанных исключений корутин от системного обработчика крашей ОС
+    private val coroutineExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        logger.e("Unhandled coroutine exception in SessionManager", throwable)
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + coroutineExceptionHandler)
     private val mutex = Mutex()
     private val micMutex = Mutex()
 
@@ -387,7 +391,7 @@ class SessionManager @Inject constructor(
             it.copy(link = if (resume) LinkState.RECONNECTING else LinkState.CONNECTING, error = null)
         }
 
-        // На Android 14+ запрещено дергать startForegroundService из фонового реконнекта
+        // ERR-09: На Android 14+ запрещено дергать startForegroundService из фонового реконнекта
         if (!resume) {
             startForegroundService()
         }
