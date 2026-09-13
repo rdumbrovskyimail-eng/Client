@@ -220,6 +220,7 @@ class SessionManager @Inject constructor(
         client.sendRealtimeText(trimmed)
     }
 
+    // Ошибка №15 [AUDIO]: Сброс монопольного буфера AAudio перед запуском системного MediaPlayer
     fun playForvo(word: ForvoWord) = scope.launch {
         val url = forvoRepo.freshUrl(word.query, word.language) ?: run {
             _state.update { it.copy(error = "Ссылка Forvo недоступна или устарела") }
@@ -229,6 +230,7 @@ class SessionManager @Inject constructor(
         val wasMic = _state.value.isMicActive
         if (wasMic) stopMic(userInitiated = false)
 
+        audioEngine.flushPlayback() // сбрасываем монопольный буфер AAudio, освобождая звуковой тракт
         forvoPlayer.play(url)
 
         if (wasMic && userMicDesired && !userStopped) {
