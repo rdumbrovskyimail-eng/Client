@@ -150,7 +150,17 @@ class ForvoRepository @Inject constructor(
                     val body = resp.body?.string().orEmpty()
                     if (!resp.isSuccessful) return@use ForvoResult.Failed("HTTP ${resp.code}")
 
+                    // Ошибка №6 [DEFECT]: Учитываем списание квоты сразу за совершенный поисковый запрос к API
+                    registerSuccessfulPlayback()
+
                     val root = json.parseToJsonElement(body).jsonObject
+
+                    // Ошибка №5 [DEFECT]: Валидация ошибок Forvo для исключения отравления Negative Cache (misses)
+                    if (root.containsKey("errors")) {
+                        val msg = root["errors"].toString()
+                        return@use ForvoResult.Failed("Forvo API: $msg")
+                    }
+
                     val item = root["items"]?.jsonArray?.firstOrNull()?.jsonObject
                     val mp3 = item?.get("pathmp3")?.jsonPrimitive?.contentOrNull?.replace("http://", "https://")
 
@@ -176,7 +186,7 @@ class ForvoRepository @Inject constructor(
         }
     }
 
-    // E-17, E-18: Персистентная регистрация успешного воспроизведения
+    // E-17, E-18: Персистентная регистрация успешного выполнения запроса
     fun registerSuccessfulPlayback() {
         CoroutineScope(Dispatchers.IO).launch {
             val currentDay = calculateForvoDayId(Instant.now())
