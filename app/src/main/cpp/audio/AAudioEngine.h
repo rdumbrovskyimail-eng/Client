@@ -5,6 +5,7 @@
 #include <atomic>
 #include <memory>
 #include <vector>
+#include <mutex>
 #include "AudioConstants.h"
 #include "LockFreeRingBuffer.h"
 #include "PolyphaseResampler.h"
@@ -20,7 +21,7 @@ public:
     bool start();
     void stop();
 
-    // E-09: Прямая запись звука без выделения DirectByteBuffer в JVM
+    // E-09, ERR-07: Потокобезопасная запись звука без выделения DirectByteBuffer и динамических реаллокаций
     size_t writePlaybackPcm(const int16_t* pcm, size_t frames);
     size_t readCapturePcm(int16_t* pcm, size_t maxFrames);
 
@@ -38,7 +39,7 @@ public:
     int32_t getActualCaptureSampleRate() const { return actualCaptureSampleRate_.load(std::memory_order_relaxed); }
     int32_t getActualPlaybackSampleRate() const { return actualPlaybackSampleRate_.load(std::memory_order_relaxed); }
 
-    // E-03: Возврат согласованного снимка спектра
+    // E-03, ERR-05: Возврат согласованного снимка спектра через Wait-Free алгоритм Андерсона
     void getSpectrumData(dsp::SpectrumSnapshot& outSnapshot);
 
 private:
@@ -81,7 +82,10 @@ private:
     std::vector<float> fftAccumulator_;
     size_t fftAccumulatorPos_{0};
 
-    // E-25: Статический рабочий буфер для сетевых чанков
+    // ERR-07: Мьютекс для защиты ресемплеров и скретчпада при смене маршрутов
+    std::mutex playbackWriteMutex_;
+
+    // ERR-07: Предвыделенный статический буфер ресемплинга на 16384 сэмпла (Zero-Allocation)
     std::vector<int16_t> resampleScratchBuffer_;
 
     // ERR-04: Предвыделенный буфер децимации для исключения Stack Buffer Overflow
