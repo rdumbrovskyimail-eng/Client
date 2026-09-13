@@ -20,8 +20,8 @@ AAudioEngine& AAudioEngine::getInstance() {
 AAudioEngine::AAudioEngine()
     : fftProcessor_(std::make_unique<dsp::FastFft>()),
       fftAccumulator_(FFT_SIZE, 0.0f),
-      resampleScratchBuffer_(BURST_10MS_24K * 4, 0),
-      captureDecimateBuffer_(4096, 0) {
+      resampleScratchBuffer_(16384, 0), // ERR-07: Однократное предвыделение 16К сэмплов (32 КБ)
+      captureDecimateBuffer_(4096, 0) {  // ERR-04: Однократное предвыделение 4К сэмплов (8 КБ)
     dsp::enableHardwareFtz();
 }
 
@@ -32,10 +32,14 @@ AAudioEngine::~AAudioEngine() {
 bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) {
     stop(); // E-12: Всегда полностью закрываем предыдущие потоки
 
-    resampler24To16_.reset();
-    resampler24To48_.reset();
-    captureDecimator48To16_.reset();
-    resetEarcon();
+    {
+        // ERR-07: Потокобезопасный сброс ресемплеров
+        std::lock_guard<std::mutex> lock(playbackWriteMutex_);
+        resampler24To16_.reset();
+        resampler24To48_.reset();
+        captureDecimator48To16_.reset();
+        resetEarcon();
+    }
 
     isBluetoothMode_.store(isBluetoothMode, std::memory_order_relaxed);
     playbackSampleRate_.store(targetPlaybackSampleRate, std::memory_order_relaxed);
@@ -157,10 +161,14 @@ void AAudioEngine::stop() {
         playbackStream_ = nullptr;
     }
 
-    resampler24To16_.reset();
-    resampler24To48_.reset();
-    captureDecimator48To16_.reset();
-    resetEarcon();
+    {
+        // ERR-07: Изолируем сброс ресемплеров от параллельных сетевых записей
+        std::lock_guard<std::mutex> lock(playbackWriteMutex_);
+        resampler24To16_.reset();
+        resampler24To48_.reset();
+        captureDecimator48To16_.reset();
+        resetEarcon();
+    }
 
     captureBuffer_.requestFlush();
     playbackBuffer_.requestFlush();
@@ -173,13 +181,17 @@ void AAudioEngine::stop() {
 size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
     if (frames == 0) return 0;
 
+    // ERR-07: Потокобезопасная блокировка вызова без динамических аллокаций памяти
+    std::lock_guard<std::mutex> lock(playbackWriteMutex_);
+
     int32_t actualRate = actualPlaybackSampleRate_.load(std::memory_order_acquire);
 
     // Bluetooth 16 кГц: 24 кГц -> 16 кГц
     if (actualRate == SAMPLE_RATE_BT_HFP) {
         const size_t neededCapacity = frames * 2;
-        if (resampleScratchBuffer_.size() < neededCapacity) {
-            resampleScratchBuffer_.resize(neededCapacity);
+        if (neededCapacity > resampleScratchBuffer_.size()) {
+            LOGE("writePlaybackPcm: frames %zu exceeds scratch buffer capacity", frames);
+            return 0;
         }
         size_t resampledFrames = resampler24To16_.process(
             pcm, frames, resampleScratchBuffer_.data()
@@ -190,8 +202,9 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
     // Bluetooth 48 кГц: 24 кГц -> 48 кГц
     if (actualRate == SAMPLE_RATE_BT_A2DP) {
         const size_t neededCapacity = frames * 2;
-        if (resampleScratchBuffer_.size() < neededCapacity) {
-            resampleScratchBuffer_.resize(neededCapacity);
+        if (neededCapacity > resampleScratchBuffer_.size()) {
+            LOGE("writePlaybackPcm: frames %zu exceeds scratch buffer capacity", frames);
+            return 0;
         }
         size_t resampledFrames = resampler24To48_.process(
             pcm, frames, resampleScratchBuffer_.data()
