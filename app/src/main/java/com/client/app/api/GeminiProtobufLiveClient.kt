@@ -1,9 +1,9 @@
-// >>> FILE: app/src/main/java/com/client/app/api/GeminiProtobufLiveClient.kt
 package com.client.app.api
 
 import android.util.Base64
 import com.client.app.audio.NativeAudioBridge
-import com.client.app.util.AppLogger
+import com.client.app.logging.AppLogManager
+import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
@@ -16,6 +16,7 @@ import kotlinx.serialization.json.*
 import okhttp3.*
 import okio.ByteString
 import java.io.ByteArrayOutputStream
+import java.net.InetAddress
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -26,19 +27,45 @@ import javax.net.SocketFactory
 @Singleton
 class GeminiProtobufLiveClient @Inject constructor(
     private val nativeBridge: NativeAudioBridge,
-    private val logger: AppLogger
+    private val logManager: AppLogManager
 ) {
     companion object {
         const val WS_HOST = "generativelanguage.googleapis.com"
         const val WS_PATH = "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         private const val MAX_QUEUE_BYTES = 64L * 1024
-        private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280 // 40 мс @ 16 кГц (640 сэмплов)
+        private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280
     }
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
+    // Трассировщик фаз соединения (DNS, TLS, Connect)
+    private val loggingEventListener = object : EventListener() {
+        override fun dnsStart(call: Call, domainName: String) {
+            logManager.net("OkHttp:DNS", "Старт резолва: $domainName")
+        }
+        override fun dnsEnd(call: Call, domainName: String, inetAddressList: List<InetAddress>) {
+            logManager.net("OkHttp:DNS", "Резолв успешен: $domainName -> $inetAddressList")
+        }
+        override fun connectStart(call: Call, inetSocketAddress: java.net.InetSocketAddress, proxy: java.net.Proxy) {
+            logManager.net("OkHttp:TCP", "Подключение к $inetSocketAddress...")
+        }
+        override fun connectEnd(call: Call, inetSocketAddress: java.net.InetSocketAddress, proxy: java.net.Proxy, protocol: Protocol?) {
+            logManager.net("OkHttp:TCP", "TCP соединение установлено ($protocol)")
+        }
+        override fun secureConnectStart(call: Call) {
+            logManager.net("OkHttp:TLS", "Старт TLS 1.3 хендшейка...")
+        }
+        override fun secureConnectEnd(call: Call, handshake: Handshake?) {
+            logManager.net("OkHttp:TLS", "TLS успешен: ${handshake?.tlsVersion()} [${handshake?.cipherSuite()}]")
+        }
+        override fun connectFailed(call: Call, inetSocketAddress: java.net.InetSocketAddress, protocol: Protocol?, ioe: java.io.IOException) {
+            logManager.e("OkHttp:Connect", "Сбой подключения к $inetSocketAddress: ${ioe.message}", ioe)
+        }
+    }
+
     private val httpClient = OkHttpClient.Builder()
-        .socketFactory(TunedSocketFactory(SocketFactory.getDefault(), nativeBridge, logger))
+        .eventListener(loggingEventListener)
+        .socketFactory(TunedSocketFactory(SocketFactory.getDefault(), nativeBridge, logManager))
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .writeTimeout(0, TimeUnit.MILLISECONDS)
@@ -77,6 +104,8 @@ class GeminiProtobufLiveClient @Inject constructor(
         val encodedKey = URLEncoder.encode(cfg.apiKey.trim(), "UTF-8")
         val url = "wss://$WS_HOST/$WS_PATH?key=$encodedKey"
 
+        logManager.net("WebSocket", "Инициализация соединения (epoch=$myEpoch, model=${cfg.model})")
+
         val req = Request.Builder()
             .url(url)
             .header("X-Accel-Buffering", "no")
@@ -86,35 +115,56 @@ class GeminiProtobufLiveClient @Inject constructor(
         webSocket = httpClient.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 if (myEpoch != epoch) { ws.close(1000, "stale"); return }
+                logManager.net("WebSocket:Open", "Соединение открыто! HTTP ${response.code} ${response.message}")
                 _events.tryEmit(GeminiEvent.Connected)
-                ws.send(buildSetupMessage(cfg))
+
+                val setupMsg = buildSetupMessage(cfg)
+                logManager.net("WebSocket:Tx", "Отправка сообщения setup", setupMsg)
+                ws.send(setupMsg)
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
-                if (myEpoch == epoch) parseServerJsonMessage(text, myEpoch)
+                if (myEpoch == epoch) {
+                    // Маскируем аудио в логах, чтобы не перегружать память
+                    val logSummary = if (text.contains("\"audio/pcm")) {
+                        "[Серверный чанк аудио ~${text.length} байт]"
+                    } else {
+                        text
+                    }
+                    logManager.net("WebSocket:Rx", logSummary)
+                    parseServerJsonMessage(text, myEpoch)
+                }
             }
 
             override fun onMessage(ws: WebSocket, bytes: ByteString) {
-                if (myEpoch == epoch) parseServerJsonMessage(bytes.utf8(), myEpoch)
+                if (myEpoch == epoch) {
+                    logManager.net("WebSocket:RxBinary", "Получено ${bytes.size()} байт")
+                    parseServerJsonMessage(bytes.utf8(), myEpoch)
+                }
             }
 
             override fun onClosing(ws: WebSocket, code: Int, reason: String) {
+                logManager.w("WebSocket:Closing", "Сервер инициировал закрытие сокета: $code / '$reason'")
                 ws.close(1000, null)
             }
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+                logManager.w("WebSocket:Closed", "Соединение закрыто (code=$code, reason='$reason', epoch=$myEpoch)")
                 if (myEpoch != epoch) return
                 isReady = false
                 _events.tryEmit(GeminiEvent.Disconnected(code, reason, myEpoch))
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                val httpCode = response?.code
+                val errBody = runCatching { response?.body?.string() }.getOrNull()
+                logManager.e("WebSocket:Failure", "Фатальный сбой сокета (HTTP $httpCode): ${t.localizedMessage}. Ответ: $errBody", t)
+
                 if (myEpoch != epoch) return
                 isReady = false
-                val http = response?.code
-                val fatal = http == 400 || http == 401 || http == 403
-                _events.tryEmit(GeminiEvent.Error("Сетевой сбой ($http): ${t.localizedMessage}", fatal))
-                _events.tryEmit(GeminiEvent.Disconnected(http ?: 1006, t.message.orEmpty(), myEpoch))
+                val fatal = httpCode == 400 || httpCode == 401 || httpCode == 403 || httpCode == 404
+                _events.tryEmit(GeminiEvent.Error("Сетевой сбой ($httpCode): ${t.localizedMessage}", fatal))
+                _events.tryEmit(GeminiEvent.Disconnected(httpCode ?: 1006, t.message.orEmpty(), myEpoch))
             }
         })
     }
@@ -136,10 +186,9 @@ class GeminiProtobufLiveClient @Inject constructor(
         sendAudioPayload(ws, payload)
     }
 
-    // Ошибка №23 [NET/PROTO]: Передача медиа-чанков строго через mediaChunks с объектом Blob
     private fun sendAudioPayload(ws: WebSocket, payload: ByteArray) {
         if (ws.queueSize() > MAX_QUEUE_BYTES) {
-            logger.w("GeminiProtobufLiveClient: Очередь сокета переполнена (${ws.queueSize()} байт), пропуск блока для исключения задержки")
+            logManager.w("WebSocket:Backpressure", "Очередь отправки переполнена (${ws.queueSize()} байт). Пропуск чанка.")
             return
         }
 
@@ -158,10 +207,12 @@ class GeminiProtobufLiveClient @Inject constructor(
         ws.send(jsonMessage)
     }
 
-    // Ошибка №24 [NET/PROTO]: Передача текста через clientContent с массивом turns и флагом turnComplete
     fun sendRealtimeText(text: String) {
         val ws = webSocket ?: return
-        if (!isReady || text.isBlank()) return
+        if (!isReady || text.isBlank()) {
+            logManager.w("WebSocket", "Попытка отправить текст при неактивном сокете: '$text'")
+            return
+        }
 
         val jsonMessage = buildJsonObject {
             putJsonObject("clientContent") {
@@ -177,15 +228,14 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
         }.toString()
 
+        logManager.net("WebSocket:TxText", "Отправка текста: '$text'", jsonMessage)
         ws.send(jsonMessage)
     }
 
-    // ERR-10 & Ошибка №25 [NET/PROTO]: Гарантированная выгрузка хвоста речи и сигнал turnComplete
     fun sendAudioStreamEnd() {
         if (!isReady) return
         val ws = webSocket ?: return
 
-        // 1. Извлекаем и отправляем задержанный хвост речи (от 10 до 30 мс звука)
         var tailPayload: ByteArray? = null
         synchronized(batchLock) {
             if (audioBatchBuffer.size() > 0) {
@@ -196,19 +246,18 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         tailPayload?.let { sendAudioPayload(ws, it) }
 
-        // 2. Отправляем признак завершения речевого хода модели через clientContent.turnComplete
         val jsonMessage = buildJsonObject {
             putJsonObject("clientContent") {
                 put("turnComplete", true)
             }
         }.toString()
 
+        logManager.net("WebSocket:TurnComplete", "Сигнал завершения речи turnComplete")
         ws.send(jsonMessage)
     }
 
     fun sendToolResponses(responses: List<ToolResponse>) {
         val ws = webSocket ?: return
-
         val jsonMessage = buildJsonObject {
             putJsonObject("toolResponse") {
                 putJsonArray("functionResponses") {
@@ -228,19 +277,21 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
         }.toString()
 
+        logManager.net("WebSocket:ToolResp", "Ответы функций инструментов", jsonMessage)
         ws.send(jsonMessage)
     }
 
-    // E-29 & Ошибка №26 [NET/PROTO]: Исключение googleSearch из Live сетапа
     private fun buildSetupMessage(cfg: LiveConfig): String {
         val cleanModel = if (cfg.model.startsWith("models/")) cfg.model else "models/${cfg.model}"
 
         val setupObj = buildJsonObject {
             putJsonObject("setup") {
                 put("model", cleanModel)
-
                 putJsonObject("generationConfig") {
-                    putJsonArray("responseModalities") { add("AUDIO") }
+                    putJsonArray("responseModalities") {
+                        add("AUDIO")
+                        add("TEXT")
+                    }
                     put("temperature", cfg.temperature)
                     putJsonObject("speechConfig") {
                         putJsonObject("voiceConfig") {
@@ -266,7 +317,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }
 
-                // Ошибка №26 [NET/PROTO]: Live API поддерживает исключительно functionDeclarations
                 if (cfg.toolsJson != null && cfg.toolsJson.isNotEmpty()) {
                     putJsonArray("tools") {
                         cfg.toolsJson.forEach { add(it) }
@@ -275,20 +325,6 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 cfg.resumptionHandle?.takeIf { it.isNotBlank() }?.let { handle ->
                     putJsonObject("sessionResumption") { put("handle", handle) }
-                }
-
-                putJsonArray("safetySettings") {
-                    listOf(
-                        "HARM_CATEGORY_HARASSMENT",
-                        "HARM_CATEGORY_HATE_SPEECH",
-                        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                        "HARM_CATEGORY_DANGEROUS_CONTENT"
-                    ).forEach { cat ->
-                        addJsonObject {
-                            put("category", cat)
-                            put("threshold", "BLOCK_ONLY_HIGH")
-                        }
-                    }
                 }
             }
         }
@@ -301,6 +337,7 @@ class GeminiProtobufLiveClient @Inject constructor(
 
             if (root.containsKey("setupComplete")) {
                 isReady = true
+                logManager.i("GeminiLive", "Сессия полностью готова (setupComplete получен)")
                 _events.tryEmit(GeminiEvent.SetupComplete)
             }
 
@@ -310,13 +347,10 @@ class GeminiProtobufLiveClient @Inject constructor(
 
             root["goAway"]?.jsonObject?.let { goAway ->
                 val timeLeftMs = goAway["timeLeft"]?.jsonPrimitive?.contentOrNull?.let { str ->
-                    if (str.endsWith("s")) {
-                        str.removeSuffix("s").toDoubleOrNull()?.let { (it * 1000).toLong() }
-                    } else {
-                        str.toLongOrNull()
-                    }
+                    if (str.endsWith("s")) str.removeSuffix("s").toDoubleOrNull()?.let { (it * 1000).toLong() } else str.toLongOrNull()
                 } ?: goAway["timeLeftMs"]?.jsonPrimitive?.longOrNull ?: 10000L
 
+                logManager.w("GeminiLive", "Получен сигнал GoAway: осталось $timeLeftMs мс")
                 _events.tryEmit(GeminiEvent.GoAway(timeLeftMs))
             }
 
@@ -324,6 +358,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                 val handle = sru["newHandle"]?.jsonPrimitive?.contentOrNull.orEmpty()
                 val resumable = sru["resumable"]?.jsonPrimitive?.booleanOrNull ?: true
                 if (resumable && handle.isNotBlank()) {
+                    logManager.d("GeminiLive", "Обновлён маркер возобновления сессии")
                     _events.tryEmit(GeminiEvent.ResumptionHandle(handle))
                 }
             }
@@ -340,7 +375,10 @@ class GeminiProtobufLiveClient @Inject constructor(
                     FunctionCall(name, id, argsMap)
                 } ?: emptyList()
 
-                if (calls.isNotEmpty()) _events.tryEmit(GeminiEvent.ToolCall(calls))
+                if (calls.isNotEmpty()) {
+                    logManager.i("GeminiLive:ToolCall", "Вызовы функций: ${calls.map { it.name }}")
+                    _events.tryEmit(GeminiEvent.ToolCall(calls))
+                }
             }
 
             root["toolCallCancellation"]?.jsonObject?.get("ids")?.jsonArray?.let { idsArr ->
@@ -349,18 +387,31 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
 
             root["serverContent"]?.jsonObject?.let { sc ->
-                if (sc["interrupted"]?.jsonPrimitive?.booleanOrNull == true) _events.tryEmit(GeminiEvent.Interrupted)
-                if (sc["generationComplete"]?.jsonPrimitive?.booleanOrNull == true) _events.tryEmit(GeminiEvent.GenerationComplete)
-                if (sc["turnComplete"]?.jsonPrimitive?.booleanOrNull == true) _events.tryEmit(GeminiEvent.TurnComplete)
+                if (sc["interrupted"]?.jsonPrimitive?.booleanOrNull == true) {
+                    logManager.w("GeminiLive", "Модель перебита пользователем (interrupted)")
+                    _events.tryEmit(GeminiEvent.Interrupted)
+                }
+                if (sc["generationComplete"]?.jsonPrimitive?.booleanOrNull == true) {
+                    _events.tryEmit(GeminiEvent.GenerationComplete)
+                }
+                if (sc["turnComplete"]?.jsonPrimitive?.booleanOrNull == true) {
+                    _events.tryEmit(GeminiEvent.TurnComplete)
+                }
 
                 sc["interimInputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let {
                     if (it.isNotBlank()) _events.tryEmit(GeminiEvent.InputTranscript(it, interim = true))
                 }
                 sc["inputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let {
-                    if (it.isNotBlank()) _events.tryEmit(GeminiEvent.InputTranscript(it, interim = false))
+                    if (it.isNotBlank()) {
+                        logManager.i("GeminiLive:ASR", "Распознана речь пользователя: '$it'")
+                        _events.tryEmit(GeminiEvent.InputTranscript(it, interim = false))
+                    }
                 }
                 sc["outputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let {
-                    if (it.isNotBlank()) _events.tryEmit(GeminiEvent.OutputTranscript(it))
+                    if (it.isNotBlank()) {
+                        logManager.i("GeminiLive:TTS", "Транскрипт ответа модели: '$it'")
+                        _events.tryEmit(GeminiEvent.OutputTranscript(it))
+                    }
                 }
 
                 sc["modelTurn"]?.jsonObject?.get("parts")?.jsonArray?.forEach { partEl ->
@@ -383,7 +434,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                 }
             }
         } catch (e: Exception) {
-            logger.e("GeminiLiveClient: Ошибка разбора сообщения", e)
+            logManager.e("GeminiLive:Parse", "Ошибка разбора входящего фрейма: ${e.message}", e)
         }
     }
 
@@ -398,6 +449,7 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     suspend fun disconnect() = wsMutex.withLock {
         epoch = epochGen.incrementAndGet()
+        logManager.w("WebSocket", "Отключение сессии (новая эпоха=$epoch)")
         closeInternal()
     }
 }
