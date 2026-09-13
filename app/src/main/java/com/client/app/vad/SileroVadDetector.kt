@@ -61,6 +61,16 @@ class SileroVadDetector @Inject constructor(
         initMutex.withLock {
             if (isNeuralModelLoaded) return@withContext
             try {
+                val hasAsset = runCatching {
+                    context.assets.open(MODEL_PATH).use { true }
+                }.getOrDefault(false)
+
+                if (!hasAsset) {
+                    logger.w("SileroVadDetector: Ассет $MODEL_PATH не найден в assets. Активирован RMS fallback.")
+                    isNeuralModelLoaded = false
+                    return@withContext
+                }
+
                 val env = OrtEnvironment.getEnvironment()
                 ortEnvironment = env
 
@@ -75,10 +85,16 @@ class SileroVadDetector @Inject constructor(
                 // Пул постоянных тензоров (Zero Allocation)
                 persistentSrTensor = OnnxTensor.createTensor(env, longArrayOf(16000L))
                 isNeuralModelLoaded = true
-                logger.d("SileroVadDetector: Модель успешно скомпилирована в фоновом потоке")
+                logger.d("SileroVadDetector: Модель Silero VAD v5 успешно загружена")
             } catch (e: Exception) {
-                logger.e("SileroVadDetector: Ошибка ONNX, задействован RMS fallback", e)
+                logger.e("SileroVadDetector: Ошибка инициализации ONNX Runtime, активирован RMS fallback", e)
                 isNeuralModelLoaded = false
+                runCatching { persistentSrTensor?.close() }
+                runCatching { ortSession?.close() }
+                runCatching { ortEnvironment?.close() }
+                persistentSrTensor = null
+                ortSession = null
+                ortEnvironment = null
             }
         }
     }
