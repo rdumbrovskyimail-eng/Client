@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <thread>
 
 #define LOG_TAG "NativeAudioEngine"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -67,6 +68,7 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
     }
 
     AAudioStreamBuilder_setDataCallback(inBuilder, captureCallback, this);
+    AAudioStreamBuilder_setErrorCallback(inBuilder, errorCallback, this);
 
     aaudio_result_t res = AAudioStreamBuilder_openStream(inBuilder, &captureStream_);
     AAudioStreamBuilder_delete(inBuilder);
@@ -102,6 +104,7 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate) 
     }
 
     AAudioStreamBuilder_setDataCallback(outBuilder, playbackCallback, this);
+    AAudioStreamBuilder_setErrorCallback(outBuilder, errorCallback, this);
 
     res = AAudioStreamBuilder_openStream(outBuilder, &playbackStream_);
     AAudioStreamBuilder_delete(outBuilder);
@@ -347,6 +350,21 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     }
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+void AAudioEngine::errorCallback(AAudioStream* /* stream */, void* userData, aaudio_result_t error) {
+    LOGE("AAudio stream error callback invoked. Error code: %d (%s)", 
+         error, AAudio_convertResultToText(error));
+
+    if (error == AAUDIO_ERROR_DISCONNECTED) {
+        auto* engine = static_cast<AAudioEngine*>(userData);
+        // Запрещено вызывать AAudioStream_close непосредственно в errorCallback потоке во избежание дедлока.
+        // Запускаем остановку в отдельном отсоединенном потоке.
+        std::thread([engine]() {
+            LOGI("Asynchronously stopping AAudioEngine after device disconnect.");
+            engine->stop();
+        }).detach();
+    }
 }
 
 } // namespace client::audio
