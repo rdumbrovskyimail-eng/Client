@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <atomic>
+#include <cstdint>
 #include "audio/AudioConstants.h"
 
 namespace client::dsp {
@@ -19,8 +20,8 @@ public:
     FastFft();
     ~FastFft() = default;
 
-    // Расчет 5 спектральных полос и публикация снимка (вызывается из аудиопотока)
-    void process(const float* pcmInput, size_t count, float micRms, float outRms);
+    // ERR-09: Расчет спектра с учетом динамической частоты дискретизации sampleRate
+    void process(const float* pcmInput, size_t count, float micRms, float outRms, int32_t sampleRate = audio::SAMPLE_RATE_GEMINI_OUT);
 
     // E-03, ERR-05: Истинно Wait-Free считывание когерентного среза из UI JNI
     void getLatestSnapshot(SpectrumSnapshot& out) const;
