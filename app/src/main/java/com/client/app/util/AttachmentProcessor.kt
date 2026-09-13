@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -68,6 +69,8 @@ class AttachmentProcessor @Inject constructor(
                     }
                 }
             } catch (e: Exception) {
+                // Ошибка №14 [PERF]: Проброс CancellationException для соблюдения Cooperative Cancellation
+                if (e is CancellationException) throw e
                 logger.e("Attachment error: $name", e)
             }
         }
