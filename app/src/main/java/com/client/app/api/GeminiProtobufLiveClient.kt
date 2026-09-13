@@ -1,9 +1,9 @@
+// >>> FILE: app/src/main/java/com/client/app/api/GeminiProtobufLiveClient.kt
 package com.client.app.api
 
 import android.util.Base64
 import com.client.app.audio.NativeAudioBridge
 import com.client.app.logging.AppLogManager
-import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
@@ -16,7 +16,10 @@ import kotlinx.serialization.json.*
 import okhttp3.*
 import okio.ByteString
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -38,27 +41,36 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
-    // Трассировщик фаз соединения (DNS, TLS, Connect)
+    // Трассировщик фаз соединения OkHttp с точными типами и свойствами Kotlin
     private val loggingEventListener = object : EventListener() {
         override fun dnsStart(call: Call, domainName: String) {
             logManager.net("OkHttp:DNS", "Старт резолва: $domainName")
         }
+
         override fun dnsEnd(call: Call, domainName: String, inetAddressList: List<InetAddress>) {
             logManager.net("OkHttp:DNS", "Резолв успешен: $domainName -> $inetAddressList")
         }
-        override fun connectStart(call: Call, inetSocketAddress: java.net.InetSocketAddress, proxy: java.net.Proxy) {
+
+        override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) {
             logManager.net("OkHttp:TCP", "Подключение к $inetSocketAddress...")
         }
-        override fun connectEnd(call: Call, inetSocketAddress: java.net.InetSocketAddress, proxy: java.net.Proxy, protocol: Protocol?) {
+
+        override fun connectEnd(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy, protocol: Protocol?) {
             logManager.net("OkHttp:TCP", "TCP соединение установлено ($protocol)")
         }
+
         override fun secureConnectStart(call: Call) {
             logManager.net("OkHttp:TLS", "Старт TLS 1.3 хендшейка...")
         }
+
         override fun secureConnectEnd(call: Call, handshake: Handshake?) {
-            logManager.net("OkHttp:TLS", "TLS успешен: ${handshake?.tlsVersion()} [${handshake?.cipherSuite()}]")
+            // Исправлено: использование свойств val tlsVersion и val cipherSuite без скобок
+            val tls = handshake?.tlsVersion
+            val cipher = handshake?.cipherSuite
+            logManager.net("OkHttp:TLS", "TLS успешен: $tls [$cipher]")
         }
-        override fun connectFailed(call: Call, inetSocketAddress: java.net.InetSocketAddress, protocol: Protocol?, ioe: java.io.IOException) {
+
+        override fun connectFailed(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy, protocol: Protocol?, ioe: IOException) {
             logManager.e("OkHttp:Connect", "Сбой подключения к $inetSocketAddress: ${ioe.message}", ioe)
         }
     }
@@ -125,7 +137,6 @@ class GeminiProtobufLiveClient @Inject constructor(
 
             override fun onMessage(ws: WebSocket, text: String) {
                 if (myEpoch == epoch) {
-                    // Маскируем аудио в логах, чтобы не перегружать память
                     val logSummary = if (text.contains("\"audio/pcm")) {
                         "[Серверный чанк аудио ~${text.length} байт]"
                     } else {
@@ -138,7 +149,8 @@ class GeminiProtobufLiveClient @Inject constructor(
 
             override fun onMessage(ws: WebSocket, bytes: ByteString) {
                 if (myEpoch == epoch) {
-                    logManager.net("WebSocket:RxBinary", "Получено ${bytes.size()} байт")
+                    // Исправлено: использование свойства val size вместо метода size()
+                    logManager.net("WebSocket:RxBinary", "Получено ${bytes.size} байт")
                     parseServerJsonMessage(bytes.utf8(), myEpoch)
                 }
             }
