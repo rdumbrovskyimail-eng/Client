@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.*
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -41,14 +42,29 @@ class AttachmentProcessor @Inject constructor(
             val mime = context.contentResolver.getType(uri).orEmpty().lowercase()
 
             try {
+                // E-16 & E-31: Поддержка как PDF, так и растровых изображений
                 if (mime == "application/pdf" || name.endsWith(".pdf", true)) {
                     val pdf = processPdfStream(uri, MAX_PDF_PAGES)
                     if (pdf.text.isNotBlank()) {
-                        textBuilder.append("\n\n--- Документ: $name ---\n").append(pdf.text.take(60000))
-                        accepted.add("$name (текст)")
-                    } else if (pdf.images.isNotEmpty()) {
+                        textBuilder.append("\n\n--- Документ: $name ---\n").append(pdf.text)
+                    }
+                    if (pdf.images.isNotEmpty()) {
                         images.addAll(pdf.images)
-                        accepted.add("$name (${pdf.images.size} стр.)")
+                    }
+                    accepted.add("$name (${pdf.images.size} стр. OCR, ${pdf.text.length} симв.)")
+                } else if (mime.startsWith("image/") || name.endsWith(".jpg", true) || name.endsWith(".png", true)) {
+                    context.contentResolver.openInputStream(uri)?.use { stream ->
+                        val bmp = BitmapFactory.decodeStream(stream)
+                        if (bmp != null) {
+                            val scaled = scaleBitmap(bmp, MAX_SIDE)
+                            ByteArrayOutputStream().use { out ->
+                                scaled.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
+                                images.add(out.toByteArray())
+                            }
+                            if (scaled != bmp) scaled.recycle()
+                            bmp.recycle()
+                            accepted.add("$name (изображение)")
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -60,57 +76,50 @@ class AttachmentProcessor @Inject constructor(
 
     private data class PdfProcessed(val images: List<ByteArray>, val text: String)
 
-    /**
-     * Потоковая обработка PDF: ровно 1 переиспользуемый Bitmap в RGB_565 (память <5 МБ вместо 157 МБ).
-     */
+    // E-16: Постраничный гибридный процессинг: текст страницы -> text, скан страницы -> image
     private fun processPdfStream(uri: Uri, maxPages: Int): PdfProcessed {
         val images = mutableListOf<ByteArray>()
+        val textBuilder = StringBuilder()
+
         val pfd: ParcelFileDescriptor = context.contentResolver.openFileDescriptor(uri, "r")
             ?: return PdfProcessed(images, "")
 
         pfd.use {
             PdfRenderer(it).use { renderer ->
                 val count = minOf(renderer.pageCount, maxPages)
-
-                // Проверка цифрового слоя текста на Android 15+ (API 35+)
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-                    val sb = StringBuilder()
-                    for (i in 0 until count) {
-                        renderer.openPage(i).use { page ->
-                            runCatching {
-                                val pageText = page.textContents.joinToString(" ") { tc -> tc.text }.trim()
-                                if (pageText.isNotEmpty()) {
-                                    sb.append("--- Стр. ").append(i + 1).append(" ---\n").append(pageText).append("\n\n")
-                                }
-                            }
-                        }
-                    }
-                    if (sb.length > count * 50) {
-                        return PdfProcessed(images, sb.toString().trim())
-                    }
-                }
-
-                // Поточный рендеринг: один Bitmap, переиспользуемый между страницами
                 var reusableBmp: Bitmap? = null
+
                 try {
                     for (i in 0 until count) {
                         renderer.openPage(i).use { page ->
-                            val scale = MAX_SIDE.toFloat() / maxOf(page.width, page.height)
-                            val w = (page.width * scale).toInt().coerceAtLeast(1)
-                            val h = (page.height * scale).toInt().coerceAtLeast(1)
-
-                            if (reusableBmp == null || reusableBmp!!.width != w || reusableBmp!!.height != h) {
-                                reusableBmp?.recycle()
-                                reusableBmp = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565)
+                            var pageText = ""
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+                                runCatching {
+                                    pageText = page.textContents.joinToString(" ") { it.text }.trim()
+                                }
                             }
 
-                            val canvas = Canvas(reusableBmp!!)
-                            canvas.drawColor(Color.WHITE)
-                            page.render(reusableBmp!!, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                            if (pageText.length >= 60) {
+                                textBuilder.append("--- Стр. ").append(i + 1).append(" ---\n")
+                                    .append(pageText).append("\n\n")
+                            } else {
+                                val scale = MAX_SIDE.toFloat() / maxOf(page.width, page.height)
+                                val w = (page.width * scale).toInt().coerceAtLeast(1)
+                                val h = (page.height * scale).toInt().coerceAtLeast(1)
 
-                            ByteArrayOutputStream().use { out ->
-                                reusableBmp!!.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
-                                images.add(out.toByteArray())
+                                if (reusableBmp == null || reusableBmp!!.width != w || reusableBmp!!.height != h) {
+                                    reusableBmp?.recycle()
+                                    reusableBmp = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565)
+                                }
+
+                                val canvas = Canvas(reusableBmp!!)
+                                canvas.drawColor(Color.WHITE)
+                                page.render(reusableBmp!!, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+
+                                ByteArrayOutputStream().use { out ->
+                                    reusableBmp!!.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
+                                    images.add(out.toByteArray())
+                                }
                             }
                         }
                     }
@@ -119,7 +128,14 @@ class AttachmentProcessor @Inject constructor(
                 }
             }
         }
-        return PdfProcessed(images, "")
+        return PdfProcessed(images, textBuilder.toString().trim())
+    }
+
+    private fun scaleBitmap(bmp: Bitmap, maxSide: Int): Bitmap {
+        val maxDim = maxOf(bmp.width, bmp.height)
+        if (maxDim <= maxSide) return bmp
+        val scale = maxSide.toFloat() / maxDim
+        return Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true)
     }
 
     private fun getFileName(uri: Uri): String = runCatching {
