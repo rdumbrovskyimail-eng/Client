@@ -8,7 +8,11 @@ namespace client::dsp {
 static constexpr float PI = 3.14159265358979323846f;
 static constexpr size_t N = audio::FFT_SIZE;
 
-FastFft::FastFft() = default;
+FastFft::FastFft()
+    : readyIdx_(0),
+      writeIdx_(1),
+      readIdx_(2) {
+}
 
 void FastFft::computeFft(float* real, float* imag, size_t n) {
     size_t j = 0;
@@ -106,21 +110,23 @@ void FastFft::process(const float* pcmInput, size_t count, float micRms, float o
         }
     }
 
-    // E-03: Публикация согласованного снимка в тройной буфер (Wait-Free)
-    size_t writeIdx = 3 - readIdx_.load(std::memory_order_relaxed) - readyIdx_.load(std::memory_order_relaxed);
+    // ERR-05: Запись в изолированный рабочий буфер писателя (полное отсутствие гонок)
     for (size_t i = 0; i < audio::SPECTRUM_BANDS; ++i) {
-        pool_[writeIdx].bands[i] = smoothedBands_[i];
+        pool_[writeIdx_].bands[i] = smoothedBands_[i];
     }
-    pool_[writeIdx].micRms = micRms;
-    pool_[writeIdx].outRms = outRms;
+    pool_[writeIdx_].micRms = micRms;
+    pool_[writeIdx_].outRms = outRms;
 
-    readyIdx_.store(writeIdx, std::memory_order_release);
+    // Неделимая публикация свежего буфера по алгоритму Андерсона:
+    // Писатель передает writeIdx_ в readyIdx_ и забирает освободившийся слот
+    writeIdx_ = readyIdx_.exchange(writeIdx_, std::memory_order_acq_rel);
 }
 
 void FastFft::getLatestSnapshot(SpectrumSnapshot& out) const {
-    size_t rIdx = readyIdx_.exchange(readIdx_.load(std::memory_order_relaxed), std::memory_order_acq_rel);
-    readIdx_.store(rIdx, std::memory_order_release);
-    out = pool_[rIdx];
+    // Неделимое получение свежего буфера по алгоритму Андерсона:
+    // Читатель забирает readyIdx_ в readIdx_ и возвращает старый прочитанный слот в пул
+    readIdx_ = readyIdx_.exchange(readIdx_, std::memory_order_acq_rel);
+    out = pool_[readIdx_];
 }
 
 } // namespace client::dsp
