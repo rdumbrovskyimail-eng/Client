@@ -4,13 +4,13 @@ import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.preferencesDataStore
+import com.client.app.logging.AppLogManager
 import com.client.app.util.AppLogger
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
-import timber.log.Timber
 import javax.inject.Singleton
 
 val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "client_settings")
@@ -24,9 +24,9 @@ object AppModule {
 
     @Provides
     @Singleton
-    fun provideLogger(): AppLogger = object : AppLogger {
-        override fun d(m: String) = Timber.d(m)
-        override fun w(m: String) = Timber.w(m)
-        override fun e(m: String, t: Throwable?) = Timber.e(t, m)
+    fun provideLogger(logManager: AppLogManager): AppLogger = object : AppLogger {
+        override fun d(m: String) = logManager.d("App", m)
+        override fun w(m: String) = logManager.w("App", m)
+        override fun e(m: String, t: Throwable?) = logManager.e("App", m, t)
     }
 }
