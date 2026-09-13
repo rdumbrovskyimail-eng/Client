@@ -4,19 +4,23 @@ package com.client.app.viewmodel
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import com.client.app.audio.NativeAudioEngine
+import com.client.app.logging.AppLogManager
 import com.client.app.session.ForvoWord
 import com.client.app.session.SessionManager
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.StateFlow
 import javax.inject.Inject
 
 @HiltViewModel
 class ClientViewModel @Inject constructor(
     private val sessionManager: SessionManager,
-    val nativeAudioEngine: NativeAudioEngine
+    val nativeAudioEngine: NativeAudioEngine,
+    val logManager: AppLogManager
 ) : ViewModel() {
 
     val state = sessionManager.state
     val amplitude = sessionManager.amplitude
+    val errorCount: StateFlow<Int> = logManager.errorCount
 
     fun toggleConnection() = sessionManager.toggleConnection()
     fun stopSession() = sessionManager.stopSession()
