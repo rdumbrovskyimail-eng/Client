@@ -102,7 +102,6 @@ class SessionManager @Inject constructor(
 
         const val DEFAULT_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 
-        // Ошибка №7 [DEFECT]: Синхронизация списка поддерживаемых моделей с экраном настроек
         val SUPPORTED_LIVE_MODELS = setOf(
             "gemini-3.1-flash-live-preview",
             "gemini-2.5-flash-native-audio-latest",
@@ -220,7 +219,6 @@ class SessionManager @Inject constructor(
         client.sendRealtimeText(trimmed)
     }
 
-    // Ошибка №15 [AUDIO]: Сброс монопольного буфера AAudio перед запуском системного MediaPlayer
     fun playForvo(word: ForvoWord) = scope.launch {
         val url = forvoRepo.freshUrl(word.query, word.language) ?: run {
             _state.update { it.copy(error = "Ссылка Forvo недоступна или устарела") }
@@ -230,7 +228,7 @@ class SessionManager @Inject constructor(
         val wasMic = _state.value.isMicActive
         if (wasMic) stopMic(userInitiated = false)
 
-        audioEngine.flushPlayback() // сбрасываем монопольный буфер AAudio, освобождая звуковой тракт
+        audioEngine.flushPlayback()
         forvoPlayer.play(url)
 
         if (wasMic && userMicDesired && !userStopped) {
@@ -390,12 +388,13 @@ class SessionManager @Inject constructor(
             return
         }
 
-        _state.update {
-            it.copy(link = if (resume) LinkState.RECONNECTING else LinkState.CONNECTING, error = null)
+        // Ошибка №34 [ANDROID/LIFECYCLE]: Запуск службы строго однократно из IDLE до обновления статуса
+        if (!resume && _state.value.link == LinkState.IDLE) {
+            startForegroundService()
         }
 
-        if (!resume) {
-            startForegroundService()
+        _state.update {
+            it.copy(link = if (resume) LinkState.RECONNECTING else LinkState.CONNECTING, error = null)
         }
 
         if (!resume && cachedContentId == null) {
@@ -453,7 +452,6 @@ class SessionManager @Inject constructor(
             val attempt = ++reconnectAttempts
             _state.update { it.copy(link = LinkState.RECONNECTING) }
 
-            // Ошибка №8 [NET]: Экспоненциальный откат со случайным джиттером ±20% (RFC 8961 Full Jitter)
             val baseDelay = minOf(400L * (1L shl (attempt - 1)), 6000L)
             val jitteredDelay = (baseDelay * (0.8 + Math.random() * 0.4)).toLong()
             delay(jitteredDelay)
@@ -484,10 +482,12 @@ class SessionManager @Inject constructor(
         }
     }
 
+    // Ошибка №32 [AUDIO/PRIVACY]: Сброс очереди канала micOutput для предотвращения передачи старого звука
     private suspend fun stopMic(userInitiated: Boolean = false) = micMutex.withLock {
         if (userInitiated) userMicDesired = false
         micJob?.cancelAndJoin()
         micJob = null
+        while (audioEngine.micOutput.tryReceive().isSuccess) { /* сброс очереди */ }
         client.sendAudioStreamEnd()
         _state.update { it.copy(isMicActive = false) }
     }
@@ -547,18 +547,13 @@ class SessionManager @Inject constructor(
                     }
                 }
                 is GeminiEvent.InputTranscript -> appendTranscript("user", event.text, event.interim)
-                
-                // Ошибка №3 [DEFECT]: Истинный единственный источник истины (SSOT)
                 is GeminiEvent.OutputTranscript -> {
                     hasReceivedAudioTranscript = true
                     appendTranscript("model", event.text, false)
                 }
-                
-                // В дуплекс-режиме игнорируем сырые фрагменты ModelText во избежание дублирования ответа
                 is GeminiEvent.ModelText -> {
-                    // Игнорируем промежуточные токены, дожидаясь канонического OutputTranscript
+                    // Игнорируем промежуточные фрагменты, дожидаясь канонического OutputTranscript
                 }
-                
                 is GeminiEvent.Usage -> _state.update { it.copy(tokensUsed = event.totalTokens) }
                 is GeminiEvent.ToolCall -> handleToolCall(event.calls)
                 is GeminiEvent.Error -> {
