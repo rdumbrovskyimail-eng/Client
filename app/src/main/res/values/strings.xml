@@ -3,4 +3,42 @@
     <string name="app_name">Gemini Live Ultra</string>
     <string name="session_active_title">Gemini Live Ultra активен</string>
     <string name="session_active_desc">Аппаратный дуплекс и микрофон S23 Ultra активны</string>
+
+    <!-- UI: Экран диалога (ClientScreen) -->
+    <string name="settings_title">Настройки</string>
+    <string name="apply_role">Применить роль</string>
+    <string name="prompt_hint">Спросить или дать команду...</string>
+    <string name="default_role_placeholder">Задать системную роль...</string>
+    <string name="system_role_instruction">Системная инструкция роли</string>
+    <string name="attach_file">Прикрепить</string>
+    <string name="send_message">Отправить</string>
+    <string name="mic_content_desc">Микрофон</string>
+    <string name="session_status_desc">Статус сессии</string>
+
+    <!-- UI: Экран настроек (SettingsScreen) -->
+    <string name="settings_keys_header">КЛЮЧИ И СЕРВЕР GEMINI</string>
+    <string name="gemini_api_key_label">Gemini API Key</string>
+    <string name="show_key_desc">Показать ключ</string>
+    <string name="live_model_label">Голосовая модель Gemini Live (дуплекс):</string>
+    <string name="analyzer_model_label">Модель разбора материалов (Vision OCR):</string>
+    
+    <string name="settings_audio_header">ГОЛОС И ЗВУКОВАЯ СИСТЕМА S23 ULTRA</string>
+    <string name="tts_voice_label">Голос модели (TTS):</string>
+    <string name="speaker_volume">Громкость динамика: %1$d%%</string>
+    <string name="mic_sensitivity">Чувствительность микрофона: %1$d%%</string>
+    <string name="mic_quiet_boost"> (Усиление для тихой речи)</string>
+    
+    <string name="settings_prompt_header">СИСТЕМНЫЙ ПРОМПТ ПО УМОЛЧАНИЮ</string>
+    <string name="system_prompt_label">Базовая инструкция ассистента</string>
+    
+    <string name="settings_forvo_header">ИНТЕГРАЦИЯ С FORVO</string>
+    <string name="forvo_enable_title">Включить Forvo Tool</string>
+    <string name="forvo_enable_desc">Озвучка слов носителями языка с Forvo.com</string>
+    <string name="forvo_api_key_label">Forvo API Key</string>
+    <string name="show_forvo_key_desc">Показать Forvo ключ</string>
+    
+    <string name="settings_battery_header">ФОНОВАЯ РАБОТА НА SAMSUNG ONE UI</string>
+    <string name="battery_opt_desc">Samsung One UI может усыплять микрофонный сервис через 10–15 минут сна экрана. Выберите «Не оптимизировать» (Работа без ограничений).</string>
+    <string name="battery_opt_button">Настройки батареи устройства</string>
+    <string name="battery_toast_fallback">Откройте: Настройки -> Приложения -> Батарея -> Без ограничений</string>
 </resources>
