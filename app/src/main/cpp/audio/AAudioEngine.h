@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/cpp/audio/AAudioEngine.h
 #pragma once
 
 #include <aaudio/AAudio.h>
@@ -62,6 +63,9 @@ private:
     std::atomic<bool> isBluetoothMode_{false};
     std::atomic<bool> isMmapExclusiveActive_{false};
     std::atomic<int32_t> playbackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
+    
+    // ERR-020: Потокобезопасное хранение подтвержденной частоты открытого аппаратного стрима
+    std::atomic<int32_t> actualPlaybackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
 
     std::atomic<float> playbackVolume_{1.0f};
     std::atomic<float> micGain_{1.0f};
@@ -75,6 +79,10 @@ private:
     std::unique_ptr<dsp::FastFft> fftProcessor_;
     std::vector<float> pcmFloatBuffer_;
     std::vector<int16_t> resampleScratchBuffer_;
+
+    // Stateful-ресемплеры для корректной стыковки сетевых чанков
+    PolyphaseResampler24To16 resampler24To16_;
+    LinearResampler24To48 resampler24To48_;
 };
 
 } // namespace client::audio
