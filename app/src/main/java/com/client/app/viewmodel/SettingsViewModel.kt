@@ -43,19 +43,22 @@ class SettingsViewModel @Inject constructor(
     private val forvoKeyDebounce = MutableSharedFlow<String>(extraBufferCapacity = 1)
 
     init {
+        // Ошибка №20 [STATE]: Непрерывный реактивный сбор потока DataStore вместо разового first()
         viewModelScope.launch {
-            dataStore.data.first().let { p ->
-                _settings.value = AppSettingsState(
-                    apiKey = cryptoManager.decrypt(p[SessionManager.KEY_API].orEmpty()),
-                    model = p[SessionManager.KEY_MODEL] ?: "gemini-3.1-flash-live-preview",
-                    analyzerModel = p[SessionManager.KEY_ANALYZER_MODEL] ?: VocabularyExtractor.DEFAULT_MODEL,
-                    voice = p[SessionManager.KEY_VOICE] ?: "Charon",
-                    systemPrompt = p[SessionManager.KEY_SYSTEM_PROMPT] ?: SessionManager.DEFAULT_SYSTEM_PROMPT,
-                    volume = p[SessionManager.KEY_VOLUME] ?: 1.0f,
-                    micGain = p[SessionManager.KEY_MIC_GAIN] ?: 1.0f,
-                    enableForvo = p[SessionManager.KEY_ENABLE_FORVO] ?: false,
-                    forvoApiKey = cryptoManager.decrypt(p[ForvoRepository.KEY_FORVO_API].orEmpty())
-                )
+            dataStore.data.collect { p ->
+                _settings.update {
+                    it.copy(
+                        apiKey = cryptoManager.decrypt(p[SessionManager.KEY_API].orEmpty()),
+                        model = p[SessionManager.KEY_MODEL] ?: "gemini-3.1-flash-live-preview",
+                        analyzerModel = p[SessionManager.KEY_ANALYZER_MODEL] ?: VocabularyExtractor.DEFAULT_MODEL,
+                        voice = p[SessionManager.KEY_VOICE] ?: "Charon",
+                        systemPrompt = p[SessionManager.KEY_SYSTEM_PROMPT] ?: SessionManager.DEFAULT_SYSTEM_PROMPT,
+                        volume = p[SessionManager.KEY_VOLUME] ?: 1.0f,
+                        micGain = p[SessionManager.KEY_MIC_GAIN] ?: 1.0f,
+                        enableForvo = p[SessionManager.KEY_ENABLE_FORVO] ?: false,
+                        forvoApiKey = cryptoManager.decrypt(p[ForvoRepository.KEY_FORVO_API].orEmpty())
+                    )
+                }
             }
         }
 
@@ -112,7 +115,6 @@ class SettingsViewModel @Inject constructor(
         promptDebounce.tryEmit(sp)
     }
 
-    /** Вызывается из SettingsScreen строго при отпускании пальца (onValueChangeFinished) */
     fun setVolume(v: Float) {
         _settings.update { it.copy(volume = v) }
         viewModelScope.launch {
@@ -120,7 +122,6 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
-    /** Вызывается из SettingsScreen строго при отпускании пальца (onValueChangeFinished) */
     fun setMicGain(g: Float) {
         _settings.update { it.copy(micGain = g) }
         viewModelScope.launch {
