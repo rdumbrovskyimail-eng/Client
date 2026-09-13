@@ -79,20 +79,20 @@ class PronunciationPlayer @Inject constructor(
                         }
                         currentState = PlayerState.PLAYING
 
-                        // E-18: Списание квоты происходит ТОЛЬКО при успешной загрузке
+                        // Регистрация воспроизведения
                         forvoRepo.registerSuccessfulPlayback()
 
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                             runCatching {
                                 val config = DynamicsProcessing.Config.Builder(
-                                    DynamicsProcessing.CONFIG_OPT_VARIANT_FAVOR_FREQUENCY_RESOLUTION,
-                                    1, true, 0, false, 0, false, 0, true
+                                    DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
+                                    1, false, 0, false, 0, false, 0, true
                                 ).build()
                                 dynamicsProcessing = DynamicsProcessing(0, player.audioSessionId, config).apply {
                                     val limiter = DynamicsProcessing.Limiter(
                                         true, true, 0, 1.0f, 50.0f, 10.0f, -0.5f, 0.0f
                                     )
-                                    setLimiter(0, limiter)
+                                    setLimiterAllChannelsTo(limiter)
                                     enabled = true
                                 }
                             }
