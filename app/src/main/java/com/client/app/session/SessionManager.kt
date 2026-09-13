@@ -102,8 +102,11 @@ class SessionManager @Inject constructor(
 
         const val DEFAULT_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 
+        // Ошибка №7 [DEFECT]: Синхронизация списка поддерживаемых моделей с экраном настроек
         val SUPPORTED_LIVE_MODELS = setOf(
-            "gemini-3.1-flash-live-preview"
+            "gemini-3.1-flash-live-preview",
+            "gemini-2.5-flash-native-audio-latest",
+            "gemini-2.5-flash-native-audio-preview-12-2025"
         )
 
         private const val MAX_MESSAGES = 200
@@ -447,7 +450,12 @@ class SessionManager @Inject constructor(
         reconnectJob = scope.launch {
             val attempt = ++reconnectAttempts
             _state.update { it.copy(link = LinkState.RECONNECTING) }
-            delay(minOf(400L * (1L shl (attempt - 1)), 6000L))
+
+            // Ошибка №8 [NET]: Экспоненциальный откат со случайным джиттером ±20% (RFC 8961 Full Jitter)
+            val baseDelay = minOf(400L * (1L shl (attempt - 1)), 6000L)
+            val jitteredDelay = (baseDelay * (0.8 + Math.random() * 0.4)).toLong()
+            delay(jitteredDelay)
+
             mutex.withLock {
                 if (!userStopped) startInternal(resume = resumptionHandle != null)
             }
