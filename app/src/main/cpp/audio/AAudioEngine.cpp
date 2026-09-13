@@ -223,7 +223,33 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
     }
 
     // Нативный 24 кГц
-    return playbackBuffer_.write(pcm, frames);
+    if (actualRate == SAMPLE_RATE_GEMINI_OUT) {
+        return playbackBuffer_.write(pcm, frames);
+    }
+
+    // ERR-14: Универсальный каузальный ресемплер для 44.1 кГц и нестандартных частот HAL
+    const double rateRatio = static_cast<double>(actualRate) / static_cast<double>(SAMPLE_RATE_GEMINI_OUT);
+    const size_t targetFrames = static_cast<size_t>(frames * rateRatio);
+
+    if (targetFrames > resampleScratchBuffer_.size()) {
+        LOGE("writePlaybackPcm: targetFrames %zu exceeds scratch buffer capacity", targetFrames);
+        return 0;
+    }
+
+    int16_t* dst = resampleScratchBuffer_.data();
+    for (size_t i = 0; i < targetFrames; ++i) {
+        double srcIdx = i / rateRatio;
+        size_t idx0 = static_cast<size_t>(srcIdx);
+        size_t idx1 = std::min(idx0 + 1, frames - 1);
+        double frac = srcIdx - idx0;
+
+        int32_t val0 = pcm[idx0];
+        int32_t val1 = pcm[idx1];
+        int32_t interpolated = static_cast<int32_t>(val0 + frac * (val1 - val0));
+        dst[i] = static_cast<int16_t>(std::clamp(interpolated, -32768, 32767));
+    }
+
+    return playbackBuffer_.write(dst, targetFrames);
 }
 
 size_t AAudioEngine::readCapturePcm(int16_t* pcm, size_t maxFrames) {
