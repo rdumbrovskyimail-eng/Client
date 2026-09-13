@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/cpp/audio/LockFreeRingBuffer.h
 #pragma once
 
 #include <atomic>
@@ -43,7 +44,7 @@ public:
     }
 
     size_t read(T* data, size_t count) {
-        // Проверка атомарного запроса сброса строго в потоке-читателе (SPSC invariant)
+        // Проверка атомарного запроса динамического сброса строго в потоке-читателе (Barge-In)
         if (flushRequested_.load(std::memory_order_acquire)) {
             const size_t t = tail_.load(std::memory_order_relaxed);
             head_.store(t, std::memory_order_release);
@@ -72,7 +73,14 @@ public:
         return to_read;
     }
 
-    // Потокобезопасный запрос сброса из любого потока без нарушения SPSC инварианта
+    // ERR-08: Детерминированный сброс буфера в состоянии покоя (потоки остановлены/закрыты)
+    void clear() {
+        head_.store(0, std::memory_order_relaxed);
+        tail_.store(0, std::memory_order_relaxed);
+        flushRequested_.store(false, std::memory_order_relaxed);
+    }
+
+    // Потокобезопасный запрос динамического сброса во время активного стрима (Barge-In)
     void requestFlush() {
         flushRequested_.store(true, std::memory_order_release);
     }
