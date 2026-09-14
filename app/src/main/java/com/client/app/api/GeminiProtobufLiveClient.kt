@@ -33,15 +33,15 @@ class GeminiProtobufLiveClient @Inject constructor(
     private val logManager: AppLogManager
 ) {
     companion object {
-        const val WS_HOST = "generativelanguage.googleapis.com"
-        const val WS_PATH = "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        // Официальный шлюз Google Cloud Vertex AI (Express Mode)
+        const val WS_HOST = "aiplatform.googleapis.com"
+        const val WS_PATH = "ws/google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent"
         private const val MAX_QUEUE_BYTES = 64L * 1024
         private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280
     }
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
-    // Трассировщик фаз соединения OkHttp с точными типами и свойствами Kotlin
     private val loggingEventListener = object : EventListener() {
         override fun dnsStart(call: Call, domainName: String) {
             logManager.net("OkHttp:DNS", "Старт резолва: $domainName")
@@ -64,7 +64,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
 
         override fun secureConnectEnd(call: Call, handshake: Handshake?) {
-            // Исправлено: использование свойств val tlsVersion и val cipherSuite без скобок
             val tls = handshake?.tlsVersion
             val cipher = handshake?.cipherSuite
             logManager.net("OkHttp:TLS", "TLS успешен: $tls [$cipher]")
@@ -108,18 +107,21 @@ class GeminiProtobufLiveClient @Inject constructor(
         closeInternal()
         isReady = false
 
-        while (_audio.tryReceive().isSuccess) { /* сброс старых фреймов */ }
+        while (_audio.tryReceive().isSuccess) { /* сброс очереди */ }
 
         val myEpoch = epochGen.incrementAndGet()
         epoch = myEpoch
 
-        val encodedKey = URLEncoder.encode(cfg.apiKey.trim(), "UTF-8")
+        val rawKey = cfg.apiKey.trim()
+        val encodedKey = URLEncoder.encode(rawKey, "UTF-8")
         val url = "wss://$WS_HOST/$WS_PATH?key=$encodedKey"
 
-        logManager.net("WebSocket", "Инициализация соединения (epoch=$myEpoch, model=${cfg.model})")
+        logManager.net("WebSocket", "Инициализация соединения Vertex AI (epoch=$myEpoch, host=$WS_HOST)")
 
+        // Передаем API ключ как в URL, так и в заголовке x-goog-api-key для Express Mode
         val req = Request.Builder()
             .url(url)
+            .header("x-goog-api-key", rawKey)
             .header("X-Accel-Buffering", "no")
             .header("Cache-Control", "no-cache")
             .build()
@@ -149,7 +151,6 @@ class GeminiProtobufLiveClient @Inject constructor(
 
             override fun onMessage(ws: WebSocket, bytes: ByteString) {
                 if (myEpoch == epoch) {
-                    // Исправлено: использование свойства val size вместо метода size()
                     logManager.net("WebSocket:RxBinary", "Получено ${bytes.size} байт")
                     parseServerJsonMessage(bytes.utf8(), myEpoch)
                 }
@@ -170,7 +171,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 val httpCode = response?.code
                 val errBody = runCatching { response?.body?.string() }.getOrNull()
-                logManager.e("WebSocket:Failure", "Фатальный сбой сокета (HTTP $httpCode): ${t.localizedMessage}. Ответ: $errBody", t)
+                logManager.e("WebSocket:Failure", "Сбой сокета (HTTP $httpCode): ${t.localizedMessage}. Ответ: $errBody", t)
 
                 if (myEpoch != epoch) return
                 isReady = false
@@ -294,7 +295,11 @@ class GeminiProtobufLiveClient @Inject constructor(
     }
 
     private fun buildSetupMessage(cfg: LiveConfig): String {
-        val cleanModel = if (cfg.model.startsWith("models/")) cfg.model else "models/${cfg.model}"
+        // Для Vertex AI модель обязательно должна начинаться с 'publishers/google/models/'
+        val rawModelName = cfg.model.trim()
+            .removePrefix("publishers/google/models/")
+            .removePrefix("models/")
+        val cleanModel = "publishers/google/models/$rawModelName"
 
         val setupObj = buildJsonObject {
             putJsonObject("setup") {
