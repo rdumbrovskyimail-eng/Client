@@ -33,9 +33,9 @@ class GeminiProtobufLiveClient @Inject constructor(
     private val logManager: AppLogManager
 ) {
     companion object {
-        // Официальный шлюз Google Cloud Vertex AI (Express Mode)
-        const val WS_HOST = "aiplatform.googleapis.com"
-        const val WS_PATH = "ws/google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent"
+        // Официальный шлюз Google AI Studio Developer API
+        const val WS_HOST = "generativelanguage.googleapis.com"
+        const val WS_PATH = "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         private const val MAX_QUEUE_BYTES = 64L * 1024
         private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280
     }
@@ -116,12 +116,10 @@ class GeminiProtobufLiveClient @Inject constructor(
         val encodedKey = URLEncoder.encode(rawKey, "UTF-8")
         val url = "wss://$WS_HOST/$WS_PATH?key=$encodedKey"
 
-        logManager.net("WebSocket", "Инициализация соединения Vertex AI (epoch=$myEpoch, host=$WS_HOST)")
+        logManager.net("WebSocket", "Инициализация соединения AI Studio (epoch=$myEpoch, model=${cfg.model})")
 
-        // Передаем API ключ как в URL, так и в заголовке x-goog-api-key для Express Mode
         val req = Request.Builder()
             .url(url)
-            .header("x-goog-api-key", rawKey)
             .header("X-Accel-Buffering", "no")
             .header("Cache-Control", "no-cache")
             .build()
@@ -201,7 +199,7 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     private fun sendAudioPayload(ws: WebSocket, payload: ByteArray) {
         if (ws.queueSize() > MAX_QUEUE_BYTES) {
-            logManager.w("WebSocket:Backpressure", "Очередь отправки переполнена (${ws.queueSize()} байт). Пропуск чанка.")
+            logManager.w("WebSocket:Backpressure", "Очередь переполнена (${ws.queueSize()} байт). Пропуск чанка.")
             return
         }
 
@@ -222,10 +220,7 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     fun sendRealtimeText(text: String) {
         val ws = webSocket ?: return
-        if (!isReady || text.isBlank()) {
-            logManager.w("WebSocket", "Попытка отправить текст при неактивном сокете: '$text'")
-            return
-        }
+        if (!isReady || text.isBlank()) return
 
         val jsonMessage = buildJsonObject {
             putJsonObject("clientContent") {
@@ -290,16 +285,16 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
         }.toString()
 
-        logManager.net("WebSocket:ToolResp", "Ответы функций инструментов", jsonMessage)
+        logManager.net("WebSocket:ToolResp", "Ответы функций", jsonMessage)
         ws.send(jsonMessage)
     }
 
     private fun buildSetupMessage(cfg: LiveConfig): String {
-        // Для Vertex AI модель обязательно должна начинаться с 'publishers/google/models/'
+        // Формат AI Studio: "models/gemini-3.1-flash-live-preview"
         val rawModelName = cfg.model.trim()
             .removePrefix("publishers/google/models/")
             .removePrefix("models/")
-        val cleanModel = "publishers/google/models/$rawModelName"
+        val cleanModel = "models/$rawModelName"
 
         val setupObj = buildJsonObject {
             putJsonObject("setup") {
@@ -375,7 +370,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                 val handle = sru["newHandle"]?.jsonPrimitive?.contentOrNull.orEmpty()
                 val resumable = sru["resumable"]?.jsonPrimitive?.booleanOrNull ?: true
                 if (resumable && handle.isNotBlank()) {
-                    logManager.d("GeminiLive", "Обновлён маркер возобновления сессии")
                     _events.tryEmit(GeminiEvent.ResumptionHandle(handle))
                 }
             }
@@ -393,7 +387,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                 } ?: emptyList()
 
                 if (calls.isNotEmpty()) {
-                    logManager.i("GeminiLive:ToolCall", "Вызовы функций: ${calls.map { it.name }}")
                     _events.tryEmit(GeminiEvent.ToolCall(calls))
                 }
             }
@@ -405,7 +398,6 @@ class GeminiProtobufLiveClient @Inject constructor(
 
             root["serverContent"]?.jsonObject?.let { sc ->
                 if (sc["interrupted"]?.jsonPrimitive?.booleanOrNull == true) {
-                    logManager.w("GeminiLive", "Модель перебита пользователем (interrupted)")
                     _events.tryEmit(GeminiEvent.Interrupted)
                 }
                 if (sc["generationComplete"]?.jsonPrimitive?.booleanOrNull == true) {
@@ -419,16 +411,10 @@ class GeminiProtobufLiveClient @Inject constructor(
                     if (it.isNotBlank()) _events.tryEmit(GeminiEvent.InputTranscript(it, interim = true))
                 }
                 sc["inputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let {
-                    if (it.isNotBlank()) {
-                        logManager.i("GeminiLive:ASR", "Распознана речь пользователя: '$it'")
-                        _events.tryEmit(GeminiEvent.InputTranscript(it, interim = false))
-                    }
+                    if (it.isNotBlank()) _events.tryEmit(GeminiEvent.InputTranscript(it, interim = false))
                 }
                 sc["outputTranscription"]?.jsonObject?.get("text")?.jsonPrimitive?.contentOrNull?.let {
-                    if (it.isNotBlank()) {
-                        logManager.i("GeminiLive:TTS", "Транскрипт ответа модели: '$it'")
-                        _events.tryEmit(GeminiEvent.OutputTranscript(it))
-                    }
+                    if (it.isNotBlank()) _events.tryEmit(GeminiEvent.OutputTranscript(it))
                 }
 
                 sc["modelTurn"]?.jsonObject?.get("parts")?.jsonArray?.forEach { partEl ->
