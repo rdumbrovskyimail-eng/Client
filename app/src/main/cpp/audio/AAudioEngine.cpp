@@ -11,7 +11,6 @@
 
 #define LOG_TAG "NativeAudioEngine"
 
-// Неблокирующее логирование: отправка в Android Logcat + NativeLogQueue
 #undef LOGI
 #undef LOGE
 #define LOGI(...) do { \
@@ -27,6 +26,133 @@
     __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "%s", _buf); \
     client::logging::NativeLogQueue::getInstance().push(6, LOG_TAG, _buf); \
 } while(0)
+
+namespace {
+
+/**
+ * Высокоточный биквадратный IIR-фильтр (Direct Form II)
+ */
+struct Biquad {
+    float b0{1.0f}, b1{0.0f}, b2{0.0f};
+    float a1{0.0f}, a2{0.0f};
+    float w1{0.0f}, w2{0.0f};
+
+    void reset() {
+        w1 = 0.0f;
+        w2 = 0.0f;
+    }
+
+    inline float process(float in) {
+        float w0 = in - a1 * w1 - a2 * w2;
+        float out = b0 * w0 + b1 * w1 + b2 * w2;
+        w2 = w1;
+        w1 = w0;
+        return out;
+    }
+
+    void makeLowShelf(float fc, float gainDb, float fs) {
+        float A = std::pow(10.0f, gainDb / 40.0f);
+        float omega = 2.0f * 3.14159265f * fc / fs;
+        float sn = std::sin(omega);
+        float cs = std::cos(omega);
+        float alpha = sn / 2.0f * std::sqrt((A + 1.0f / A) * (1.0f / 0.9f - 1.0f) + 2.0f);
+        float beta = 2.0f * std::sqrt(A) * alpha;
+
+        float a0 = (A + 1.0f) + (A - 1.0f) * cs + beta;
+        b0 = (A * ((A + 1.0f) - (A - 1.0f) * cs + beta)) / a0;
+        b1 = (2.0f * A * ((A - 1.0f) - (A + 1.0f) * cs)) / a0;
+        b2 = (A * ((A + 1.0f) - (A - 1.0f) * cs - beta)) / a0;
+        a1 = (-2.0f * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
+        a2 = ((A + 1.0f) + (A - 1.0f) * cs - beta) / a0;
+    }
+
+    void makeHighShelf(float fc, float gainDb, float fs) {
+        float A = std::pow(10.0f, gainDb / 40.0f);
+        float omega = 2.0f * 3.14159265f * fc / fs;
+        float sn = std::sin(omega);
+        float cs = std::cos(omega);
+        float alpha = sn / 2.0f * std::sqrt((A + 1.0f / A) * (1.0f / 0.9f - 1.0f) + 2.0f);
+        float beta = 2.0f * std::sqrt(A) * alpha;
+
+        float a0 = (A + 1.0f) - (A - 1.0f) * cs + beta;
+        b0 = (A * ((A + 1.0f) + (A - 1.0f) * cs + beta)) / a0;
+        b1 = (-2.0f * A * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
+        b2 = (A * ((A + 1.0f) + (A - 1.0f) * cs - beta)) / a0;
+        a1 = (2.0f * ((A - 1.0f) - (A + 1.0f) * cs)) / a0;
+        a2 = ((A + 1.0f) - (A - 1.0f) * cs - beta) / a0;
+    }
+};
+
+/**
+ * Процессор аналогового лампового звука и психоакустической плотности:
+ * 1. Pre-Drive (+3.5 дБ) — подъем воспринимаемой RMS-громкости.
+ * 2. Грудной резонатор (Low-Shelf 160 Гц, +3.5 дБ) — убирает пластмассовый призвук.
+ * 3. Воздух и кристальные согласные (High-Shelf 5000 Гц, +3.2 дБ).
+ * 4. Асимметричный триодный сатуратор (четные гармоники + Soft Knee Tape Limiter).
+ */
+class AnalogVoiceEnhancer {
+public:
+    AnalogVoiceEnhancer() {
+        reset(48000);
+    }
+
+    void reset(int32_t sampleRate) {
+        currentRate_ = sampleRate;
+        float fs = static_cast<float>(sampleRate);
+
+        lowShelf_.reset();
+        highShelf_.reset();
+
+        // 160 Гц — основа грудного тембра живого человека
+        lowShelf_.makeLowShelf(160.0f, 3.5f, fs);
+
+        // 5000 Гц — воздух и читаемость согласных (адаптируется к полосе Найквиста)
+        float highFc = std::min(5000.0f, fs * 0.44f);
+        highShelf_.makeHighShelf(highFc, 3.2f, fs);
+    }
+
+    void process(int16_t* samples, size_t numFrames, int32_t sampleRate) {
+        if (samples == nullptr || numFrames == 0) return;
+
+        if (sampleRate != currentRate_ && sampleRate > 0) {
+            reset(sampleRate);
+        }
+
+        // Предварительный разгон амплитуды (+3.5 дБ)
+        constexpr float PRE_DRIVE = 1.48f;
+        constexpr float INV_32768 = 1.0f / 32768.0f;
+
+        for (size_t i = 0; i < numFrames; ++i) {
+            float x = static_cast<float>(samples[i]) * INV_32768 * PRE_DRIVE;
+
+            // 1. Утепление баса и раскрытие воздуха эквалайзером
+            x = lowShelf_.process(x);
+            x = highShelf_.process(x);
+
+            // 2. Асимметричный триодный сатуратор (генерация 2-й гармоники теплого лампового звука)
+            x = x + 0.12f * (x * x);
+
+            // 3. Аналоговый мягкий ограничитель (Soft-Knee Limiter)
+            float absX = std::abs(x);
+            float y = (absX < 1.0f)
+                ? (x - 0.22f * x * x * x)
+                : ((x > 0.0f ? 1.0f : -1.0f) * (0.78f + 0.22f * (1.0f - std::exp(-2.0f * (absX - 1.0f)))));
+
+            // 4. Запись обратно в PCM16 без жесткого клиппинга
+            int32_t outSample = static_cast<int32_t>(y * 32767.0f);
+            samples[i] = static_cast<int16_t>(std::clamp(outSample, -32768, 32767));
+        }
+    }
+
+private:
+    int32_t currentRate_{48000};
+    Biquad lowShelf_;
+    Biquad highShelf_;
+};
+
+static AnalogVoiceEnhancer s_voiceEnhancer;
+
+} // namespace
 
 namespace client::audio {
 
@@ -51,7 +177,6 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
                         int32_t inputDeviceId, int32_t outputDeviceId) {
     stop();
 
-    // Пауза 20 мс для детерминированного освобождения аппаратных дескрипторов ядра
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
     {
@@ -60,6 +185,7 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
         resampler24To48_.reset();
         captureDecimator48To16_.reset();
         resetEarcon();
+        s_voiceEnhancer.reset(targetPlaybackSampleRate);
     }
 
     captureBuffer_.clear();
@@ -86,12 +212,10 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
     AAudioStreamBuilder_setChannelCount(inBuilder, CHANNEL_COUNT_MONO);
     AAudioStreamBuilder_setFormat(inBuilder, AAUDIO_FORMAT_PCM_I16);
 
-    // Явная аппаратная привязка к микрофону CMF Buds 2 или спикера
     if (inputDeviceId > 0) {
         AAudioStreamBuilder_setDeviceId(inBuilder, inputDeviceId);
     }
 
-    // Режим SHARED с пресетом VOICE_COMMUNICATION гарантирует стабильный захват без отказов HAL
     AAudioStreamBuilder_setSharingMode(inBuilder, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setInputPreset(inBuilder, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
 
@@ -126,7 +250,6 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
     AAudioStreamBuilder_setFormat(outBuilder, AAUDIO_FORMAT_PCM_I16);
     AAudioStreamBuilder_setSampleRate(outBuilder, targetPlaybackSampleRate);
 
-    // Явная привязка к ID динамика/наушника
     if (outputDeviceId > 0) {
         AAudioStreamBuilder_setDeviceId(outBuilder, outputDeviceId);
     }
@@ -135,7 +258,6 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
         AAudioStreamBuilder_setSharingMode(outBuilder, AAUDIO_SHARING_MODE_SHARED);
         AAudioStreamBuilder_setUsage(outBuilder, AAUDIO_USAGE_VOICE_COMMUNICATION);
     } else {
-        // Для динамиков используем USAGE_VOICE_COMMUNICATION для работы аппаратного эхоподавления
         AAudioStreamBuilder_setSharingMode(outBuilder, AAUDIO_SHARING_MODE_EXCLUSIVE);
         AAudioStreamBuilder_setUsage(outBuilder, AAUDIO_USAGE_VOICE_COMMUNICATION);
     }
@@ -224,6 +346,7 @@ void AAudioEngine::stop() {
         resampler24To48_.reset();
         captureDecimator48To16_.reset();
         resetEarcon();
+        s_voiceEnhancer.reset(48000);
     }
 
     captureBuffer_.clear();
@@ -237,14 +360,6 @@ void AAudioEngine::stop() {
     LOGI("AAudioEngine stopped");
 }
 
-/**
- * Запись входящих сэмплов от Gemini Live.
- * 
- * ФУНДАМЕНТАЛЬНОЕ ПРАВИЛО МУЛЬТИРЕЙТИНГА (Источники 151, 161, 200):
- * Метод возвращает количество потребленных ВХОДНЫХ сэмплов (frames),
- * благодаря чему вызывающий слой в Kotlin сразу закрывает пакет за один проход
- * и не пересылает хвост звука повторно, устраняя эффект наложения нескольких моделей!
- */
 size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
     if (frames == 0 || pcm == nullptr) return 0;
 
@@ -253,7 +368,6 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
     int32_t actualRate = actualPlaybackSampleRate_.load(std::memory_order_acquire);
     if (actualRate <= 0) actualRate = SAMPLE_RATE_GEMINI_OUT;
 
-    // Автоматическое масштабирование скретчпада под размер любого входящего сетевого пакета
     const size_t neededCapacity = static_cast<size_t>(frames * 3);
     if (neededCapacity > resampleScratchBuffer_.size()) {
         resampleScratchBuffer_.resize(neededCapacity * 2);
@@ -264,13 +378,11 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
         size_t resampledFrames = resampler24To16_.process(
             pcm, frames, resampleScratchBuffer_.data()
         );
-        size_t writtenOut = playbackBuffer_.write(resampleScratchBuffer_.data(), resampledFrames);
-        
-        // Возвращаем количество поглощенных ВХОДНЫХ сэмплов frames, ликвидируя дублирование
-        if (writtenOut >= resampledFrames) {
-            return frames; // Весь входной пакет 24 кГц записан за 1 проход
+        size_t written = playbackBuffer_.write(resampleScratchBuffer_.data(), resampledFrames);
+        if (written >= resampledFrames) {
+            return frames;
         } else {
-            return (resampledFrames > 0) ? (writtenOut * frames / resampledFrames) : 0;
+            return (resampledFrames > 0) ? (written * frames / resampledFrames) : 0;
         }
     }
 
@@ -279,11 +391,11 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
         size_t resampledFrames = resampler24To48_.process(
             pcm, frames, resampleScratchBuffer_.data()
         );
-        size_t writtenOut = playbackBuffer_.write(resampleScratchBuffer_.data(), resampledFrames);
-        if (writtenOut >= resampledFrames) {
+        size_t written = playbackBuffer_.write(resampleScratchBuffer_.data(), resampledFrames);
+        if (written >= resampledFrames) {
             return frames;
         } else {
-            return (resampledFrames > 0) ? (writtenOut * frames / resampledFrames) : 0;
+            return (resampledFrames > 0) ? (written * frames / resampledFrames) : 0;
         }
     }
 
@@ -309,11 +421,11 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
         dst[i] = static_cast<int16_t>(std::clamp(interpolated, -32768, 32767));
     }
 
-    size_t writtenOut = playbackBuffer_.write(dst, targetFrames);
-    if (writtenOut >= targetFrames) {
+    size_t written = playbackBuffer_.write(dst, targetFrames);
+    if (written >= targetFrames) {
         return frames;
     } else {
-        return (targetFrames > 0) ? (writtenOut * frames / targetFrames) : 0;
+        return (targetFrames > 0) ? (written * frames / targetFrames) : 0;
     }
 }
 
@@ -421,6 +533,13 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
         }
         engine->earconPhase_.store(phase, std::memory_order_release);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // ПСИХОАКУСТИЧЕСКИЙ ПРОЦЕССОР АНАЛОГОВОЙ ТЕПЛОТЫ, БАСА И ВОЗДУХА
+    // Обрабатывает сэмплы перед подачей на ЦАП: грудной бас, кристальный верх,
+    // триодное насыщение (2-я гармоника) и подъем воспринимаемой громкости (+3.5 дБ)
+    // ─────────────────────────────────────────────────────────────────────────────
+    s_voiceEnhancer.process(samples, numFrames, actualRate);
 
     const float vol = engine->playbackVolume_.load(std::memory_order_relaxed);
     if (vol < 0.999f) {
