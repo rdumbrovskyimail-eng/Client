@@ -36,7 +36,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         const val WS_HOST = "generativelanguage.googleapis.com"
         const val WS_PATH = "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         
-        // Увеличен до 256 КБ: сетевые джиттер-всплески больше не глушат микрофон
+        // Лимит 256 КБ исключает ложные отсечки микрофона при стартовом джиттере
         private const val MAX_QUEUE_BYTES = 256L * 1024
         private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280
         private const val MAX_HISTORY_TURNS = 20
@@ -113,7 +113,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         seededHistory = false
         activeConfig = cfg
 
-        while (_audio.tryReceive().isSuccess) { /* сброс буфера вывода */ }
+        while (_audio.tryReceive().isSuccess) { /* сброс очереди аудио */ }
         synchronized(batchLock) { audioBatchBuffer.reset() }
 
         val myEpoch = epochGen.incrementAndGet()
@@ -205,8 +205,9 @@ class GeminiProtobufLiveClient @Inject constructor(
     }
 
     private fun sendAudioPayload(ws: WebSocket, payload: ByteArray) {
-        if (ws.queueSize() > MAX_QUEUE_BYTES) {
-            logManager.w("WebSocket:Backpressure", "Очередь переполнена (${ws.queueSize()} байт). Пропуск чанка.")
+        val currentQueue = ws.queueSize()
+        if (currentQueue > MAX_QUEUE_BYTES) {
+            logManager.w("WebSocket:Backpressure", "Очередь переполнена ($currentQueue байт > $MAX_QUEUE_BYTES). Пропуск чанка.")
             return
         }
 
@@ -224,20 +225,21 @@ class GeminiProtobufLiveClient @Inject constructor(
     }
 
     /**
-     * Отправка текстовых команд по спецификации Gemini Live API:
+     * Отправка текстовых команд:
      * 'text' обязан быть скалярной строкой (Scalar String), а не объектом!
      */
     fun sendRealtimeText(text: String) {
         val ws = webSocket ?: return
         if (!isReady || text.isBlank()) return
 
+        val cleanText = text.trim()
         val jsonMessage = buildJsonObject {
             putJsonObject("realtimeInput") {
-                put("text", text.trim()) // Строго скалярное значение "text": "привет"
+                put("text", cleanText) // Скалярное строковое поле "text": "привет"
             }
         }.toString()
 
-        logManager.net("WebSocket:TxText", "Отправка текста: '$text'", jsonMessage)
+        logManager.net("WebSocket:TxText", "Отправка текста: '$cleanText'", jsonMessage)
         ws.send(jsonMessage)
     }
 
