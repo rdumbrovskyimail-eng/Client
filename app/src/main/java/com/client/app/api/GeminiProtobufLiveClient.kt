@@ -35,7 +35,9 @@ class GeminiProtobufLiveClient @Inject constructor(
     companion object {
         const val WS_HOST = "generativelanguage.googleapis.com"
         const val WS_PATH = "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-        private const val MAX_QUEUE_BYTES = 64L * 1024
+        
+        // Увеличен до 256 КБ: сетевые джиттер-всплески больше не глушат микрофон
+        private const val MAX_QUEUE_BYTES = 256L * 1024
         private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280
         private const val MAX_HISTORY_TURNS = 20
     }
@@ -111,7 +113,8 @@ class GeminiProtobufLiveClient @Inject constructor(
         seededHistory = false
         activeConfig = cfg
 
-        while (_audio.tryReceive().isSuccess) { /* сброс буфера */ }
+        while (_audio.tryReceive().isSuccess) { /* сброс буфера вывода */ }
+        synchronized(batchLock) { audioBatchBuffer.reset() }
 
         val myEpoch = epochGen.incrementAndGet()
         epoch = myEpoch
@@ -201,10 +204,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         sendAudioPayload(ws, payload)
     }
 
-    /**
-     * Отправка микрофонных сэмплов строго по актуальной спецификации:
-     * {"realtimeInput": {"audio": {"mimeType": "audio/pcm;rate=16000", "data": "..."}}}
-     */
     private fun sendAudioPayload(ws: WebSocket, payload: ByteArray) {
         if (ws.queueSize() > MAX_QUEUE_BYTES) {
             logManager.w("WebSocket:Backpressure", "Очередь переполнена (${ws.queueSize()} байт). Пропуск чанка.")
@@ -224,15 +223,17 @@ class GeminiProtobufLiveClient @Inject constructor(
         ws.send(jsonMessage)
     }
 
+    /**
+     * Отправка текстовых команд по спецификации Gemini Live API:
+     * 'text' обязан быть скалярной строкой (Scalar String), а не объектом!
+     */
     fun sendRealtimeText(text: String) {
         val ws = webSocket ?: return
         if (!isReady || text.isBlank()) return
 
         val jsonMessage = buildJsonObject {
             putJsonObject("realtimeInput") {
-                putJsonObject("text") {
-                    put("text", text)
-                }
+                put("text", text.trim()) // Строго скалярное значение "text": "привет"
             }
         }.toString()
 
