@@ -33,11 +33,11 @@ class GeminiProtobufLiveClient @Inject constructor(
     private val logManager: AppLogManager
 ) {
     companion object {
-        // Официальный шлюз Google AI Studio Developer API
         const val WS_HOST = "generativelanguage.googleapis.com"
         const val WS_PATH = "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         private const val MAX_QUEUE_BYTES = 64L * 1024
         private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280
+        private const val MAX_HISTORY_TURNS = 20
     }
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -99,6 +99,8 @@ class GeminiProtobufLiveClient @Inject constructor(
     val audio: ReceiveChannel<AudioFrame> = _audio
 
     @Volatile var isReady: Boolean = false; private set
+    @Volatile private var seededHistory = false
+    @Volatile private var activeConfig: LiveConfig? = null
 
     private val audioBatchBuffer = ByteArrayOutputStream(AUDIO_BATCH_THRESHOLD_BYTES * 2)
     private val batchLock = Any()
@@ -106,8 +108,10 @@ class GeminiProtobufLiveClient @Inject constructor(
     suspend fun connect(cfg: LiveConfig) = wsMutex.withLock {
         closeInternal()
         isReady = false
+        seededHistory = false
+        activeConfig = cfg
 
-        while (_audio.tryReceive().isSuccess) { /* сброс очереди */ }
+        while (_audio.tryReceive().isSuccess) { /* сброс буфера */ }
 
         val myEpoch = epochGen.incrementAndGet()
         epoch = myEpoch
@@ -240,6 +244,31 @@ class GeminiProtobufLiveClient @Inject constructor(
         ws.send(jsonMessage)
     }
 
+    fun seedHistory(turns: List<Pair<String, String>>) {
+        val ws = webSocket ?: return
+        if (seededHistory || turns.isEmpty()) return
+        seededHistory = true
+
+        val jsonMessage = buildJsonObject {
+            putJsonObject("clientContent") {
+                putJsonArray("turns") {
+                    turns.takeLast(MAX_HISTORY_TURNS).forEach { (role, text) ->
+                        addJsonObject {
+                            put("role", if (role == "model") "model" else "user")
+                            putJsonArray("parts") {
+                                addJsonObject { put("text", text) }
+                            }
+                        }
+                    }
+                }
+                put("turnComplete", true)
+            }
+        }.toString()
+
+        logManager.net("WebSocket:TxHistory", "Затравка контекста сессии (${turns.size} шагов)", jsonMessage)
+        ws.send(jsonMessage)
+    }
+
     fun sendAudioStreamEnd() {
         if (!isReady) return
         val ws = webSocket ?: return
@@ -290,7 +319,6 @@ class GeminiProtobufLiveClient @Inject constructor(
     }
 
     private fun buildSetupMessage(cfg: LiveConfig): String {
-        // Формат AI Studio: "models/gemini-3.1-flash-live-preview"
         val rawModelName = cfg.model.trim()
             .removePrefix("publishers/google/models/")
             .removePrefix("models/")
@@ -300,9 +328,9 @@ class GeminiProtobufLiveClient @Inject constructor(
             putJsonObject("setup") {
                 put("model", cleanModel)
                 putJsonObject("generationConfig") {
+                    // Строго только AUDIO. Исключает отказ сервера с кодом 1007
                     putJsonArray("responseModalities") {
                         add("AUDIO")
-                        add("TEXT")
                     }
                     put("temperature", cfg.temperature)
                     putJsonObject("speechConfig") {
@@ -314,8 +342,26 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }
 
+                // Транскрипция входящего и исходящего голоса
                 putJsonObject("inputAudioTranscription") {}
                 putJsonObject("outputAudioTranscription") {}
+
+                // Скользящее сжатие контекста: предотвращает переполнение токенов при долгом разговоре
+                putJsonObject("contextWindowCompression") {
+                    putJsonObject("slidingWindow") {}
+                }
+
+                // Калибровка аппаратного VAD на стороне Google
+                putJsonObject("realtimeInputConfig") {
+                    putJsonObject("automaticActivityDetection") {
+                        put("disabled", false)
+                        put("startOfSpeechSensitivity", "START_SENSITIVITY_HIGH")
+                        put("endOfSpeechSensitivity", "END_SENSITIVITY_LOW")
+                        put("prefixPaddingMs", 60)
+                        put("silenceDurationMs", 600)
+                    }
+                    put("activityHandling", "START_OF_ACTIVITY_INTERRUPTS")
+                }
 
                 cfg.cachedContentId?.takeIf { it.isNotBlank() }?.let {
                     put("cachedContent", it)
@@ -338,6 +384,12 @@ class GeminiProtobufLiveClient @Inject constructor(
                 cfg.resumptionHandle?.takeIf { it.isNotBlank() }?.let { handle ->
                     putJsonObject("sessionResumption") { put("handle", handle) }
                 }
+
+                if (cfg.initialHistory.isNotEmpty()) {
+                    putJsonObject("historyConfig") {
+                        put("initialHistoryInClientContent", true)
+                    }
+                }
             }
         }
         return setupObj.toString()
@@ -351,6 +403,11 @@ class GeminiProtobufLiveClient @Inject constructor(
                 isReady = true
                 logManager.i("GeminiLive", "Сессия полностью готова (setupComplete получен)")
                 _events.tryEmit(GeminiEvent.SetupComplete)
+
+                // Если передана история предыдущих диалогов, отправляем её сразу после подтверждения setup
+                activeConfig?.initialHistory?.takeIf { it.isNotEmpty() }?.let { history ->
+                    seedHistory(history)
+                }
             }
 
             root["usageMetadata"]?.jsonObject?.get("totalTokenCount")?.jsonPrimitive?.intOrNull?.let {
@@ -445,6 +502,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         val ws = webSocket
         webSocket = null
         isReady = false
+        activeConfig = null
         synchronized(batchLock) { audioBatchBuffer.reset() }
         runCatching { ws?.close(1000, "close") }
         runCatching { ws?.cancel() }
