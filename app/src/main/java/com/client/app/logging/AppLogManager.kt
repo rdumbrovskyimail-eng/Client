@@ -1,8 +1,10 @@
+// >>> FILE: app/src/main/java/com/client/app/logging/AppLogManager.kt
 package com.client.app.logging
 
 import android.content.Context
 import android.net.Uri
 import androidx.core.content.FileProvider
+import com.client.app.audio.NativeAudioBridge
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -14,6 +16,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
+import javax.inject.Provider
 import javax.inject.Singleton
 import kotlin.concurrent.withLock
 
@@ -41,7 +44,8 @@ data class LogEntry(
 
 @Singleton
 class AppLogManager @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val nativeBridgeProvider: Provider<NativeAudioBridge>
 ) {
     companion object {
         const val RING_BUFFER_CAPACITY = 5000
@@ -69,12 +73,48 @@ class AppLogManager @Inject constructor(
     init {
         scope.launch {
             while (isActive) {
-                delay(100) // Батчинг обновлений до 10 кадров/сек для экономии CPU при высокой нагрузке
+                delay(65) // Опрос аппаратной очереди C++ ядра 15 раз в секунду
+                drainNativeLogsSafely()
                 if (updateDebounce.getAndSet(0) > 0) {
                     publishSnapshot()
                 }
             }
         }
+    }
+
+    /**
+     * Выкачивает накопившиеся логи из Lock-Free очереди C++ ядра (NativeLogQueue) в память JVM
+     */
+    private fun drainNativeLogsSafely() {
+        val bridge = runCatching { nativeBridgeProvider.get() }.getOrNull() ?: return
+        val rawTriplets = runCatching { bridge.drainNativeLogs() }.getOrNull() ?: return
+        if (rawTriplets.isEmpty()) return
+
+        var i = 0
+        while (i < rawTriplets.size - 2) {
+            val levelCode = rawTriplets[i].toIntOrNull() ?: 4
+            val tag = rawTriplets[i + 1]
+            val msg = rawTriplets[i + 2]
+
+            val level = when (levelCode) {
+                2 -> LogLevel.VERBOSE
+                3 -> LogLevel.DEBUG
+                4 -> LogLevel.INFO
+                5 -> LogLevel.WARN
+                6 -> LogLevel.ERROR
+                8 -> LogLevel.AUDIO
+                9 -> LogLevel.VAD
+                else -> LogLevel.INFO
+            }
+
+            if (level == LogLevel.ERROR) {
+                _errorCount.update { it + 1 }
+            }
+
+            internalLog(level, tag, msg, payload = null)
+            i += 3
+        }
+        updateDebounce.incrementAndGet()
     }
 
     fun v(tag: String, msg: String, payload: String? = null) = log(LogLevel.VERBOSE, tag, msg, payload)
@@ -91,6 +131,11 @@ class AppLogManager @Inject constructor(
     fun vad(tag: String, msg: String, payload: String? = null) = log(LogLevel.VAD, tag, msg, payload)
 
     fun log(level: LogLevel, tag: String, message: String, payload: String? = null) {
+        internalLog(level, tag, message, payload)
+        updateDebounce.incrementAndGet()
+    }
+
+    private fun internalLog(level: LogLevel, tag: String, message: String, payload: String?) {
         val now = System.currentTimeMillis()
         val formattedTime = synchronized(timeFormat) { timeFormat.format(Date(now)) }
         val sanitizedMsg = sanitize(message)
@@ -112,8 +157,6 @@ class AppLogManager @Inject constructor(
             val idx = ((id - 1) % RING_BUFFER_CAPACITY).toInt()
             buffer[idx] = entry
         }
-
-        updateDebounce.incrementAndGet()
     }
 
     private fun sanitize(input: String): String {
