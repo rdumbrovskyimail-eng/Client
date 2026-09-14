@@ -136,7 +136,6 @@ class SessionManager @Inject constructor(
     @Volatile private var userStopped = false
     @Volatile private var pendingGoAway = false
     @Volatile private var userMicDesired = true
-
     @Volatile private var hasReceivedAudioTranscript = false
 
     init {
@@ -144,6 +143,7 @@ class SessionManager @Inject constructor(
         observeEvents()
         observeAudio()
         observeBargeIn()
+        observeFocus()
         observeForvoQuota()
     }
 
@@ -366,6 +366,38 @@ class SessionManager @Inject constructor(
         }
     }
 
+    /**
+     * Сбор и валидация истории диалога для бесшовной затравки контекста через initialHistory
+     */
+    private fun recentHistory(): List<Pair<String, String>> {
+        val raw = _state.value.messages
+            .filter { !it.interim && it.text.isNotBlank() }
+
+        if (raw.isEmpty()) return emptyList()
+
+        // 1. Схлопываем идущие подряд реплики одной роли (user+user или model+model)
+        val merged = mutableListOf<Pair<String, String>>()
+        for (msg in raw) {
+            val role = if (msg.role == "model") "model" else "user"
+            val last = merged.lastOrNull()
+            if (last != null && last.first == role) {
+                merged[merged.size - 1] = role to "${last.second}\n\n${msg.text.trim()}"
+            } else {
+                merged.add(role to msg.text.trim())
+            }
+        }
+
+        // 2. Ограничиваем срез последними 20 ходами
+        var slice = merged.takeLast(20)
+
+        // 3. Сессия в Gemini Live обязана начинаться строго с реплики user
+        while (slice.isNotEmpty() && slice.first().first != "user") {
+            slice = slice.drop(1)
+        }
+
+        return slice
+    }
+
     private suspend fun startInternal(resume: Boolean) {
         pendingGoAway = false
         hasReceivedAudioTranscript = false
@@ -388,7 +420,6 @@ class SessionManager @Inject constructor(
             return
         }
 
-        // Ошибка №34 [ANDROID/LIFECYCLE]: Запуск службы строго однократно из IDLE до обновления статуса
         if (!resume && _state.value.link == LinkState.IDLE) {
             startForegroundService()
         }
@@ -416,7 +447,8 @@ class SessionManager @Inject constructor(
                 voiceName = voice,
                 toolsJson = dynamicTools,
                 resumptionHandle = if (resume) resumptionHandle else null,
-                cachedContentId = cachedContentId
+                cachedContentId = cachedContentId,
+                initialHistory = if (resume) emptyList() else recentHistory()
             )
         )
     }
@@ -482,7 +514,6 @@ class SessionManager @Inject constructor(
         }
     }
 
-    // Ошибка №32 [AUDIO/PRIVACY]: Сброс очереди канала micOutput для предотвращения передачи старого звука
     private suspend fun stopMic(userInitiated: Boolean = false) = micMutex.withLock {
         if (userInitiated) userMicDesired = false
         micJob?.cancelAndJoin()
@@ -505,6 +536,15 @@ class SessionManager @Inject constructor(
             _state.update { it.copy(isAiSpeaking = false) }
             streamingRole = null
             hasReceivedAudioTranscript = false
+        }
+    }
+
+    private fun observeFocus() = scope.launch {
+        audioEngine.focusLost.collect { lost ->
+            if (lost && _state.value.isMicActive) {
+                stopMic(userInitiated = false)
+                _state.update { it.copy(error = "Аудио прервано другим приложением или вызовом") }
+            }
         }
     }
 
@@ -552,7 +592,7 @@ class SessionManager @Inject constructor(
                     appendTranscript("model", event.text, false)
                 }
                 is GeminiEvent.ModelText -> {
-                    // Игнорируем промежуточные фрагменты, дожидаясь канонического OutputTranscript
+                    // Игнорируем промежуточные текстовые фрагменты, дожидаясь чистого OutputTranscript
                 }
                 is GeminiEvent.Usage -> _state.update { it.copy(tokensUsed = event.totalTokens) }
                 is GeminiEvent.ToolCall -> handleToolCall(event.calls)
