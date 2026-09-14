@@ -88,6 +88,7 @@ class NativeAudioEngine @Inject constructor(
         .order(ByteOrder.LITTLE_ENDIAN)
 
     private val spectrumRawData = FloatArray(7)
+    // Атомарная ссылка: 120 FPS AGSL-шейдер читает срез спектра напрямую из памяти
     val spectrumUniforms = AtomicReference(FloatArray(5))
 
     private val bufferPool = ArrayDeque<ByteArray>(32).apply {
@@ -331,13 +332,20 @@ class NativeAudioEngine @Inject constructor(
         }
 
         spectrumJob = engineScope.launch {
+            var tick = 0
             while (isActive) {
                 bridge.getSpectrumData(spectrumRawData)
                 val updated = FloatArray(5)
                 System.arraycopy(spectrumRawData, 0, updated, 0, 5)
+                // Атомарный буфер обновляется на полной скорости для 120 FPS AGSL-шейдера
                 spectrumUniforms.set(updated)
-                _micLevel.value = (spectrumRawData[5] * 3.5f).coerceIn(0f, 1f)
-                _outLevel.value = (spectrumRawData[6] * 3.5f).coerceIn(0f, 1f)
+
+                // ЭТАП 5: Обновляем StateFlow для Compose с частотой 31 Гц (каждый 4-й тик),
+                // полностью ликвидируя Recomposition Thrashing в UI-потоке!
+                if (tick++ % 4 == 0) {
+                    _micLevel.value = (spectrumRawData[5] * 3.5f).coerceIn(0f, 1f)
+                    _outLevel.value = (spectrumRawData[6] * 3.5f).coerceIn(0f, 1f)
+                }
                 delay(8)
             }
         }
@@ -421,9 +429,6 @@ class NativeAudioEngine @Inject constructor(
         _outLevel.value = 0f
     }
 
-    /**
-     * Сброс режима перебивания (вызывается SessionManager, когда Google подтвердил событие Interrupted или начал новый ход)
-     */
     fun resetBargeInState() {
         isBargeInActive = false
     }
