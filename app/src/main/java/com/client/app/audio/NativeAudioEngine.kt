@@ -35,7 +35,9 @@ class NativeAudioEngine @Inject constructor(
     private val logger: AppLogger
 ) {
     companion object {
-        private const val BURST_BYTES = 160 * 2
+        private const val BURST_BYTES = 160 * 2 // 10 мс @ 16 кГц
+        private const val PLAYBACK_GRACE_PERIOD_MS = 400L
+        private const val BARGE_IN_DEBOUNCE_MS = 600L
     }
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -86,6 +88,11 @@ class NativeAudioEngine @Inject constructor(
         repeat(32) { add(ByteArray(BURST_BYTES)) }
     }
     private val poolLock = Any()
+    private val leadInBuffer = ArrayDeque<ByteArray>(32)
+
+    @Volatile private var lastPlaybackStartMs = 0L
+    @Volatile private var lastBargeInMs = 0L
+    @Volatile private var isBargeInActive = false
 
     init {
         engineScope.launch {
@@ -164,6 +171,7 @@ class NativeAudioEngine @Inject constructor(
 
             vadDetector.prepare()
             vadDetector.resetState()
+            isBargeInActive = false
 
             router.start { profile ->
                 routeTransitionChannel.trySend(profile)
@@ -200,6 +208,7 @@ class NativeAudioEngine @Inject constructor(
     private fun startLoops() {
         captureJob = engineScope.launch {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+            var wasAiRendering = false
 
             while (isActive && _isCapturing.value) {
                 captureDirectBuffer.clear()
@@ -210,26 +219,82 @@ class NativeAudioEngine @Inject constructor(
                     captureDirectBuffer.position(0)
                     captureDirectBuffer.get(frame, 0, bytesRead)
 
-                    // 1. Непрерывная потоковая передача звука в сеть (Gemini слышит пользователя без потерь)
-                    _micOutput.trySend(frame.copyOf(bytesRead))
+                    val now = System.currentTimeMillis()
+                    val currentOut = _outLevel.value
+                    val currentMic = _micLevel.value
+                    val isBluetooth = router.currentProfile.value.path == AudioRoutePath.CMF_BUDS_WIRELESS
+                    
+                    // Акустическое эхо существует ТОЛЬКО на встроенном динамике телефона
+                    val isAiRendering = !isBluetooth && (currentOut > 0.04f)
 
-                    // 2. Локальный нейросетевой VAD: используется для мгновенного аппаратного Barge-In
+                    // 1. ЛИКВИДАЦИЯ «СЛЕПОЙ ЗОНЫ»: если динамик телефона только что замолчал,
+                    // мгновенно выталкиваем весь накопленный пре-ролл буфер в Gemini
+                    if (wasAiRendering && !isAiRendering) {
+                        synchronized(poolLock) {
+                            while (leadInBuffer.isNotEmpty()) {
+                                _micOutput.trySend(leadInBuffer.removeFirst())
+                            }
+                        }
+                    }
+                    wasAiRendering = isAiRendering
+
+                    // 2. Локальный нейросетевой VAD для перебивания ассистента
                     vadDetector.processSamples(
                         pcm16 = frame,
                         onSpeechStart = {
-                            if (_outLevel.value > 0.05f) {
-                                bridge.flushPlayback()
-                                if (router.currentProfile.value.path == AudioRoutePath.CMF_BUDS_WIRELESS) {
-                                    bridge.triggerBargeInEarcon()
+                            if (isAiRendering) {
+                                // Защита от динамика S23 Ultra: DTD Гейгеля (голос должен превысить огибающую эха)
+                                val echoThreshold = maxOf(0.12f, currentOut * 0.42f)
+                                val canBargeIn = (now - lastPlaybackStartMs > PLAYBACK_GRACE_PERIOD_MS) &&
+                                                 (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS) &&
+                                                 (currentMic > echoThreshold)
+
+                                if (canBargeIn) {
+                                    lastBargeInMs = now
+                                    isBargeInActive = true
+                                    bridge.flushPlayback()
+                                    hapticManager.triggerBargeIn()
+                                    _bargeInEvents.tryEmit(Unit)
+
+                                    // Мгновенный сброс согласных звуков перебивания
+                                    synchronized(poolLock) {
+                                        while (leadInBuffer.isNotEmpty()) {
+                                            _micOutput.trySend(leadInBuffer.removeFirst())
+                                        }
+                                    }
                                 }
-                                hapticManager.triggerBargeIn()
-                                _bargeInEvents.tryEmit(Unit)
+                            } else if (isBluetooth && currentOut > 0.04f) {
+                                // На наушниках CMF Buds 2 перебивание мгновенно без барьеров
+                                if (now - lastPlaybackStartMs > 250L && now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS) {
+                                    lastBargeInMs = now
+                                    bridge.flushPlayback()
+                                    bridge.triggerBargeInEarcon()
+                                    hapticManager.triggerBargeIn()
+                                    _bargeInEvents.tryEmit(Unit)
+                                }
                             }
                         },
                         onSpeechEnd = {
-                            // Окончание реплики фиксируется автоматически облачной моделью
+                            if (now - lastBargeInMs > 1000L) {
+                                isBargeInActive = false
+                            }
                         }
                     )
+
+                    // 3. Маршрутизация звука:
+                    // На наушниках микрофон открыт ВСЕГДА (100% чувствительность, ноль съеденных букв).
+                    // На спикере S23 Ultra: если играет диффузор — копим пре-ролл, если замолчал или перебит — шлем сразу.
+                    if (isBluetooth || !isAiRendering || isBargeInActive) {
+                        _micOutput.trySend(frame.copyOf(bytesRead))
+                    } else {
+                        synchronized(poolLock) {
+                            leadInBuffer.addLast(frame.copyOf(bytesRead))
+                            val maxPreRoll = router.currentProfile.value.leadInBufferSizeFrames / 160
+                            while (leadInBuffer.size > maxPreRoll) {
+                                leadInBuffer.removeFirst()
+                            }
+                        }
+                    }
 
                     recycleBuffer(frame)
                 } else {
@@ -286,17 +351,19 @@ class NativeAudioEngine @Inject constructor(
 
         _micLevel.value = 0f
         _outLevel.value = 0f
+        isBargeInActive = false
     }
 
     fun setVolume(volume: Float) = bridge.setVolume(volume.coerceIn(0f, 1f))
     fun setMicGain(gain: Float) = bridge.setMicGain(gain.coerceIn(0.5f, 2.0f))
 
-    /**
-     * Потоковая неблокирующая передача входящих чанков речи от модели Gemini в C++ буфер.
-     * Полностью исключает вызовы Thread.sleep() и зависания пользовательского интерфейса.
-     */
     fun enqueuePlayback(pcm: ByteArray) {
         if (pcm.isEmpty() || !_isPlaying.value) return
+
+        if (_outLevel.value < 0.02f) {
+            lastPlaybackStartMs = System.currentTimeMillis()
+        }
+
         var offset = 0
         var remaining = pcm.size
         var attempts = 0
@@ -309,13 +376,14 @@ class NativeAudioEngine @Inject constructor(
                 remaining -= written
             }
             attempts++
-            Thread.yield() // Неблокирующее уступание кванта планировщику CPU вместо блокировки sleep
+            Thread.yield()
         }
     }
 
     fun flushPlayback() {
         bridge.flushPlayback()
         _outLevel.value = 0f
+        isBargeInActive = false
     }
 
     private fun obtainBuffer(): ByteArray = synchronized(poolLock) {
