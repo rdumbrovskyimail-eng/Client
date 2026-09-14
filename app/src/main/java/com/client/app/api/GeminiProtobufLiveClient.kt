@@ -201,6 +201,10 @@ class GeminiProtobufLiveClient @Inject constructor(
         sendAudioPayload(ws, payload)
     }
 
+    /**
+     * Отправка микрофонных сэмплов строго по актуальной спецификации:
+     * {"realtimeInput": {"audio": {"mimeType": "audio/pcm;rate=16000", "data": "..."}}}
+     */
     private fun sendAudioPayload(ws: WebSocket, payload: ByteArray) {
         if (ws.queueSize() > MAX_QUEUE_BYTES) {
             logManager.w("WebSocket:Backpressure", "Очередь переполнена (${ws.queueSize()} байт). Пропуск чанка.")
@@ -210,11 +214,9 @@ class GeminiProtobufLiveClient @Inject constructor(
         val base64Data = Base64.encodeToString(payload, Base64.NO_WRAP)
         val jsonMessage = buildJsonObject {
             putJsonObject("realtimeInput") {
-                putJsonArray("mediaChunks") {
-                    addJsonObject {
-                        put("mimeType", "audio/pcm;rate=16000")
-                        put("data", base64Data)
-                    }
+                putJsonObject("audio") {
+                    put("mimeType", "audio/pcm;rate=16000")
+                    put("data", base64Data)
                 }
             }
         }.toString()
@@ -227,16 +229,10 @@ class GeminiProtobufLiveClient @Inject constructor(
         if (!isReady || text.isBlank()) return
 
         val jsonMessage = buildJsonObject {
-            putJsonObject("clientContent") {
-                putJsonArray("turns") {
-                    addJsonObject {
-                        put("role", "user")
-                        putJsonArray("parts") {
-                            addJsonObject { put("text", text) }
-                        }
-                    }
+            putJsonObject("realtimeInput") {
+                putJsonObject("text") {
+                    put("text", text)
                 }
-                put("turnComplete", true)
             }
         }.toString()
 
@@ -284,12 +280,12 @@ class GeminiProtobufLiveClient @Inject constructor(
         tailPayload?.let { sendAudioPayload(ws, it) }
 
         val jsonMessage = buildJsonObject {
-            putJsonObject("clientContent") {
-                put("turnComplete", true)
+            putJsonObject("realtimeInput") {
+                put("audioStreamEnd", true)
             }
         }.toString()
 
-        logManager.net("WebSocket:TurnComplete", "Сигнал завершения речи turnComplete")
+        logManager.net("WebSocket:AudioStreamEnd", "Сигнал завершения речи audioStreamEnd")
         ws.send(jsonMessage)
     }
 
@@ -328,7 +324,6 @@ class GeminiProtobufLiveClient @Inject constructor(
             putJsonObject("setup") {
                 put("model", cleanModel)
                 putJsonObject("generationConfig") {
-                    // Строго только AUDIO. Исключает отказ сервера с кодом 1007
                     putJsonArray("responseModalities") {
                         add("AUDIO")
                     }
@@ -342,16 +337,13 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }
 
-                // Транскрипция входящего и исходящего голоса
                 putJsonObject("inputAudioTranscription") {}
                 putJsonObject("outputAudioTranscription") {}
 
-                // Скользящее сжатие контекста: предотвращает переполнение токенов при долгом разговоре
                 putJsonObject("contextWindowCompression") {
                     putJsonObject("slidingWindow") {}
                 }
 
-                // Калибровка аппаратного VAD на стороне Google
                 putJsonObject("realtimeInputConfig") {
                     putJsonObject("automaticActivityDetection") {
                         put("disabled", false)
@@ -404,7 +396,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                 logManager.i("GeminiLive", "Сессия полностью готова (setupComplete получен)")
                 _events.tryEmit(GeminiEvent.SetupComplete)
 
-                // Если передана история предыдущих диалогов, отправляем её сразу после подтверждения setup
                 activeConfig?.initialHistory?.takeIf { it.isNotEmpty() }?.let { history ->
                     seedHistory(history)
                 }
