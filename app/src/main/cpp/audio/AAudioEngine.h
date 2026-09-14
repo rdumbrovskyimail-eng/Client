@@ -37,7 +37,6 @@ public:
     void resetEarcon();
 
     void setVolume(float vol);
-    void setMicGain(gain_t gain);
     void setMicGain(float gain);
 
     float getMicRms() const { return micRms_.load(std::memory_order_relaxed); }
