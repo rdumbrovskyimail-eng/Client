@@ -1,10 +1,16 @@
 // >>> FILE: app/src/main/java/com/client/app/audio/NativeAudioEngine.kt
 package com.client.app.audio
 
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.os.Build
 import android.os.Process
 import com.client.app.haptics.HapticBargeInManager
 import com.client.app.util.AppLogger
 import com.client.app.vad.SileroVadDetector
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
@@ -21,6 +27,7 @@ import javax.inject.Singleton
 
 @Singleton
 class NativeAudioEngine @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val bridge: NativeAudioBridge,
     private val vadDetector: SileroVadDetector,
     private val hapticManager: HapticBargeInManager,
@@ -30,6 +37,9 @@ class NativeAudioEngine @Inject constructor(
     companion object {
         private const val BURST_BYTES = 160 * 2
     }
+
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private var focusRequest: AudioFocusRequest? = null
 
     private val _isCapturing = MutableStateFlow(false)
     val isCapturing: StateFlow<Boolean> = _isCapturing.asStateFlow()
@@ -48,6 +58,12 @@ class NativeAudioEngine @Inject constructor(
     )
     val bargeInEvents: SharedFlow<Unit> = _bargeInEvents.asSharedFlow()
 
+    /** Уведомление о потере AudioFocus (звонки, медиа других приложений) */
+    private val _focusLost = MutableSharedFlow<Boolean>(
+        replay = 0, extraBufferCapacity = 4, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val focusLost: SharedFlow<Boolean> = _focusLost.asSharedFlow()
+
     private val _micOutput = Channel<ByteArray>(256, BufferOverflow.DROP_OLDEST)
     val micOutput: ReceiveChannel<ByteArray> = _micOutput
 
@@ -59,10 +75,10 @@ class NativeAudioEngine @Inject constructor(
     private var captureJob: Job? = null
     private var spectrumJob: Job? = null
 
-    // Ошибка №9 [CONCURRENCY]: Мьютекс взаимного исключения для предотвращения гонок инициализации C++ ядра
+    // Мьютекс взаимного исключения для предотвращения гонок инициализации C++ ядра
     private val audioLifecycleMutex = Mutex()
 
-    // Conflated-канал для защиты от гонок при множественных событиях Bluetooth
+    // Conflated-канал для защиты от гонок при множественных событиях переключения Bluetooth
     private val routeTransitionChannel = Channel<RouteProfile>(Channel.CONFLATED)
 
     private val captureDirectBuffer: ByteBuffer = ByteBuffer.allocateDirect(BURST_BYTES * 4)
@@ -88,10 +104,72 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    // Ошибка №9 [CONCURRENCY]: Сериализация старта через audioLifecycleMutex
+    /* ═════════════════════════ AUDIO FOCUS ═════════════════════════ */
+
+    private fun requestAudioFocus(): Boolean {
+        val attrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(attrs)
+                .setAcceptsDelayedFocusGain(false)
+                .setOnAudioFocusChangeListener { change ->
+                    when (change) {
+                        AudioManager.AUDIOFOCUS_LOSS,
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                            logger.w("NativeAudioEngine: AudioFocus потерян ($change)")
+                            _focusLost.tryEmit(true)
+                        }
+                        AudioManager.AUDIOFOCUS_GAIN -> {
+                            logger.d("NativeAudioEngine: AudioFocus восстановлен")
+                            _focusLost.tryEmit(false)
+                        }
+                    }
+                }
+                .build()
+            focusRequest = req
+            audioManager.requestAudioFocus(req) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.requestAudioFocus(
+                { change ->
+                    if (change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+                        _focusLost.tryEmit(true)
+                    } else if (change == AudioManager.AUDIOFOCUS_GAIN) {
+                        _focusLost.tryEmit(false)
+                    }
+                },
+                AudioManager.STREAM_VOICE_CALL,
+                AudioManager.AUDIOFOCUS_GAIN
+            ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        }
+    }
+
+    private fun abandonAudioFocus() {
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+                focusRequest = null
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.abandonAudioFocus(null)
+            }
+        }
+    }
+
+    /* ═════════════════════════ ЖИЗНЕННЫЙ ЦИКЛ ═════════════════════════ */
+
     suspend fun start(): Boolean = audioLifecycleMutex.withLock {
         withContext(Dispatchers.IO) {
             if (_isCapturing.value) return@withContext true
+
+            if (!requestAudioFocus()) {
+                logger.e("NativeAudioEngine: Сбой запроса AudioFocus")
+                return@withContext false
+            }
 
             vadDetector.prepare()
             vadDetector.resetState()
@@ -105,12 +183,16 @@ class NativeAudioEngine @Inject constructor(
                 isBluetooth = profile.path == AudioRoutePath.CMF_BUDS_WIRELESS,
                 sampleRate = profile.sampleRateOut
             )
-            if (!inited) return@withContext false
+            if (!inited) {
+                abandonAudioFocus()
+                return@withContext false
+            }
 
             vadDetector.setThresholds(profile.vadThresholdStart, profile.vadThresholdEnd)
 
             if (!bridge.startAudio()) {
                 logger.e("NativeAudioEngine: Сбой запуска AAudio")
+                abandonAudioFocus()
                 return@withContext false
             }
 
@@ -135,7 +217,7 @@ class NativeAudioEngine @Inject constructor(
                     captureDirectBuffer.position(0)
                     captureDirectBuffer.get(frame, 0, bytesRead)
 
-                    // Ошибка №10 [PERF]: Устранение GC Thrashing — использование пула вместо copyOf()
+                    // Устранение GC Thrashing — использование пула вместо copyOf()
                     val maxPreRoll = router.currentProfile.value.leadInBufferSizeFrames / 160
                     synchronized(poolLock) {
                         val preRollBuf = obtainBuffer()
@@ -146,11 +228,9 @@ class NativeAudioEngine @Inject constructor(
                         }
                     }
 
-                    var speechTriggeredThisBurst = false
                     vadDetector.processSamples(
                         pcm16 = frame,
                         onSpeechStart = {
-                            speechTriggeredThisBurst = true
                             isSpeechActive = true
                             synchronized(poolLock) {
                                 while (leadInBuffer.isNotEmpty()) {
@@ -171,7 +251,7 @@ class NativeAudioEngine @Inject constructor(
                         }
                     )
 
-                    // Ошибка №11 [DEFECT]: Исключение утечки пула bufferPool при фиксации речи
+                    // Исключение утечки пула bufferPool при фиксации речи
                     if (isSpeechActive) {
                         _micOutput.trySend(frame)
                     } else {
@@ -196,7 +276,6 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    // Ошибка №9 [CONCURRENCY]: Сериализация смены аудиомаршрута через audioLifecycleMutex
     private suspend fun applyRouteInternal(profile: RouteProfile) = audioLifecycleMutex.withLock {
         withContext(Dispatchers.IO) {
             bridge.stopAudio()
@@ -224,6 +303,7 @@ class NativeAudioEngine @Inject constructor(
         spectrumJob = null
 
         bridge.stopAudio()
+        abandonAudioFocus()
         router.stop()
         vadDetector.resetState()
 
@@ -235,7 +315,6 @@ class NativeAudioEngine @Inject constructor(
     fun setVolume(volume: Float) = bridge.setVolume(volume.coerceIn(0f, 1f))
     fun setMicGain(gain: Float) = bridge.setMicGain(gain.coerceIn(0.5f, 2.0f))
 
-    // Ошибка №12 [DEFECT]: Гарантированная досылка сэмплов речи при переполнении буфера вывода
     fun enqueuePlayback(pcm: ByteArray) {
         if (pcm.isEmpty() || !_isPlaying.value) return
         var offset = 0
