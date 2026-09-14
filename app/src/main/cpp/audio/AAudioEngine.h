@@ -17,11 +17,18 @@ class AAudioEngine {
 public:
     static AAudioEngine& getInstance();
 
-    bool init(bool isBluetoothMode = false, int32_t targetPlaybackSampleRate = SAMPLE_RATE_GEMINI_OUT);
+    /**
+     * Инициализация аудиопотоков с поддержкой явных системных ID устройств ввода/вывода (Bluetooth SCO/BLE/Speaker)
+     */
+    bool init(bool isBluetoothMode = false, 
+              int32_t targetPlaybackSampleRate = SAMPLE_RATE_GEMINI_OUT,
+              int32_t inputDeviceId = AAUDIO_UNSPECIFIED,
+              int32_t outputDeviceId = AAUDIO_UNSPECIFIED);
+
     bool start();
     void stop();
 
-    // E-09, ERR-07: Потокобезопасная запись звука без выделения DirectByteBuffer и динамических реаллокаций
+    // Потокобезопасная запись сэмплов без динамических аллокаций
     size_t writePlaybackPcm(const int16_t* pcm, size_t frames);
     size_t readCapturePcm(int16_t* pcm, size_t maxFrames);
 
@@ -30,6 +37,7 @@ public:
     void resetEarcon();
 
     void setVolume(float vol);
+    void setMicGain(gain_t gain);
     void setMicGain(float gain);
 
     float getMicRms() const { return micRms_.load(std::memory_order_relaxed); }
@@ -39,7 +47,10 @@ public:
     int32_t getActualCaptureSampleRate() const { return actualCaptureSampleRate_.load(std::memory_order_relaxed); }
     int32_t getActualPlaybackSampleRate() const { return actualPlaybackSampleRate_.load(std::memory_order_relaxed); }
 
-    // E-03, ERR-05: Возврат согласованного снимка спектра через Wait-Free алгоритм Андерсона
+    int32_t getActiveInputDeviceId() const { return actualInputDeviceId_.load(std::memory_order_relaxed); }
+    int32_t getActiveOutputDeviceId() const { return actualOutputDeviceId_.load(std::memory_order_relaxed); }
+
+    // Возврат когерентного среза спектра через Wait-Free алгоритм Андерсона
     void getSpectrumData(dsp::SpectrumSnapshot& outSnapshot);
 
 private:
@@ -58,10 +69,11 @@ private:
     AAudioStream* captureStream_{nullptr};
     AAudioStream* playbackStream_{nullptr};
 
+    // Расширенные безблокировочные кольцевые буферы (32K сэмплов захват / 256K сэмплов вывод)
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_CAPTURE> captureBuffer_;
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_PLAYBACK> playbackBuffer_;
 
-    // Ошибка №27 [CONCURRENCY/CRASH]: Мьютекс состояния остановки стримов для исключения Double Free
+    // Мьютекс управления состоянием открытия/закрытия стримов
     std::mutex stateMutex_;
 
     std::atomic<bool> isRunning_{false};
@@ -69,9 +81,13 @@ private:
     std::atomic<bool> isMmapExclusiveActive_{false};
     std::atomic<int32_t> playbackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
 
-    // E-07: Подтверждённая HAL частота микрофона и динамика
+    // Подтвержденные HAL частоты дискретизации микрофона и динамика
     std::atomic<int32_t> actualCaptureSampleRate_{SAMPLE_RATE_GEMINI_IN};
     std::atomic<int32_t> actualPlaybackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
+
+    // Подтвержденные аппаратные ID устройств ввода и вывода
+    std::atomic<int32_t> actualInputDeviceId_{AAUDIO_UNSPECIFIED};
+    std::atomic<int32_t> actualOutputDeviceId_{AAUDIO_UNSPECIFIED};
 
     std::atomic<float> playbackVolume_{1.0f};
     std::atomic<float> micGain_{1.0f};
@@ -79,26 +95,24 @@ private:
     std::atomic<float> micRms_{0.0f};
     std::atomic<float> outRms_{0.0f};
 
-    // E-10: Фаза генератора Earcon
+    // Фазовый аккумулятор генератора Earcon
     std::atomic<size_t> earconPhase_{EARCON_INACTIVE_PHASE};
 
     std::unique_ptr<dsp::FastFft> fftProcessor_;
 
-    // E-02: Накопитель с перекрытием для БПФ
+    // Накопитель с перекрытием для БПФ
     std::vector<float> fftAccumulator_;
     size_t fftAccumulatorPos_{0};
 
-    // ERR-07: Мьютекс для защиты ресемплеров и скретчпада при смене маршрутов
+    // Мьютекс для защиты скретчпада писателя в JNI-потоке (НЕ блокирует RT playbackCallback!)
     std::mutex playbackWriteMutex_;
 
-    // ERR-07: Предвыделенный статический буфер ресемплинга на 16384 сэмпла (Zero-Allocation)
+    // Статически предвыделенные буферы ресемплинга и децимации
     std::vector<int16_t> resampleScratchBuffer_;
-
-    // ERR-04: Предвыделенный буфер децимации для исключения Stack Buffer Overflow
     std::vector<int16_t> captureDecimateBuffer_;
 
     PolyphaseResampler24To16 resampler24To16_;
-    LinearResampler24To48 resampler24To48_;
+    HermiteResampler24To48 resampler24To48_;
     Decimator48To16 captureDecimator48To16_;
 };
 
