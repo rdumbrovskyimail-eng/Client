@@ -51,7 +51,7 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
                         int32_t inputDeviceId, int32_t outputDeviceId) {
     stop();
 
-    // Пауза 20 мс для детерминированного освобождения аппаратных дескрипторов драйвера ядра
+    // Пауза 20 мс для детерминированного освобождения аппаратных дескрипторов ядра
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
     {
@@ -86,13 +86,12 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
     AAudioStreamBuilder_setChannelCount(inBuilder, CHANNEL_COUNT_MONO);
     AAudioStreamBuilder_setFormat(inBuilder, AAUDIO_FORMAT_PCM_I16);
 
-    // Явная аппаратная привязка к ID микрофона гарнитуры (CMF Buds 2) или спикера
+    // Явная аппаратная привязка к микрофону CMF Buds 2 или спикера
     if (inputDeviceId > 0) {
         AAudioStreamBuilder_setDeviceId(inBuilder, inputDeviceId);
     }
 
-    // Источник 110: Монопольный захват микрофона на Qualcomm часто отклоняется HAL.
-    // Режим SHARED с пресетом VOICE_COMMUNICATION гарантирует стабильный старт.
+    // Режим SHARED с пресетом VOICE_COMMUNICATION гарантирует стабильный захват без отказов HAL
     AAudioStreamBuilder_setSharingMode(inBuilder, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setInputPreset(inBuilder, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
 
@@ -127,7 +126,7 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
     AAudioStreamBuilder_setFormat(outBuilder, AAUDIO_FORMAT_PCM_I16);
     AAudioStreamBuilder_setSampleRate(outBuilder, targetPlaybackSampleRate);
 
-    // Явная привязка к ID устройства вывода
+    // Явная привязка к ID динамика/наушника
     if (outputDeviceId > 0) {
         AAudioStreamBuilder_setDeviceId(outBuilder, outputDeviceId);
     }
@@ -136,8 +135,7 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
         AAudioStreamBuilder_setSharingMode(outBuilder, AAUDIO_SHARING_MODE_SHARED);
         AAudioStreamBuilder_setUsage(outBuilder, AAUDIO_USAGE_VOICE_COMMUNICATION);
     } else {
-        // Источники 73 и 116: Для встроенных динамиков используем USAGE_VOICE_COMMUNICATION,
-        // чтобы замкнуть аппаратную петлю эхоподавления Qualcomm Fluence
+        // Для динамиков используем USAGE_VOICE_COMMUNICATION для работы аппаратного эхоподавления
         AAudioStreamBuilder_setSharingMode(outBuilder, AAUDIO_SHARING_MODE_EXCLUSIVE);
         AAudioStreamBuilder_setUsage(outBuilder, AAUDIO_USAGE_VOICE_COMMUNICATION);
     }
@@ -239,6 +237,14 @@ void AAudioEngine::stop() {
     LOGI("AAudioEngine stopped");
 }
 
+/**
+ * Запись входящих сэмплов от Gemini Live.
+ * 
+ * ФУНДАМЕНТАЛЬНОЕ ПРАВИЛО МУЛЬТИРЕЙТИНГА (Источники 151, 161, 200):
+ * Метод возвращает количество потребленных ВХОДНЫХ сэмплов (frames),
+ * благодаря чему вызывающий слой в Kotlin сразу закрывает пакет за один проход
+ * и не пересылает хвост звука повторно, устраняя эффект наложения нескольких моделей!
+ */
 size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
     if (frames == 0 || pcm == nullptr) return 0;
 
@@ -247,7 +253,7 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
     int32_t actualRate = actualPlaybackSampleRate_.load(std::memory_order_acquire);
     if (actualRate <= 0) actualRate = SAMPLE_RATE_GEMINI_OUT;
 
-    // Автоматическое расширение скретчпада под любые залпы Gemini (исключает сброс сэмплов)
+    // Автоматическое масштабирование скретчпада под размер любого входящего сетевого пакета
     const size_t neededCapacity = static_cast<size_t>(frames * 3);
     if (neededCapacity > resampleScratchBuffer_.size()) {
         resampleScratchBuffer_.resize(neededCapacity * 2);
@@ -258,15 +264,27 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
         size_t resampledFrames = resampler24To16_.process(
             pcm, frames, resampleScratchBuffer_.data()
         );
-        return playbackBuffer_.write(resampleScratchBuffer_.data(), resampledFrames);
+        size_t writtenOut = playbackBuffer_.write(resampleScratchBuffer_.data(), resampledFrames);
+        
+        // Возвращаем количество поглощенных ВХОДНЫХ сэмплов frames, ликвидируя дублирование
+        if (writtenOut >= resampledFrames) {
+            return frames; // Весь входной пакет 24 кГц записан за 1 проход
+        } else {
+            return (resampledFrames > 0) ? (writtenOut * frames / resampledFrames) : 0;
+        }
     }
 
     // 2. Встроенный ЦАП S23 Ultra / A2DP: 24 кГц -> 48 кГц через кубический сплайн Эрмита
-    if (actualRate == SAMPLE_RATE_NATIVE_SPEAKER) {
+    if (actualRate == SAMPLE_RATE_NATIVE_SPEAKER || actualRate == SAMPLE_RATE_BT_A2DP) {
         size_t resampledFrames = resampler24To48_.process(
             pcm, frames, resampleScratchBuffer_.data()
         );
-        return playbackBuffer_.write(resampleScratchBuffer_.data(), resampledFrames);
+        size_t writtenOut = playbackBuffer_.write(resampleScratchBuffer_.data(), resampledFrames);
+        if (writtenOut >= resampledFrames) {
+            return frames;
+        } else {
+            return (resampledFrames > 0) ? (writtenOut * frames / resampledFrames) : 0;
+        }
     }
 
     // 3. Нативная частота Gemini Live (24 кГц - LE Audio LC3)
@@ -291,7 +309,12 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
         dst[i] = static_cast<int16_t>(std::clamp(interpolated, -32768, 32767));
     }
 
-    return playbackBuffer_.write(dst, targetFrames);
+    size_t writtenOut = playbackBuffer_.write(dst, targetFrames);
+    if (writtenOut >= targetFrames) {
+        return frames;
+    } else {
+        return (targetFrames > 0) ? (writtenOut * frames / targetFrames) : 0;
+    }
 }
 
 size_t AAudioEngine::readCapturePcm(int16_t* pcm, size_t maxFrames) {
@@ -379,7 +402,6 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     auto* engine = static_cast<AAudioEngine*>(userData);
     auto* samples = static_cast<int16_t*>(audioData);
 
-    // Чтение без блокировок из расширенного кольца 262K сэмплов
     size_t read = engine->playbackBuffer_.read(samples, numFrames);
     if (read < static_cast<size_t>(numFrames)) {
         std::memset(samples + read, 0, (numFrames - read) * sizeof(int16_t));
