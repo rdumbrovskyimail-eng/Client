@@ -9,7 +9,7 @@
 namespace client::audio {
 
 /**
- * E-25: 12-точечный полифазный FIR-ресемплер 24 кГц -> 16 кГц (L=2, M=3).
+ * 12-точечный полифазный FIR-ресемплер 24 кГц -> 16 кГц (L=2, M=3).
  * Полностью исключает аллокации в heap (Zero-Allocation Chunked Loop).
  */
 class PolyphaseResampler24To16 {
@@ -28,7 +28,7 @@ public:
     }
 
     size_t process(const int16_t* in, size_t inFrames, int16_t* out) {
-        if (inFrames == 0) return 0;
+        if (in == nullptr || out == nullptr || inFrames == 0) return 0;
 
         size_t processedIn = 0;
         size_t totalOut = 0;
@@ -50,42 +50,42 @@ private:
         int16_t workBuf[CHUNK_SIZE + FILTER_ORDER];
         std::memcpy(workBuf, historyBuf_, FILTER_ORDER * sizeof(int16_t));
         std::memcpy(workBuf + FILTER_ORDER, in, inFrames * sizeof(int16_t));
-        size_t totalFrames = FILTER_ORDER + inFrames;
+        const size_t totalFrames = FILTER_ORDER + inFrames;
 
         size_t outFrames = 0;
-        size_t inputIndex = FILTER_ORDER + offset_;
+        size_t inputIndex = FILTER_ORDER + static_cast<size_t>(offset_);
 
         while (inputIndex < totalFrames) {
             const int32_t* H = (phase_ == 0) ? H0 : H1;
 
-            int64_t acc = H[0] * workBuf[inputIndex]     +
-                          H[1] * workBuf[inputIndex - 1] +
-                          H[2] * workBuf[inputIndex - 2] +
-                          H[3] * workBuf[inputIndex - 3] +
-                          H[4] * workBuf[inputIndex - 4] +
-                          H[5] * workBuf[inputIndex - 5];
+            const int64_t acc = static_cast<int64_t>(H[0]) * workBuf[inputIndex]     +
+                                static_cast<int64_t>(H[1]) * workBuf[inputIndex - 1] +
+                                static_cast<int64_t>(H[2]) * workBuf[inputIndex - 2] +
+                                static_cast<int64_t>(H[3]) * workBuf[inputIndex - 3] +
+                                static_cast<int64_t>(H[4]) * workBuf[inputIndex - 4] +
+                                static_cast<int64_t>(H[5]) * workBuf[inputIndex - 5];
 
-            out[outFrames++] = static_cast<int16_t>(std::clamp<int32_t>(acc >> 15, -32768, 32767));
+            out[outFrames++] = static_cast<int16_t>(std::clamp<int32_t>(static_cast<int32_t>(acc >> 15), -32768, 32767));
 
-            size_t step = phase_ + 3;
-            inputIndex += step / 2;
+            const int32_t step = phase_ + 3;
+            inputIndex += static_cast<size_t>(step / 2);
             phase_ = step % 2;
         }
 
-        offset_ = inputIndex - totalFrames;
+        offset_ = static_cast<int32_t>(inputIndex - totalFrames);
         std::memcpy(historyBuf_, workBuf + totalFrames - FILTER_ORDER, FILTER_ORDER * sizeof(int16_t));
         return outFrames;
     }
 
-    int16_t historyBuf_[FILTER_ORDER]{0};
-    size_t phase_{0};
-    size_t offset_{0};
+    alignas(16) int16_t historyBuf_[FILTER_ORDER]{0};
+    int32_t phase_{0};
+    int32_t offset_{0};
 };
 
 /**
- * E-07: Полифазный дециматор 3:1 (48 кГц -> 16 кГц) для входящего микрофонного тракта.
- * ERR-12: Исправлена индексация истории TAPS - (t - i), исключающая пропуск сэмпла x[-1] и фазовые щелчки.
- * Ошибка №30 [DSP]: Добавлено сохранение остатка offset_ между блоками, устраняющее фазовые щелчки на 100 Гц.
+ * ИСПРАВЛЕННЫЙ Дециматор 3:1 (48 кГц -> 16 кГц) для микрофонного тракта.
+ * Исключает замирание микрофона: кольцевой аккумулятор phase_ строго в пределах [0..2].
+ * Устраняет поднормальное переполнение size_t и гарантирует непрерывную отдачу фреймов в VAD.
  */
 class Decimator48To16 {
 public:
@@ -97,71 +97,92 @@ public:
 
     void reset() {
         std::memset(history_, 0, sizeof(history_));
-        offset_ = 0;
+        phase_ = 0;
     }
 
     size_t process(const int16_t* in, size_t inFrames, int16_t* out, size_t maxOutFrames) {
-        if (inFrames == 0 || maxOutFrames == 0) return 0;
+        if (in == nullptr || out == nullptr || inFrames == 0 || maxOutFrames == 0) return 0;
 
-        static const int32_t COEFFS[12] = {
+        static const int32_t COEFFS[TAPS] = {
             -180, -320, 450, 2400, 5800, 8234, 8234, 5800, 2400, 450, -320, -180
         };
 
         size_t outCount = 0;
-        size_t i = offset_;
-        for (; i < inFrames; i += 3) {
-            if (outCount >= maxOutFrames) break;
 
-            int64_t acc = 0;
-            for (size_t t = 0; t < TAPS; ++t) {
-                int32_t sample = (i >= t) ? in[i - t] : history_[TAPS - (t - i)];
-                acc += COEFFS[t] * sample;
+        for (size_t i = 0; i < inFrames; ++i) {
+            if (phase_ == 0) {
+                if (outCount >= maxOutFrames) break;
+
+                int64_t acc = 0;
+                for (size_t t = 0; t < TAPS; ++t) {
+                    const int32_t sample = (i >= t)
+                        ? static_cast<int32_t>(in[i - t])
+                        : static_cast<int32_t>(history_[TAPS + (static_cast<int32_t>(i) - static_cast<int32_t>(t))]);
+                    acc += static_cast<int64_t>(COEFFS[t]) * sample;
+                }
+                out[outCount++] = static_cast<int16_t>(std::clamp<int32_t>(static_cast<int32_t>(acc >> 15), -32768, 32767));
             }
-            out[outCount++] = static_cast<int16_t>(std::clamp<int32_t>(acc >> 15, -32768, 32767));
+            phase_ = (phase_ + 1) % 3;
         }
 
-        // Сохраняем фазовое смещение для следующего буфера:
-        offset_ = i - inFrames;
-
-        size_t toKeep = std::min(inFrames, TAPS);
-        if (toKeep < TAPS) {
-            std::memmove(history_, history_ + toKeep, (TAPS - toKeep) * sizeof(int16_t));
+        // Обновление циклической истории без повреждения границ буфера
+        if (inFrames >= TAPS) {
+            std::memcpy(history_, in + inFrames - TAPS, TAPS * sizeof(int16_t));
+        } else {
+            std::memmove(history_, history_ + inFrames, (TAPS - inFrames) * sizeof(int16_t));
+            std::memcpy(history_ + (TAPS - inFrames), in, inFrames * sizeof(int16_t));
         }
-        std::memcpy(history_ + (TAPS - toKeep), in + inFrames - toKeep, toKeep * sizeof(int16_t));
+
         return outCount;
     }
 
 private:
-    int16_t history_[TAPS]{0};
-    size_t offset_{0};
+    alignas(16) int16_t history_[TAPS]{0};
+    int32_t phase_{0};
 };
 
 /**
- * Каузальный линейный интерполятор 24 кГц -> 48 кГц (L=2, M=1).
+ * Непрерывный кубический интерполятор Эрмита 24 кГц -> 48 кГц (Catmull-Rom C1 Spline).
+ * Полностью устраняет разрывы производной и фазовый дребезг при выводе на 48 кГц ЦАП.
  */
-class LinearResampler24To48 {
+class HermiteResampler24To48 {
 public:
+    HermiteResampler24To48() {
+        reset();
+    }
+
     void reset() {
-        lastSample_ = 0;
+        p0_ = 0;
+        p1_ = 0;
+        p2_ = 0;
     }
 
     size_t process(const int16_t* in, size_t inFrames, int16_t* out) {
-        if (inFrames == 0) return 0;
+        if (in == nullptr || out == nullptr || inFrames == 0) return 0;
         size_t outFrames = 0;
 
-        int32_t prev = lastSample_;
         for (size_t i = 0; i < inFrames; ++i) {
-            int32_t cur = in[i];
-            out[outFrames++] = static_cast<int16_t>((prev + cur) >> 1);
-            out[outFrames++] = static_cast<int16_t>(cur);
-            prev = cur;
+            const int32_t p3 = in[i];
+
+            // 1. Четный сэмпл: оригинальный отсчет модели без малейших искажений
+            out[outFrames++] = static_cast<int16_t>(p2_);
+
+            // 2. Нечетный сэмпл: 4-точечная гладкая интерполяция Эрмита (-p0 + 9*p1 + 9*p2 - p3) / 16
+            const int32_t interpolated = (-p0_ + 9 * (p1_ + p2_) - p3 + 8) >> 4;
+            out[outFrames++] = static_cast<int16_t>(std::clamp<int32_t>(interpolated, -32768, 32767));
+
+            p0_ = p1_;
+            p1_ = p2_;
+            p2_ = p3;
         }
-        lastSample_ = static_cast<int16_t>(prev);
+
         return outFrames;
     }
 
 private:
-    int16_t lastSample_{0};
+    int32_t p0_{0};
+    int32_t p1_{0};
+    int32_t p2_{0};
 };
 
 } // namespace client::audio
