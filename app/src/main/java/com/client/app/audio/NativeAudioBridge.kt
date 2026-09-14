@@ -13,15 +13,32 @@ class NativeAudioBridge @Inject constructor() {
         }
     }
 
+    /**
+     * Возвращает подробную диагностическую строку о текущем состоянии аппаратного тракта Qualcomm HAL,
+     * активных частотах АЦП/ЦАП и привязанных ID устройств.
+     */
     external fun getHardwareCoreInfo(): String
-    external fun initAudioRoute(isBluetooth: Boolean, sampleRate: Int): Boolean
+
+    /**
+     * Инициализация аудиомаршрутов AAudio с явным указанием ID физических портов микрофона и динамика
+     * (для предотвращения захвата встроенного микрофона вместо Bluetooth-гарнитуры).
+     */
+    external fun initAudioRoute(
+        isBluetooth: Boolean,
+        sampleRate: Int,
+        inputDeviceId: Int = 0,
+        outputDeviceId: Int = 0
+    ): Boolean
+
     external fun startAudio(): Boolean
     external fun stopAudio()
     external fun setVolume(volume: Float)
     external fun setMicGain(gain: Float)
 
-    // E-09: Прямой массив для Zero-Allocation воспроизведения
+    // Прямой байтовый массив для воспроизведения сетевых чанков
     external fun writePlaybackByteArray(pcmArray: ByteArray, offsetBytes: Int, lengthBytes: Int): Int
+
+    // Прямые DirectByteBuffer-операции без копирования памяти
     external fun writePlaybackDirect(byteBuffer: ByteBuffer, offsetBytes: Int, lengthBytes: Int): Int
     external fun readCaptureDirect(byteBuffer: ByteBuffer, capacityBytes: Int): Int
 
@@ -30,6 +47,6 @@ class NativeAudioBridge @Inject constructor() {
     external fun tuneNativeSocket(fd: Int)
     external fun getSpectrumData(outArray: FloatArray)
 
-    // E-51: Вычитка нативных логов из Lock-Free C++ очереди NativeLogQueue в JVM
+    // Вычитка нативных логов из Lock-Free C++ очереди NativeLogQueue в JVM
     external fun drainNativeLogs(): Array<String>?
 }
