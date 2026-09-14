@@ -36,8 +36,8 @@ class NativeAudioEngine @Inject constructor(
 ) {
     companion object {
         private const val BURST_BYTES = 160 * 2 // 10 мс @ 16 кГц
-        private const val PLAYBACK_GRACE_PERIOD_MS = 400L
-        private const val BARGE_IN_DEBOUNCE_MS = 600L
+        private const val PLAYBACK_GRACE_PERIOD_MS = 350L
+        private const val BARGE_IN_DEBOUNCE_MS = 550L
     }
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -59,6 +59,12 @@ class NativeAudioEngine @Inject constructor(
         replay = 0, extraBufferCapacity = 8, onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
     val bargeInEvents: SharedFlow<Unit> = _bargeInEvents.asSharedFlow()
+
+    /** Сигнал локального окончания речи для моментального закрытия хода (audioStreamEnd) */
+    private val _speechEndEvents = MutableSharedFlow<Unit>(
+        replay = 0, extraBufferCapacity = 8, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val speechEndEvents: SharedFlow<Unit> = _speechEndEvents.asSharedFlow()
 
     private val _focusLost = MutableSharedFlow<Boolean>(
         replay = 0, extraBufferCapacity = 4, onBufferOverflow = BufferOverflow.DROP_OLDEST
@@ -92,7 +98,12 @@ class NativeAudioEngine @Inject constructor(
 
     @Volatile private var lastPlaybackStartMs = 0L
     @Volatile private var lastBargeInMs = 0L
-    @Volatile private var isBargeInActive = false
+    
+    // Блокировка летящих из сети хвостов старой речи при перебивании
+    @Volatile var isBargeInActive = false; private set
+    
+    // Флаг активного говорения пользователя для отсечки тишины
+    @Volatile private var isUserSpeaking = false
 
     init {
         engineScope.launch {
@@ -172,6 +183,7 @@ class NativeAudioEngine @Inject constructor(
             vadDetector.prepare()
             vadDetector.resetState()
             isBargeInActive = false
+            isUserSpeaking = false
 
             router.start { profile ->
                 routeTransitionChannel.trySend(profile)
@@ -223,12 +235,10 @@ class NativeAudioEngine @Inject constructor(
                     val currentOut = _outLevel.value
                     val currentMic = _micLevel.value
                     val isBluetooth = router.currentProfile.value.path == AudioRoutePath.CMF_BUDS_WIRELESS
-                    
-                    // Акустическое эхо существует ТОЛЬКО на встроенном динамике телефона
                     val isAiRendering = !isBluetooth && (currentOut > 0.04f)
 
-                    // 1. ЛИКВИДАЦИЯ «СЛЕПОЙ ЗОНЫ»: если динамик телефона только что замолчал,
-                    // мгновенно выталкиваем весь накопленный пре-ролл буфер в Gemini
+                    // 1. Ликвидация «слепой зоны» спикера S23 Ultra: если диффузор только что затих,
+                    // мгновенно выталкиваем пре-ролл в сеть
                     if (wasAiRendering && !isAiRendering) {
                         synchronized(poolLock) {
                             while (leadInBuffer.isNotEmpty()) {
@@ -238,12 +248,14 @@ class NativeAudioEngine @Inject constructor(
                     }
                     wasAiRendering = isAiRendering
 
-                    // 2. Локальный нейросетевой VAD для перебивания ассистента
+                    // 2. Детекция начала и окончания речи (Silero VAD)
                     vadDetector.processSamples(
                         pcm16 = frame,
                         onSpeechStart = {
+                            isUserSpeaking = true
+
+                            // Проверка перебивания ассистента
                             if (isAiRendering) {
-                                // Защита от динамика S23 Ultra: DTD Гейгеля (голос должен превысить огибающую эха)
                                 val echoThreshold = maxOf(0.12f, currentOut * 0.42f)
                                 val canBargeIn = (now - lastPlaybackStartMs > PLAYBACK_GRACE_PERIOD_MS) &&
                                                  (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS) &&
@@ -251,40 +263,55 @@ class NativeAudioEngine @Inject constructor(
 
                                 if (canBargeIn) {
                                     lastBargeInMs = now
-                                    isBargeInActive = true
+                                    isBargeInActive = true // Блокируем долетающие из сети пакеты
                                     bridge.flushPlayback()
                                     hapticManager.triggerBargeIn()
                                     _bargeInEvents.tryEmit(Unit)
 
-                                    // Мгновенный сброс согласных звуков перебивания
+                                    // Выталкиваем первые звуки перебивания
                                     synchronized(poolLock) {
                                         while (leadInBuffer.isNotEmpty()) {
                                             _micOutput.trySend(leadInBuffer.removeFirst())
                                         }
                                     }
                                 }
-                            } else if (isBluetooth && currentOut > 0.04f) {
+                            } else if (currentOut > 0.04f) {
                                 // На наушниках CMF Buds 2 перебивание мгновенно без барьеров
-                                if (now - lastPlaybackStartMs > 250L && now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS) {
+                                if (now - lastPlaybackStartMs > 200L && now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS) {
                                     lastBargeInMs = now
+                                    isBargeInActive = true // Блокируем долетающие пакеты
                                     bridge.flushPlayback()
                                     bridge.triggerBargeInEarcon()
                                     hapticManager.triggerBargeIn()
                                     _bargeInEvents.tryEmit(Unit)
+
+                                    synchronized(poolLock) {
+                                        while (leadInBuffer.isNotEmpty()) {
+                                            _micOutput.trySend(leadInBuffer.removeFirst())
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Обычный старт фразы в тишине: выталкиваем сохраненный пре-ролл (согласные)
+                                synchronized(poolLock) {
+                                    while (leadInBuffer.isNotEmpty()) {
+                                        _micOutput.trySend(leadInBuffer.removeFirst())
+                                    }
                                 }
                             }
                         },
                         onSpeechEnd = {
-                            if (now - lastBargeInMs > 1000L) {
-                                isBargeInActive = false
+                            if (isUserSpeaking) {
+                                isUserSpeaking = false
+                                // Сигнализируем SessionManager моментально закрыть ход (audioStreamEnd)
+                                _speechEndEvents.tryEmit(Unit)
                             }
                         }
                     )
 
-                    // 3. Маршрутизация звука:
-                    // На наушниках микрофон открыт ВСЕГДА (100% чувствительность, ноль съеденных букв).
-                    // На спикере S23 Ultra: если играет диффузор — копим пре-ролл, если замолчал или перебит — шлем сразу.
-                    if (isBluetooth || !isAiRendering || isBargeInActive) {
+                    // 3. Умная маршрутизация: звук отправляется в сеть только когда вы реально говорите.
+                    // В тишине звук удерживается в циклическом кольце (160 мс) и не забивает контекст Google!
+                    if (isUserSpeaking || isBargeInActive) {
                         _micOutput.trySend(frame.copyOf(bytesRead))
                     } else {
                         synchronized(poolLock) {
@@ -352,13 +379,22 @@ class NativeAudioEngine @Inject constructor(
         _micLevel.value = 0f
         _outLevel.value = 0f
         isBargeInActive = false
+        isUserSpeaking = false
     }
 
     fun setVolume(volume: Float) = bridge.setVolume(volume.coerceIn(0f, 1f))
     fun setMicGain(gain: Float) = bridge.setMicGain(gain.coerceIn(0.5f, 2.0f))
 
+    /**
+     * Воспроизведение звука с фильтрацией долетающих пакетов старой фразы
+     */
     fun enqueuePlayback(pcm: ByteArray) {
         if (pcm.isEmpty() || !_isPlaying.value) return
+        
+        // Если пользователь только что перебил модель — долетающие из сети остатки фразы выбрасываются!
+        if (isBargeInActive) {
+            return
+        }
 
         if (_outLevel.value < 0.02f) {
             lastPlaybackStartMs = System.currentTimeMillis()
@@ -383,6 +419,12 @@ class NativeAudioEngine @Inject constructor(
     fun flushPlayback() {
         bridge.flushPlayback()
         _outLevel.value = 0f
+    }
+
+    /**
+     * Сброс режима перебивания (вызывается SessionManager, когда Google подтвердил событие Interrupted или начал новый ход)
+     */
+    fun resetBargeInState() {
         isBargeInActive = false
     }
 
