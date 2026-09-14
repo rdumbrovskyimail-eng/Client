@@ -58,16 +58,14 @@ class NativeAudioEngine @Inject constructor(
     )
     val bargeInEvents: SharedFlow<Unit> = _bargeInEvents.asSharedFlow()
 
-    /** Уведомление о потере AudioFocus (звонки, медиа других приложений) */
     private val _focusLost = MutableSharedFlow<Boolean>(
         replay = 0, extraBufferCapacity = 4, onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
     val focusLost: SharedFlow<Boolean> = _focusLost.asSharedFlow()
 
-    private val _micOutput = Channel<ByteArray>(256, BufferOverflow.DROP_OLDEST)
+    private val _micOutput = Channel<ByteArray>(512, BufferOverflow.DROP_OLDEST)
     val micOutput: ReceiveChannel<ByteArray> = _micOutput
 
-    // Изоляция исключений аудиотракта от системного краша JVM
     private val coroutineExceptionHandler = CoroutineExceptionHandler { _, throwable ->
         logger.e("Unhandled coroutine exception in NativeAudioEngine", throwable)
     }
@@ -75,26 +73,19 @@ class NativeAudioEngine @Inject constructor(
     private var captureJob: Job? = null
     private var spectrumJob: Job? = null
 
-    // Мьютекс взаимного исключения для предотвращения гонок инициализации C++ ядра
     private val audioLifecycleMutex = Mutex()
-
-    // Conflated-канал для защиты от гонок при множественных событиях переключения Bluetooth
     private val routeTransitionChannel = Channel<RouteProfile>(Channel.CONFLATED)
 
     private val captureDirectBuffer: ByteBuffer = ByteBuffer.allocateDirect(BURST_BYTES * 4)
         .order(ByteOrder.LITTLE_ENDIAN)
 
     private val spectrumRawData = FloatArray(7)
-    // Атомарная ссылка исключает Torn Reads между фоновым DSP и 120 FPS RenderThread
     val spectrumUniforms = AtomicReference(FloatArray(5))
 
-    private val bufferPool = ArrayDeque<ByteArray>(16).apply {
-        repeat(16) { add(ByteArray(BURST_BYTES)) }
+    private val bufferPool = ArrayDeque<ByteArray>(32).apply {
+        repeat(32) { add(ByteArray(BURST_BYTES)) }
     }
     private val poolLock = Any()
-    private val leadInBuffer = ArrayDeque<ByteArray>(32)
-
-    private var isSpeechActive = false
 
     init {
         engineScope.launch {
@@ -181,7 +172,9 @@ class NativeAudioEngine @Inject constructor(
             val profile = router.currentProfile.value
             val inited = bridge.initAudioRoute(
                 isBluetooth = profile.path == AudioRoutePath.CMF_BUDS_WIRELESS,
-                sampleRate = profile.sampleRateOut
+                sampleRate = profile.sampleRateOut,
+                inputDeviceId = profile.inputDeviceId,
+                outputDeviceId = profile.outputDeviceId
             )
             if (!inited) {
                 abandonAudioFocus()
@@ -217,26 +210,13 @@ class NativeAudioEngine @Inject constructor(
                     captureDirectBuffer.position(0)
                     captureDirectBuffer.get(frame, 0, bytesRead)
 
-                    // Устранение GC Thrashing — использование пула вместо copyOf()
-                    val maxPreRoll = router.currentProfile.value.leadInBufferSizeFrames / 160
-                    synchronized(poolLock) {
-                        val preRollBuf = obtainBuffer()
-                        System.arraycopy(frame, 0, preRollBuf, 0, bytesRead)
-                        leadInBuffer.addLast(preRollBuf)
-                        while (leadInBuffer.size > maxPreRoll) {
-                            recycleBuffer(leadInBuffer.removeFirst())
-                        }
-                    }
+                    // 1. Непрерывная потоковая передача звука в сеть (Gemini слышит пользователя без потерь)
+                    _micOutput.trySend(frame.copyOf(bytesRead))
 
+                    // 2. Локальный нейросетевой VAD: используется для мгновенного аппаратного Barge-In
                     vadDetector.processSamples(
                         pcm16 = frame,
                         onSpeechStart = {
-                            isSpeechActive = true
-                            synchronized(poolLock) {
-                                while (leadInBuffer.isNotEmpty()) {
-                                    _micOutput.trySend(leadInBuffer.removeFirst())
-                                }
-                            }
                             if (_outLevel.value > 0.05f) {
                                 bridge.flushPlayback()
                                 if (router.currentProfile.value.path == AudioRoutePath.CMF_BUDS_WIRELESS) {
@@ -247,16 +227,11 @@ class NativeAudioEngine @Inject constructor(
                             }
                         },
                         onSpeechEnd = {
-                            isSpeechActive = false
+                            // Окончание реплики фиксируется автоматически облачной моделью
                         }
                     )
 
-                    // Исключение утечки пула bufferPool при фиксации речи
-                    if (isSpeechActive) {
-                        _micOutput.trySend(frame)
-                    } else {
-                        recycleBuffer(frame)
-                    }
+                    recycleBuffer(frame)
                 } else {
                     delay(2)
                 }
@@ -281,7 +256,9 @@ class NativeAudioEngine @Inject constructor(
             bridge.stopAudio()
             val success = bridge.initAudioRoute(
                 isBluetooth = profile.path == AudioRoutePath.CMF_BUDS_WIRELESS,
-                sampleRate = profile.sampleRateOut
+                sampleRate = profile.sampleRateOut,
+                inputDeviceId = profile.inputDeviceId,
+                outputDeviceId = profile.outputDeviceId
             )
             if (success) {
                 vadDetector.setThresholds(profile.vadThresholdStart, profile.vadThresholdEnd)
@@ -309,18 +286,22 @@ class NativeAudioEngine @Inject constructor(
 
         _micLevel.value = 0f
         _outLevel.value = 0f
-        isSpeechActive = false
     }
 
     fun setVolume(volume: Float) = bridge.setVolume(volume.coerceIn(0f, 1f))
     fun setMicGain(gain: Float) = bridge.setMicGain(gain.coerceIn(0.5f, 2.0f))
 
+    /**
+     * Потоковая неблокирующая передача входящих чанков речи от модели Gemini в C++ буфер.
+     * Полностью исключает вызовы Thread.sleep() и зависания пользовательского интерфейса.
+     */
     fun enqueuePlayback(pcm: ByteArray) {
         if (pcm.isEmpty() || !_isPlaying.value) return
         var offset = 0
         var remaining = pcm.size
         var attempts = 0
-        while (remaining > 0 && attempts < 4) {
+
+        while (remaining > 0 && attempts < 8) {
             val written = bridge.writePlaybackByteArray(pcm, offset, remaining)
             if (written >= remaining) break
             if (written > 0) {
@@ -328,7 +309,7 @@ class NativeAudioEngine @Inject constructor(
                 remaining -= written
             }
             attempts++
-            Thread.sleep(2)
+            Thread.yield() // Неблокирующее уступание кванта планировщику CPU вместо блокировки sleep
         }
     }
 
@@ -342,6 +323,6 @@ class NativeAudioEngine @Inject constructor(
     }
 
     private fun recycleBuffer(buf: ByteArray) = synchronized(poolLock) {
-        if (bufferPool.size < 32) bufferPool.addLast(buf)
+        if (bufferPool.size < 64) bufferPool.addLast(buf)
     }
 }
