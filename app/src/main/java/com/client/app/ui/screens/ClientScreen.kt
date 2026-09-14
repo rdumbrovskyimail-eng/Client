@@ -3,37 +3,28 @@ package com.client.app.ui.screens
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.*
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
-import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -42,12 +33,9 @@ import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.client.app.R
-import com.client.app.session.ChatMessage
+import com.client.app.session.LinkState
 import com.client.app.ui.components.AgslVoiceVisualizer
 import com.client.app.viewmodel.ClientViewModel
-import com.mikepenz.markdown.m3.Markdown
-import com.mikepenz.markdown.m3.markdownColor
-import com.mikepenz.markdown.m3.markdownTypography
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -60,13 +48,7 @@ fun ClientScreen(
     val errorCount by viewModel.errorCount.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
-    var chatInput by rememberSaveable { mutableStateOf("") }
-    var attachedUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var isSheetOpen by remember { mutableStateOf(false) }
-
-    val filePicker = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenMultipleDocuments()
-    ) { uris -> attachedUris = (attachedUris + uris).distinct().take(8) }
 
     val permissionsLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -204,147 +186,57 @@ fun ClientScreen(
             }
         }
     ) { padding ->
-        Column(
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
+                .background(Color(0xFF09090B)),
+            contentAlignment = Alignment.Center
         ) {
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-            ) {
-                if (state.messages.isEmpty()) {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        AgslVoiceVisualizer(
-                            nativeEngine = viewModel.nativeAudioEngine,
-                            state = state,
-                            onClick = {
-                                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                                    if (!state.isConnected && !state.isConnecting) {
-                                        viewModel.toggleConnection()
-                                    } else {
-                                        viewModel.toggleMic()
-                                    }
-                                } else {
-                                    handleConnectClick()
-                                }
-                            },
-                            size = 230.dp
-                        )
-                    }
-                } else {
-                    val listState = rememberLazyListState()
-
-                    LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.text?.length) {
-                        if (state.messages.isNotEmpty()) {
-                            listState.animateScrollToItem(state.messages.lastIndex)
-                        }
-                    }
-
-                    LazyColumn(
-                        state = listState,
-                        modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        contentPadding = PaddingValues(vertical = 12.dp)
-                    ) {
-                        items(items = state.messages, key = { it.id }) { msg ->
-                            val isLast = msg.id == state.messages.lastOrNull()?.id
-                            ChatBubble(msg = msg, isStreaming = isLast && state.isAiSpeaking)
-                        }
-                    }
-                }
-            }
-
+            // Центральный полноэкранный 120 FPS AGSL-визуализатор
             Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFF09090B))
-                    .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
-                    .padding(horizontal = 16.dp, vertical = 8.dp)
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
             ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(26.dp))
-                        .background(Color(0xFF18181B))
-                        .border(0.5.dp, Color(0xFF27272A), RoundedCornerShape(26.dp))
-                        .padding(horizontal = 6.dp, vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    IconButton(
-                        onClick = { filePicker.launch(arrayOf("application/pdf", "image/*")) },
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .size(38.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.Add,
-                            contentDescription = stringResource(R.string.attach_file),
-                            tint = Color(0xFFA1A1AA),
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-
-                    BasicTextField(
-                        value = chatInput,
-                        onValueChange = { chatInput = it },
-                        modifier = Modifier.weight(1f).padding(horizontal = 8.dp, vertical = 8.dp),
-                        textStyle = LocalTextStyle.current.copy(color = Color(0xFFFAFAFA), fontSize = 15.sp),
-                        cursorBrush = SolidColor(Color(0xFF60A5FA)),
-                        decorationBox = { inner ->
-                            if (chatInput.isEmpty()) {
-                                Text(stringResource(R.string.prompt_hint), color = Color(0xFF71717A), fontSize = 15.sp)
+                AgslVoiceVisualizer(
+                    nativeEngine = viewModel.nativeAudioEngine,
+                    state = state,
+                    onClick = {
+                        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                            if (!state.isConnected && !state.isConnecting) {
+                                viewModel.toggleConnection()
+                            } else {
+                                viewModel.toggleMic()
                             }
-                            inner()
+                        } else {
+                            handleConnectClick()
                         }
-                    )
+                    },
+                    size = 280.dp
+                )
 
-                    if (chatInput.isNotBlank() || attachedUris.isNotEmpty()) {
-                        Box(
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .size(36.dp)
-                                .clip(CircleShape)
-                                .background(Color(0xFFFAFAFA))
-                                .clickable {
-                                    viewModel.sendText(chatInput, attachedUris)
-                                    chatInput = ""
-                                    attachedUris = emptyList()
-                                },
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.ArrowUpward,
-                                contentDescription = stringResource(R.string.send_message),
-                                tint = Color(0xFF09090B),
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                    } else {
-                        IconButton(
-                            onClick = {
-                                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                                    viewModel.toggleMic()
-                                } else {
-                                    handleConnectClick()
-                                }
-                            },
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .size(36.dp)
-                                .clip(CircleShape)
-                                .background(if (state.isMicActive) Color(0xFF1E3A8A) else Color.Transparent)
-                        ) {
-                            Icon(
-                                imageVector = if (state.isMicActive) Icons.Filled.Mic else Icons.Outlined.Mic,
-                                contentDescription = stringResource(R.string.mic_content_desc),
-                                tint = if (state.isMicActive) Color(0xFF60A5FA) else Color(0xFFA1A1AA),
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
-                    }
-                }
+                Spacer(Modifier.height(24.dp))
+
+                // Элегантная текстовая подсказка статуса
+                Text(
+                    text = when {
+                        state.error != null -> state.error.orEmpty()
+                        state.isAiSpeaking -> "Ассистент говорит..."
+                        state.link == LinkState.CONNECTING -> "Подключение..."
+                        state.link == LinkState.RECONNECTING -> "Восстановление связи..."
+                        state.isMicActive -> "Слушаю вас..."
+                        state.isConnected -> "Микрофон на паузе (нажмите на сферу)"
+                        else -> "Нажмите на сферу для запуска"
+                    },
+                    color = when {
+                        state.error != null -> Color(0xFFF87171)
+                        state.isAiSpeaking -> Color(0xFF34D399)
+                        state.isMicActive -> Color(0xFF60A5FA)
+                        else -> Color(0xFF71717A)
+                    },
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium
+                )
             }
         }
     }
@@ -392,40 +284,6 @@ fun ClientScreen(
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
                 ) {
                     Text(stringResource(R.string.apply_role), color = Color.White)
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ChatBubble(msg: ChatMessage, isStreaming: Boolean) {
-    if (msg.text.isBlank()) return
-    val isUser = msg.role == "user"
-    val clipboard = LocalClipboardManager.current
-
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = if (isUser) Alignment.End else Alignment.Start
-    ) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth(if (isUser) 0.85f else 0.95f)
-                .clip(RoundedCornerShape(16.dp))
-                .background(if (isUser) Color(0xFF27272A) else Color(0xFF141416))
-                .border(0.5.dp, if (isUser) Color(0xFF3F3F46) else Color(0xFF27272A), RoundedCornerShape(16.dp))
-                .clickable { clipboard.setText(AnnotatedString(msg.text)) }
-                .padding(horizontal = 14.dp, vertical = 10.dp)
-        ) {
-            Column {
-                if (isUser || isStreaming) {
-                    Text(text = msg.text, color = Color(0xFFFAFAFA), fontSize = 14.sp, lineHeight = 20.sp)
-                } else {
-                    Markdown(
-                        content = msg.text,
-                        colors = markdownColor(text = Color(0xFFFAFAFA), codeBackground = Color(0xFF18181B)),
-                        typography = markdownTypography(text = TextStyle(fontSize = 14.sp, lineHeight = 20.sp, color = Color(0xFFFAFAFA)))
-                    )
                 }
             }
         }
