@@ -143,6 +143,7 @@ class SessionManager @Inject constructor(
         observeEvents()
         observeAudio()
         observeBargeIn()
+        observeSpeechEnd()
         observeFocus()
         observeForvoQuota()
     }
@@ -366,16 +367,12 @@ class SessionManager @Inject constructor(
         }
     }
 
-    /**
-     * Сбор и валидация истории диалога для бесшовной затравки контекста через initialHistory
-     */
     private fun recentHistory(): List<Pair<String, String>> {
         val raw = _state.value.messages
             .filter { !it.interim && it.text.isNotBlank() }
 
         if (raw.isEmpty()) return emptyList()
 
-        // 1. Схлопываем идущие подряд реплики одной роли (user+user или model+model)
         val merged = mutableListOf<Pair<String, String>>()
         for (msg in raw) {
             val role = if (msg.role == "model") "model" else "user"
@@ -387,10 +384,8 @@ class SessionManager @Inject constructor(
             }
         }
 
-        // 2. Ограничиваем срез последними 20 ходами
         var slice = merged.takeLast(20)
 
-        // 3. Сессия в Gemini Live обязана начинаться строго с реплики user
         while (slice.isNotEmpty() && slice.first().first != "user") {
             slice = slice.drop(1)
         }
@@ -498,6 +493,8 @@ class SessionManager @Inject constructor(
         if (_state.value.isMicActive) return@withLock
         userMicDesired = true
 
+        while (audioEngine.micOutput.tryReceive().isSuccess) { /* сброс залежавшихся буферов */ }
+
         if (!audioEngine.start()) {
             _state.update { it.copy(error = "Микрофон недоступен") }
             return@withLock
@@ -539,6 +536,18 @@ class SessionManager @Inject constructor(
         }
     }
 
+    /**
+     * ЭТАП 3: Моментальный выстрел audioStreamEnd по локальному окончанию речи пользователя
+     */
+    private fun observeSpeechEnd() = scope.launch {
+        audioEngine.speechEndEvents.collect {
+            if (_state.value.isMicActive && client.isReady) {
+                logger.d("SessionManager: Локальный VAD зафиксировал конец речи -> выстрел audioStreamEnd")
+                client.sendAudioStreamEnd()
+            }
+        }
+    }
+
     private fun observeFocus() = scope.launch {
         audioEngine.focusLost.collect { lost ->
             if (lost && _state.value.isMicActive) {
@@ -569,6 +578,7 @@ class SessionManager @Inject constructor(
                 }
                 is GeminiEvent.Interrupted -> {
                     audioEngine.flushPlayback()
+                    audioEngine.resetBargeInState() // Сброс блокировки перебивания
                     _state.update { it.copy(isAiSpeaking = false) }
                     streamingRole = null
                     hasReceivedAudioTranscript = false
@@ -577,6 +587,7 @@ class SessionManager @Inject constructor(
                 is GeminiEvent.TurnComplete -> {
                     streamingRole = null
                     hasReceivedAudioTranscript = false
+                    audioEngine.resetBargeInState() // Сброс блокировки перебивания
                     scope.launch {
                         delay(100)
                         _state.update { it.copy(isAiSpeaking = false) }
@@ -592,7 +603,7 @@ class SessionManager @Inject constructor(
                     appendTranscript("model", event.text, false)
                 }
                 is GeminiEvent.ModelText -> {
-                    // Игнорируем промежуточные текстовые фрагменты, дожидаясь чистого OutputTranscript
+                    // Игнорируем промежуточные фрагменты
                 }
                 is GeminiEvent.Usage -> _state.update { it.copy(tokensUsed = event.totalTokens) }
                 is GeminiEvent.ToolCall -> handleToolCall(event.calls)
