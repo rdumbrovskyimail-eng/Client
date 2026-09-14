@@ -25,13 +25,10 @@ class ContextCacheService @Inject constructor(
     private val logger: AppLogger
 ) {
     companion object {
-        // Глобальный эндпоинт Vertex AI Express Mode (v1)
-        private const val BASE_URL = "https://aiplatform.googleapis.com/v1"
+        private const val BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
         val KEY_CACHED_CONTENT_ID = stringPreferencesKey("cached_content_id")
         val KEY_CACHED_CONTENT_HASH = stringPreferencesKey("cached_content_hash")
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
-
-        // E-28: Минимальный порог токенов Google Context Caching (32 768 токенов)
         private const val MIN_TOKENS_FOR_CACHE = 32768
     }
 
@@ -42,7 +39,6 @@ class ContextCacheService @Inject constructor(
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
-    // E-15: SHA-256 fingerprint от полного набора параметров кэша
     private fun generateCacheFingerprint(model: String, prompt: String): String {
         val input = "model:$model\u0000prompt:$prompt"
         val md = MessageDigest.getInstance("SHA-256")
@@ -57,7 +53,6 @@ class ContextCacheService @Inject constructor(
         val cleanApiKey = apiKey.trim()
         if (cleanApiKey.isBlank() || systemPrompt.isBlank()) return@withContext null
 
-        // E-28: Эвристическая оценка токенов (~4 символа на токен)
         val estimatedTokens = systemPrompt.length / 4
         if (estimatedTokens < MIN_TOKENS_FOR_CACHE) {
             return@withContext null
@@ -76,12 +71,7 @@ class ContextCacheService @Inject constructor(
             deleteCache(cleanApiKey, existingId)
         }
 
-        // Преобразование модели в формат Vertex AI publishers/google/models/...
-        val rawModelName = modelName.trim()
-            .removePrefix("publishers/google/models/")
-            .removePrefix("models/")
-        val cleanModel = "publishers/google/models/$rawModelName"
-
+        val cleanModel = if (modelName.startsWith("models/")) modelName else "models/$modelName"
         val payload = buildJsonObject {
             put("model", cleanModel)
             put("displayName", "gemini_voice_session_cache")
@@ -96,7 +86,6 @@ class ContextCacheService @Inject constructor(
         val url = "$BASE_URL/cachedContents?key=$cleanApiKey"
         val request = Request.Builder()
             .url(url)
-            .header("x-goog-api-key", cleanApiKey)
             .header("Content-Type", "application/json")
             .post(payload.toRequestBody(JSON_MEDIA))
             .build()
@@ -112,7 +101,7 @@ class ContextCacheService @Inject constructor(
                             it[KEY_CACHED_CONTENT_ID] = cacheName
                             it[KEY_CACHED_CONTENT_HASH] = promptHash
                         }
-                        logger.d("ContextCacheService: Создан KV-кэш Vertex AI: $cacheName")
+                        logger.d("ContextCacheService: Создан KV-кэш: $cacheName")
                         return@withContext cacheName
                     }
                 } else {
@@ -129,29 +118,18 @@ class ContextCacheService @Inject constructor(
     suspend fun deleteCache(apiKey: String, cacheId: String) = withContext(Dispatchers.IO) {
         val cleanApiKey = apiKey.trim()
         if (cleanApiKey.isBlank() || cacheId.isBlank()) return@withContext
-
-        // Формирование корректного REST-пути для aiplatform.googleapis.com/v1/{name}
         val cleanId = cacheId.removePrefix("cachedContents/")
         val url = "$BASE_URL/cachedContents/$cleanId?key=$cleanApiKey"
 
         runCatching {
-            val request = Request.Builder()
-                .url(url)
-                .header("x-goog-api-key", cleanApiKey)
-                .delete()
-                .build()
-
-            httpClient.newCall(request).execute().use { response ->
+            httpClient.newCall(Request.Builder().url(url).delete().build()).execute().use { response ->
                 if (response.isSuccessful) {
                     dataStore.edit {
                         it.remove(KEY_CACHED_CONTENT_ID)
                         it.remove(KEY_CACHED_CONTENT_HASH)
                     }
-                    logger.d("ContextCacheService: Кэш $cacheId успешно удален")
                 }
             }
-        }.onFailure {
-            logger.w("ContextCacheService: Не удалось удалить кэш $cacheId: ${it.message}")
         }
     }
 }
