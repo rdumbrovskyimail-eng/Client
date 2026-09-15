@@ -225,7 +225,7 @@ class GeminiProtobufLiveClient @Inject constructor(
     }
 
     /**
-     * Отправка текстовых команд:
+     * Отправка текстовых команд по спецификации Gemini Live API:
      * 'text' обязан быть скалярной строкой (Scalar String), а не объектом!
      */
     fun sendRealtimeText(text: String) {
@@ -235,7 +235,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         val cleanText = text.trim()
         val jsonMessage = buildJsonObject {
             putJsonObject("realtimeInput") {
-                put("text", cleanText) // Скалярное строковое поле "text": "привет"
+                put("text", cleanText)
             }
         }.toString()
 
@@ -370,10 +370,16 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }
 
-                if (cfg.toolsJson != null && cfg.toolsJson.isNotEmpty()) {
-                    putJsonArray("tools") {
-                        cfg.toolsJson.forEach { add(it) }
+                // ─────────────────────────────────────────────────────────────
+                // ИНТЕГРАЦИЯ ИНТЕРНЕТ-ПОИСКА (GOOGLE SEARCH GROUNDING)
+                // ─────────────────────────────────────────────────────────────
+                putJsonArray("tools") {
+                    // 1. Всегда активируем живой поиск Google в реальном времени
+                    addJsonObject {
+                        putJsonObject("googleSearch") {}
                     }
+                    // 2. Добавляем пользовательские функции (например, Forvo Tool), если они переданы
+                    cfg.toolsJson?.forEach { add(it) }
                 }
 
                 cfg.resumptionHandle?.takeIf { it.isNotBlank() }?.let { handle ->
