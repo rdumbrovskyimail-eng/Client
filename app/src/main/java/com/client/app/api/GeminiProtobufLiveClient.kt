@@ -36,7 +36,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         const val WS_HOST = "generativelanguage.googleapis.com"
         const val WS_PATH = "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         
-        // Лимит 256 КБ исключает ложные отсечки микрофона при стартовом джиттере
         private const val MAX_QUEUE_BYTES = 256L * 1024
         private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280
         private const val MAX_HISTORY_TURNS = 20
@@ -224,10 +223,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         ws.send(jsonMessage)
     }
 
-    /**
-     * Отправка текстовых команд по спецификации Gemini Live API:
-     * 'text' обязан быть скалярной строкой (Scalar String), а не объектом!
-     */
     fun sendRealtimeText(text: String) {
         val ws = webSocket ?: return
         if (!isReady || text.isBlank()) return
@@ -370,16 +365,11 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }
 
-                // ─────────────────────────────────────────────────────────────
-                // ИНТЕГРАЦИЯ ИНТЕРНЕТ-ПОИСКА (GOOGLE SEARCH GROUNDING)
-                // ─────────────────────────────────────────────────────────────
-                putJsonArray("tools") {
-                    // 1. Всегда активируем живой поиск Google в реальном времени
-                    addJsonObject {
-                        putJsonObject("googleSearch") {}
+                // Инструменты подключаются только если они переданы и разрешены ключом
+                if (cfg.toolsJson != null && cfg.toolsJson.isNotEmpty()) {
+                    putJsonArray("tools") {
+                        cfg.toolsJson.forEach { add(it) }
                     }
-                    // 2. Добавляем пользовательские функции (например, Forvo Tool), если они переданы
-                    cfg.toolsJson?.forEach { add(it) }
                 }
 
                 cfg.resumptionHandle?.takeIf { it.isNotBlank() }?.let { handle ->
