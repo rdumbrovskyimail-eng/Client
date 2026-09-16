@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/java/com/client/app/attach/VocabularyExtractor.kt
 package com.client.app.attach
 
 import android.util.Base64
@@ -47,8 +46,11 @@ class VocabularyExtractor @Inject constructor(
 ) {
     companion object {
         private const val ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
-        const val DEFAULT_MODEL = "gemini-2.5-flash"
-        private const val FALLBACK_MODEL = "gemini-2.5-flash"
+        
+        // Полная миграция на gemini-3.8-flash; устаревшие версии 2.5 удалены
+        const val DEFAULT_MODEL = "gemini-3.8-flash"
+        private const val FALLBACK_MODEL = "gemini-3.8-flash"
+        
         private const val MAX_IMAGES_PER_CALL = 4
         private const val MAX_VOCAB = 250
     }
@@ -133,8 +135,7 @@ class VocabularyExtractor @Inject constructor(
             put("generationConfig", buildJsonObject {
                 put("responseMimeType", "application/json")
                 put("responseSchema", schema(forLanguageLearning))
-                put("temperature", 0.1)
-                put("maxOutputTokens", 32768)
+                put("maxOutputTokens", 65536)
                 if (!isFallbackAttempt) put("mediaResolution", "MEDIA_RESOLUTION_HIGH")
             })
 
@@ -230,7 +231,6 @@ class VocabularyExtractor @Inject constructor(
             }?.joinToString("")?.trim()
             ?: return AnalysisResult.Failure("Отсутствует текстовая часть ответа")
 
-        // Ошибка №4 [DEFECT]: Регулярное выражение для надежного снятия любых markdown-ограждений
         val cleanedJson = payload
             .replace(Regex("^```(?:json)?\\s*", RegexOption.IGNORE_CASE), "")
             .replace(Regex("\\s*```$"), "")
