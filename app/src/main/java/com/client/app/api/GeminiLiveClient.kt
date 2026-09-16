@@ -37,10 +37,6 @@ sealed interface GeminiEvent {
     data class Disconnected(val code: Int, val reason: String, val epoch: Long) : GeminiEvent
 }
 
-/**
- * Функция вызова со строго типизированными аргументами в виде JsonObject
- * и опциональным ID согласно wire-спецификации Google Live API.
- */
 data class FunctionCall(
     val name: String,
     val id: String?,
@@ -71,16 +67,45 @@ data class ClientTurn(
 
 class AudioFrame(val pcm: ByteArray, val epoch: Long)
 
+data class TranscriptionSettings(
+    val enabled: Boolean = true,
+    val languageCodes: List<String> = emptyList(),
+    val customVocabulary: List<String> = emptyList(),
+    val mode: String = "VERBATIM"
+)
+
+data class RealtimeInputSettings(
+    val aadEnabled: Boolean = true,
+    val startSensitivity: String = "START_SENSITIVITY_HIGH",
+    val endSensitivity: String = "END_SENSITIVITY_LOW",
+    val prefixPaddingMs: Int = 60,
+    val silenceDurationMs: Int = 600,
+    val activityHandling: String = "START_OF_ACTIVITY_INTERRUPTS",
+    val turnCoverage: String = "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
+)
+
+data class CompressionSettings(
+    val enabled: Boolean = true,
+    val triggerTokens: Int = 0,
+    val targetTokens: Int = 0
+)
+
 data class LiveConfig(
     val apiKey: String,
     val model: String = "gemini-3.8-live",
     val systemInstruction: String,
     val voiceName: String = "Charon",
-    val temperature: Double = 0.5,
+    val speechLanguage: String? = null,
+    val temperature: Float = 0.5f,
     val mediaResolution: String = "MEDIA_RESOLUTION_HIGH",
+    val inputTranscription: TranscriptionSettings = TranscriptionSettings(),
+    val outputTranscription: TranscriptionSettings = TranscriptionSettings(),
+    val realtimeInput: RealtimeInputSettings = RealtimeInputSettings(),
+    val compression: CompressionSettings = CompressionSettings(),
+    val sessionResumptionEnabled: Boolean = true,
+    val resumptionHandle: String? = null,
     val toolsJson: JsonArray? = null,
     val enableGoogleSearch: Boolean = false,
-    val resumptionHandle: String? = null,
     val initialHistory: List<ClientTurn> = emptyList()
 )
 
