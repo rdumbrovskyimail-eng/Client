@@ -18,12 +18,13 @@ struct NativeLogItem {
 
 /**
  * Высокопроизводительная безблокировочная MPSC-очередь (Multi-Producer Single-Consumer)
- * фиксированной емкости на алгоритме Дмитрия Вьюкова.
+ * фиксированной емкости на строгом алгоритме Дмитрия Вьюкова.
  * 
  * Особенности:
  * - Zero-Allocation: память под 1024 слота предвыделена статически.
- * - Lock-Free: в методе push() нет мьютексов и системных вызовов ядра,
- *   что гарантирует 100% безопасность вызова из RT-колбэков AAudio (AAudioStream_dataCallback).
+ * - Lock-Free & Non-Blocking: в методе push() нет мьютексов и системных вызовов ядра.
+ * - Строгий инвариант sequence: при переполнении очереди (diff < 0) запись отбрасывается
+ *   без изменения enqueuePos_ и без порчи ячеек буфера, что предотвращает зацикливание pop().
  * - Выравнивание по 64 байтам (alignas(64)) исключает деградацию кэш-линий CPU (False Sharing).
  */
 class NativeLogQueue {
@@ -36,7 +37,7 @@ public:
         return instance;
     }
 
-    void push(int level, const char* tag, const char* msg) {
+    bool push(int level, const char* tag, const char* msg) {
         Cell* cell = nullptr;
         uint64_t pos = enqueuePos_.load(std::memory_order_relaxed);
 
@@ -50,10 +51,10 @@ public:
                     break;
                 }
             } else if (diff < 0) {
-                // Буфер переполнен: перезаписываем слот, принудительно продвигая позицию
-                if (enqueuePos_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                    break;
-                }
+                // Очередь переполнена: слот занят и еще не прочитан consumer'ом.
+                // Не продвигаем enqueuePos_ и не перезаписываем ячейку, сохраняя инвариант.
+                droppedCount_.fetch_add(1, std::memory_order_relaxed);
+                return false;
             } else {
                 pos = enqueuePos_.load(std::memory_order_relaxed);
             }
@@ -80,6 +81,7 @@ public:
         cell->item.timestampNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
 
         cell->sequence.store(pos + 1, std::memory_order_release);
+        return true;
     }
 
     bool pop(NativeLogItem& outItem) {
@@ -107,6 +109,10 @@ public:
         return true;
     }
 
+    uint64_t getDroppedCount() const {
+        return droppedCount_.load(std::memory_order_relaxed);
+    }
+
 private:
     struct Cell {
         std::atomic<uint64_t> sequence;
@@ -119,6 +125,7 @@ private:
         }
         enqueuePos_.store(0, std::memory_order_relaxed);
         dequeuePos_.store(0, std::memory_order_relaxed);
+        droppedCount_.store(0, std::memory_order_relaxed);
     }
 
     ~NativeLogQueue() = default;
@@ -128,6 +135,7 @@ private:
     alignas(64) Cell buffer_[CAPACITY];
     alignas(64) std::atomic<uint64_t> enqueuePos_{0};
     alignas(64) std::atomic<uint64_t> dequeuePos_{0};
+    std::atomic<uint64_t> droppedCount_{0};
 };
 
 } // namespace client::logging
