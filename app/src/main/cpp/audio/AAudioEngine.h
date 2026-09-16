@@ -109,6 +109,12 @@ private:
     // Статически предвыделенные буферы ресемплинга и децимации
     std::vector<int16_t> resampleScratchBuffer_;
     std::vector<int16_t> captureDecimateBuffer_;
+    std::vector<int16_t> captureInputScratchBuffer_;
+
+    // Буфер отложенного сброса ресемплированного вывода при противодавлении ring buffer
+    std::vector<int16_t> resamplePendingBuffer_;
+    size_t resamplePendingOffset_{0};
+    size_t resamplePendingCount_{0};
 
     PolyphaseResampler24To16 resampler24To16_;
     HermiteResampler24To48 resampler24To48_;
