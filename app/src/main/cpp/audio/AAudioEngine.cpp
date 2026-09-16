@@ -165,7 +165,11 @@ AAudioEngine::AAudioEngine()
     : fftProcessor_(std::make_unique<dsp::FastFft>()),
       fftAccumulator_(FFT_SIZE * 2, 0.0f),
       resampleScratchBuffer_(RESAMPLE_SCRATCH_CAPACITY, 0),
-      captureDecimateBuffer_(CAPTURE_DECIMATE_CAPACITY, 0) {
+      captureDecimateBuffer_(CAPTURE_DECIMATE_CAPACITY, 0),
+      captureInputScratchBuffer_(CAPTURE_DECIMATE_CAPACITY, 0),
+      resamplePendingBuffer_(RESAMPLE_SCRATCH_CAPACITY, 0),
+      resamplePendingOffset_(0),
+      resamplePendingCount_(0) {
     dsp::enableHardwareFtz();
 }
 
@@ -184,6 +188,8 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
         resampler24To16_.reset();
         resampler24To48_.reset();
         captureDecimator48To16_.reset();
+        resamplePendingOffset_ = 0;
+        resamplePendingCount_ = 0;
         resetEarcon();
         s_voiceEnhancer.reset(targetPlaybackSampleRate);
     }
@@ -232,6 +238,29 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
 
     actualCaptureSampleRate_.store(AAudioStream_getSampleRate(captureStream_), std::memory_order_release);
     actualInputDeviceId_.store(AAudioStream_getDeviceId(captureStream_), std::memory_order_release);
+
+    // Расчет безопасного размера скретч-буферов захвата ДО старта callback
+    int32_t inFramesPerCallback = AAudioStream_getFramesPerDataCallback(captureStream_);
+    int32_t inCapacity = AAudioStream_getBufferCapacityInFrames(captureStream_);
+    int32_t inBurst = AAudioStream_getFramesPerBurst(captureStream_);
+
+    size_t neededCaptureScratch = CAPTURE_DECIMATE_CAPACITY;
+    if (inCapacity > 0 && static_cast<size_t>(inCapacity * 4) > neededCaptureScratch) {
+        neededCaptureScratch = static_cast<size_t>(inCapacity * 4);
+    }
+    if (inFramesPerCallback > 0 && static_cast<size_t>(inFramesPerCallback * 4) > neededCaptureScratch) {
+        neededCaptureScratch = static_cast<size_t>(inFramesPerCallback * 4);
+    }
+    if (inBurst > 0 && static_cast<size_t>(inBurst * 8) > neededCaptureScratch) {
+        neededCaptureScratch = static_cast<size_t>(inBurst * 8);
+    }
+
+    if (captureInputScratchBuffer_.size() < neededCaptureScratch) {
+        captureInputScratchBuffer_.resize(neededCaptureScratch, 0);
+    }
+    if (captureDecimateBuffer_.size() < neededCaptureScratch) {
+        captureDecimateBuffer_.resize(neededCaptureScratch, 0);
+    }
 
     // ─────────────────────────────────────────────────────────────
     // 2. КОНФИГУРАЦИЯ ПОТОКА ВОСПРОИЗВЕДЕНИЯ (ДИНАМИК / НАУШНИКИ)
@@ -311,6 +340,7 @@ bool AAudioEngine::start() {
     res = AAudioStream_requestStart(playbackStream_);
     if (res != AAUDIO_OK) {
         LOGE("AAudioStream_requestStart(playback) failed: %d (%s)", res, AAudio_convertResultToText(res));
+        AAudioStream_requestStop(captureStream_);
         stop();
         return false;
     }
@@ -322,7 +352,8 @@ bool AAudioEngine::start() {
 
 void AAudioEngine::stop() {
     std::lock_guard<std::mutex> lock(stateMutex_);
-    if (!isRunning_.exchange(false)) {
+    bool wasRunning = isRunning_.exchange(false);
+    if (!wasRunning && !captureStream_ && !playbackStream_) {
         return;
     }
 
@@ -345,6 +376,8 @@ void AAudioEngine::stop() {
         resampler24To16_.reset();
         resampler24To48_.reset();
         captureDecimator48To16_.reset();
+        resamplePendingOffset_ = 0;
+        resamplePendingCount_ = 0;
         resetEarcon();
         s_voiceEnhancer.reset(48000);
     }
@@ -365,12 +398,31 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
 
     std::lock_guard<std::mutex> lock(playbackWriteMutex_);
 
+    // 0. Сначала сбрасываем неотправленный остаток от предыдущей частичной записи
+    if (resamplePendingCount_ > 0) {
+        size_t written = playbackBuffer_.write(
+            resamplePendingBuffer_.data() + resamplePendingOffset_,
+            resamplePendingCount_
+        );
+        resamplePendingOffset_ += written;
+        resamplePendingCount_ -= written;
+
+        if (resamplePendingCount_ > 0) {
+            // Кольцевой буфер всё ещё полон; не принимаем новые входные фреймы
+            return 0;
+        }
+        resamplePendingOffset_ = 0;
+    }
+
     int32_t actualRate = actualPlaybackSampleRate_.load(std::memory_order_acquire);
     if (actualRate <= 0) actualRate = SAMPLE_RATE_GEMINI_OUT;
 
     const size_t neededCapacity = static_cast<size_t>(frames * 3);
     if (neededCapacity > resampleScratchBuffer_.size()) {
         resampleScratchBuffer_.resize(neededCapacity * 2);
+    }
+    if (neededCapacity > resamplePendingBuffer_.size()) {
+        resamplePendingBuffer_.resize(neededCapacity * 2);
     }
 
     // 1. Bluetooth HFP: 24 кГц -> 16 кГц (L=2, M=3)
@@ -379,11 +431,15 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
             pcm, frames, resampleScratchBuffer_.data()
         );
         size_t written = playbackBuffer_.write(resampleScratchBuffer_.data(), resampledFrames);
-        if (written >= resampledFrames) {
-            return frames;
-        } else {
-            return (resampledFrames > 0) ? (written * frames / resampledFrames) : 0;
+        if (written < resampledFrames) {
+            size_t unwritten = resampledFrames - written;
+            std::memcpy(resamplePendingBuffer_.data(),
+                        resampleScratchBuffer_.data() + written,
+                        unwritten * sizeof(int16_t));
+            resamplePendingOffset_ = 0;
+            resamplePendingCount_ = unwritten;
         }
+        return frames;
     }
 
     // 2. Встроенный ЦАП S23 Ultra / A2DP: 24 кГц -> 48 кГц через кубический сплайн Эрмита
@@ -392,11 +448,15 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
             pcm, frames, resampleScratchBuffer_.data()
         );
         size_t written = playbackBuffer_.write(resampleScratchBuffer_.data(), resampledFrames);
-        if (written >= resampledFrames) {
-            return frames;
-        } else {
-            return (resampledFrames > 0) ? (written * frames / resampledFrames) : 0;
+        if (written < resampledFrames) {
+            size_t unwritten = resampledFrames - written;
+            std::memcpy(resamplePendingBuffer_.data(),
+                        resampleScratchBuffer_.data() + written,
+                        unwritten * sizeof(int16_t));
+            resamplePendingOffset_ = 0;
+            resamplePendingCount_ = unwritten;
         }
+        return frames;
     }
 
     // 3. Нативная частота Gemini Live (24 кГц - LE Audio LC3)
@@ -435,6 +495,11 @@ size_t AAudioEngine::readCapturePcm(int16_t* pcm, size_t maxFrames) {
 }
 
 void AAudioEngine::flushPlayback() {
+    {
+        std::lock_guard<std::mutex> lock(playbackWriteMutex_);
+        resamplePendingOffset_ = 0;
+        resamplePendingCount_ = 0;
+    }
     playbackBuffer_.requestFlush();
     outRms_.store(0.0f);
     LOGI("AAudioEngine: flushPlayback executed");
@@ -464,6 +529,10 @@ void AAudioEngine::getSpectrumData(dsp::SpectrumSnapshot& outSnapshot) {
 aaudio_data_callback_result_t AAudioEngine::captureCallback(
     AAudioStream* /* stream */, void* userData, void* audioData, int32_t numFrames) {
 
+    if (audioData == nullptr || numFrames <= 0) {
+        return AAUDIO_CALLBACK_RESULT_CONTINUE;
+    }
+
     thread_local bool ftzSet = false;
     if (!ftzSet) {
         dsp::enableHardwareFtz();
@@ -471,32 +540,48 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     }
 
     auto* engine = static_cast<AAudioEngine*>(userData);
-    auto* samples = static_cast<int16_t*>(audioData);
+    const auto* inSamples = static_cast<const int16_t*>(audioData);
 
     const float gain = engine->micGain_.load(std::memory_order_relaxed);
-    if (std::abs(gain - 1.0f) > 0.001f) {
-        for (int32_t i = 0; i < numFrames; ++i) {
-            int32_t amplified = static_cast<int32_t>(std::round(samples[i] * gain));
-            samples[i] = static_cast<int16_t>(std::clamp(amplified, -32768, 32767));
-        }
-    }
-
+    const bool applyGain = (std::abs(gain - 1.0f) > 0.001f);
     const int32_t capRate = engine->actualCaptureSampleRate_.load(std::memory_order_relaxed);
-    if (capRate == 48000) {
-        size_t decCap = engine->captureDecimateBuffer_.size();
-        if (static_cast<size_t>(numFrames) > decCap) {
-            engine->captureDecimateBuffer_.resize(numFrames * 2);
-            decCap = engine->captureDecimateBuffer_.size();
+
+    const size_t inputScratchCap = engine->captureInputScratchBuffer_.size();
+    const size_t decimateScratchCap = engine->captureDecimateBuffer_.size();
+
+    // Zero-Allocation потоковая обработка (чанкование без heap-аллокаций при любых numFrames)
+    size_t framesRemaining = static_cast<size_t>(numFrames);
+    const int16_t* inPtr = inSamples;
+
+    while (framesRemaining > 0) {
+        const size_t chunkFrames = std::min(framesRemaining, inputScratchCap);
+        int16_t* scratchBuf = engine->captureInputScratchBuffer_.data();
+
+        if (applyGain) {
+            for (size_t i = 0; i < chunkFrames; ++i) {
+                int32_t amplified = static_cast<int32_t>(std::round(inPtr[i] * gain));
+                scratchBuf[i] = static_cast<int16_t>(std::clamp(amplified, -32768, 32767));
+            }
+        } else {
+            std::memcpy(scratchBuf, inPtr, chunkFrames * sizeof(int16_t));
         }
-        int16_t* decBuf = engine->captureDecimateBuffer_.data();
-        size_t processed = engine->captureDecimator48To16_.process(samples, numFrames, decBuf, decCap);
-        if (processed > 0) {
-            engine->captureBuffer_.write(decBuf, processed);
-            engine->micRms_.store(dsp::calculateRms(decBuf, processed), std::memory_order_relaxed);
+
+        if (capRate == 48000) {
+            int16_t* decBuf = engine->captureDecimateBuffer_.data();
+            size_t processed = engine->captureDecimator48To16_.process(
+                scratchBuf, chunkFrames, decBuf, decimateScratchCap
+            );
+            if (processed > 0) {
+                engine->captureBuffer_.write(decBuf, processed);
+                engine->micRms_.store(dsp::calculateRms(decBuf, processed), std::memory_order_relaxed);
+            }
+        } else {
+            engine->captureBuffer_.write(scratchBuf, chunkFrames);
+            engine->micRms_.store(dsp::calculateRms(scratchBuf, chunkFrames), std::memory_order_relaxed);
         }
-    } else {
-        engine->captureBuffer_.write(samples, numFrames);
-        engine->micRms_.store(dsp::calculateRms(samples, numFrames), std::memory_order_relaxed);
+
+        framesRemaining -= chunkFrames;
+        inPtr += chunkFrames;
     }
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
