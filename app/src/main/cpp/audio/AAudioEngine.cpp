@@ -29,9 +29,6 @@
 
 namespace {
 
-/**
- * Высокоточный биквадратный IIR-фильтр (Direct Form II)
- */
 struct Biquad {
     float b0{1.0f}, b1{0.0f}, b2{0.0f};
     float a1{0.0f}, a2{0.0f};
@@ -83,13 +80,6 @@ struct Biquad {
     }
 };
 
-/**
- * Процессор аналогового лампового звука и психоакустической плотности:
- * 1. Pre-Drive (+3.5 дБ) — подъем воспринимаемой RMS-громкости.
- * 2. Грудной резонатор (Low-Shelf 160 Гц, +3.5 дБ) — убирает пластмассовый призвук.
- * 3. Воздух и кристальные согласные (High-Shelf 5000 Гц, +3.2 дБ).
- * 4. Асимметричный триодный сатуратор (четные гармоники + Soft Knee Tape Limiter).
- */
 class AnalogVoiceEnhancer {
 public:
     AnalogVoiceEnhancer() {
@@ -103,10 +93,8 @@ public:
         lowShelf_.reset();
         highShelf_.reset();
 
-        // 160 Гц — основа грудного тембра живого человека
         lowShelf_.makeLowShelf(160.0f, 3.5f, fs);
 
-        // 5000 Гц — воздух и читаемость согласных (адаптируется к полосе Найквиста)
         float highFc = std::min(5000.0f, fs * 0.44f);
         highShelf_.makeHighShelf(highFc, 3.2f, fs);
     }
@@ -118,27 +106,22 @@ public:
             reset(sampleRate);
         }
 
-        // Предварительный разгон амплитуды (+3.5 дБ)
         constexpr float PRE_DRIVE = 1.48f;
         constexpr float INV_32768 = 1.0f / 32768.0f;
 
         for (size_t i = 0; i < numFrames; ++i) {
             float x = static_cast<float>(samples[i]) * INV_32768 * PRE_DRIVE;
 
-            // 1. Утепление баса и раскрытие воздуха эквалайзером
             x = lowShelf_.process(x);
             x = highShelf_.process(x);
 
-            // 2. Асимметричный триодный сатуратор (генерация 2-й гармоники теплого лампового звука)
             x = x + 0.12f * (x * x);
 
-            // 3. Аналоговый мягкий ограничитель (Soft-Knee Limiter)
             float absX = std::abs(x);
             float y = (absX < 1.0f)
                 ? (x - 0.22f * x * x * x)
                 : ((x > 0.0f ? 1.0f : -1.0f) * (0.78f + 0.22f * (1.0f - std::exp(-2.0f * (absX - 1.0f)))));
 
-            // 4. Запись обратно в PCM16 без жесткого клиппинга
             int32_t outSample = static_cast<int32_t>(y * 32767.0f);
             samples[i] = static_cast<int16_t>(std::clamp(outSample, -32768, 32767));
         }
@@ -179,12 +162,17 @@ AAudioEngine::~AAudioEngine() {
 
 bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
                         int32_t inputDeviceId, int32_t outputDeviceId) {
-    stop();
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+    return initLocked(isBluetoothMode, targetPlaybackSampleRate, inputDeviceId, outputDeviceId);
+}
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+bool AAudioEngine::initLocked(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
+                              int32_t inputDeviceId, int32_t outputDeviceId) {
+    stopLocked();
+    isDisconnected_.store(false, std::memory_order_release);
 
     {
-        std::lock_guard<std::mutex> lock(playbackWriteMutex_);
+        std::lock_guard<std::mutex> pLock(playbackWriteMutex_);
         resampler24To16_.reset();
         resampler24To48_.reset();
         captureDecimator48To16_.reset();
@@ -200,7 +188,7 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
     isBluetoothMode_.store(isBluetoothMode, std::memory_order_relaxed);
     playbackSampleRate_.store(targetPlaybackSampleRate, std::memory_order_relaxed);
 
-    LOGI("AAudioEngine::init: BT=%d, targetRate=%d, inDevId=%d, outDevId=%d", 
+    LOGI("AAudioEngine::initLocked: BT=%d, targetRate=%d, inDevId=%d, outDevId=%d", 
          (int)isBluetoothMode, targetPlaybackSampleRate, inputDeviceId, outputDeviceId);
 
     // ─────────────────────────────────────────────────────────────
@@ -236,10 +224,23 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
         return false;
     }
 
-    actualCaptureSampleRate_.store(AAudioStream_getSampleRate(captureStream_), std::memory_order_release);
+    // P1-04: Валидация фактических характеристик потока захвата
+    const int32_t actualInRate = AAudioStream_getSampleRate(captureStream_);
+    const int32_t actualInChannels = AAudioStream_getChannelCount(captureStream_);
+    const aaudio_format_t actualInFormat = AAudioStream_getFormat(captureStream_);
+
+    if (actualInFormat != AAUDIO_FORMAT_PCM_I16 || actualInChannels != CHANNEL_COUNT_MONO ||
+        (actualInRate != 16000 && actualInRate != 48000)) {
+        LOGE("AAudio capture unsupported format: rate=%d, channels=%d, format=%d",
+             actualInRate, actualInChannels, (int)actualInFormat);
+        AAudioStream_close(captureStream_);
+        captureStream_ = nullptr;
+        return false;
+    }
+
+    actualCaptureSampleRate_.store(actualInRate, std::memory_order_release);
     actualInputDeviceId_.store(AAudioStream_getDeviceId(captureStream_), std::memory_order_release);
 
-    // Расчет безопасного размера скретч-буферов захвата ДО старта callback
     int32_t inFramesPerCallback = AAudioStream_getFramesPerDataCallback(captureStream_);
     int32_t inCapacity = AAudioStream_getBufferCapacityInFrames(captureStream_);
     int32_t inBurst = AAudioStream_getFramesPerBurst(captureStream_);
@@ -263,40 +264,9 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
     }
 
     // ─────────────────────────────────────────────────────────────
-    // 2. КОНФИГУРАЦИЯ ПОТОКА ВОСПРОИЗВЕДЕНИЯ (ДИНАМИК / НАУШНИКИ)
+    // 2. КОНФИГУРАЦИЯ ПОТОКА ВОСПРОИЗВЕДЕНИЯ (P1-03: EXCLUSIVE -> SHARED FALLBACK)
     // ─────────────────────────────────────────────────────────────
-    AAudioStreamBuilder* outBuilder = nullptr;
-    if (AAudio_createStreamBuilder(&outBuilder) != AAUDIO_OK) {
-        LOGE("Failed to create playback stream builder");
-        AAudioStream_close(captureStream_);
-        captureStream_ = nullptr;
-        return false;
-    }
-
-    AAudioStreamBuilder_setDirection(outBuilder, AAUDIO_DIRECTION_OUTPUT);
-    AAudioStreamBuilder_setPerformanceMode(outBuilder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-    AAudioStreamBuilder_setChannelCount(outBuilder, CHANNEL_COUNT_MONO);
-    AAudioStreamBuilder_setFormat(outBuilder, AAUDIO_FORMAT_PCM_I16);
-    AAudioStreamBuilder_setSampleRate(outBuilder, targetPlaybackSampleRate);
-
-    if (outputDeviceId > 0) {
-        AAudioStreamBuilder_setDeviceId(outBuilder, outputDeviceId);
-    }
-
-    if (isBluetoothMode) {
-        AAudioStreamBuilder_setSharingMode(outBuilder, AAUDIO_SHARING_MODE_SHARED);
-        AAudioStreamBuilder_setUsage(outBuilder, AAUDIO_USAGE_VOICE_COMMUNICATION);
-    } else {
-        AAudioStreamBuilder_setSharingMode(outBuilder, AAUDIO_SHARING_MODE_EXCLUSIVE);
-        AAudioStreamBuilder_setUsage(outBuilder, AAUDIO_USAGE_VOICE_COMMUNICATION);
-    }
-
-    AAudioStreamBuilder_setDataCallback(outBuilder, playbackCallback, this);
-    AAudioStreamBuilder_setErrorCallback(outBuilder, errorCallback, this);
-
-    res = AAudioStreamBuilder_openStream(outBuilder, &playbackStream_);
-    AAudioStreamBuilder_delete(outBuilder);
-
+    res = openPlaybackStreamWithFallback(targetPlaybackSampleRate, outputDeviceId, isBluetoothMode);
     if (res != AAUDIO_OK) {
         LOGE("Failed to open playback stream: %d (%s)", res, AAudio_convertResultToText(res));
         AAudioStream_close(captureStream_);
@@ -312,6 +282,16 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
         std::memory_order_relaxed
     );
 
+    // P1-08: Безопасный тюнинг размера буфера (2 * burst)
+    const int32_t playBurst = AAudioStream_getFramesPerBurst(playbackStream_);
+    const int32_t playCapacity = AAudioStream_getBufferCapacityInFrames(playbackStream_);
+    if (playBurst > 0 && playCapacity > 0) {
+        const int32_t targetBufSize = std::clamp(playBurst * 2, playBurst, playCapacity);
+        const int32_t appliedBufSize = AAudioStream_setBufferSizeInFrames(playbackStream_, targetBufSize);
+        LOGI("Playback buffer size tuned: requested=%d, applied=%d (burst=%d, capacity=%d)",
+             targetBufSize, appliedBufSize, playBurst, playCapacity);
+    }
+
     LOGI("AAudio Initialized: CapRate=%d (DevId=%d), PlayRate=%d (DevId=%d), MMAP=%d",
          actualCaptureSampleRate_.load(), actualInputDeviceId_.load(),
          actualPlaybackSampleRate_.load(), actualOutputDeviceId_.load(),
@@ -319,12 +299,72 @@ bool AAudioEngine::init(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
     return true;
 }
 
+aaudio_result_t AAudioEngine::openPlaybackStreamWithFallback(
+    int32_t targetPlaybackSampleRate, int32_t outputDeviceId, bool isBluetooth) {
+
+    const aaudio_sharing_mode_t desiredSharing = isBluetooth ? AAUDIO_SHARING_MODE_SHARED : AAUDIO_SHARING_MODE_EXCLUSIVE;
+
+    auto buildAndOpen = [this, targetPlaybackSampleRate, outputDeviceId](aaudio_sharing_mode_t sharingMode) -> aaudio_result_t {
+        AAudioStreamBuilder* outBuilder = nullptr;
+        if (AAudio_createStreamBuilder(&outBuilder) != AAUDIO_OK) {
+            return AAUDIO_ERROR_INTERNAL;
+        }
+
+        AAudioStreamBuilder_setDirection(outBuilder, AAUDIO_DIRECTION_OUTPUT);
+        AAudioStreamBuilder_setPerformanceMode(outBuilder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+        AAudioStreamBuilder_setChannelCount(outBuilder, CHANNEL_COUNT_MONO);
+        AAudioStreamBuilder_setFormat(outBuilder, AAUDIO_FORMAT_PCM_I16);
+        AAudioStreamBuilder_setSampleRate(outBuilder, targetPlaybackSampleRate);
+
+        if (outputDeviceId > 0) {
+            AAudioStreamBuilder_setDeviceId(outBuilder, outputDeviceId);
+        }
+
+        AAudioStreamBuilder_setSharingMode(outBuilder, sharingMode);
+        AAudioStreamBuilder_setUsage(outBuilder, AAUDIO_USAGE_VOICE_COMMUNICATION);
+
+        AAudioStreamBuilder_setDataCallback(outBuilder, playbackCallback, this);
+        AAudioStreamBuilder_setErrorCallback(outBuilder, errorCallback, this);
+
+        if (playbackStream_ != nullptr) {
+            AAudioStream_close(playbackStream_);
+            playbackStream_ = nullptr;
+        }
+
+        aaudio_result_t openRes = AAudioStreamBuilder_openStream(outBuilder, &playbackStream_);
+        AAudioStreamBuilder_delete(outBuilder);
+
+        if (openRes != AAUDIO_OK && playbackStream_ != nullptr) {
+            AAudioStream_close(playbackStream_);
+            playbackStream_ = nullptr;
+        }
+        return openRes;
+    };
+
+    aaudio_result_t res = buildAndOpen(desiredSharing);
+
+    // P1-03: Контролируемый однократный откат с EXCLUSIVE на SHARED
+    if (res != AAUDIO_OK && desiredSharing == AAUDIO_SHARING_MODE_EXCLUSIVE) {
+        LOGI("Playback EXCLUSIVE open failed (%d: %s). Conservative fallback to SHARED...",
+             res, AAudio_convertResultToText(res));
+        res = buildAndOpen(AAUDIO_SHARING_MODE_SHARED);
+    }
+
+    return res;
+}
+
 bool AAudioEngine::start() {
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+
     if (isRunning_.load()) return true;
+
+    // REMEDIATION #1: Вызываем initLocked без повторного захвата mutex
     if (!captureStream_ || !playbackStream_) {
         LOGI("start() called with null streams, reinitializing...");
-        if (!init(isBluetoothMode_.load(), playbackSampleRate_.load(),
-                  actualInputDeviceId_.load(), actualOutputDeviceId_.load())) return false;
+        if (!initLocked(isBluetoothMode_.load(), playbackSampleRate_.load(),
+                        actualInputDeviceId_.load(), actualOutputDeviceId_.load())) {
+            return false;
+        }
     }
 
     captureBuffer_.clear();
@@ -333,7 +373,7 @@ bool AAudioEngine::start() {
     aaudio_result_t res = AAudioStream_requestStart(captureStream_);
     if (res != AAUDIO_OK) {
         LOGE("AAudioStream_requestStart(capture) failed: %d (%s)", res, AAudio_convertResultToText(res));
-        stop();
+        stopLocked();
         return false;
     }
 
@@ -341,7 +381,7 @@ bool AAudioEngine::start() {
     if (res != AAUDIO_OK) {
         LOGE("AAudioStream_requestStart(playback) failed: %d (%s)", res, AAudio_convertResultToText(res));
         AAudioStream_requestStop(captureStream_);
-        stop();
+        stopLocked();
         return false;
     }
 
@@ -351,13 +391,17 @@ bool AAudioEngine::start() {
 }
 
 void AAudioEngine::stop() {
-    std::lock_guard<std::mutex> lock(stateMutex_);
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+    stopLocked();
+}
+
+void AAudioEngine::stopLocked() {
     bool wasRunning = isRunning_.exchange(false);
     if (!wasRunning && !captureStream_ && !playbackStream_) {
         return;
     }
 
-    LOGI("Stopping AAudioEngine...");
+    LOGI("Stopping AAudioEngine (stopLocked)...");
 
     if (captureStream_) {
         AAudioStream_requestStop(captureStream_);
@@ -390,7 +434,7 @@ void AAudioEngine::stop() {
     isMmapExclusiveActive_.store(false);
     fftAccumulatorPos_ = 0;
 
-    LOGI("AAudioEngine stopped");
+    LOGI("AAudioEngine stopped cleanly");
 }
 
 size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
@@ -398,7 +442,6 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
 
     std::lock_guard<std::mutex> lock(playbackWriteMutex_);
 
-    // 0. Сначала сбрасываем неотправленный остаток от предыдущей частичной записи
     if (resamplePendingCount_ > 0) {
         size_t written = playbackBuffer_.write(
             resamplePendingBuffer_.data() + resamplePendingOffset_,
@@ -408,7 +451,6 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
         resamplePendingCount_ -= written;
 
         if (resamplePendingCount_ > 0) {
-            // Кольцевой буфер всё ещё полон; не принимаем новые входные фреймы
             return 0;
         }
         resamplePendingOffset_ = 0;
@@ -425,7 +467,6 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
         resamplePendingBuffer_.resize(neededCapacity * 2);
     }
 
-    // 1. Bluetooth HFP: 24 кГц -> 16 кГц (L=2, M=3)
     if (actualRate == SAMPLE_RATE_BT_HFP) {
         size_t resampledFrames = resampler24To16_.process(
             pcm, frames, resampleScratchBuffer_.data()
@@ -442,7 +483,6 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
         return frames;
     }
 
-    // 2. Встроенный ЦАП S23 Ultra / A2DP: 24 кГц -> 48 кГц через кубический сплайн Эрмита
     if (actualRate == SAMPLE_RATE_NATIVE_SPEAKER || actualRate == SAMPLE_RATE_BT_A2DP) {
         size_t resampledFrames = resampler24To48_.process(
             pcm, frames, resampleScratchBuffer_.data()
@@ -459,12 +499,10 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
         return frames;
     }
 
-    // 3. Нативная частота Gemini Live (24 кГц - LE Audio LC3)
     if (actualRate == SAMPLE_RATE_GEMINI_OUT) {
         return playbackBuffer_.write(pcm, frames);
     }
 
-    // 4. Дробная интерполяция для нестандартных частот
     const double rateRatio = static_cast<double>(actualRate) / static_cast<double>(SAMPLE_RATE_GEMINI_OUT);
     const size_t targetFrames = static_cast<size_t>(frames * rateRatio);
 
@@ -549,7 +587,6 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     const size_t inputScratchCap = engine->captureInputScratchBuffer_.size();
     const size_t decimateScratchCap = engine->captureDecimateBuffer_.size();
 
-    // Zero-Allocation потоковая обработка (чанкование без heap-аллокаций при любых numFrames)
     size_t framesRemaining = static_cast<size_t>(numFrames);
     const int16_t* inPtr = inSamples;
 
@@ -575,7 +612,7 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
                 engine->captureBuffer_.write(decBuf, processed);
                 engine->micRms_.store(dsp::calculateRms(decBuf, processed), std::memory_order_relaxed);
             }
-        } else {
+        } else if (capRate == 16000) {
             engine->captureBuffer_.write(scratchBuf, chunkFrames);
             engine->micRms_.store(dsp::calculateRms(scratchBuf, chunkFrames), std::memory_order_relaxed);
         }
@@ -619,11 +656,6 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
         engine->earconPhase_.store(phase, std::memory_order_release);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // ПСИХОАКУСТИЧЕСКИЙ ПРОЦЕССОР АНАЛОГОВОЙ ТЕПЛОТЫ, БАСА И ВОЗДУХА
-    // Обрабатывает сэмплы перед подачей на ЦАП: грудной бас, кристальный верх,
-    // триодное насыщение (2-я гармоника) и подъем воспринимаемой громкости (+3.5 дБ)
-    // ─────────────────────────────────────────────────────────────────────────────
     s_voiceEnhancer.process(samples, numFrames, actualRate);
 
     const float vol = engine->playbackVolume_.load(std::memory_order_relaxed);
@@ -655,14 +687,13 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
 }
 
 void AAudioEngine::errorCallback(AAudioStream* /* stream */, void* userData, aaudio_result_t error) {
-    LOGE("AAudio stream error callback: code %d (%s)", error, AAudio_convertResultToText(error));
+    char errBuf[64];
+    snprintf(errBuf, sizeof(errBuf), "AAudio stream error: %d", error);
+    client::logging::NativeLogQueue::getInstance().push(5, LOG_TAG, errBuf);
 
     if (error == AAUDIO_ERROR_DISCONNECTED) {
         auto* engine = static_cast<AAudioEngine*>(userData);
-        std::thread([engine]() {
-            LOGI("Asynchronously stopping AAudioEngine after AAUDIO_ERROR_DISCONNECTED.");
-            engine->stop();
-        }).detach();
+        engine->isDisconnected_.store(true, std::memory_order_release);
     }
 }
 
