@@ -46,6 +46,7 @@ public:
     bool isDisconnected() const { return isDisconnected_.load(std::memory_order_relaxed); }
 
     int32_t getActualCaptureSampleRate() const { return actualCaptureSampleRate_.load(std::memory_order_relaxed); }
+    int32_t getActualCaptureChannels() const { return actualCaptureChannels_.load(std::memory_order_relaxed); }
     int32_t getActualPlaybackSampleRate() const { return actualPlaybackSampleRate_.load(std::memory_order_relaxed); }
 
     int32_t getActiveInputDeviceId() const { return actualInputDeviceId_.load(std::memory_order_relaxed); }
@@ -95,8 +96,9 @@ private:
     std::atomic<bool> isDisconnected_{false};
     std::atomic<int32_t> playbackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
 
-    // Подтвержденные HAL частоты дискретизации микрофона и динамика
+    // Подтвержденные HAL характеристики микрофона и динамика
     std::atomic<int32_t> actualCaptureSampleRate_{SAMPLE_RATE_GEMINI_IN};
+    std::atomic<int32_t> actualCaptureChannels_{CHANNEL_COUNT_MONO};
     std::atomic<int32_t> actualPlaybackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
 
     // Подтвержденные аппаратные ID устройств ввода и вывода
@@ -134,6 +136,9 @@ private:
     PolyphaseResampler24To16 resampler24To16_;
     HermiteResampler24To48 resampler24To48_;
     Decimator48To16 captureDecimator48To16_;
+
+    // Отдельный экземпляр полифазного ресемплера для микрофонного тракта (RT Capture Callback)
+    PolyphaseResampler24To16 captureResampler24To16_;
 };
 
 } // namespace client::audio
