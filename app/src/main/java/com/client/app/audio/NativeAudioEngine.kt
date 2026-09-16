@@ -114,11 +114,7 @@ class NativeAudioEngine @Inject constructor(
 
     /*
      * Generation физического жизненного цикла аудиоядра.
-     *
-     * Защищает от запоздалых callback маршрутизации
-     * старого физического поколения.
-     *
-     * НЕ является Gemini WebSocket epoch.
+     * Защищает от запоздалых callback маршрутизации старого физического поколения.
      */
     private val engineGeneration = AtomicLong(0)
 
@@ -275,6 +271,19 @@ class NativeAudioEngine @Inject constructor(
             var isSpeechActiveManual = false
 
             while (isActive && _isCapturing.value) {
+                // Автоматическое восстановление потока AAudio при переключении SCO/BLE
+                if (bridge.isAudioDisconnected()) {
+                    logger.w("NativeAudioEngine: Обнаружен дисконнект AAudio (переключение BT), восстанавливаем поток...")
+                    applyRouteInternal(
+                        RouteTransitionRequest(
+                            profile = router.currentProfile.value,
+                            generation = engineGeneration.get()
+                        )
+                    )
+                    delay(50)
+                    continue
+                }
+
                 captureDirectBuffer.clear()
                 val bytesRead = captureDirectMutex.withLock {
                     if (!_isCapturing.value) return@withLock 0
@@ -304,13 +313,11 @@ class NativeAudioEngine @Inject constructor(
                         onSpeechEnd = { speechEndedOnFrame = true }
                     )
 
-                    // Передача аудиокадра между корутинами использует одну immutable ByteArray-копию на полный 10-ms frame
                     val currentAudioBytes = if (validPcm === frame) frame.copyOf(bytesRead) else validPcm
 
                     // 2. Разделение продюсера по режимам (AAD ON vs Manual VAD)
                     if (isAadMode) {
                         // ── РЕЖИМ 1: AAD = ON (Hybrid VAD) ──
-                        // Непрерывный поток аудио без дублирования пре-ролла
                         if (speechStartedOnFrame) {
                             if (isAiRendering) {
                                 val echoThreshold = maxOf(0.12f, currentOut * 0.42f)
@@ -325,7 +332,6 @@ class NativeAudioEngine @Inject constructor(
                                     hapticManager.triggerBargeIn()
                                     _bargeInEvents.tryEmit(Unit)
 
-                                    // Выталкиваем придержанный буфер эхоподавления (не отправлялся ранее)
                                     val preRoll = mutableListOf<ByteArray>()
                                     synchronized(poolLock) {
                                         while (leadInBuffer.isNotEmpty()) {
@@ -365,7 +371,6 @@ class NativeAudioEngine @Inject constructor(
                         }
                     } else {
                         // ── РЕЖИМ 2: AAD = OFF (Manual VAD) ──
-                        // В тишине кадры не отправляются в канал, а только наполняют leadInBuffer
                         if (speechStartedOnFrame) {
                             val preRoll = mutableListOf<ByteArray>()
                             synchronized(poolLock) {
@@ -374,10 +379,8 @@ class NativeAudioEngine @Inject constructor(
                                 }
                             }
 
-                            // SpeechStart идет строго первым
                             _micOutput.send(AudioStreamEvent.SpeechStart)
 
-                            // До 200 мс пре-ролла отправляются следом
                             for (pf in preRoll) {
                                 _micOutput.send(AudioStreamEvent.Audio(pf))
                             }
@@ -387,7 +390,6 @@ class NativeAudioEngine @Inject constructor(
                         } else if (isSpeechActiveManual) {
                             _micOutput.send(AudioStreamEvent.Audio(currentAudioBytes))
                         } else {
-                            // Сохраняем до 200 мс контекста в тишине без отправки в FIFO
                             synchronized(poolLock) {
                                 leadInBuffer.addLast(currentAudioBytes)
                                 while (leadInBuffer.size > PRE_ROLL_FRAMES_CAPACITY) {
@@ -516,14 +518,6 @@ class NativeAudioEngine @Inject constructor(
         return false
     }
 
-    /**
-     * Bounded Graceful Shutdown продюсера захвата:
-     * - Идемпотентность по состоянию _isCapturing.
-     * - Ожидание завершения продюсера ограничено gracefulTimeoutMs.
-     * - Bounded cancellation (100 мс) при превышении таймаута без вечного зависания.
-     * - Очистка буфера контекста после остановки продюсера.
-     * - Идемпотентная постановка StreamStop с привязкой к generation.
-     */
     suspend fun stopCaptureGraceful(
         gracefulTimeoutMs: Long = 1500L
     ): CaptureShutdownResult = audioLifecycleMutex.withLock {
