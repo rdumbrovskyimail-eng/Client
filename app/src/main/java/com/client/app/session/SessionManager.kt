@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/java/com/client/app/session/SessionManager.kt
 package com.client.app.session
 
 import android.content.Context
@@ -28,6 +27,7 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.*
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -36,7 +36,7 @@ private val idGen = AtomicLong(0)
 
 data class ChatMessage(
     val id: Long = idGen.incrementAndGet(),
-    val role: String,
+    val role: ClientRole,
     val text: String,
     val attachmentNames: List<String> = emptyList(),
     val interim: Boolean = false,
@@ -72,11 +72,15 @@ data class SessionState(
     val isConnecting: Boolean get() = link == LinkState.CONNECTING || link == LinkState.RECONNECTING
 }
 
+data class ToolCallKey(
+    val epoch: Long,
+    val callId: String
+)
+
 @Singleton
 class SessionManager @Inject constructor(
     @ApplicationContext private val context: Context,
     private val client: GeminiProtobufLiveClient,
-    private val contextCacheService: ContextCacheService,
     private val audioEngine: NativeAudioEngine,
     private val forvoRepo: ForvoRepository,
     private val forvoPlayer: PronunciationPlayer,
@@ -88,10 +92,9 @@ class SessionManager @Inject constructor(
 ) {
     companion object {
         val KEY_API = stringPreferencesKey("gemini_api_key")
-        val KEY_MODEL = stringPreferencesKey("gemini_model")
-        val KEY_ANALYZER_MODEL = stringPreferencesKey("analyzer_model")
         val KEY_SYSTEM_PROMPT = stringPreferencesKey("gemini_system_prompt")
         val KEY_ENABLE_FORVO = booleanPreferencesKey("enable_forvo")
+        val KEY_ENABLE_SEARCH = booleanPreferencesKey("enable_search")
         val KEY_VOICE = stringPreferencesKey("gemini_voice")
         val KEY_VOLUME = floatPreferencesKey("audio_volume")
         val KEY_MIC_GAIN = floatPreferencesKey("audio_mic_gain")
@@ -100,13 +103,7 @@ class SessionManager @Inject constructor(
             "Ты — интеллектуальный персональный голосовой ассистент с академической культурой речи. " +
             "Отвечай лаконично, точно и структурированно, без шаблонных вводных слов."
 
-        const val DEFAULT_LIVE_MODEL = "gemini-3.1-flash-live-preview"
-
-        val SUPPORTED_LIVE_MODELS = setOf(
-            "gemini-3.1-flash-live-preview",
-            "gemini-2.5-flash-native-audio-latest",
-            "gemini-2.5-flash-native-audio-preview-12-2025"
-        )
+        const val DEFAULT_LIVE_MODEL = "gemini-3.8-live"
 
         private const val MAX_MESSAGES = 200
         private const val MAX_RECONNECT_ATTEMPTS = 5
@@ -129,14 +126,16 @@ class SessionManager @Inject constructor(
 
     private var micJob: Job? = null
     private var reconnectJob: Job? = null
-    @Volatile private var streamingRole: String? = null
+    @Volatile private var streamingRole: ClientRole? = null
     @Volatile private var resumptionHandle: String? = null
-    @Volatile private var cachedContentId: String? = null
     @Volatile private var reconnectAttempts = 0
     @Volatile private var userStopped = false
     @Volatile private var pendingGoAway = false
     @Volatile private var userMicDesired = true
     @Volatile private var hasReceivedAudioTranscript = false
+
+    private val activeToolJobs = ConcurrentHashMap<ToolCallKey, Job>()
+    private val cancelledToolCallKeys = ConcurrentHashMap.newKeySet<ToolCallKey>()
 
     init {
         observeSettings()
@@ -188,7 +187,6 @@ class SessionManager @Inject constructor(
         scope.launch {
             mutex.withLock {
                 resumptionHandle = null
-                cachedContentId = null
                 stopInternal(full = false)
                 startInternal(resume = false)
             }
@@ -209,7 +207,7 @@ class SessionManager @Inject constructor(
             return@launch
         }
 
-        addMessage(ChatMessage(role = "user", text = trimmed))
+        addMessage(ChatMessage(role = ClientRole.USER, text = trimmed))
         streamingRole = null
         hasReceivedAudioTranscript = false
 
@@ -217,7 +215,11 @@ class SessionManager @Inject constructor(
             _state.update { it.copy(error = "Нет соединения с сервером") }
             return@launch
         }
-        client.sendRealtimeText(trimmed)
+        
+        client.sendClientContent(
+            turns = listOf(ClientTurn(role = ClientRole.USER, text = trimmed)),
+            turnComplete = true
+        )
     }
 
     fun playForvo(word: ForvoWord) = scope.launch {
@@ -294,16 +296,15 @@ class SessionManager @Inject constructor(
             val prefs = dataStore.data.first()
             val apiKey = cryptoManager.decrypt(prefs[KEY_API]?.trim().orEmpty())
             val forvoOn = prefs[KEY_ENABLE_FORVO] ?: false
-            val analyzerModel = prefs[KEY_ANALYZER_MODEL] ?: VocabularyExtractor.DEFAULT_MODEL
 
-            addMessage(ChatMessage(role = "user", text = text.ifEmpty { "Изучи приложенный документ." }, attachmentNames = processed.accepted))
+            addMessage(ChatMessage(role = ClientRole.USER, text = text.ifEmpty { "Изучи приложенный документ." }, attachmentNames = processed.accepted))
 
             val result = extractor.analyze(
                 apiKey = apiKey,
                 images = processed.images,
                 plainText = processed.extractedText,
                 forLanguageLearning = forvoOn,
-                model = analyzerModel
+                model = VocabularyExtractor.DEFAULT_MODEL
             )
 
             when (result) {
@@ -313,7 +314,10 @@ class SessionManager @Inject constructor(
                         scope.launch { resolveForvo(a.vocabulary, a.language) }
                     }
                     if (!ensureLive()) return
-                    client.sendRealtimeText(a.fullText.take(15000))
+                    client.sendClientContent(
+                        turns = listOf(ClientTurn(role = ClientRole.USER, text = a.fullText.take(15000))),
+                        turnComplete = true
+                    )
                 }
                 is AnalysisResult.Failure -> {
                     _state.update { it.copy(error = "Ошибка анализа: ${result.reason}") }
@@ -347,6 +351,7 @@ class SessionManager @Inject constructor(
             addJsonObject {
                 put("name", "lookup_pronunciation")
                 put("description", "Запрашивает аудиозаписи произношения слов носителями языка из базы Forvo.")
+                put("behavior", "NON_BLOCKING")
                 putJsonObject("parameters") {
                     put("type", "OBJECT")
                     putJsonObject("properties") {
@@ -367,29 +372,26 @@ class SessionManager @Inject constructor(
         }
     }
 
-    private fun recentHistory(): List<Pair<String, String>> {
+    private fun recentHistory(): List<ClientTurn> {
         val raw = _state.value.messages
             .filter { !it.interim && it.text.isNotBlank() }
 
         if (raw.isEmpty()) return emptyList()
 
-        val merged = mutableListOf<Pair<String, String>>()
+        val merged = mutableListOf<ClientTurn>()
         for (msg in raw) {
-            val role = if (msg.role == "model") "model" else "user"
             val last = merged.lastOrNull()
-            if (last != null && last.first == role) {
-                merged[merged.size - 1] = role to "${last.second}\n\n${msg.text.trim()}"
+            if (last != null && last.role == msg.role) {
+                merged[merged.size - 1] = ClientTurn(msg.role, "${last.text}\n\n${msg.text.trim()}")
             } else {
-                merged.add(role to msg.text.trim())
+                merged.add(ClientTurn(msg.role, msg.text.trim()))
             }
         }
 
         var slice = merged.takeLast(20)
-
-        while (slice.isNotEmpty() && slice.first().first != "user") {
+        while (slice.isNotEmpty() && slice.first().role != ClientRole.USER) {
             slice = slice.drop(1)
         }
-
         return slice
     }
 
@@ -403,8 +405,6 @@ class SessionManager @Inject constructor(
             return
         }
 
-        val rawModel = prefs[KEY_MODEL]?.trim().orEmpty()
-        val model = if (rawModel in SUPPORTED_LIVE_MODELS) rawModel else DEFAULT_LIVE_MODEL
         val voice = prefs[KEY_VOICE]?.ifBlank { null } ?: "Charon"
 
         audioEngine.setVolume(prefs[KEY_VOLUME] ?: 1.0f)
@@ -423,11 +423,9 @@ class SessionManager @Inject constructor(
             it.copy(link = if (resume) LinkState.RECONNECTING else LinkState.CONNECTING, error = null)
         }
 
-        if (!resume && cachedContentId == null) {
-            cachedContentId = contextCacheService.getOrCreateCache(apiKey, _state.value.activePrompt, model)
-        }
-
         val forvoEnabled = prefs[KEY_ENABLE_FORVO] ?: false
+        val searchEnabled = prefs[KEY_ENABLE_SEARCH] ?: false
+
         val dynamicTools = if (forvoEnabled) {
             buildJsonArray { add(buildForvoToolDeclaration()) }
         } else {
@@ -437,12 +435,12 @@ class SessionManager @Inject constructor(
         client.connect(
             LiveConfig(
                 apiKey = apiKey,
-                model = model,
+                model = DEFAULT_LIVE_MODEL,
                 systemInstruction = _state.value.activePrompt,
                 voiceName = voice,
                 toolsJson = dynamicTools,
+                enableGoogleSearch = searchEnabled,
                 resumptionHandle = if (resume) resumptionHandle else null,
-                cachedContentId = cachedContentId,
                 initialHistory = if (resume) emptyList() else recentHistory()
             )
         )
@@ -452,6 +450,9 @@ class SessionManager @Inject constructor(
         pendingGoAway = false
         hasReceivedAudioTranscript = false
         reconnectJob?.cancel()
+        if (full) {
+            cancelAllPendingToolJobs()
+        }
         stopMic(userInitiated = false)
         client.disconnect()
         if (full) {
@@ -463,6 +464,12 @@ class SessionManager @Inject constructor(
         _state.update {
             it.copy(link = LinkState.IDLE, isAiSpeaking = false, isMicActive = false)
         }
+    }
+
+    private fun cancelAllPendingToolJobs() {
+        activeToolJobs.values.forEach { it.cancel() }
+        activeToolJobs.clear()
+        cancelledToolCallKeys.clear()
     }
 
     private fun scheduleReconnect(reason: String) {
@@ -493,7 +500,7 @@ class SessionManager @Inject constructor(
         if (_state.value.isMicActive) return@withLock
         userMicDesired = true
 
-        while (audioEngine.micOutput.tryReceive().isSuccess) { /* сброс залежавшихся буферов */ }
+        while (audioEngine.micOutput.tryReceive().isSuccess) { /* сброс очереди */ }
 
         if (!audioEngine.start()) {
             _state.update { it.copy(error = "Микрофон недоступен") }
@@ -528,6 +535,10 @@ class SessionManager @Inject constructor(
         }
     }
 
+    /**
+     * Прерывание речи пользователем (Barge-in): останавливает воспроизведение,
+     * но НЕ отменяет асинхронные тулы (отменяются строго по toolCallCancellation).
+     */
     private fun observeBargeIn() = scope.launch {
         audioEngine.bargeInEvents.collect {
             _state.update { it.copy(isAiSpeaking = false) }
@@ -536,9 +547,6 @@ class SessionManager @Inject constructor(
         }
     }
 
-    /**
-     * ЭТАП 3: Моментальный выстрел audioStreamEnd по локальному окончанию речи пользователя
-     */
     private fun observeSpeechEnd() = scope.launch {
         audioEngine.speechEndEvents.collect {
             if (_state.value.isMicActive && client.isReady) {
@@ -578,18 +586,22 @@ class SessionManager @Inject constructor(
                 }
                 is GeminiEvent.Interrupted -> {
                     audioEngine.flushPlayback()
-                    audioEngine.resetBargeInState() // Сброс блокировки перебивания
+                    audioEngine.resetBargeInState()
                     _state.update { it.copy(isAiSpeaking = false) }
                     streamingRole = null
                     hasReceivedAudioTranscript = false
                 }
-                is GeminiEvent.GenerationComplete,
+                is GeminiEvent.GenerationComplete -> {
+                    streamingRole = null
+                    hasReceivedAudioTranscript = false
+                    audioEngine.resetBargeInState()
+                }
                 is GeminiEvent.TurnComplete -> {
                     streamingRole = null
                     hasReceivedAudioTranscript = false
-                    audioEngine.resetBargeInState() // Сброс блокировки перебивания
+                    audioEngine.resetBargeInState()
                     scope.launch {
-                        delay(100)
+                        delay(80)
                         _state.update { it.copy(isAiSpeaking = false) }
                         if (pendingGoAway && !userStopped) {
                             pendingGoAway = false
@@ -597,16 +609,22 @@ class SessionManager @Inject constructor(
                         }
                     }
                 }
-                is GeminiEvent.InputTranscript -> appendTranscript("user", event.text, event.interim)
+                is GeminiEvent.InputTranscript -> appendTranscript(ClientRole.USER, event.text, event.interim)
                 is GeminiEvent.OutputTranscript -> {
                     hasReceivedAudioTranscript = true
-                    appendTranscript("model", event.text, false)
+                    appendTranscript(ClientRole.MODEL, event.text, false)
                 }
-                is GeminiEvent.ModelText -> {
-                    // Игнорируем промежуточные фрагменты
-                }
+                is GeminiEvent.ModelText -> Unit
                 is GeminiEvent.Usage -> _state.update { it.copy(tokensUsed = event.totalTokens) }
                 is GeminiEvent.ToolCall -> handleToolCall(event.calls)
+                is GeminiEvent.ToolCallCancelled -> {
+                    val currentEpoch = client.epoch
+                    event.ids.forEach { id ->
+                        val key = ToolCallKey(currentEpoch, id)
+                        cancelledToolCallKeys.add(key)
+                        activeToolJobs.remove(key)?.cancel()
+                    }
+                }
                 is GeminiEvent.Error -> {
                     _state.update { it.copy(error = event.message) }
                     if (event.fatal) {
@@ -623,37 +641,76 @@ class SessionManager @Inject constructor(
         }
     }
 
-    private fun handleToolCall(calls: List<FunctionCall>) = scope.launch {
-        val responses = calls.map { call ->
-            if (call.name == "lookup_pronunciation") {
-                val raw = call.args["words"].orEmpty()
-                val lang = call.args["language"]?.ifBlank { null } ?: "de"
+    /**
+     * Точечный патч: проверка актуальности эпохи (currentEpoch == client.epoch)
+     * непосредственно перед job.start() исключает запуск устаревших задач при реконнекте.
+     */
+    private fun handleToolCall(calls: List<FunctionCall>) {
+        val currentEpoch = client.epoch
+        for (call in calls) {
+            val callId = call.id
+            if (callId.isNullOrBlank()) {
+                client.sendToolResponses(
+                    listOf(
+                        ToolResponse(
+                            name = call.name,
+                            id = null,
+                            response = buildJsonObject { put("error", "missing_call_id") },
+                            scheduling = FunctionResponseScheduling.SILENT
+                        )
+                    )
+                )
+                continue
+            }
 
-                val list = runCatching {
-                    Json.parseToJsonElement(raw).jsonArray.map { it.jsonPrimitive.content }
-                }.getOrElse { raw.split(",").map { it.trim() } }
-                    .filter { it.isNotBlank() }
-                    .distinctBy { it.lowercase() }
-                    .take(40)
+            val key = ToolCallKey(currentEpoch, callId)
 
-                if (list.isNotEmpty()) {
-                    val existing = _state.value.forvoWords.map { it.query.lowercase() }.toSet()
-                    val fresh = list.filter { it.lowercase() !in existing }
-                    if (fresh.isNotEmpty()) {
-                        _state.update { s ->
-                            s.copy(forvoWords = s.forvoWords + fresh.map {
-                                ForvoWord(word = it, query = it, language = lang)
-                            })
-                        }
-                        scope.launch {
+            if (call.name != "lookup_pronunciation") {
+                client.sendToolResponses(
+                    listOf(
+                        ToolResponse(
+                            name = call.name,
+                            id = callId,
+                            response = buildJsonObject { put("error", "unknown_tool") },
+                            scheduling = FunctionResponseScheduling.SILENT
+                        )
+                    )
+                )
+                continue
+            }
+
+            val rawWords = call.getString("words")
+            val lang = call.getString("language", default = "de").ifBlank { "de" }
+
+            val list = runCatching {
+                Json.parseToJsonElement(rawWords).jsonArray.map { it.jsonPrimitive.content }
+            }.getOrElse { rawWords.split(",").map { it.trim() } }
+                .filter { it.isNotBlank() }
+                .distinctBy { it.lowercase() }
+                .take(40)
+
+            val job = scope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+                try {
+                    if (list.isNotEmpty()) {
+                        val existing = _state.value.forvoWords.map { it.query.lowercase() }.toSet()
+                        val fresh = list.filter { it.lowercase() !in existing }
+                        if (fresh.isNotEmpty()) {
+                            _state.update { s ->
+                                s.copy(forvoWords = s.forvoWords + fresh.map {
+                                    ForvoWord(word = it, query = it, language = lang)
+                                })
+                            }
                             forvoRepo.lookupBatch(fresh, lang) { q, res ->
+                                if (currentEpoch != client.epoch || cancelledToolCallKeys.contains(key) || !coroutineContext.isActive) {
+                                    return@lookupBatch
+                                }
                                 _state.update { s ->
                                     s.copy(forvoWords = s.forvoWords.map { w ->
                                         if (!w.query.equals(q, true)) w
                                         else when (res) {
                                             is ForvoResult.Found -> w.copy(
                                                 audioUrl = res.pronunciation.mp3Url,
-                                                isLoading = false
+                                                isLoading = false, notFound = false
                                             )
                                             else -> w.copy(isLoading = false, notFound = true)
                                         }
@@ -662,16 +719,48 @@ class SessionManager @Inject constructor(
                             }
                         }
                     }
+
+                    if (currentEpoch != client.epoch || cancelledToolCallKeys.contains(key) || !isActive) {
+                        return@launch
+                    }
+
+                    val respPayload = buildJsonObject {
+                        put("status", "ok")
+                        put("accepted_words_count", list.size)
+                    }
+
+                    client.sendToolResponses(
+                        listOf(
+                            ToolResponse(
+                                name = call.name,
+                                id = callId,
+                                response = respPayload,
+                                scheduling = FunctionResponseScheduling.WHEN_IDLE,
+                                willContinue = false
+                            )
+                        )
+                    )
+                } finally {
+                    activeToolJobs.remove(key)
                 }
-                ToolResponse(call.name, call.id, """{"status":"ok","accepted":${list.size}}""")
+            }
+
+            // Атомарная регистрация с последующей проверкой актуальности эпохи
+            val existing = activeToolJobs.putIfAbsent(key, job)
+            if (existing == null) {
+                if (currentEpoch == client.epoch) {
+                    job.start()
+                } else {
+                    job.cancel()
+                    activeToolJobs.remove(key, job)
+                }
             } else {
-                ToolResponse(call.name, call.id, """{"error":"unknown_tool"}""")
+                job.cancel()
             }
         }
-        client.sendToolResponses(responses)
     }
 
-    private fun appendTranscript(role: String, text: String, interim: Boolean) {
+    private fun appendTranscript(role: ClientRole, text: String, interim: Boolean) {
         _state.update { s ->
             val list = s.messages.toMutableList()
             if (interim) {
