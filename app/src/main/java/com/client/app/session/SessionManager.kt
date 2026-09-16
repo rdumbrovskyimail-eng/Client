@@ -8,11 +8,14 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import com.client.app.api.*
 import com.client.app.attach.AnalysisResult
 import com.client.app.attach.VocabItem
 import com.client.app.attach.VocabularyExtractor
+import com.client.app.audio.AudioStreamEvent
+import com.client.app.audio.CaptureShutdownResult
 import com.client.app.audio.NativeAudioEngine
 import com.client.app.audio.PronunciationPlayer
 import com.client.app.forvo.ForvoRepository
@@ -28,6 +31,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.*
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -77,6 +81,20 @@ data class ToolCallKey(
     val callId: String
 )
 
+/**
+ * Bounded shutdown policy.
+ *
+ * Graceful producer wait: 1500 ms.
+ * Forced producer cancellation join: 100 ms.
+ * StreamStop enqueue: 500 ms.
+ * Graceful consumer wait: 1500 ms.
+ * Forced consumer cancellation join: 100 ms.
+ * Emergency server finalization: 500 ms.
+ *
+ * These are bounded coroutine waits in this layer.
+ * They do not constitute a mathematically proven end-to-end
+ * wall-clock deadline for non-cooperative native/network code.
+ */
 @Singleton
 class SessionManager @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -92,10 +110,40 @@ class SessionManager @Inject constructor(
 ) {
     companion object {
         val KEY_API = stringPreferencesKey("gemini_api_key")
+        val KEY_ANALYZER_MODEL = stringPreferencesKey("analyzer_model")
         val KEY_SYSTEM_PROMPT = stringPreferencesKey("gemini_system_prompt")
+        val KEY_VOICE = stringPreferencesKey("gemini_voice")
+        val KEY_SPEECH_LANGUAGE = stringPreferencesKey("gemini_speech_language")
+        val KEY_TEMPERATURE = floatPreferencesKey("gemini_temperature")
+        val KEY_MEDIA_RESOLUTION = stringPreferencesKey("gemini_media_resolution")
+
+        val KEY_INPUT_TRANSCRIPTION_ENABLED = booleanPreferencesKey("gemini_input_tx_enabled")
+        val KEY_INPUT_TRANSCRIPTION_LANGUAGES = stringPreferencesKey("gemini_input_tx_languages")
+        val KEY_INPUT_TRANSCRIPTION_VOCAB = stringPreferencesKey("gemini_input_tx_vocab")
+        val KEY_INPUT_TRANSCRIPTION_MODE = stringPreferencesKey("gemini_input_tx_mode")
+
+        val KEY_OUTPUT_TRANSCRIPTION_ENABLED = booleanPreferencesKey("gemini_output_tx_enabled")
+        val KEY_OUTPUT_TRANSCRIPTION_LANGUAGES = stringPreferencesKey("gemini_output_tx_languages")
+        val KEY_OUTPUT_TRANSCRIPTION_VOCAB = stringPreferencesKey("gemini_output_tx_vocab")
+        val KEY_OUTPUT_TRANSCRIPTION_MODE = stringPreferencesKey("gemini_output_tx_mode")
+
+        val KEY_AAD_ENABLED = booleanPreferencesKey("gemini_aad_enabled")
+        val KEY_AAD_START_SENSITIVITY = stringPreferencesKey("gemini_aad_start_sensitivity")
+        val KEY_AAD_END_SENSITIVITY = stringPreferencesKey("gemini_aad_end_sensitivity")
+        val KEY_PREFIX_PADDING_MS = intPreferencesKey("gemini_prefix_padding_ms")
+        val KEY_SILENCE_DURATION_MS = intPreferencesKey("gemini_silence_duration_ms")
+        val KEY_ACTIVITY_HANDLING = stringPreferencesKey("gemini_activity_handling")
+        val KEY_TURN_COVERAGE = stringPreferencesKey("gemini_turn_coverage")
+
+        val KEY_COMPRESSION_ENABLED = booleanPreferencesKey("gemini_compression_enabled")
+        val KEY_COMPRESSION_TRIGGER_TOKENS = intPreferencesKey("gemini_compression_trigger_tokens")
+        val KEY_COMPRESSION_TARGET_TOKENS = intPreferencesKey("gemini_compression_target_tokens")
+
+        val KEY_SESSION_RESUMPTION_ENABLED = booleanPreferencesKey("gemini_session_resumption_enabled")
+        val KEY_INITIAL_HISTORY_TURNS = intPreferencesKey("gemini_initial_history_turns")
+
         val KEY_ENABLE_FORVO = booleanPreferencesKey("enable_forvo")
         val KEY_ENABLE_SEARCH = booleanPreferencesKey("enable_search")
-        val KEY_VOICE = stringPreferencesKey("gemini_voice")
         val KEY_VOLUME = floatPreferencesKey("audio_volume")
         val KEY_MIC_GAIN = floatPreferencesKey("audio_mic_gain")
 
@@ -134,6 +182,11 @@ class SessionManager @Inject constructor(
     @Volatile private var userMicDesired = true
     @Volatile private var hasReceivedAudioTranscript = false
 
+    @Volatile private var currentAadEnabled = true
+
+    // Атомарный флаг активного окна речи (Manual VAD)
+    private val isManualActivityActive = AtomicBoolean(false)
+
     private val activeToolJobs = ConcurrentHashMap<ToolCallKey, Job>()
     private val cancelledToolCallKeys = ConcurrentHashMap.newKeySet<ToolCallKey>()
 
@@ -142,7 +195,6 @@ class SessionManager @Inject constructor(
         observeEvents()
         observeAudio()
         observeBargeIn()
-        observeSpeechEnd()
         observeFocus()
         observeForvoQuota()
     }
@@ -372,7 +424,7 @@ class SessionManager @Inject constructor(
         }
     }
 
-    private fun recentHistory(): List<ClientTurn> {
+    private fun recentHistory(maxTurns: Int): List<ClientTurn> {
         val raw = _state.value.messages
             .filter { !it.interim && it.text.isNotBlank() }
 
@@ -388,7 +440,7 @@ class SessionManager @Inject constructor(
             }
         }
 
-        var slice = merged.takeLast(20)
+        var slice = merged.takeLast(maxTurns.coerceIn(1, 100))
         while (slice.isNotEmpty() && slice.first().role != ClientRole.USER) {
             slice = slice.drop(1)
         }
@@ -398,6 +450,8 @@ class SessionManager @Inject constructor(
     private suspend fun startInternal(resume: Boolean) {
         pendingGoAway = false
         hasReceivedAudioTranscript = false
+        isManualActivityActive.set(false)
+
         val prefs = dataStore.data.first()
         val apiKey = cryptoManager.decrypt(prefs[KEY_API]?.trim().orEmpty())
         if (apiKey.isEmpty()) {
@@ -406,6 +460,47 @@ class SessionManager @Inject constructor(
         }
 
         val voice = prefs[KEY_VOICE]?.ifBlank { null } ?: "Charon"
+        val speechLang = prefs[KEY_SPEECH_LANGUAGE]?.takeIf { it.isNotBlank() }
+        val temperature = prefs[KEY_TEMPERATURE] ?: 0.5f
+        val mediaResolution = prefs[KEY_MEDIA_RESOLUTION] ?: "MEDIA_RESOLUTION_HIGH"
+
+        val inputTx = TranscriptionSettings(
+            enabled = prefs[KEY_INPUT_TRANSCRIPTION_ENABLED] ?: true,
+            languageCodes = prefs[KEY_INPUT_TRANSCRIPTION_LANGUAGES]?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() } ?: emptyList(),
+            customVocabulary = prefs[KEY_INPUT_TRANSCRIPTION_VOCAB]?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() }?.take(1000) ?: emptyList(),
+            mode = prefs[KEY_INPUT_TRANSCRIPTION_MODE] ?: "VERBATIM"
+        )
+
+        val outputTx = TranscriptionSettings(
+            enabled = prefs[KEY_OUTPUT_TRANSCRIPTION_ENABLED] ?: true,
+            languageCodes = prefs[KEY_OUTPUT_TRANSCRIPTION_LANGUAGES]?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() } ?: emptyList(),
+            customVocabulary = prefs[KEY_OUTPUT_TRANSCRIPTION_VOCAB]?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() }?.take(1000) ?: emptyList(),
+            mode = prefs[KEY_OUTPUT_TRANSCRIPTION_MODE] ?: "VERBATIM"
+        )
+
+        val aadEnabled = prefs[KEY_AAD_ENABLED] ?: true
+        currentAadEnabled = aadEnabled
+        
+        audioEngine.isAadMode = aadEnabled
+
+        val realtimeInput = RealtimeInputSettings(
+            aadEnabled = aadEnabled,
+            startSensitivity = prefs[KEY_AAD_START_SENSITIVITY] ?: "START_SENSITIVITY_HIGH",
+            endSensitivity = prefs[KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_LOW",
+            prefixPaddingMs = prefs[KEY_PREFIX_PADDING_MS] ?: 60,
+            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 600,
+            activityHandling = prefs[KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
+            turnCoverage = prefs[KEY_TURN_COVERAGE] ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
+        )
+
+        val compression = CompressionSettings(
+            enabled = prefs[KEY_COMPRESSION_ENABLED] ?: true,
+            triggerTokens = prefs[KEY_COMPRESSION_TRIGGER_TOKENS] ?: 0,
+            targetTokens = prefs[KEY_COMPRESSION_TARGET_TOKENS] ?: 0
+        )
+
+        val resumptionEnabled = prefs[KEY_SESSION_RESUMPTION_ENABLED] ?: true
+        val maxHistoryTurns = prefs[KEY_INITIAL_HISTORY_TURNS] ?: 20
 
         audioEngine.setVolume(prefs[KEY_VOLUME] ?: 1.0f)
         audioEngine.setMicGain(prefs[KEY_MIC_GAIN] ?: 1.0f)
@@ -438,10 +533,18 @@ class SessionManager @Inject constructor(
                 model = DEFAULT_LIVE_MODEL,
                 systemInstruction = _state.value.activePrompt,
                 voiceName = voice,
+                speechLanguage = speechLang,
+                temperature = temperature,
+                mediaResolution = mediaResolution,
+                inputTranscription = inputTx,
+                outputTranscription = outputTx,
+                realtimeInput = realtimeInput,
+                compression = compression,
+                sessionResumptionEnabled = resumptionEnabled,
+                resumptionHandle = if (resume && resumptionEnabled) resumptionHandle else null,
                 toolsJson = dynamicTools,
                 enableGoogleSearch = searchEnabled,
-                resumptionHandle = if (resume) resumptionHandle else null,
-                initialHistory = if (resume) emptyList() else recentHistory()
+                initialHistory = if (resume) emptyList() else recentHistory(maxHistoryTurns)
             )
         )
     }
@@ -453,8 +556,13 @@ class SessionManager @Inject constructor(
         if (full) {
             cancelAllPendingToolJobs()
         }
+
+        // 1. Остановка логического захвата микрофона
         stopMic(userInitiated = false)
         client.disconnect()
+        isManualActivityActive.set(false)
+
+        // 2. Освобождение физического аудиоядра ТОЛЬКО при полном завершении сессии
         if (full) {
             audioEngine.stop()
             stopForegroundService()
@@ -496,11 +604,25 @@ class SessionManager @Inject constructor(
         }
     }
 
+    private suspend fun finalizeMicActivityBounded() {
+        withTimeoutOrNull(500L) {
+            if (currentAadEnabled) {
+                client.sendAudioStreamEnd()
+            } else {
+                if (isManualActivityActive.compareAndSet(true, false) && client.isReady) {
+                    client.sendActivityEnd()
+                }
+            }
+        } ?: logger.w("SessionManager: bounded mic activity finalization timed out")
+    }
+
+    /**
+     * Запуск микрофона с монотонной обработкой AudioStreamEvent.
+     */
     private suspend fun startMic() = micMutex.withLock {
         if (_state.value.isMicActive) return@withLock
         userMicDesired = true
-
-        while (audioEngine.micOutput.tryReceive().isSuccess) { /* сброс очереди */ }
+        isManualActivityActive.set(false)
 
         if (!audioEngine.start()) {
             _state.update { it.copy(error = "Микрофон недоступен") }
@@ -509,22 +631,105 @@ class SessionManager @Inject constructor(
         _state.update { it.copy(isMicActive = true) }
 
         micJob = scope.launch {
-            for (chunk in audioEngine.micOutput) {
+            for (event in audioEngine.micOutput) {
                 if (!isActive) break
-                if (!forvoPlayer.isPlaying.value) {
-                    client.sendAudioPcm(chunk)
+                when (event) {
+                    is AudioStreamEvent.SpeechStart -> {
+                        if (!currentAadEnabled && client.isReady) {
+                            if (isManualActivityActive.compareAndSet(false, true)) {
+                                logger.d("SessionManager: VAD SpeechStart (Manual VAD) -> sendActivityStart")
+                                client.sendActivityStart()
+                            }
+                        }
+                    }
+                    is AudioStreamEvent.Audio -> {
+                        if (!forvoPlayer.isPlaying.value) {
+                            if (currentAadEnabled || isManualActivityActive.get()) {
+                                client.sendAudioPcm(event.pcm)
+                            }
+                        }
+                    }
+                    is AudioStreamEvent.SpeechEnd -> {
+                        if (currentAadEnabled) {
+                            withTimeoutOrNull(500L) {
+                                client.sendAudioStreamEnd()
+                            } ?: logger.w("SessionManager: SpeechEnd audioStreamEnd timed out")
+                        } else {
+                            if (isManualActivityActive.compareAndSet(true, false) && client.isReady) {
+                                withTimeoutOrNull(500L) {
+                                    client.sendActivityEnd()
+                                } ?: logger.w("SessionManager: SpeechEnd activityEnd timed out")
+                            }
+                        }
+                    }
+                    is AudioStreamEvent.StreamStop -> {
+                        if (currentAadEnabled) {
+                            withTimeoutOrNull(500L) {
+                                client.sendAudioStreamEnd()
+                            } ?: logger.w("SessionManager: StreamStop audioStreamEnd timed out")
+                        } else {
+                            if (isManualActivityActive.compareAndSet(true, false) && client.isReady) {
+                                withTimeoutOrNull(500L) {
+                                    client.sendActivityEnd()
+                                } ?: logger.w("SessionManager: StreamStop activityEnd timed out")
+                            }
+                        }
+                        break
+                    }
                 }
             }
         }
     }
 
-    private suspend fun stopMic(userInitiated: Boolean = false) = micMutex.withLock {
-        if (userInitiated) userMicDesired = false
-        micJob?.cancelAndJoin()
+    /**
+     * Bounded Graceful Shutdown логического микрофона.
+     */
+    private suspend fun stopMic(
+        userInitiated: Boolean = false
+    ) = micMutex.withLock {
+        if (userInitiated) {
+            userMicDesired = false
+        }
+        if (!_state.value.isMicActive) {
+            return@withLock
+        }
+
+        val producerResult = audioEngine.stopCaptureGraceful(gracefulTimeoutMs = 1500L)
+        if (producerResult == CaptureShutdownResult.FORCED_TIMEOUT) {
+            logger.w("SessionManager: producer shutdown forced")
+        }
+
+        val consumerJob = micJob
+        val consumerCompleted = if (consumerJob == null) {
+            true
+        } else {
+            withTimeoutOrNull(1500L) {
+                consumerJob.join()
+                true
+            } ?: false
+        }
+
+        if (!consumerCompleted && consumerJob != null) {
+            logger.w("SessionManager: micJob consumer timeout; forcing bounded cancellation")
+            consumerJob.cancel()
+            val cancelledAndJoined = withTimeoutOrNull(100L) {
+                consumerJob.join()
+                true
+            } ?: false
+
+            if (!cancelledAndJoined) {
+                logger.e("SessionManager: micJob did not terminate after bounded cancellation")
+            }
+
+            finalizeMicActivityBounded()
+        }
+
         micJob = null
-        while (audioEngine.micOutput.tryReceive().isSuccess) { /* сброс очереди */ }
-        client.sendAudioStreamEnd()
-        _state.update { it.copy(isMicActive = false) }
+        isManualActivityActive.set(false)
+
+        _state.update {
+            it.copy(isMicActive = false)
+        }
     }
 
     private fun observeAudio() = scope.launch {
@@ -535,24 +740,11 @@ class SessionManager @Inject constructor(
         }
     }
 
-    /**
-     * Прерывание речи пользователем (Barge-in): останавливает воспроизведение,
-     * но НЕ отменяет асинхронные тулы (отменяются строго по toolCallCancellation).
-     */
     private fun observeBargeIn() = scope.launch {
         audioEngine.bargeInEvents.collect {
             _state.update { it.copy(isAiSpeaking = false) }
             streamingRole = null
             hasReceivedAudioTranscript = false
-        }
-    }
-
-    private fun observeSpeechEnd() = scope.launch {
-        audioEngine.speechEndEvents.collect {
-            if (_state.value.isMicActive && client.isReady) {
-                logger.d("SessionManager: Локальный VAD зафиксировал конец речи -> выстрел audioStreamEnd")
-                client.sendAudioStreamEnd()
-            }
         }
     }
 
@@ -641,10 +833,6 @@ class SessionManager @Inject constructor(
         }
     }
 
-    /**
-     * Точечный патч: проверка актуальности эпохи (currentEpoch == client.epoch)
-     * непосредственно перед job.start() исключает запуск устаревших задач при реконнекте.
-     */
     private fun handleToolCall(calls: List<FunctionCall>) {
         val currentEpoch = client.epoch
         for (call in calls) {
@@ -745,7 +933,6 @@ class SessionManager @Inject constructor(
                 }
             }
 
-            // Атомарная регистрация с последующей проверкой актуальности эпохи
             val existing = activeToolJobs.putIfAbsent(key, job)
             if (existing == null) {
                 if (currentEpoch == client.epoch) {
