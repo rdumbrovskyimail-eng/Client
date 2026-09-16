@@ -176,6 +176,7 @@ bool AAudioEngine::initLocked(bool isBluetoothMode, int32_t targetPlaybackSample
         resampler24To16_.reset();
         resampler24To48_.reset();
         captureDecimator48To16_.reset();
+        captureResampler24To16_.reset();
         resamplePendingOffset_ = 0;
         resamplePendingCount_ = 0;
         resetEarcon();
@@ -224,13 +225,14 @@ bool AAudioEngine::initLocked(bool isBluetoothMode, int32_t targetPlaybackSample
         return false;
     }
 
-    // P1-04: Валидация фактических характеристик потока захвата
+    // Валидация фактических характеристик потока захвата с полной поддержкой Bluetooth-интерфейсов
     const int32_t actualInRate = AAudioStream_getSampleRate(captureStream_);
     const int32_t actualInChannels = AAudioStream_getChannelCount(captureStream_);
     const aaudio_format_t actualInFormat = AAudioStream_getFormat(captureStream_);
 
-    if (actualInFormat != AAUDIO_FORMAT_PCM_I16 || actualInChannels != CHANNEL_COUNT_MONO ||
-        (actualInRate != 16000 && actualInRate != 48000)) {
+    if (actualInFormat != AAUDIO_FORMAT_PCM_I16 || 
+        (actualInChannels != 1 && actualInChannels != 2) ||
+        (actualInRate != 8000 && actualInRate != 16000 && actualInRate != 24000 && actualInRate != 48000)) {
         LOGE("AAudio capture unsupported format: rate=%d, channels=%d, format=%d",
              actualInRate, actualInChannels, (int)actualInFormat);
         AAudioStream_close(captureStream_);
@@ -239,6 +241,7 @@ bool AAudioEngine::initLocked(bool isBluetoothMode, int32_t targetPlaybackSample
     }
 
     actualCaptureSampleRate_.store(actualInRate, std::memory_order_release);
+    actualCaptureChannels_.store(actualInChannels, std::memory_order_release);
     actualInputDeviceId_.store(AAudioStream_getDeviceId(captureStream_), std::memory_order_release);
 
     int32_t inFramesPerCallback = AAudioStream_getFramesPerDataCallback(captureStream_);
@@ -264,7 +267,7 @@ bool AAudioEngine::initLocked(bool isBluetoothMode, int32_t targetPlaybackSample
     }
 
     // ─────────────────────────────────────────────────────────────
-    // 2. КОНФИГУРАЦИЯ ПОТОКА ВОСПРОИЗВЕДЕНИЯ (P1-03: EXCLUSIVE -> SHARED FALLBACK)
+    // 2. КОНФИГУРАЦИЯ ПОТОКА ВОСПРОИЗВЕДЕНИЯ (EXCLUSIVE -> SHARED FALLBACK)
     // ─────────────────────────────────────────────────────────────
     res = openPlaybackStreamWithFallback(targetPlaybackSampleRate, outputDeviceId, isBluetoothMode);
     if (res != AAUDIO_OK) {
@@ -282,7 +285,6 @@ bool AAudioEngine::initLocked(bool isBluetoothMode, int32_t targetPlaybackSample
         std::memory_order_relaxed
     );
 
-    // P1-08: Безопасный тюнинг размера буфера (2 * burst)
     const int32_t playBurst = AAudioStream_getFramesPerBurst(playbackStream_);
     const int32_t playCapacity = AAudioStream_getBufferCapacityInFrames(playbackStream_);
     if (playBurst > 0 && playCapacity > 0) {
@@ -292,8 +294,8 @@ bool AAudioEngine::initLocked(bool isBluetoothMode, int32_t targetPlaybackSample
              targetBufSize, appliedBufSize, playBurst, playCapacity);
     }
 
-    LOGI("AAudio Initialized: CapRate=%d (DevId=%d), PlayRate=%d (DevId=%d), MMAP=%d",
-         actualCaptureSampleRate_.load(), actualInputDeviceId_.load(),
+    LOGI("AAudio Initialized: CapRate=%d (Ch=%d, DevId=%d), PlayRate=%d (DevId=%d), MMAP=%d",
+         actualCaptureSampleRate_.load(), actualCaptureChannels_.load(), actualInputDeviceId_.load(),
          actualPlaybackSampleRate_.load(), actualOutputDeviceId_.load(),
          isMmapExclusiveActive_.load());
     return true;
@@ -343,7 +345,6 @@ aaudio_result_t AAudioEngine::openPlaybackStreamWithFallback(
 
     aaudio_result_t res = buildAndOpen(desiredSharing);
 
-    // P1-03: Контролируемый однократный откат с EXCLUSIVE на SHARED
     if (res != AAUDIO_OK && desiredSharing == AAUDIO_SHARING_MODE_EXCLUSIVE) {
         LOGI("Playback EXCLUSIVE open failed (%d: %s). Conservative fallback to SHARED...",
              res, AAudio_convertResultToText(res));
@@ -358,7 +359,6 @@ bool AAudioEngine::start() {
 
     if (isRunning_.load()) return true;
 
-    // REMEDIATION #1: Вызываем initLocked без повторного захвата mutex
     if (!captureStream_ || !playbackStream_) {
         LOGI("start() called with null streams, reinitializing...");
         if (!initLocked(isBluetoothMode_.load(), playbackSampleRate_.load(),
@@ -420,6 +420,7 @@ void AAudioEngine::stopLocked() {
         resampler24To16_.reset();
         resampler24To48_.reset();
         captureDecimator48To16_.reset();
+        captureResampler24To16_.reset();
         resamplePendingOffset_ = 0;
         resamplePendingCount_ = 0;
         resetEarcon();
@@ -583,6 +584,7 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     const float gain = engine->micGain_.load(std::memory_order_relaxed);
     const bool applyGain = (std::abs(gain - 1.0f) > 0.001f);
     const int32_t capRate = engine->actualCaptureSampleRate_.load(std::memory_order_relaxed);
+    const int32_t channels = engine->actualCaptureChannels_.load(std::memory_order_relaxed);
 
     const size_t inputScratchCap = engine->captureInputScratchBuffer_.size();
     const size_t decimateScratchCap = engine->captureDecimateBuffer_.size();
@@ -594,15 +596,27 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
         const size_t chunkFrames = std::min(framesRemaining, inputScratchCap);
         int16_t* scratchBuf = engine->captureInputScratchBuffer_.data();
 
-        if (applyGain) {
+        // 1. Извлечение моно-сигнала (стерео-даунмикс при Bluetooth) с учетом micGain
+        if (channels == 2) {
             for (size_t i = 0; i < chunkFrames; ++i) {
-                int32_t amplified = static_cast<int32_t>(std::round(inPtr[i] * gain));
-                scratchBuf[i] = static_cast<int16_t>(std::clamp(amplified, -32768, 32767));
+                int32_t mixed = (static_cast<int32_t>(inPtr[i * 2]) + static_cast<int32_t>(inPtr[i * 2 + 1])) / 2;
+                if (applyGain) {
+                    mixed = static_cast<int32_t>(std::round(mixed * gain));
+                }
+                scratchBuf[i] = static_cast<int16_t>(std::clamp(mixed, -32768, 32767));
             }
         } else {
-            std::memcpy(scratchBuf, inPtr, chunkFrames * sizeof(int16_t));
+            if (applyGain) {
+                for (size_t i = 0; i < chunkFrames; ++i) {
+                    int32_t amplified = static_cast<int32_t>(std::round(inPtr[i] * gain));
+                    scratchBuf[i] = static_cast<int16_t>(std::clamp(amplified, -32768, 32767));
+                }
+            } else {
+                std::memcpy(scratchBuf, inPtr, chunkFrames * sizeof(int16_t));
+            }
         }
 
+        // 2. Адаптивный ресемплинг захвата к целевым 16 кГц (для Silero VAD и Gemini Live)
         if (capRate == 48000) {
             int16_t* decBuf = engine->captureDecimateBuffer_.data();
             size_t processed = engine->captureDecimator48To16_.process(
@@ -612,13 +626,35 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
                 engine->captureBuffer_.write(decBuf, processed);
                 engine->micRms_.store(dsp::calculateRms(decBuf, processed), std::memory_order_relaxed);
             }
+        } else if (capRate == 24000) {
+            int16_t* decBuf = engine->captureDecimateBuffer_.data();
+            size_t processed = engine->captureResampler24To16_.process(
+                scratchBuf, chunkFrames, decBuf
+            );
+            if (processed > 0) {
+                engine->captureBuffer_.write(decBuf, processed);
+                engine->micRms_.store(dsp::calculateRms(decBuf, processed), std::memory_order_relaxed);
+            }
+        } else if (capRate == 8000) {
+            int16_t* upBuf = engine->captureDecimateBuffer_.data();
+            size_t outIdx = 0;
+            for (size_t i = 0; i < chunkFrames && (outIdx + 1) < decimateScratchCap; ++i) {
+                int16_t current = scratchBuf[i];
+                int16_t next = (i + 1 < chunkFrames) ? scratchBuf[i + 1] : current;
+                upBuf[outIdx++] = current;
+                upBuf[outIdx++] = static_cast<int16_t>((static_cast<int32_t>(current) + static_cast<int32_t>(next)) / 2);
+            }
+            if (outIdx > 0) {
+                engine->captureBuffer_.write(upBuf, outIdx);
+                engine->micRms_.store(dsp::calculateRms(upBuf, outIdx), std::memory_order_relaxed);
+            }
         } else if (capRate == 16000) {
             engine->captureBuffer_.write(scratchBuf, chunkFrames);
             engine->micRms_.store(dsp::calculateRms(scratchBuf, chunkFrames), std::memory_order_relaxed);
         }
 
         framesRemaining -= chunkFrames;
-        inPtr += chunkFrames;
+        inPtr += chunkFrames * channels;
     }
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
