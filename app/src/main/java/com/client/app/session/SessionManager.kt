@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/java/com/client/app/session/SessionManager.kt
 package com.client.app.session
 
 import android.content.Context
@@ -81,20 +82,6 @@ data class ToolCallKey(
     val callId: String
 )
 
-/**
- * Bounded shutdown policy.
- *
- * Graceful producer wait: 1500 ms.
- * Forced producer cancellation join: 100 ms.
- * StreamStop enqueue: 500 ms.
- * Graceful consumer wait: 1500 ms.
- * Forced consumer cancellation join: 100 ms.
- * Emergency server finalization: 500 ms.
- *
- * These are bounded coroutine waits in this layer.
- * They do not constitute a mathematically proven end-to-end
- * wall-clock deadline for non-cooperative native/network code.
- */
 @Singleton
 class SessionManager @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -557,12 +544,10 @@ class SessionManager @Inject constructor(
             cancelAllPendingToolJobs()
         }
 
-        // 1. Остановка логического захвата микрофона
         stopMic(userInitiated = false)
         client.disconnect()
         isManualActivityActive.set(false)
 
-        // 2. Освобождение физического аудиоядра ТОЛЬКО при полном завершении сессии
         if (full) {
             audioEngine.stop()
             stopForegroundService()
@@ -616,9 +601,6 @@ class SessionManager @Inject constructor(
         } ?: logger.w("SessionManager: bounded mic activity finalization timed out")
     }
 
-    /**
-     * Запуск микрофона с монотонной обработкой AudioStreamEvent.
-     */
     private suspend fun startMic() = micMutex.withLock {
         if (_state.value.isMicActive) return@withLock
         userMicDesired = true
@@ -650,17 +632,16 @@ class SessionManager @Inject constructor(
                         }
                     }
                     is AudioStreamEvent.SpeechEnd -> {
-                        if (currentAadEnabled) {
-                            withTimeoutOrNull(500L) {
-                                client.sendAudioStreamEnd()
-                            } ?: logger.w("SessionManager: SpeechEnd audioStreamEnd timed out")
-                        } else {
+                        if (!currentAadEnabled) {
                             if (isManualActivityActive.compareAndSet(true, false) && client.isReady) {
                                 withTimeoutOrNull(500L) {
                                     client.sendActivityEnd()
                                 } ?: logger.w("SessionManager: SpeechEnd activityEnd timed out")
                             }
                         }
+                        // При включенном AAD (currentAadEnabled == true) закрытием хода управляет
+                        // нейросеть Gemini по параметрам silenceDurationMs / endSensitivity.
+                        // Отправлять audioStreamEnd на промежуточных паузах речи категорически нельзя.
                     }
                     is AudioStreamEvent.StreamStop -> {
                         if (currentAadEnabled) {
@@ -681,9 +662,6 @@ class SessionManager @Inject constructor(
         }
     }
 
-    /**
-     * Bounded Graceful Shutdown логического микрофона.
-     */
     private suspend fun stopMic(
         userInitiated: Boolean = false
     ) = micMutex.withLock {
