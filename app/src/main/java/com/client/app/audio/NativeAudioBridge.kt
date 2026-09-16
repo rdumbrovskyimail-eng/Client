@@ -20,8 +20,7 @@ class NativeAudioBridge @Inject constructor() {
     external fun getHardwareCoreInfo(): String
 
     /**
-     * Инициализация аудиомаршрутов AAudio с явным указанием ID физических портов микрофона и динамика
-     * (для предотвращения захвата встроенного микрофона вместо Bluetooth-гарнитуры).
+     * Инициализация аудиомаршрутов AAudio с явным указанием ID физических портов микрофона и динамика.
      */
     external fun initAudioRoute(
         isBluetooth: Boolean,
@@ -32,6 +31,7 @@ class NativeAudioBridge @Inject constructor() {
 
     external fun startAudio(): Boolean
     external fun stopAudio()
+    external fun isAudioDisconnected(): Boolean
     external fun setVolume(volume: Float)
     external fun setMicGain(gain: Float)
 
