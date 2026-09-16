@@ -18,7 +18,8 @@ public:
     static AAudioEngine& getInstance();
 
     /**
-     * Инициализация аудиопотоков с поддержкой явных системных ID устройств ввода/вывода (Bluetooth SCO/BLE/Speaker)
+     * Инициализация аудиопотоков с поддержкой явных системных ID устройств ввода/вывода (Bluetooth SCO/BLE/Speaker).
+     * Сериализована под защитой lifecycleMutex_.
      */
     bool init(bool isBluetoothMode = false, 
               int32_t targetPlaybackSampleRate = SAMPLE_RATE_GEMINI_OUT,
@@ -42,6 +43,7 @@ public:
     float getMicRms() const { return micRms_.load(std::memory_order_relaxed); }
     float getOutRms() const { return outRms_.load(std::memory_order_relaxed); }
     bool isMmapActive() const { return isMmapExclusiveActive_.load(std::memory_order_relaxed); }
+    bool isDisconnected() const { return isDisconnected_.load(std::memory_order_relaxed); }
 
     int32_t getActualCaptureSampleRate() const { return actualCaptureSampleRate_.load(std::memory_order_relaxed); }
     int32_t getActualPlaybackSampleRate() const { return actualPlaybackSampleRate_.load(std::memory_order_relaxed); }
@@ -55,6 +57,18 @@ public:
 private:
     AAudioEngine();
     ~AAudioEngine();
+
+    // Внутренняя сериализованная инициализация под уже захваченным lifecycleMutex_
+    bool initLocked(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
+                    int32_t inputDeviceId, int32_t outputDeviceId);
+
+    // Внутренняя сериализованная остановка под уже захваченным lifecycleMutex_
+    void stopLocked();
+
+    // Открытие потока воспроизведения с безопасным fallback EXCLUSIVE -> SHARED
+    aaudio_result_t openPlaybackStreamWithFallback(int32_t targetPlaybackSampleRate,
+                                                   int32_t outputDeviceId,
+                                                   bool isBluetooth);
 
     static aaudio_data_callback_result_t captureCallback(
         AAudioStream* stream, void* userData, void* audioData, int32_t numFrames);
@@ -72,12 +86,13 @@ private:
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_CAPTURE> captureBuffer_;
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_PLAYBACK> playbackBuffer_;
 
-    // Мьютекс управления состоянием открытия/закрытия стримов
-    std::mutex stateMutex_;
+    // Единый нерекурсивный мьютекс управления жизненным циклом
+    std::mutex lifecycleMutex_;
 
     std::atomic<bool> isRunning_{false};
     std::atomic<bool> isBluetoothMode_{false};
     std::atomic<bool> isMmapExclusiveActive_{false};
+    std::atomic<bool> isDisconnected_{false};
     std::atomic<int32_t> playbackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
 
     // Подтвержденные HAL частоты дискретизации микрофона и динамика
