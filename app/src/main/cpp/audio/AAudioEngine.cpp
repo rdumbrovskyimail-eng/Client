@@ -74,7 +74,7 @@ struct Biquad {
         float a0 = (A + 1.0f) - (A - 1.0f) * cs + beta;
         b0 = (A * ((A + 1.0f) + (A - 1.0f) * cs + beta)) / a0;
         b1 = (-2.0f * A * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
-        b2 = (A * ((A + 1.0f) + (A - 1.0f) * cs - beta)) / a0;
+        b2 = (A * ((A + 1.0f) - (A - 1.0f) * cs - beta)) / a0;
         a1 = (2.0f * ((A - 1.0f) - (A + 1.0f) * cs)) / a0;
         a2 = ((A + 1.0f) - (A - 1.0f) * cs - beta) / a0;
     }
