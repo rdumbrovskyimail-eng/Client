@@ -11,7 +11,6 @@
 
 #define LOG_TAG "NativeCoreBridge"
 
-// Перехват логов: вывод в системный logcat + фиксация в Lock-Free кольцевой очереди логов
 #undef LOGI
 #undef LOGE
 #define LOGI(...) do { \
@@ -75,6 +74,11 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_client_app_audio_NativeAudioBridge_stopAudio(JNIEnv * /* env */, jobject /* this */) {
     LOGI("stopAudio called");
     AAudioEngine::getInstance().stop();
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_isAudioDisconnected(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jboolean>(AAudioEngine::getInstance().isDisconnected());
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -193,11 +197,6 @@ Java_com_client_app_audio_NativeAudioBridge_getSpectrumData(JNIEnv *env, jobject
     env->SetFloatArrayRegion(outArray, 0, 7, data);
 }
 
-/**
- * Вычитка логов из C++ Lock-Free очереди NativeLogQueue в Java.
- * Защита от переполнения JNI Local References Table (лимит 512):
- * строгий вызов DeleteLocalRef на каждой итерации и ограничение пачки до 64 записей.
- */
 extern "C" JNIEXPORT jobjectArray JNICALL
 Java_com_client_app_audio_NativeAudioBridge_drainNativeLogs(JNIEnv *env, jobject /* this */) {
     std::vector<client::logging::NativeLogItem> drained;
@@ -232,7 +231,6 @@ Java_com_client_app_audio_NativeAudioBridge_drainNativeLogs(JNIEnv *env, jobject
         env->SetObjectArrayElement(resultArray, baseIdx + 1, jTag);
         env->SetObjectArrayElement(resultArray, baseIdx + 2, jMsg);
 
-        // Освобождаем локальные ссылки для предотвращения утечки таблицы ссылок JNI
         env->DeleteLocalRef(jLevel);
         env->DeleteLocalRef(jTag);
         env->DeleteLocalRef(jMsg);
