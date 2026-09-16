@@ -21,7 +21,6 @@ import java.net.InetSocketAddress
 import java.net.Proxy
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -45,11 +44,11 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     private val loggingEventListener = object : EventListener() {
         override fun dnsStart(call: Call, domainName: String) {
-            logManager.net("OkHttp:DNS", "Старт резолва: $domainName")
+            logManager.net("OkHttp:DNS", "Старт DNS-резолва: $domainName")
         }
 
         override fun dnsEnd(call: Call, domainName: String, inetAddressList: List<InetAddress>) {
-            logManager.net("OkHttp:DNS", "Резолв успешен: $domainName -> $inetAddressList")
+            logManager.net("OkHttp:DNS", "DNS успешен: $domainName -> $inetAddressList")
         }
 
         override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) {
@@ -105,7 +104,6 @@ class GeminiProtobufLiveClient @Inject constructor(
     private val audioBatchBuffer = ByteArrayOutputStream(AUDIO_BATCH_THRESHOLD_BYTES * 2)
     private val batchLock = Any()
 
-    // Защита от дублирования audioStreamEnd (мутируется строго под batchLock)
     private var isAudioStreamEnded = true
 
     suspend fun connect(cfg: LiveConfig) = wsMutex.withLock {
@@ -117,7 +115,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             audioBatchBuffer.reset()
         }
 
-        while (_audio.tryReceive().isSuccess) { /* сброс очереди */ }
+        while (_audio.tryReceive().isSuccess) { }
 
         val myEpoch = epochGen.incrementAndGet()
         epoch = myEpoch
@@ -126,7 +124,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         val encodedKey = URLEncoder.encode(rawKey, "UTF-8")
         val url = "wss://$WS_HOST/$WS_PATH?key=$encodedKey"
 
-        logManager.net("WebSocket", "Инициализация Bidi сессии Gemini 3.8 Live (epoch=$myEpoch)")
+        logManager.net("WebSocket", "Инициализация Bidi сессии Gemini 3.8 Live (epoch=$myEpoch, key=[REDACTED])")
 
         val req = Request.Builder()
             .url(url)
@@ -190,10 +188,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         })
     }
 
-    /**
-     * Сериализованная передача аудио PCM: накопление, батчинг и отправка
-     * выполняются строго в рамках одной неделимой транзакции под batchLock.
-     */
     fun sendAudioPcm(pcm: ByteArray) {
         val ws = webSocket ?: return
         if (!isReady || pcm.isEmpty()) return
@@ -209,21 +203,16 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
     }
 
-    /**
-     * Сериализованное завершение аудиопотока: сброс остатка буфера и отправка
-     * audioStreamEnd выполняются неделимо. Появление аудиокадра после audioStreamEnd исключено.
-     */
     fun sendAudioStreamEnd() {
         if (!isReady) return
         val ws = webSocket ?: return
 
         synchronized(batchLock) {
             if (isAudioStreamEnded) {
-                return // Сигнал уже отправлен для текущего голосового кванта
+                return
             }
             isAudioStreamEnded = true
 
-            // Сначала принудительно выталкиваем остаток буфера (tail)
             if (audioBatchBuffer.size() > 0) {
                 val tailPayload = audioBatchBuffer.toByteArray()
                 audioBatchBuffer.reset()
@@ -410,26 +399,70 @@ class GeminiProtobufLiveClient @Inject constructor(
                                 put("voiceName", cfg.voiceName)
                             }
                         }
+                        if (!cfg.speechLanguage.isNullOrBlank()) {
+                            put("languageCode", cfg.speechLanguage)
+                        }
                     }
                 }
 
-                putJsonObject("inputAudioTranscription") {}
-                putJsonObject("outputAudioTranscription") {}
-
-                putJsonObject("contextWindowCompression") {
-                    putJsonObject("slidingWindow") {}
+                if (cfg.inputTranscription.enabled) {
+                    putJsonObject("inputAudioTranscription") {
+                        if (cfg.inputTranscription.languageCodes.isNotEmpty()) {
+                            putJsonArray("languageCodes") {
+                                cfg.inputTranscription.languageCodes.forEach { add(it) }
+                            }
+                        }
+                        if (cfg.inputTranscription.customVocabulary.isNotEmpty()) {
+                            putJsonArray("customVocabulary") {
+                                cfg.inputTranscription.customVocabulary.forEach { add(it) }
+                            }
+                        }
+                        put("mode", cfg.inputTranscription.mode)
+                    }
                 }
 
+                if (cfg.outputTranscription.enabled) {
+                    putJsonObject("outputAudioTranscription") {
+                        if (cfg.outputTranscription.languageCodes.isNotEmpty()) {
+                            putJsonArray("languageCodes") {
+                                cfg.outputTranscription.languageCodes.forEach { add(it) }
+                            }
+                        }
+                        if (cfg.outputTranscription.customVocabulary.isNotEmpty()) {
+                            putJsonArray("customVocabulary") {
+                                cfg.outputTranscription.customVocabulary.forEach { add(it) }
+                            }
+                        }
+                        put("mode", cfg.outputTranscription.mode)
+                    }
+                }
+
+                // Управление сжатием контекста: исключение блока при disabled
+                if (cfg.compression.enabled) {
+                    putJsonObject("contextWindowCompression") {
+                        putJsonObject("slidingWindow") {
+                            if (cfg.compression.triggerTokens > 0 && cfg.compression.targetTokens > 0 && 
+                                cfg.compression.triggerTokens > cfg.compression.targetTokens) {
+                                put("triggerTokens", cfg.compression.triggerTokens)
+                                put("targetTokens", cfg.compression.targetTokens)
+                            }
+                        }
+                    }
+                }
+
+                // Семантика VAD: при disabled = true отправляется только статус отключения
                 putJsonObject("realtimeInputConfig") {
                     putJsonObject("automaticActivityDetection") {
-                        put("disabled", false)
-                        put("startOfSpeechSensitivity", "START_SENSITIVITY_HIGH")
-                        put("endOfSpeechSensitivity", "END_SENSITIVITY_LOW")
-                        put("prefixPaddingMs", 60)
-                        put("silenceDurationMs", 600)
+                        put("disabled", !cfg.realtimeInput.aadEnabled)
+                        if (cfg.realtimeInput.aadEnabled) {
+                            put("startOfSpeechSensitivity", cfg.realtimeInput.startSensitivity)
+                            put("endOfSpeechSensitivity", cfg.realtimeInput.endSensitivity)
+                            put("prefixPaddingMs", cfg.realtimeInput.prefixPaddingMs)
+                            put("silenceDurationMs", cfg.realtimeInput.silenceDurationMs)
+                        }
                     }
-                    put("activityHandling", "START_OF_ACTIVITY_INTERRUPTS")
-                    put("turnCoverage", "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO")
+                    put("activityHandling", cfg.realtimeInput.activityHandling)
+                    put("turnCoverage", cfg.realtimeInput.turnCoverage)
                 }
 
                 if (cfg.systemInstruction.isNotBlank()) {
@@ -455,8 +488,10 @@ class GeminiProtobufLiveClient @Inject constructor(
                     put("tools", allTools)
                 }
 
-                cfg.resumptionHandle?.takeIf { it.isNotBlank() }?.let { handle ->
-                    putJsonObject("sessionResumption") { put("handle", handle) }
+                if (cfg.sessionResumptionEnabled) {
+                    cfg.resumptionHandle?.takeIf { it.isNotBlank() }?.let { handle ->
+                        putJsonObject("sessionResumption") { put("handle", handle) }
+                    }
                 }
 
                 if (cfg.initialHistory.isNotEmpty()) {
@@ -577,10 +612,8 @@ class GeminiProtobufLiveClient @Inject constructor(
         webSocket = null
         isReady = false
         activeConfig = null
-        synchronized(batchLock) {
-            isAudioStreamEnded = true
-            audioBatchBuffer.reset()
-        }
+        isAudioStreamEnded = true
+        synchronized(batchLock) { audioBatchBuffer.reset() }
         runCatching { ws?.close(1000, "close") }
         runCatching { ws?.cancel() }
     }
