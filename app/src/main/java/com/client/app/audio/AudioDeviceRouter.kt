@@ -19,7 +19,7 @@ import javax.inject.Singleton
 
 enum class AudioRoutePath {
     SPEAKER_EXCLUSIVE, // Samsung Galaxy S23 Ultra Native MMAP Exclusive (48 кГц / 4.2 мс)
-    CMF_BUDS_WIRELESS  // Nothing CMF Buds 2 (LE Audio LC3 24 кГц / BT SCO 16 кГц)
+    CMF_BUDS_WIRELESS  // Nothing CMF Buds 2 (LE Audio LC3 / BT SCO)
 }
 
 data class RouteProfile(
@@ -42,7 +42,6 @@ class AudioDeviceRouter @Inject constructor(
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val routeLock = Any()
 
-    // Скоуп антидребезга системных колбэков маршрутизации
     private var routerScope: CoroutineScope? = null
     private val debounceTrigger = MutableSharedFlow<Unit>(
         replay = 0, extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST
@@ -53,7 +52,6 @@ class AudioDeviceRouter @Inject constructor(
 
     private var onRouteChangedListener: ((RouteProfile) -> Unit)? = null
 
-    // Фингерпринт для отсечения повторных ложных срабатываний
     private data class RouteFingerprint(
         val path: AudioRoutePath,
         val inDevId: Int,
@@ -72,14 +70,19 @@ class AudioDeviceRouter @Inject constructor(
         }
     }
 
-    fun start(onRouteChange: (RouteProfile) -> Unit) {
+    /**
+     * REMEDIATION #5: Атомарная инициализация маршрута.
+     * Слушатель регистрируется, первичный профиль вычисляется и сохраняется в activeFingerprint
+     * под routeLock. Это исключает окно потери событий между оценкой и подпиской,
+     * а также устраняет ложный повторный запуск движка при старте.
+     */
+    fun start(onRouteChange: (RouteProfile) -> Unit) = synchronized(routeLock) {
         this.onRouteChangedListener = onRouteChange
-        
+
         routerScope?.cancel()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         routerScope = scope
 
-        // Подписка на антидребезг: гасит пачки из 3–5 системных колбэков за 180 мс
         scope.launch {
             debounceTrigger
                 .debounce(180L)
@@ -89,9 +92,17 @@ class AudioDeviceRouter @Inject constructor(
         }
 
         audioManager.registerAudioDeviceCallback(deviceCallback, null)
-        
-        // Первый запуск выполняется мгновенно без задержки дебаунса
-        evaluateActiveRouteInternal()
+
+        // Первичная оценка под единой блокировкой: инициализирует fingerprint,
+        // поэтому первое совпадение не вызовет повторный duplicate trigger
+        val initialProfile = evaluateActiveProfileLocked()
+        activeFingerprint = RouteFingerprint(
+            path = initialProfile.path,
+            inDevId = initialProfile.inputDeviceId,
+            outDevId = initialProfile.outputDeviceId,
+            sampleRate = initialProfile.sampleRateOut
+        )
+        _currentProfile.value = initialProfile
     }
 
     fun stop() {
@@ -109,74 +120,21 @@ class AudioDeviceRouter @Inject constructor(
         }
     }
 
-    /**
-     * Внутренняя оценка портов с фильтрацией дребезга и фингерпринтингом
-     */
+    private fun selectOptimalBluetoothSampleRate(device: AudioDeviceInfo): Int {
+        val supportedRates = device.sampleRates
+        if (supportedRates.isNotEmpty()) {
+            return when {
+                supportedRates.contains(24000) -> 24000
+                supportedRates.contains(16000) -> 16000
+                supportedRates.contains(48000) -> 48000
+                else -> supportedRates.firstOrNull { it >= 16000 } ?: 16000
+            }
+        }
+        return if (device.type == AudioDeviceInfo.TYPE_BLE_HEADSET) 24000 else 16000
+    }
+
     private fun evaluateActiveRouteInternal() = synchronized(routeLock) {
-        val hasBtPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            ContextCompat.checkSelfPermission(
-                context, Manifest.permission.BLUETOOTH_CONNECT
-            ) == PackageManager.PERMISSION_GRANTED
-        } else {
-            true
-        }
-
-        // 1. Поиск разрешенных коммуникационных портов вывода (A2DP строго запрещен!)
-        val commDevices = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && hasBtPermission) {
-            runCatching { audioManager.availableCommunicationDevices }.getOrDefault(emptyList())
-        } else {
-            emptyList()
-        }
-
-        val allOutputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-        val allInputs = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-
-        val btOutputDevice = if (hasBtPermission) {
-            commDevices.firstOrNull { dev ->
-                dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-            } ?: allOutputs.firstOrNull { dev ->
-                dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-            }
-        } else {
-            null
-        }
-
-        // 2. Поиск парного физического микрофона гарнитуры (Source)
-        val btInputDevice = if (hasBtPermission && btOutputDevice != null) {
-            allInputs.firstOrNull { dev ->
-                (dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                 dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) &&
-                dev.isSource
-            }
-        } else {
-            null
-        }
-
-        val newProfile = if (btOutputDevice != null && bindBluetoothCommunication(btOutputDevice)) {
-            // Источник 8: Если гарнитура поддерживает LE Audio (LC3) — нативная частота 24 кГц!
-            // Ресемплинг полностью отключается, звук транслируется бит-в-бит с Gemini Live!
-            val sampleRate = if (btOutputDevice.type == AudioDeviceInfo.TYPE_BLE_HEADSET) 24000 else 16000
-            val inDevId = btInputDevice?.id ?: 0
-            val outDevId = btOutputDevice.id
-
-            RouteProfile(
-                path = AudioRoutePath.CMF_BUDS_WIRELESS,
-                sampleRateOut = sampleRate,
-                leadInBufferSizeFrames = 260 * 16,
-                vadThresholdStart = 0.40f, // Высокая чувствительность для наушников
-                vadThresholdEnd = 0.20f,
-                deviceName = btOutputDevice.productName.toString().ifBlank { "CMF Buds 2 (Wireless)" },
-                inputDeviceId = inDevId,
-                outputDeviceId = outDevId
-            )
-        } else {
-            bindSpeakerCommunication()
-            createSpeakerProfile()
-        }
-
-        // 3. Проверка фингерпринта: если конфигурация железа не изменилась — не дергаем C++ ядро!
+        val newProfile = evaluateActiveProfileLocked()
         val newFingerprint = RouteFingerprint(
             path = newProfile.path,
             inDevId = newProfile.inputDeviceId,
@@ -192,6 +150,63 @@ class AudioDeviceRouter @Inject constructor(
         }
     }
 
+    /**
+     * REMEDIATION #4: Проверка результата setCommunicationDevice() и безопасная ассоциация входа.
+     */
+    private fun evaluateActiveProfileLocked(): RouteProfile {
+        val hasBtPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            ContextCompat.checkSelfPermission(
+                context, Manifest.permission.BLUETOOTH_CONNECT
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+
+        val commDevices = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && hasBtPermission) {
+            runCatching { audioManager.availableCommunicationDevices }.getOrDefault(emptyList())
+        } else {
+            emptyList()
+        }
+
+        val allOutputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+
+        val btOutputDevice = if (hasBtPermission) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                commDevices.firstOrNull { dev ->
+                    dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                    dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                }
+            } else {
+                allOutputs.firstOrNull { dev ->
+                    dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                    dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                }
+            }
+        } else {
+            null
+        }
+
+        // Проверяем фактический булев результат привязки communication device
+        val bound = btOutputDevice != null && bindBluetoothCommunication(btOutputDevice)
+
+        return if (bound && btOutputDevice != null) {
+            val sampleRate = selectOptimalBluetoothSampleRate(btOutputDevice)
+            RouteProfile(
+                path = AudioRoutePath.CMF_BUDS_WIRELESS,
+                sampleRateOut = sampleRate,
+                leadInBufferSizeFrames = 260 * 16,
+                vadThresholdStart = 0.40f,
+                vadThresholdEnd = 0.20f,
+                deviceName = btOutputDevice.productName.toString().ifBlank { "CMF Buds 2 (Wireless)" },
+                inputDeviceId = 0, // AAUDIO_UNSPECIFIED: communication routing управляется платформой Android
+                outputDeviceId = btOutputDevice.id
+            )
+        } else {
+            bindSpeakerCommunication()
+            createSpeakerProfile()
+        }
+    }
+
     private fun bindBluetoothCommunication(device: AudioDeviceInfo): Boolean {
         if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
@@ -199,10 +214,10 @@ class AudioDeviceRouter @Inject constructor(
 
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val currentComm = audioManager.communicationDevice
-            if (currentComm?.id != device.id) {
-                audioManager.setCommunicationDevice(device)
-            } else {
+            if (currentComm?.id == device.id) {
                 true
+            } else {
+                audioManager.setCommunicationDevice(device)
             }
         } else {
             @Suppress("DEPRECATION")
@@ -250,7 +265,7 @@ class AudioDeviceRouter @Inject constructor(
 
         return RouteProfile(
             path = AudioRoutePath.SPEAKER_EXCLUSIVE,
-            sampleRateOut = 48000, // 48 кГц нативный ЦАП WCD9385 Galaxy S23 Ultra для чистого MMAP
+            sampleRateOut = 48000,
             leadInBufferSizeFrames = 160 * 16,
             vadThresholdStart = 0.50f,
             vadThresholdEnd = 0.25f,
