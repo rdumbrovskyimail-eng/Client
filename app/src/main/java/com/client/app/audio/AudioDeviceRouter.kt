@@ -70,12 +70,6 @@ class AudioDeviceRouter @Inject constructor(
         }
     }
 
-    /**
-     * REMEDIATION #5: Атомарная инициализация маршрута.
-     * Слушатель регистрируется, первичный профиль вычисляется и сохраняется в activeFingerprint
-     * под routeLock. Это исключает окно потери событий между оценкой и подпиской,
-     * а также устраняет ложный повторный запуск движка при старте.
-     */
     fun start(onRouteChange: (RouteProfile) -> Unit) = synchronized(routeLock) {
         this.onRouteChangedListener = onRouteChange
 
@@ -93,8 +87,6 @@ class AudioDeviceRouter @Inject constructor(
 
         audioManager.registerAudioDeviceCallback(deviceCallback, null)
 
-        // Первичная оценка под единой блокировкой: инициализирует fingerprint,
-        // поэтому первое совпадение не вызовет повторный duplicate trigger
         val initialProfile = evaluateActiveProfileLocked()
         activeFingerprint = RouteFingerprint(
             path = initialProfile.path,
@@ -150,9 +142,6 @@ class AudioDeviceRouter @Inject constructor(
         }
     }
 
-    /**
-     * REMEDIATION #4: Проверка результата setCommunicationDevice() и безопасная ассоциация входа.
-     */
     private fun evaluateActiveProfileLocked(): RouteProfile {
         val hasBtPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             ContextCompat.checkSelfPermission(
@@ -169,6 +158,7 @@ class AudioDeviceRouter @Inject constructor(
         }
 
         val allOutputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        val allInputs = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
 
         val btOutputDevice = if (hasBtPermission) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -186,7 +176,16 @@ class AudioDeviceRouter @Inject constructor(
             null
         }
 
-        // Проверяем фактический булев результат привязки communication device
+        // Явный поиск соответствующего микрофона гарнитуры (SCO / BLE Headset) в списке устройств ввода
+        val btInputDevice = if (hasBtPermission) {
+            allInputs.firstOrNull { dev ->
+                dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            }
+        } else {
+            null
+        }
+
         val bound = btOutputDevice != null && bindBluetoothCommunication(btOutputDevice)
 
         return if (bound && btOutputDevice != null) {
@@ -198,7 +197,7 @@ class AudioDeviceRouter @Inject constructor(
                 vadThresholdStart = 0.40f,
                 vadThresholdEnd = 0.20f,
                 deviceName = btOutputDevice.productName.toString().ifBlank { "CMF Buds 2 (Wireless)" },
-                inputDeviceId = 0, // AAUDIO_UNSPECIFIED: communication routing управляется платформой Android
+                inputDeviceId = btInputDevice?.id ?: 0,
                 outputDeviceId = btOutputDevice.id
             )
         } else {
