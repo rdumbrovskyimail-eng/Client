@@ -170,8 +170,6 @@ class SessionManager @Inject constructor(
     @Volatile private var hasReceivedAudioTranscript = false
 
     @Volatile private var currentAadEnabled = true
-
-    // Атомарный флаг активного окна речи (Manual VAD)
     private val isManualActivityActive = AtomicBoolean(false)
 
     private val activeToolJobs = ConcurrentHashMap<ToolCallKey, Job>()
@@ -237,7 +235,8 @@ class SessionManager @Inject constructor(
         if (trimmed.isEmpty() && uris.isEmpty()) return@launch
 
         if (_state.value.isAiSpeaking) {
-            audioEngine.flushPlayback()
+            val newGen = client.invalidateAudio()
+            audioEngine.flushPlayback(newGen)
             _state.update { it.copy(isAiSpeaking = false) }
         }
 
@@ -270,7 +269,8 @@ class SessionManager @Inject constructor(
         val wasMic = _state.value.isMicActive
         if (wasMic) stopMic(userInitiated = false)
 
-        audioEngine.flushPlayback()
+        val newGen = client.invalidateAudio()
+        audioEngine.flushPlayback(newGen)
         forvoPlayer.play(url)
 
         if (wasMic && userMicDesired && !userStopped) {
@@ -552,7 +552,8 @@ class SessionManager @Inject constructor(
             audioEngine.stop()
             stopForegroundService()
         } else {
-            audioEngine.flushPlayback()
+            val newGen = client.invalidateAudio()
+            audioEngine.flushPlayback(newGen)
         }
         _state.update {
             it.copy(link = LinkState.IDLE, isAiSpeaking = false, isMicActive = false)
@@ -639,9 +640,6 @@ class SessionManager @Inject constructor(
                                 } ?: logger.w("SessionManager: SpeechEnd activityEnd timed out")
                             }
                         }
-                        // При включенном AAD (currentAadEnabled == true) закрытием хода управляет
-                        // нейросеть Gemini по параметрам silenceDurationMs / endSensitivity.
-                        // Отправлять audioStreamEnd на промежуточных паузах речи категорически нельзя.
                     }
                     is AudioStreamEvent.StreamStop -> {
                         if (currentAadEnabled) {
@@ -710,16 +708,28 @@ class SessionManager @Inject constructor(
         }
     }
 
+    // AUD-005.4: Фильтрация по epoch и generation, releaseAudio через finally
     private fun observeAudio() = scope.launch {
         for (frame in client.audio) {
-            if (frame.epoch != client.epoch) continue
-            _state.update { it.copy(isAiSpeaking = true) }
-            audioEngine.enqueuePlayback(frame.pcm)
+            try {
+                if (frame.epoch != client.epoch) continue
+                if (frame.generation != client.audioGeneration) continue
+
+                _state.update { it.copy(isAiSpeaking = true) }
+                audioEngine.enqueuePlayback(frame.pcm, frame.generation)
+            } finally {
+                client.releaseAudio(frame.pcm.size)
+            }
         }
     }
 
+    // AUD-005.11: Single Owner Barge-In цепочки
     private fun observeBargeIn() = scope.launch {
         audioEngine.bargeInEvents.collect {
+            val newGen = client.invalidateAudio()
+            audioEngine.flushPlayback(newGen)
+            audioEngine.triggerBargeInEarcon()
+
             _state.update { it.copy(isAiSpeaking = false) }
             streamingRole = null
             hasReceivedAudioTranscript = false
@@ -754,9 +764,12 @@ class SessionManager @Inject constructor(
                         }
                     }
                 }
+                // AUD-005.12: Единый вызов invalidateAudio() при Interrupted через SessionManager
                 is GeminiEvent.Interrupted -> {
-                    audioEngine.flushPlayback()
+                    val newGen = client.invalidateAudio()
+                    audioEngine.flushPlayback(newGen)
                     audioEngine.resetBargeInState()
+
                     _state.update { it.copy(isAiSpeaking = false) }
                     streamingRole = null
                     hasReceivedAudioTranscript = false
