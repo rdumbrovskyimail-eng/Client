@@ -1,0 +1,6 @@
+# Keep the real Silero V5 ONNX model in Git LFS.
+# -text is intentional because the asset is binary.
+# The Android build also marks .onnx as noCompress so AssetManager.openFd()
+# can expose the actual file range for memory mapping.
+
+app/src/main/assets/models/silero_vad_v5_quant.onnx filter=lfs diff=lfs merge=lfs -text
