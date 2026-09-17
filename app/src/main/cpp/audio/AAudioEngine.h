@@ -6,6 +6,11 @@
 #include <memory>
 #include <vector>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <cstdint>
+#include <cstddef>
+#include <cstdio>
 #include "AudioConstants.h"
 #include "LockFreeRingBuffer.h"
 #include "PolyphaseResampler.h"
@@ -13,14 +18,15 @@
 
 namespace client::audio {
 
+constexpr size_t PLAYBACK_DSP_INPUT_CHUNK_FRAMES = 1024;
+constexpr size_t PLAYBACK_DSP_MAX_OUTPUT_FRAMES = 8192;
+constexpr size_t EARCON_SCRATCH_MAX_FRAMES = 2048;
+constexpr size_t CAPTURE_RAW_SCRATCH_FRAMES = 2048;
+
 class AAudioEngine {
 public:
     static AAudioEngine& getInstance();
 
-    /**
-     * Инициализация аудиопотоков с поддержкой явных системных ID устройств ввода/вывода (Bluetooth SCO/BLE/Speaker).
-     * Сериализована под защитой lifecycleMutex_.
-     */
     bool init(bool isBluetoothMode = false, 
               int32_t targetPlaybackSampleRate = SAMPLE_RATE_GEMINI_OUT,
               int32_t inputDeviceId = AAUDIO_UNSPECIFIED,
@@ -29,11 +35,12 @@ public:
     bool start();
     void stop();
 
-    // Потокобезопасная запись сэмплов без динамических аллокаций
-    size_t writePlaybackPcm(const int16_t* pcm, size_t frames);
+    // AUD-005: generation строго обязателен
+    size_t writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation);
     size_t readCapturePcm(int16_t* pcm, size_t maxFrames);
 
-    void flushPlayback();
+    // AUD-005: generation строго обязателен
+    void flushPlayback(uint64_t generation);
     void triggerBargeInEarcon();
     void resetEarcon();
 
@@ -52,24 +59,26 @@ public:
     int32_t getActiveInputDeviceId() const { return actualInputDeviceId_.load(std::memory_order_relaxed); }
     int32_t getActiveOutputDeviceId() const { return actualOutputDeviceId_.load(std::memory_order_relaxed); }
 
-    // Возврат когерентного среза спектра через Wait-Free алгоритм Андерсона
+    // AUD-004: Метрика отброшенных входных аудио-фреймов
+    uint64_t getCaptureDroppedFrames() const { return captureDroppedFrames_.load(std::memory_order_relaxed); }
+
     void getSpectrumData(dsp::SpectrumSnapshot& outSnapshot);
 
 private:
     AAudioEngine();
     ~AAudioEngine();
 
-    // Внутренняя сериализованная инициализация под уже захваченным lifecycleMutex_
     bool initLocked(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
                     int32_t inputDeviceId, int32_t outputDeviceId);
 
-    // Внутренняя сериализованная остановка под уже захваченным lifecycleMutex_
     void stopLocked();
 
-    // Открытие потока воспроизведения с безопасным fallback EXCLUSIVE -> SHARED
     aaudio_result_t openPlaybackStreamWithFallback(int32_t targetPlaybackSampleRate,
                                                    int32_t outputDeviceId,
                                                    bool isBluetooth);
+
+    void playbackDspThreadLoop();
+    void captureDspThreadLoop();
 
     static aaudio_data_callback_result_t captureCallback(
         AAudioStream* stream, void* userData, void* audioData, int32_t numFrames);
@@ -83,11 +92,14 @@ private:
     AAudioStream* captureStream_{nullptr};
     AAudioStream* playbackStream_{nullptr};
 
-    // Расширенные безблокировочные кольцевые буферы (32K сэмплов захват / 256K сэмплов вывод)
+    // AUD-003: SPSC очереди захвата
+    LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_CAPTURE> captureRawBuffer_;
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_CAPTURE> captureBuffer_;
+
+    // AUD-001: SPSC очереди воспроизведения
+    LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_PLAYBACK> playbackDspInputBuffer_;
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_PLAYBACK> playbackBuffer_;
 
-    // Единый нерекурсивный мьютекс управления жизненным циклом
     std::mutex lifecycleMutex_;
 
     std::atomic<bool> isRunning_{false};
@@ -96,12 +108,10 @@ private:
     std::atomic<bool> isDisconnected_{false};
     std::atomic<int32_t> playbackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
 
-    // Подтвержденные HAL характеристики микрофона и динамика
     std::atomic<int32_t> actualCaptureSampleRate_{SAMPLE_RATE_GEMINI_IN};
     std::atomic<int32_t> actualCaptureChannels_{CHANNEL_COUNT_MONO};
     std::atomic<int32_t> actualPlaybackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
 
-    // Подтвержденные аппаратные ID устройств ввода и вывода
     std::atomic<int32_t> actualInputDeviceId_{AAUDIO_UNSPECIFIED};
     std::atomic<int32_t> actualOutputDeviceId_{AAUDIO_UNSPECIFIED};
 
@@ -111,33 +121,43 @@ private:
     std::atomic<float> micRms_{0.0f};
     std::atomic<float> outRms_{0.0f};
 
-    // Фазовый аккумулятор генератора Earcon
-    std::atomic<size_t> earconPhase_{EARCON_INACTIVE_PHASE};
+    alignas(64) std::atomic<uint64_t> captureDroppedFrames_{0};
+
+    std::thread playbackDspThread_;
+    std::atomic<bool> playbackDspRunning_{false};
+    std::mutex playbackDspWaitMutex_;
+    std::condition_variable playbackDspCv_;
+
+    std::thread captureDspThread_;
+    std::atomic<bool> captureDspRunning_{false};
+    std::mutex captureDspWaitMutex_;
+    std::condition_variable captureDspCv_;
+
+    alignas(64) std::atomic<uint64_t> playbackEpoch_{0};
+
+    std::mutex playbackControlMutex_;
+    std::mutex playbackJniWriteMutex_;
+    std::mutex playbackIngressMutex_;
+    std::condition_variable playbackIngressCv_;
+    std::atomic<bool> inputIngressBlocked_{false};
+
+    std::atomic<bool> earconRequested_{false};
 
     std::unique_ptr<dsp::FastFft> fftProcessor_;
 
-    // Накопитель с перекрытием для БПФ
-    std::vector<float> fftAccumulator_;
-    size_t fftAccumulatorPos_{0};
+    std::vector<int16_t> playbackDspInputScratch_;
+    std::vector<int16_t> playbackDspOutputScratch_;
+    std::vector<int16_t> earconScratch_;
+    std::vector<float> fftBuffer_;
+    size_t fftPos_{0};
 
-    // Мьютекс для защиты скретчпада писателя в JNI-потоке (НЕ блокирует RT playbackCallback!)
-    std::mutex playbackWriteMutex_;
-
-    // Статически предвыделенные буферы ресемплинга и децимации
-    std::vector<int16_t> resampleScratchBuffer_;
+    std::vector<int16_t> captureRawScratchBuffer_;
     std::vector<int16_t> captureDecimateBuffer_;
     std::vector<int16_t> captureInputScratchBuffer_;
-
-    // Буфер отложенного сброса ресемплированного вывода при противодавлении ring buffer
-    std::vector<int16_t> resamplePendingBuffer_;
-    size_t resamplePendingOffset_{0};
-    size_t resamplePendingCount_{0};
 
     PolyphaseResampler24To16 resampler24To16_;
     HermiteResampler24To48 resampler24To48_;
     Decimator48To16 captureDecimator48To16_;
-
-    // Отдельный экземпляр полифазного ресемплера для микрофонного тракта (RT Capture Callback)
     PolyphaseResampler24To16 captureResampler24To16_;
 };
 
