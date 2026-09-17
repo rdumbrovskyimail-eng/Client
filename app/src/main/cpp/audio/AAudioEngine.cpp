@@ -3,21 +3,31 @@
 #include "NativeLogQueue.h"
 #include "dsp/NeonDspUtils.h"
 #include <android/log.h>
+#include <pthread.h>
+#include <cstdio>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <thread>
 #include <chrono>
 
 #define LOG_TAG "NativeAudioEngine"
 
 #undef LOGI
+#undef LOGW
 #undef LOGE
+
 #define LOGI(...) do { \
     char _buf[256]; \
     snprintf(_buf, sizeof(_buf), __VA_ARGS__); \
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", _buf); \
     client::logging::NativeLogQueue::getInstance().push(4, LOG_TAG, _buf); \
+} while(0)
+
+#define LOGW(...) do { \
+    char _buf[256]; \
+    snprintf(_buf, sizeof(_buf), __VA_ARGS__); \
+    __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "%s", _buf); \
+    client::logging::NativeLogQueue::getInstance().push(5, LOG_TAG, _buf); \
 } while(0)
 
 #define LOGE(...) do { \
@@ -88,7 +98,7 @@ public:
 
     void reset(int32_t sampleRate) {
         currentRate_ = sampleRate;
-        float fs = static_cast<float>(sampleRate);
+        float fs = static_cast<float>(sampleRate > 0 ? sampleRate : 48000);
 
         lowShelf_.reset();
         highShelf_.reset();
@@ -146,13 +156,14 @@ AAudioEngine& AAudioEngine::getInstance() {
 
 AAudioEngine::AAudioEngine()
     : fftProcessor_(std::make_unique<dsp::FastFft>()),
-      fftAccumulator_(FFT_SIZE * 2, 0.0f),
-      resampleScratchBuffer_(RESAMPLE_SCRATCH_CAPACITY, 0),
+      playbackDspInputScratch_(PLAYBACK_DSP_INPUT_CHUNK_FRAMES, 0),
+      playbackDspOutputScratch_(PLAYBACK_DSP_MAX_OUTPUT_FRAMES, 0),
+      earconScratch_(EARCON_SCRATCH_MAX_FRAMES, 0),
+      fftBuffer_(FFT_SIZE * 2, 0.0f),
+      fftPos_(0),
+      captureRawScratchBuffer_(CAPTURE_RAW_SCRATCH_FRAMES, 0),
       captureDecimateBuffer_(CAPTURE_DECIMATE_CAPACITY, 0),
-      captureInputScratchBuffer_(CAPTURE_DECIMATE_CAPACITY, 0),
-      resamplePendingBuffer_(RESAMPLE_SCRATCH_CAPACITY, 0),
-      resamplePendingOffset_(0),
-      resamplePendingCount_(0) {
+      captureInputScratchBuffer_(CAPTURE_DECIMATE_CAPACITY, 0) {
     dsp::enableHardwareFtz();
 }
 
@@ -172,18 +183,22 @@ bool AAudioEngine::initLocked(bool isBluetoothMode, int32_t targetPlaybackSample
     isDisconnected_.store(false, std::memory_order_release);
 
     {
-        std::lock_guard<std::mutex> pLock(playbackWriteMutex_);
+        std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
         resampler24To16_.reset();
         resampler24To48_.reset();
         captureDecimator48To16_.reset();
         captureResampler24To16_.reset();
-        resamplePendingOffset_ = 0;
-        resamplePendingCount_ = 0;
         resetEarcon();
         s_voiceEnhancer.reset(targetPlaybackSampleRate);
+        fftPos_ = 0;
+        playbackEpoch_.store(0, std::memory_order_release);
+        inputIngressBlocked_.store(false, std::memory_order_release);
     }
 
+    captureDroppedFrames_.store(0, std::memory_order_relaxed);
+    captureRawBuffer_.clear();
     captureBuffer_.clear();
+    playbackDspInputBuffer_.clear();
     playbackBuffer_.clear();
 
     isBluetoothMode_.store(isBluetoothMode, std::memory_order_relaxed);
@@ -192,9 +207,6 @@ bool AAudioEngine::initLocked(bool isBluetoothMode, int32_t targetPlaybackSample
     LOGI("AAudioEngine::initLocked: BT=%d, targetRate=%d, inDevId=%d, outDevId=%d", 
          (int)isBluetoothMode, targetPlaybackSampleRate, inputDeviceId, outputDeviceId);
 
-    // ─────────────────────────────────────────────────────────────
-    // 1. КОНФИГУРАЦИЯ ПОТОКА ЗАХВАТА (МИКРОФОН)
-    // ─────────────────────────────────────────────────────────────
     AAudioStreamBuilder* inBuilder = nullptr;
     if (AAudio_createStreamBuilder(&inBuilder) != AAUDIO_OK) {
         LOGE("Failed to create capture stream builder");
@@ -225,7 +237,6 @@ bool AAudioEngine::initLocked(bool isBluetoothMode, int32_t targetPlaybackSample
         return false;
     }
 
-    // Валидация фактических характеристик потока захвата с полной поддержкой Bluetooth-интерфейсов
     const int32_t actualInRate = AAudioStream_getSampleRate(captureStream_);
     const int32_t actualInChannels = AAudioStream_getChannelCount(captureStream_);
     const aaudio_format_t actualInFormat = AAudioStream_getFormat(captureStream_);
@@ -265,10 +276,10 @@ bool AAudioEngine::initLocked(bool isBluetoothMode, int32_t targetPlaybackSample
     if (captureDecimateBuffer_.size() < neededCaptureScratch) {
         captureDecimateBuffer_.resize(neededCaptureScratch, 0);
     }
+    if (captureRawScratchBuffer_.size() < CAPTURE_RAW_SCRATCH_FRAMES) {
+        captureRawScratchBuffer_.resize(CAPTURE_RAW_SCRATCH_FRAMES, 0);
+    }
 
-    // ─────────────────────────────────────────────────────────────
-    // 2. КОНФИГУРАЦИЯ ПОТОКА ВОСПРОИЗВЕДЕНИЯ (EXCLUSIVE -> SHARED FALLBACK)
-    // ─────────────────────────────────────────────────────────────
     res = openPlaybackStreamWithFallback(targetPlaybackSampleRate, outputDeviceId, isBluetoothMode);
     if (res != AAUDIO_OK) {
         LOGE("Failed to open playback stream: %d (%s)", res, AAudio_convertResultToText(res));
@@ -292,6 +303,16 @@ bool AAudioEngine::initLocked(bool isBluetoothMode, int32_t targetPlaybackSample
         const int32_t appliedBufSize = AAudioStream_setBufferSizeInFrames(playbackStream_, targetBufSize);
         LOGI("Playback buffer size tuned: requested=%d, applied=%d (burst=%d, capacity=%d)",
              targetBufSize, appliedBufSize, playBurst, playCapacity);
+    }
+
+    if (playbackDspInputScratch_.size() < PLAYBACK_DSP_INPUT_CHUNK_FRAMES) {
+        playbackDspInputScratch_.resize(PLAYBACK_DSP_INPUT_CHUNK_FRAMES, 0);
+    }
+    if (playbackDspOutputScratch_.size() < PLAYBACK_DSP_MAX_OUTPUT_FRAMES) {
+        playbackDspOutputScratch_.resize(PLAYBACK_DSP_MAX_OUTPUT_FRAMES, 0);
+    }
+    if (earconScratch_.size() < EARCON_SCRATCH_MAX_FRAMES) {
+        earconScratch_.resize(EARCON_SCRATCH_MAX_FRAMES, 0);
     }
 
     LOGI("AAudio Initialized: CapRate=%d (Ch=%d, DevId=%d), PlayRate=%d (DevId=%d), MMAP=%d",
@@ -367,7 +388,10 @@ bool AAudioEngine::start() {
         }
     }
 
+    captureDroppedFrames_.store(0, std::memory_order_relaxed);
+    captureRawBuffer_.clear();
     captureBuffer_.clear();
+    playbackDspInputBuffer_.clear();
     playbackBuffer_.clear();
 
     aaudio_result_t res = AAudioStream_requestStart(captureStream_);
@@ -385,8 +409,14 @@ bool AAudioEngine::start() {
         return false;
     }
 
+    playbackDspRunning_.store(true, std::memory_order_release);
+    playbackDspThread_ = std::thread(&AAudioEngine::playbackDspThreadLoop, this);
+
+    captureDspRunning_.store(true, std::memory_order_release);
+    captureDspThread_ = std::thread(&AAudioEngine::captureDspThreadLoop, this);
+
     isRunning_.store(true);
-    LOGI("AAudioEngine started successfully");
+    LOGI("AAudioEngine, Playback DSP worker and Capture DSP worker started successfully");
     return true;
 }
 
@@ -397,11 +427,28 @@ void AAudioEngine::stop() {
 
 void AAudioEngine::stopLocked() {
     bool wasRunning = isRunning_.exchange(false);
-    if (!wasRunning && !captureStream_ && !playbackStream_) {
+    if (!wasRunning && !captureStream_ && !playbackStream_ && !playbackDspRunning_.load() && !captureDspRunning_.load()) {
         return;
     }
 
     LOGI("Stopping AAudioEngine (stopLocked)...");
+
+    if (captureDspRunning_.load(std::memory_order_acquire)) {
+        captureDspRunning_.store(false, std::memory_order_release);
+        captureDspCv_.notify_all();
+        if (captureDspThread_.joinable()) {
+            captureDspThread_.join();
+        }
+    }
+
+    if (playbackDspRunning_.load(std::memory_order_acquire)) {
+        playbackDspRunning_.store(false, std::memory_order_release);
+        playbackDspCv_.notify_all();
+        playbackIngressCv_.notify_all();
+        if (playbackDspThread_.joinable()) {
+            playbackDspThread_.join();
+        }
+    }
 
     if (captureStream_) {
         AAudioStream_requestStop(captureStream_);
@@ -416,115 +463,354 @@ void AAudioEngine::stopLocked() {
     }
 
     {
-        std::lock_guard<std::mutex> pLock(playbackWriteMutex_);
+        std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
         resampler24To16_.reset();
         resampler24To48_.reset();
         captureDecimator48To16_.reset();
         captureResampler24To16_.reset();
-        resamplePendingOffset_ = 0;
-        resamplePendingCount_ = 0;
         resetEarcon();
         s_voiceEnhancer.reset(48000);
+        fftPos_ = 0;
+        inputIngressBlocked_.store(false, std::memory_order_release);
     }
 
+    captureRawBuffer_.clear();
     captureBuffer_.clear();
+    playbackDspInputBuffer_.clear();
     playbackBuffer_.clear();
 
     micRms_.store(0.0f);
     outRms_.store(0.0f);
     isMmapExclusiveActive_.store(false);
-    fftAccumulatorPos_ = 0;
 
     LOGI("AAudioEngine stopped cleanly");
 }
 
-size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames) {
-    if (frames == 0 || pcm == nullptr) return 0;
+// AUD-003: Dedicated Capture DSP Worker
+void AAudioEngine::captureDspThreadLoop() {
+    pthread_setname_np(pthread_self(), "AudioCapWorker");
+    dsp::enableHardwareFtz();
 
-    std::lock_guard<std::mutex> lock(playbackWriteMutex_);
+    while (captureDspRunning_.load(std::memory_order_acquire)) {
+        const int32_t channels = actualCaptureChannels_.load(std::memory_order_relaxed);
+        const size_t ch = static_cast<size_t>(channels > 0 ? channels : 1);
 
-    if (resamplePendingCount_ > 0) {
-        size_t written = playbackBuffer_.write(
-            resamplePendingBuffer_.data() + resamplePendingOffset_,
-            resamplePendingCount_
+        size_t availableSamples = captureRawBuffer_.availableRead();
+        availableSamples -= (availableSamples % ch);
+
+        if (availableSamples == 0) {
+            std::unique_lock<std::mutex> lock(captureDspWaitMutex_);
+            captureDspCv_.wait_for(lock, std::chrono::milliseconds(2), [this]() {
+                return !captureDspRunning_.load(std::memory_order_acquire)
+                    || captureRawBuffer_.availableRead() > 0;
+            });
+            continue;
+        }
+
+        size_t maxScratchSamples = captureRawScratchBuffer_.size();
+        maxScratchSamples -= (maxScratchSamples % ch);
+
+        const size_t samplesToRead = std::min(availableSamples, maxScratchSamples);
+        const size_t readSamples = captureRawBuffer_.read(captureRawScratchBuffer_.data(), samplesToRead);
+        if (readSamples == 0) continue;
+
+        const size_t chunkFrames = readSamples / ch;
+        const int16_t* inPtr = captureRawScratchBuffer_.data();
+        int16_t* monoBuf = captureInputScratchBuffer_.data();
+
+        const float gain = micGain_.load(std::memory_order_relaxed);
+        const bool applyGain = (std::abs(gain - 1.0f) > 0.001f);
+        const int32_t capRate = actualCaptureSampleRate_.load(std::memory_order_relaxed);
+
+        if (channels == 2) {
+            for (size_t i = 0; i < chunkFrames; ++i) {
+                int32_t mixed = (static_cast<int32_t>(inPtr[i * 2]) + static_cast<int32_t>(inPtr[i * 2 + 1])) / 2;
+                if (applyGain) {
+                    mixed = static_cast<int32_t>(std::round(mixed * gain));
+                }
+                monoBuf[i] = static_cast<int16_t>(std::clamp(mixed, -32768, 32767));
+            }
+        } else {
+            if (applyGain) {
+                for (size_t i = 0; i < chunkFrames; ++i) {
+                    int32_t amplified = static_cast<int32_t>(std::round(inPtr[i] * gain));
+                    monoBuf[i] = static_cast<int16_t>(std::clamp(amplified, -32768, 32767));
+                }
+            } else {
+                std::memcpy(monoBuf, inPtr, chunkFrames * sizeof(int16_t));
+            }
+        }
+
+        const size_t decimateScratchCap = captureDecimateBuffer_.size();
+        int16_t* finalPcm = monoBuf;
+        size_t finalFrames = chunkFrames;
+
+        if (capRate == 48000) {
+            int16_t* decBuf = captureDecimateBuffer_.data();
+            size_t processed = captureDecimator48To16_.process(
+                monoBuf, chunkFrames, decBuf, decimateScratchCap
+            );
+            finalPcm = decBuf;
+            finalFrames = processed;
+        } else if (capRate == 24000) {
+            int16_t* decBuf = captureDecimateBuffer_.data();
+            size_t processed = captureResampler24To16_.process(
+                monoBuf, chunkFrames, decBuf
+            );
+            finalPcm = decBuf;
+            finalFrames = processed;
+        } else if (capRate == 8000) {
+            int16_t* upBuf = captureDecimateBuffer_.data();
+            size_t outIdx = 0;
+            for (size_t i = 0; i < chunkFrames && (outIdx + 1) < decimateScratchCap; ++i) {
+                int16_t current = monoBuf[i];
+                int16_t next = (i + 1 < chunkFrames) ? monoBuf[i + 1] : current;
+                upBuf[outIdx++] = current;
+                upBuf[outIdx++] = static_cast<int16_t>((static_cast<int32_t>(current) + static_cast<int32_t>(next)) / 2);
+            }
+            finalPcm = upBuf;
+            finalFrames = outIdx;
+        }
+
+        if (finalFrames > 0) {
+            micRms_.store(dsp::calculateRms(finalPcm, finalFrames), std::memory_order_relaxed);
+            captureBuffer_.write(finalPcm, finalFrames);
+        }
+    }
+}
+
+// AUD-001: Dedicated Playback DSP Worker
+void AAudioEngine::playbackDspThreadLoop() {
+    pthread_setname_np(pthread_self(), "AudioDspWorker");
+    dsp::enableHardwareFtz();
+
+    constexpr size_t TARGET_BUFFER_MS = 40;
+    int16_t* input = playbackDspInputScratch_.data();
+    int16_t* output = playbackDspOutputScratch_.data();
+    int16_t* earconBuf = earconScratch_.data();
+
+    uint64_t workerDspEpoch = playbackEpoch_.load(std::memory_order_acquire);
+
+    while (playbackDspRunning_.load(std::memory_order_acquire)) {
+        const uint64_t activeEpoch = playbackEpoch_.load(std::memory_order_acquire);
+
+        if (activeEpoch != workerDspEpoch) {
+            const int32_t currentRate = std::max(1, actualPlaybackSampleRate_.load(std::memory_order_acquire));
+            s_voiceEnhancer.reset(currentRate);
+            resampler24To48_.reset();
+            resampler24To16_.reset();
+            fftPos_ = 0;
+            std::fill(fftBuffer_.begin(), fftBuffer_.end(), 0.0f);
+
+            playbackDspInputBuffer_.discardAll();
+            workerDspEpoch = activeEpoch;
+
+            inputIngressBlocked_.store(false, std::memory_order_release);
+            playbackIngressCv_.notify_all();
+        }
+
+        if (!playbackBuffer_.isFlushAcknowledged(activeEpoch)) {
+            std::unique_lock<std::mutex> waitLock(playbackDspWaitMutex_);
+            playbackDspCv_.wait_for(waitLock, std::chrono::milliseconds(2), [this, activeEpoch]() {
+                return !playbackDspRunning_.load(std::memory_order_acquire)
+                    || playbackEpoch_.load(std::memory_order_acquire) != activeEpoch
+                    || playbackBuffer_.isFlushAcknowledged(activeEpoch);
+            });
+
+            if (playbackEpoch_.load(std::memory_order_acquire) != activeEpoch) {
+                continue;
+            }
+            if (!playbackBuffer_.isFlushAcknowledged(activeEpoch)) {
+                continue;
+            }
+        }
+
+        const int32_t actualRate = std::max(1, actualPlaybackSampleRate_.load(std::memory_order_acquire));
+        const size_t targetBufferFrames = std::max<size_t>(1, static_cast<size_t>(actualRate * TARGET_BUFFER_MS / 1000));
+
+        if (earconRequested_.load(std::memory_order_acquire)) {
+            const size_t earconFrames = std::min<size_t>(
+                static_cast<size_t>(actualRate * (EARCON_DURATION_MS / 1000.0f)),
+                earconScratch_.size()
+            );
+
+            if (playbackBuffer_.availableWrite() >= earconFrames) {
+                for (size_t i = 0; i < earconFrames; ++i) {
+                    const float t = static_cast<float>(i) / static_cast<float>(actualRate);
+                    const float env = std::cos((3.14159265f * static_cast<float>(i)) / (2.0f * static_cast<float>(earconFrames)));
+                    const float sample = std::sin(2.0f * 3.14159265f * EARCON_FREQ_HZ * t) * env * env * 12000.0f;
+                    earconBuf[i] = static_cast<int16_t>(std::clamp(sample, -32768.0f, 32767.0f));
+                }
+
+                {
+                    std::lock_guard<std::mutex> commitLock(playbackControlMutex_);
+                    if (playbackEpoch_.load(std::memory_order_acquire) == activeEpoch) {
+                        playbackBuffer_.write(earconBuf, earconFrames);
+                        earconRequested_.store(false, std::memory_order_release);
+                    }
+                }
+            }
+        }
+
+        const size_t maxOutputFrames = static_cast<size_t>(
+            std::ceil(
+                static_cast<double>(PLAYBACK_DSP_INPUT_CHUNK_FRAMES) *
+                static_cast<double>(actualRate) /
+                static_cast<double>(SAMPLE_RATE_GEMINI_OUT)
+            )
         );
-        resamplePendingOffset_ += written;
-        resamplePendingCount_ -= written;
 
-        if (resamplePendingCount_ > 0) {
+        const size_t buffered = playbackBuffer_.availableRead();
+        const size_t freeSpace = playbackBuffer_.availableWrite();
+
+        if (buffered >= targetBufferFrames || freeSpace < maxOutputFrames) {
+            std::unique_lock<std::mutex> waitLock(playbackDspWaitMutex_);
+            playbackDspCv_.wait_for(waitLock, std::chrono::milliseconds(4), [this, activeEpoch, maxOutputFrames]() {
+                return !playbackDspRunning_.load(std::memory_order_acquire)
+                    || playbackEpoch_.load(std::memory_order_acquire) != activeEpoch
+                    || earconRequested_.load(std::memory_order_acquire)
+                    || playbackBuffer_.availableWrite() >= maxOutputFrames;
+            });
+            continue;
+        }
+
+        size_t inputFrames = playbackDspInputBuffer_.read(input, PLAYBACK_DSP_INPUT_CHUNK_FRAMES);
+
+        if (inputFrames == 0) {
+            std::unique_lock<std::mutex> waitLock(playbackDspWaitMutex_);
+            playbackDspCv_.wait(waitLock, [this, activeEpoch]() {
+                return !playbackDspRunning_.load(std::memory_order_acquire)
+                    || playbackEpoch_.load(std::memory_order_acquire) != activeEpoch
+                    || earconRequested_.load(std::memory_order_acquire)
+                    || playbackDspInputBuffer_.availableRead() > 0;
+            });
+            continue;
+        }
+
+        if (activeEpoch != playbackEpoch_.load(std::memory_order_acquire)) {
+            continue;
+        }
+
+        size_t outputFrames = 0;
+
+        if (actualRate == SAMPLE_RATE_GEMINI_OUT) {
+            outputFrames = inputFrames;
+            std::memcpy(output, input, outputFrames * sizeof(int16_t));
+        } else if (actualRate == SAMPLE_RATE_NATIVE_SPEAKER || actualRate == SAMPLE_RATE_BT_A2DP) {
+            outputFrames = resampler24To48_.process(input, inputFrames, output);
+        } else if (actualRate == SAMPLE_RATE_BT_HFP) {
+            outputFrames = resampler24To16_.process(input, inputFrames, output);
+        } else {
+            const double ratio = static_cast<double>(actualRate) / static_cast<double>(SAMPLE_RATE_GEMINI_OUT);
+            const size_t wanted = std::min(playbackDspOutputScratch_.size(), static_cast<size_t>(inputFrames * ratio));
+            for (size_t i = 0; i < wanted; ++i) {
+                const double src = static_cast<double>(i) / ratio;
+                const size_t idx0 = std::min(static_cast<size_t>(src), inputFrames - 1);
+                const size_t idx1 = std::min(idx0 + 1, inputFrames - 1);
+                const double frac = src - static_cast<double>(idx0);
+                const double s = static_cast<double>(input[idx0]) + frac * (static_cast<double>(input[idx1]) - static_cast<double>(input[idx0]));
+                output[i] = static_cast<int16_t>(std::clamp(s, -32768.0, 32767.0));
+            }
+            outputFrames = wanted;
+        }
+
+        if (outputFrames == 0) continue;
+
+        s_voiceEnhancer.process(output, outputFrames, actualRate);
+
+        const float volume = playbackVolume_.load(std::memory_order_relaxed);
+        if (volume != 1.0f) {
+            for (size_t i = 0; i < outputFrames; ++i) {
+                const float v = static_cast<float>(output[i]) * volume;
+                output[i] = static_cast<int16_t>(std::clamp(v, -32768.0f, 32767.0f));
+            }
+        }
+
+        const float outRms = dsp::calculateRms(output, outputFrames);
+        outRms_.store(outRms, std::memory_order_relaxed);
+        const float micRms = micRms_.load(std::memory_order_relaxed);
+        const size_t requiredAccum = (actualRate >= 44100) ? (FFT_SIZE * 2) : FFT_SIZE;
+        const size_t hopSize = (actualRate >= 44100) ? (FFT_HOP_SIZE * 2) : FFT_HOP_SIZE;
+
+        for (size_t i = 0; i < outputFrames; ++i) {
+            if (fftPos_ < fftBuffer_.size()) {
+                fftBuffer_[fftPos_++] = static_cast<float>(output[i]) * (1.0f / 32768.0f);
+            }
+            if (fftPos_ >= requiredAccum) {
+                if (fftProcessor_) {
+                    fftProcessor_->process(fftBuffer_.data(), requiredAccum, micRms, outRms, actualRate);
+                }
+                std::memmove(fftBuffer_.data(), fftBuffer_.data() + hopSize, (requiredAccum - hopSize) * sizeof(float));
+                fftPos_ = requiredAccum - hopSize;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> commitLock(playbackControlMutex_);
+
+            if (playbackEpoch_.load(std::memory_order_acquire) == activeEpoch) {
+                if (outputFrames > playbackBuffer_.availableWrite()) {
+                    LOGE("Playback DSP invariant violation: outputFrames=%zu free=%zu",
+                         outputFrames, playbackBuffer_.availableWrite());
+                    continue;
+                }
+
+                const size_t written = playbackBuffer_.write(output, outputFrames);
+                if (written != outputFrames) {
+                    LOGE("Playback DSP invariant violation: written=%zu expected=%zu",
+                         written, outputFrames);
+                }
+            }
+        }
+    }
+}
+
+// AUD-005: writePlaybackPcm с циклом ожидания без удержания playbackJniWriteMutex_
+size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation) {
+    if (pcm == nullptr || frames == 0) return 0;
+    if (generation == 0) {
+        LOGE("writePlaybackPcm called without authoritative generation");
+        return 0;
+    }
+    if (!playbackDspRunning_.load(std::memory_order_acquire)) return 0;
+
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(playbackJniWriteMutex_);
+
+            if (generation < playbackEpoch_.load(std::memory_order_acquire)) {
+                return frames; // Устаревший кадр отброшен, отчитываемся об успешном потреблении
+            }
+
+            if (!inputIngressBlocked_.load(std::memory_order_acquire)) {
+                const size_t written = playbackDspInputBuffer_.write(pcm, frames);
+                if (written > 0) {
+                    playbackDspCv_.notify_one();
+                }
+                return written;
+            }
+        }
+
+        {
+            std::unique_lock<std::mutex> lock(playbackIngressMutex_);
+
+            if (!inputIngressBlocked_.load(std::memory_order_acquire)) {
+                continue;
+            }
+
+            playbackIngressCv_.wait_for(
+                lock,
+                std::chrono::milliseconds(4),
+                [this]() {
+                    return !inputIngressBlocked_.load(std::memory_order_acquire)
+                        || !playbackDspRunning_.load(std::memory_order_acquire);
+                }
+            );
+        }
+
+        if (!playbackDspRunning_.load(std::memory_order_acquire)) {
             return 0;
         }
-        resamplePendingOffset_ = 0;
-    }
-
-    int32_t actualRate = actualPlaybackSampleRate_.load(std::memory_order_acquire);
-    if (actualRate <= 0) actualRate = SAMPLE_RATE_GEMINI_OUT;
-
-    const size_t neededCapacity = static_cast<size_t>(frames * 3);
-    if (neededCapacity > resampleScratchBuffer_.size()) {
-        resampleScratchBuffer_.resize(neededCapacity * 2);
-    }
-    if (neededCapacity > resamplePendingBuffer_.size()) {
-        resamplePendingBuffer_.resize(neededCapacity * 2);
-    }
-
-    if (actualRate == SAMPLE_RATE_BT_HFP) {
-        size_t resampledFrames = resampler24To16_.process(
-            pcm, frames, resampleScratchBuffer_.data()
-        );
-        size_t written = playbackBuffer_.write(resampleScratchBuffer_.data(), resampledFrames);
-        if (written < resampledFrames) {
-            size_t unwritten = resampledFrames - written;
-            std::memcpy(resamplePendingBuffer_.data(),
-                        resampleScratchBuffer_.data() + written,
-                        unwritten * sizeof(int16_t));
-            resamplePendingOffset_ = 0;
-            resamplePendingCount_ = unwritten;
-        }
-        return frames;
-    }
-
-    if (actualRate == SAMPLE_RATE_NATIVE_SPEAKER || actualRate == SAMPLE_RATE_BT_A2DP) {
-        size_t resampledFrames = resampler24To48_.process(
-            pcm, frames, resampleScratchBuffer_.data()
-        );
-        size_t written = playbackBuffer_.write(resampleScratchBuffer_.data(), resampledFrames);
-        if (written < resampledFrames) {
-            size_t unwritten = resampledFrames - written;
-            std::memcpy(resamplePendingBuffer_.data(),
-                        resampleScratchBuffer_.data() + written,
-                        unwritten * sizeof(int16_t));
-            resamplePendingOffset_ = 0;
-            resamplePendingCount_ = unwritten;
-        }
-        return frames;
-    }
-
-    if (actualRate == SAMPLE_RATE_GEMINI_OUT) {
-        return playbackBuffer_.write(pcm, frames);
-    }
-
-    const double rateRatio = static_cast<double>(actualRate) / static_cast<double>(SAMPLE_RATE_GEMINI_OUT);
-    const size_t targetFrames = static_cast<size_t>(frames * rateRatio);
-
-    int16_t* dst = resampleScratchBuffer_.data();
-    for (size_t i = 0; i < targetFrames; ++i) {
-        double srcIdx = i / rateRatio;
-        size_t idx0 = static_cast<size_t>(srcIdx);
-        size_t idx1 = std::min(idx0 + 1, frames - 1);
-        double frac = srcIdx - idx0;
-
-        int32_t val0 = pcm[idx0];
-        int32_t val1 = pcm[idx1];
-        int32_t interpolated = static_cast<int32_t>(val0 + frac * (val1 - val0));
-        dst[i] = static_cast<int16_t>(std::clamp(interpolated, -32768, 32767));
-    }
-
-    size_t written = playbackBuffer_.write(dst, targetFrames);
-    if (written >= targetFrames) {
-        return frames;
-    } else {
-        return (targetFrames > 0) ? (written * frames / targetFrames) : 0;
     }
 }
 
@@ -533,24 +819,45 @@ size_t AAudioEngine::readCapturePcm(int16_t* pcm, size_t maxFrames) {
     return captureBuffer_.read(pcm, maxFrames);
 }
 
-void AAudioEngine::flushPlayback() {
-    {
-        std::lock_guard<std::mutex> lock(playbackWriteMutex_);
-        resamplePendingOffset_ = 0;
-        resamplePendingCount_ = 0;
+// AUD-005: flushPlayback с единым монотонным поколением из Kotlin
+void AAudioEngine::flushPlayback(uint64_t generation) {
+    if (generation == 0) {
+        LOGE("flushPlayback called without authoritative generation");
+        return;
     }
-    playbackBuffer_.requestFlush();
-    outRms_.store(0.0f);
-    LOGI("AAudioEngine: flushPlayback executed");
+
+    std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
+
+    const uint64_t currentEpoch = playbackEpoch_.load(std::memory_order_acquire);
+    if (generation <= currentEpoch) {
+        LOGW("flushPlayback called with non-monotonic generation=%llu <= currentEpoch=%llu",
+             static_cast<unsigned long long>(generation),
+             static_cast<unsigned long long>(currentEpoch));
+        return;
+    }
+
+    inputIngressBlocked_.store(true, std::memory_order_release);
+
+    playbackBuffer_.requestFlush(generation);
+    playbackDspInputBuffer_.requestFlush(generation);
+    playbackEpoch_.store(generation, std::memory_order_release);
+
+    earconRequested_.store(false, std::memory_order_release);
+    outRms_.store(0.0f, std::memory_order_relaxed);
+
+    playbackDspCv_.notify_all();
+    LOGI("AAudioEngine: flushPlayback committed. Authoritative Epoch=%llu, Ingress Barrier engaged",
+         static_cast<unsigned long long>(generation));
 }
 
 void AAudioEngine::triggerBargeInEarcon() {
-    earconPhase_.store(0, std::memory_order_release);
-    LOGI("AAudioEngine: triggerBargeInEarcon (750 Hz pip)");
+    earconRequested_.store(true, std::memory_order_release);
+    playbackDspCv_.notify_all();
+    LOGI("AAudioEngine: triggerBargeInEarcon");
 }
 
 void AAudioEngine::resetEarcon() {
-    earconPhase_.store(EARCON_INACTIVE_PHASE, std::memory_order_release);
+    earconRequested_.store(false, std::memory_order_release);
 }
 
 void AAudioEngine::setVolume(float vol) {
@@ -565,158 +872,51 @@ void AAudioEngine::getSpectrumData(dsp::SpectrumSnapshot& outSnapshot) {
     fftProcessor_->getLatestSnapshot(outSnapshot);
 }
 
+// AUD-003 / AUD-004: Исключительно легковесный RT Capture Callback (< 2 мкс, целостность фреймов)
 aaudio_data_callback_result_t AAudioEngine::captureCallback(
     AAudioStream* /* stream */, void* userData, void* audioData, int32_t numFrames) {
 
-    if (audioData == nullptr || numFrames <= 0) {
+    if (userData == nullptr || audioData == nullptr || numFrames <= 0) {
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
-    }
-
-    thread_local bool ftzSet = false;
-    if (!ftzSet) {
-        dsp::enableHardwareFtz();
-        ftzSet = true;
     }
 
     auto* engine = static_cast<AAudioEngine*>(userData);
     const auto* inSamples = static_cast<const int16_t*>(audioData);
-
-    const float gain = engine->micGain_.load(std::memory_order_relaxed);
-    const bool applyGain = (std::abs(gain - 1.0f) > 0.001f);
-    const int32_t capRate = engine->actualCaptureSampleRate_.load(std::memory_order_relaxed);
     const int32_t channels = engine->actualCaptureChannels_.load(std::memory_order_relaxed);
+    const size_t ch = static_cast<size_t>(channels > 0 ? channels : 1);
 
-    const size_t inputScratchCap = engine->captureInputScratchBuffer_.size();
-    const size_t decimateScratchCap = engine->captureDecimateBuffer_.size();
+    const size_t availableFrames = engine->captureRawBuffer_.availableWrite() / ch;
+    const size_t framesToWrite = std::min(static_cast<size_t>(numFrames), availableFrames);
+    const size_t samplesToWrite = framesToWrite * ch;
 
-    size_t framesRemaining = static_cast<size_t>(numFrames);
-    const int16_t* inPtr = inSamples;
+    const size_t written = engine->captureRawBuffer_.write(inSamples, samplesToWrite);
+    const size_t writtenFrames = written / ch;
 
-    while (framesRemaining > 0) {
-        const size_t chunkFrames = std::min(framesRemaining, inputScratchCap);
-        int16_t* scratchBuf = engine->captureInputScratchBuffer_.data();
-
-        // 1. Извлечение моно-сигнала (стерео-даунмикс при Bluetooth) с учетом micGain
-        if (channels == 2) {
-            for (size_t i = 0; i < chunkFrames; ++i) {
-                int32_t mixed = (static_cast<int32_t>(inPtr[i * 2]) + static_cast<int32_t>(inPtr[i * 2 + 1])) / 2;
-                if (applyGain) {
-                    mixed = static_cast<int32_t>(std::round(mixed * gain));
-                }
-                scratchBuf[i] = static_cast<int16_t>(std::clamp(mixed, -32768, 32767));
-            }
-        } else {
-            if (applyGain) {
-                for (size_t i = 0; i < chunkFrames; ++i) {
-                    int32_t amplified = static_cast<int32_t>(std::round(inPtr[i] * gain));
-                    scratchBuf[i] = static_cast<int16_t>(std::clamp(amplified, -32768, 32767));
-                }
-            } else {
-                std::memcpy(scratchBuf, inPtr, chunkFrames * sizeof(int16_t));
-            }
-        }
-
-        // 2. Адаптивный ресемплинг захвата к целевым 16 кГц (для Silero VAD и Gemini Live)
-        if (capRate == 48000) {
-            int16_t* decBuf = engine->captureDecimateBuffer_.data();
-            size_t processed = engine->captureDecimator48To16_.process(
-                scratchBuf, chunkFrames, decBuf, decimateScratchCap
-            );
-            if (processed > 0) {
-                engine->captureBuffer_.write(decBuf, processed);
-                engine->micRms_.store(dsp::calculateRms(decBuf, processed), std::memory_order_relaxed);
-            }
-        } else if (capRate == 24000) {
-            int16_t* decBuf = engine->captureDecimateBuffer_.data();
-            size_t processed = engine->captureResampler24To16_.process(
-                scratchBuf, chunkFrames, decBuf
-            );
-            if (processed > 0) {
-                engine->captureBuffer_.write(decBuf, processed);
-                engine->micRms_.store(dsp::calculateRms(decBuf, processed), std::memory_order_relaxed);
-            }
-        } else if (capRate == 8000) {
-            int16_t* upBuf = engine->captureDecimateBuffer_.data();
-            size_t outIdx = 0;
-            for (size_t i = 0; i < chunkFrames && (outIdx + 1) < decimateScratchCap; ++i) {
-                int16_t current = scratchBuf[i];
-                int16_t next = (i + 1 < chunkFrames) ? scratchBuf[i + 1] : current;
-                upBuf[outIdx++] = current;
-                upBuf[outIdx++] = static_cast<int16_t>((static_cast<int32_t>(current) + static_cast<int32_t>(next)) / 2);
-            }
-            if (outIdx > 0) {
-                engine->captureBuffer_.write(upBuf, outIdx);
-                engine->micRms_.store(dsp::calculateRms(upBuf, outIdx), std::memory_order_relaxed);
-            }
-        } else if (capRate == 16000) {
-            engine->captureBuffer_.write(scratchBuf, chunkFrames);
-            engine->micRms_.store(dsp::calculateRms(scratchBuf, chunkFrames), std::memory_order_relaxed);
-        }
-
-        framesRemaining -= chunkFrames;
-        inPtr += chunkFrames * channels;
+    if (writtenFrames < static_cast<size_t>(numFrames)) {
+        engine->captureDroppedFrames_.fetch_add(
+            static_cast<size_t>(numFrames) - writtenFrames,
+            std::memory_order_relaxed
+        );
     }
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
+// AUD-001: Исключительно легковесный RT Playback Callback (только read + memset)
 aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     AAudioStream* /* stream */, void* userData, void* audioData, int32_t numFrames) {
 
-    thread_local bool ftzSet = false;
-    if (!ftzSet) {
-        dsp::enableHardwareFtz();
-        ftzSet = true;
+    if (userData == nullptr || audioData == nullptr || numFrames <= 0) {
+        return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
 
     auto* engine = static_cast<AAudioEngine*>(userData);
     auto* samples = static_cast<int16_t*>(audioData);
+    const size_t frames = static_cast<size_t>(numFrames);
 
-    size_t read = engine->playbackBuffer_.read(samples, numFrames);
-    if (read < static_cast<size_t>(numFrames)) {
-        std::memset(samples + read, 0, (numFrames - read) * sizeof(int16_t));
-    }
-
-    const int32_t actualRate = engine->actualPlaybackSampleRate_.load(std::memory_order_relaxed);
-    const size_t earconLimitFrames = static_cast<size_t>(actualRate * (EARCON_DURATION_MS / 1000.0f));
-    size_t phase = engine->earconPhase_.load(std::memory_order_acquire);
-
-    if (phase < earconLimitFrames) {
-        for (int32_t i = 0; i < numFrames && phase < earconLimitFrames; ++i, ++phase) {
-            float t = static_cast<float>(phase) / static_cast<float>(actualRate);
-            float env = std::cos((3.14159265f * phase) / (2.0f * earconLimitFrames));
-            env *= env;
-            int16_t pip = static_cast<int16_t>(std::sin(2.0f * 3.14159265f * EARCON_FREQ_HZ * t) * env * 12000.0f);
-            samples[i] = std::clamp(samples[i] + pip, -32768, 32767);
-        }
-        engine->earconPhase_.store(phase, std::memory_order_release);
-    }
-
-    s_voiceEnhancer.process(samples, numFrames, actualRate);
-
-    const float vol = engine->playbackVolume_.load(std::memory_order_relaxed);
-    if (vol < 0.999f) {
-        for (int32_t i = 0; i < numFrames; ++i) {
-            samples[i] = static_cast<int16_t>(samples[i] * vol);
-        }
-    }
-
-    const float outRms = dsp::calculateRms(samples, numFrames);
-    engine->outRms_.store(outRms, std::memory_order_relaxed);
-
-    const float micRms = engine->micRms_.load(std::memory_order_relaxed);
-    const size_t requiredAccum = (actualRate >= 44100) ? (FFT_SIZE * 2) : FFT_SIZE;
-    const size_t hopSize = (actualRate >= 44100) ? (FFT_HOP_SIZE * 2) : FFT_HOP_SIZE;
-
-    for (int32_t i = 0; i < numFrames; ++i) {
-        if (engine->fftAccumulatorPos_ < engine->fftAccumulator_.size()) {
-            engine->fftAccumulator_[engine->fftAccumulatorPos_++] = samples[i] * (1.0f / 32768.0f);
-        }
-        if (engine->fftAccumulatorPos_ >= requiredAccum) {
-            engine->fftProcessor_->process(engine->fftAccumulator_.data(), requiredAccum, micRms, outRms, actualRate);
-            std::memmove(&engine->fftAccumulator_[0], &engine->fftAccumulator_[hopSize], (requiredAccum - hopSize) * sizeof(float));
-            engine->fftAccumulatorPos_ = requiredAccum - hopSize;
-        }
+    const size_t read = engine->playbackBuffer_.read(samples, frames);
+    if (read < frames) {
+        std::memset(samples + read, 0, (frames - read) * sizeof(int16_t));
     }
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
