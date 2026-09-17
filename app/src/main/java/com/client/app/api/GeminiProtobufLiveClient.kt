@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/java/com/client/app/api/GeminiProtobufLiveClient.kt
 package com.client.app.api
 
 import android.util.Base64
@@ -38,6 +39,8 @@ class GeminiProtobufLiveClient @Inject constructor(
         private const val MAX_QUEUE_BYTES = 256L * 1024
         private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280 // 40 мс @ 16 кГц PCM16
         private const val MAX_INITIAL_HISTORY_TURNS = 20
+        // AUD-005.1: 4 МБ предел накопления бэклога в RAM
+        private const val MAX_AI_AUDIO_BACKLOG_BYTES = 4L * 1024L * 1024L
     }
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -90,12 +93,19 @@ class GeminiProtobufLiveClient @Inject constructor(
     private val epochGen = AtomicLong(0)
     @Volatile var epoch: Long = 0L; private set
 
+    // AUD-005.3: audioGenerationGen — единственный источник поколения воспроизведения
+    private val audioGenerationGen = AtomicLong(0L)
+    val audioGeneration: Long get() = audioGenerationGen.get()
+
+    private val queuedAudioBytes = AtomicLong(0L)
+
     private val _events = MutableSharedFlow<GeminiEvent>(
         replay = 0, extraBufferCapacity = 512, onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
     val events: Flow<GeminiEvent> = _events.asSharedFlow()
 
-    private val _audio = Channel<AudioFrame>(1024, BufferOverflow.DROP_OLDEST)
+    // AUD-005.1: Channel.UNLIMITED вместо DROP_OLDEST
+    private val _audio = Channel<AudioFrame>(Channel.UNLIMITED)
     val audio: ReceiveChannel<AudioFrame> = _audio
 
     @Volatile var isReady: Boolean = false; private set
@@ -103,8 +113,26 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     private val audioBatchBuffer = ByteArrayOutputStream(AUDIO_BATCH_THRESHOLD_BYTES * 2)
     private val batchLock = Any()
-
     private var isAudioStreamEnded = true
+
+    // AUD-005.3: Возвращает Long
+    fun invalidateAudio(): Long {
+        val newGeneration = audioGenerationGen.incrementAndGet()
+        logManager.audio("AudioStream", "Audio generation invalidated: $newGeneration")
+        return newGeneration
+    }
+
+    // AUD-005.1: CAS-loop, никакого set(0)
+    fun releaseAudio(bytes: Int) {
+        if (bytes <= 0) return
+        while (true) {
+            val current = queuedAudioBytes.get()
+            val next = (current - bytes.toLong()).coerceAtLeast(0L)
+            if (queuedAudioBytes.compareAndSet(current, next)) {
+                return
+            }
+        }
+    }
 
     suspend fun connect(cfg: LiveConfig) = wsMutex.withLock {
         closeInternal()
@@ -115,7 +143,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             audioBatchBuffer.reset()
         }
 
-        while (_audio.tryReceive().isSuccess) { }
+        invalidateAudio()
 
         val myEpoch = epochGen.incrementAndGet()
         epoch = myEpoch
@@ -437,7 +465,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }
 
-                // Управление сжатием контекста: исключение блока при disabled
                 if (cfg.compression.enabled) {
                     putJsonObject("contextWindowCompression") {
                         putJsonObject("slidingWindow") {
@@ -450,7 +477,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }
 
-                // Семантика VAD: при disabled = true отправляется только статус отключения
                 putJsonObject("realtimeInputConfig") {
                     putJsonObject("automaticActivityDetection") {
                         put("disabled", !cfg.realtimeInput.aadEnabled)
@@ -563,9 +589,13 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
 
             root["serverContent"]?.jsonObject?.let { sc ->
-                if (sc["interrupted"]?.jsonPrimitive?.booleanOrNull == true) {
+                // AUD-005.12: ТОЛЬКО emit Interrupted + return
+                val interrupted = sc["interrupted"]?.jsonPrimitive?.booleanOrNull == true
+                if (interrupted) {
                     _events.tryEmit(GeminiEvent.Interrupted)
+                    return
                 }
+
                 if (sc["generationComplete"]?.jsonPrimitive?.booleanOrNull == true) {
                     _events.tryEmit(GeminiEvent.GenerationComplete)
                 }
@@ -597,7 +627,24 @@ class GeminiProtobufLiveClient @Inject constructor(
                         val dataB64 = inline["data"]?.jsonPrimitive?.contentOrNull.orEmpty()
                         if (mime.startsWith("audio/pcm") && dataB64.isNotEmpty()) {
                             val pcmBytes = Base64.decode(dataB64, Base64.NO_WRAP)
-                            _audio.trySend(AudioFrame(pcmBytes, myEpoch))
+                            val currentGen = audioGenerationGen.get()
+
+                            // AUD-005.13: Controlled recovery с нативным flush при превышении 4 МБ
+                            val newBacklog = queuedAudioBytes.addAndGet(pcmBytes.size.toLong())
+                            if (newBacklog > MAX_AI_AUDIO_BACKLOG_BYTES) {
+                                queuedAudioBytes.addAndGet(-pcmBytes.size.toLong())
+                                logManager.w("AudioStream", "Превышен лимит бэклога ($newBacklog > $MAX_AI_AUDIO_BACKLOG_BYTES). Controlled recovery.")
+                                val recoveryGen = invalidateAudio()
+                                nativeBridge.flushPlayback(recoveryGen)
+                                return
+                            }
+
+                            // AUD-005.1: При отказе trySend немедленно откатываем accounting
+                            val sendResult = _audio.trySend(AudioFrame(pcmBytes, myEpoch, currentGen))
+                            if (sendResult.isFailure) {
+                                releaseAudio(pcmBytes.size)
+                                return
+                            }
                         }
                     }
                 }
@@ -614,12 +661,14 @@ class GeminiProtobufLiveClient @Inject constructor(
         activeConfig = null
         isAudioStreamEnded = true
         synchronized(batchLock) { audioBatchBuffer.reset() }
+        invalidateAudio()
         runCatching { ws?.close(1000, "close") }
         runCatching { ws?.cancel() }
     }
 
     suspend fun disconnect() = wsMutex.withLock {
         epoch = epochGen.incrementAndGet()
+        invalidateAudio()
         logManager.w("WebSocket", "Отключение сессии (эпоха=$epoch)")
         closeInternal()
     }
