@@ -6,6 +6,7 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <cstdint>
 
 namespace client::audio {
 
@@ -17,15 +18,18 @@ public:
     LockFreeRingBuffer() : buffer_(Capacity) {
         head_.store(0, std::memory_order_relaxed);
         tail_.store(0, std::memory_order_relaxed);
-        flushRequested_.store(false, std::memory_order_relaxed);
+        flushGeneration_.store(0, std::memory_order_relaxed);
+        flushAcknowledgedGeneration_.store(0, std::memory_order_relaxed);
     }
 
     size_t write(const T* data, size_t count) {
+        if (data == nullptr || count == 0) return 0;
+
         const size_t current_tail = tail_.load(std::memory_order_relaxed);
         const size_t current_head = head_.load(std::memory_order_acquire);
 
-        // Беззнаковое вычисление корректно при переполнении счетчиков
-        const size_t free_space = Capacity - (current_tail - current_head);
+        const size_t used = current_tail - current_head;
+        const size_t free_space = (used >= Capacity) ? 0 : (Capacity - used);
         const size_t to_write = std::min(count, free_space);
 
         if (to_write == 0) return 0;
@@ -44,11 +48,15 @@ public:
     }
 
     size_t read(T* data, size_t count) {
-        // Проверка атомарного запроса динамического сброса строго в потоке-читателе (Barge-In)
-        if (flushRequested_.load(std::memory_order_acquire)) {
-            const size_t t = tail_.load(std::memory_order_relaxed);
+        if (data == nullptr || count == 0) return 0;
+
+        const uint64_t requested = flushGeneration_.load(std::memory_order_acquire);
+        const uint64_t acknowledged = flushAcknowledgedGeneration_.load(std::memory_order_relaxed);
+
+        if (requested != acknowledged) {
+            const size_t t = tail_.load(std::memory_order_acquire);
             head_.store(t, std::memory_order_release);
-            flushRequested_.store(false, std::memory_order_release);
+            flushAcknowledgedGeneration_.store(requested, std::memory_order_release);
             return 0;
         }
 
@@ -73,31 +81,71 @@ public:
         return to_read;
     }
 
-    // ERR-08: Детерминированный сброс буфера в состоянии покоя (потоки остановлены/закрыты)
+    void discardAll() {
+        const size_t t = tail_.load(std::memory_order_acquire);
+        head_.store(t, std::memory_order_release);
+        const uint64_t requested = flushGeneration_.load(std::memory_order_acquire);
+        flushAcknowledgedGeneration_.store(requested, std::memory_order_release);
+    }
+
     void clear() {
         head_.store(0, std::memory_order_relaxed);
         tail_.store(0, std::memory_order_relaxed);
-        flushRequested_.store(false, std::memory_order_relaxed);
+        flushGeneration_.store(0, std::memory_order_relaxed);
+        flushAcknowledgedGeneration_.store(0, std::memory_order_relaxed);
     }
 
-    // Потокобезопасный запрос динамического сброса во время активного стрима (Barge-In)
-    void requestFlush() {
-        flushRequested_.store(true, std::memory_order_release);
+    uint64_t requestFlush(uint64_t generation) {
+        if (generation == 0) {
+            return flushGeneration_.load(std::memory_order_acquire);
+        }
+
+        uint64_t current = flushGeneration_.load(std::memory_order_acquire);
+        while (generation > current) {
+            if (flushGeneration_.compare_exchange_weak(
+                    current, generation,
+                    std::memory_order_release,
+                    std::memory_order_acquire)) {
+                return generation;
+            }
+        }
+        return current;
     }
 
+    uint64_t getFlushGeneration() const {
+        return flushGeneration_.load(std::memory_order_acquire);
+    }
+
+    uint64_t getFlushAcknowledgedGeneration() const {
+        return flushAcknowledgedGeneration_.load(std::memory_order_acquire);
+    }
+
+    bool isFlushAcknowledged(uint64_t generation) const {
+        return flushAcknowledgedGeneration_.load(std::memory_order_acquire) >= generation;
+    }
+
+    // AUD-002: Consumer side: own head relaxed, producer tail acquire
     size_t availableRead() const {
         const size_t h = head_.load(std::memory_order_relaxed);
         const size_t t = tail_.load(std::memory_order_acquire);
         return (t - h);
     }
 
+    // AUD-002: Producer side: own tail relaxed, consumer head acquire
+    size_t availableWrite() const {
+        const size_t h = head_.load(std::memory_order_acquire);
+        const size_t t = tail_.load(std::memory_order_relaxed);
+        const size_t used = t - h;
+        return (used >= Capacity) ? 0 : (Capacity - used);
+    }
+
 private:
     std::vector<T> buffer_;
 
-    // Выравнивание по 64 байтам исключает False Sharing в кэш-линиях CPU
     alignas(64) std::atomic<size_t> head_{0};
     alignas(64) std::atomic<size_t> tail_{0};
-    alignas(64) std::atomic<bool> flushRequested_{false};
+    alignas(64) std::atomic<uint64_t> flushGeneration_{0};
+    alignas(64) std::atomic<uint64_t> flushAcknowledgedGeneration_{0};
 };
 
 } // namespace client::audio
