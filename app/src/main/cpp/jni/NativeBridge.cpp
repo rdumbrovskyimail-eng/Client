@@ -1,5 +1,6 @@
 // >>> FILE: app/src/main/cpp/jni/NativeBridge.cpp
 #include <jni.h>
+#include <cstdio>
 #include <string>
 #include <vector>
 #include <android/log.h>
@@ -93,11 +94,13 @@ Java_com_client_app_audio_NativeAudioBridge_setMicGain(
     AAudioEngine::getInstance().setMicGain(static_cast<float>(gain));
 }
 
+// AUD-005.6: jlong generation обязателен + проверка чётности байт PCM16
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
-    JNIEnv *env, jobject /* this */, jbyteArray byteArray, jint offset, jint length) {
+    JNIEnv *env, jobject /* this */, jbyteArray byteArray, jint offset, jint length, jlong generation) {
 
     if (!byteArray || offset < 0 || length <= 0) return 0;
+    if ((length & 1) != 0) return 0; // Защита от нечётного количества байт PCM16
     const jsize arrayLen = env->GetArrayLength(byteArray);
     if (offset + length > arrayLen) return 0;
 
@@ -112,15 +115,20 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
         byteArray, offset, length, reinterpret_cast<jbyte*>(playbackJniBuffer.data())
     );
 
-    const size_t writtenFrames = AAudioEngine::getInstance().writePlaybackPcm(playbackJniBuffer.data(), frames);
+    const size_t writtenFrames = AAudioEngine::getInstance().writePlaybackPcm(
+        playbackJniBuffer.data(), frames, static_cast<uint64_t>(generation)
+    );
     return static_cast<jint>(writtenFrames * sizeof(int16_t));
 }
 
+// AUD-005.6: jlong generation обязателен + проверка чётности байт PCM16
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackDirect(
-    JNIEnv *env, jobject /* this */, jobject byteBuffer, jint offsetBytes, jint lengthBytes) {
+    JNIEnv *env, jobject /* this */, jobject byteBuffer, jint offsetBytes, jint lengthBytes, jlong generation) {
 
     if (!byteBuffer || offsetBytes < 0 || lengthBytes <= 0) return 0;
+    if ((lengthBytes & 1) != 0) return 0; // Защита от нечётного количества байт PCM16
+    if ((offsetBytes & 1) != 0) return 0;
 
     const jlong capacity = env->GetDirectBufferCapacity(byteBuffer);
     if (capacity < 0 || (offsetBytes + lengthBytes) > capacity) {
@@ -134,7 +142,9 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackDirect(
     auto *startPtr = reinterpret_cast<int16_t*>(reinterpret_cast<char*>(bufferPtr) + offsetBytes);
     const size_t frames = static_cast<size_t>(lengthBytes) / sizeof(int16_t);
 
-    const size_t writtenFrames = AAudioEngine::getInstance().writePlaybackPcm(startPtr, frames);
+    const size_t writtenFrames = AAudioEngine::getInstance().writePlaybackPcm(
+        startPtr, frames, static_cast<uint64_t>(generation)
+    );
     return static_cast<jint>(writtenFrames * sizeof(int16_t));
 }
 
@@ -157,9 +167,11 @@ Java_com_client_app_audio_NativeAudioBridge_readCaptureDirect(
     return static_cast<jint>(readFrames * sizeof(int16_t));
 }
 
+// AUD-005.6: jlong generation обязателен
 extern "C" JNIEXPORT void JNICALL
-Java_com_client_app_audio_NativeAudioBridge_flushPlayback(JNIEnv * /* env */, jobject /* this */) {
-    AAudioEngine::getInstance().flushPlayback();
+Java_com_client_app_audio_NativeAudioBridge_flushPlayback(
+    JNIEnv * /* env */, jobject /* this */, jlong generation) {
+    AAudioEngine::getInstance().flushPlayback(static_cast<uint64_t>(generation));
 }
 
 extern "C" JNIEXPORT void JNICALL
