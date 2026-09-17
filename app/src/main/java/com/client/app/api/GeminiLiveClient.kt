@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/java/com/client/app/api/GeminiLiveClient.kt
 package com.client.app.api
 
 import kotlinx.coroutines.flow.Flow
@@ -65,7 +66,12 @@ data class ClientTurn(
     val text: String
 )
 
-class AudioFrame(val pcm: ByteArray, val epoch: Long)
+// AUD-005.2: Тройка pcm + epoch + generation
+class AudioFrame(
+    val pcm: ByteArray,
+    val epoch: Long,
+    val generation: Long
+)
 
 data class TranscriptionSettings(
     val enabled: Boolean = true,
@@ -117,6 +123,7 @@ class GeminiLiveClient @Inject constructor(
     val audio: ReceiveChannel<AudioFrame> get() = protobufClient.audio
     val isReady: Boolean get() = protobufClient.isReady
     val epoch: Long get() = protobufClient.epoch
+    val audioGeneration: Long get() = protobufClient.audioGeneration
 
     suspend fun connect(cfg: LiveConfig) = protobufClient.connect(cfg)
     fun sendAudio(pcm: ByteArray) = protobufClient.sendAudioPcm(pcm)
@@ -128,5 +135,10 @@ class GeminiLiveClient @Inject constructor(
         protobufClient.sendClientContent(turns, turnComplete)
     fun sendAudioStreamEnd() = protobufClient.sendAudioStreamEnd()
     fun sendToolResponses(responses: List<ToolResponse>) = protobufClient.sendToolResponses(responses)
+
+    // AUD-005.3: Возвращает Long
+    fun invalidateAudio(): Long = protobufClient.invalidateAudio()
+    fun releaseAudio(bytes: Int) = protobufClient.releaseAudio(bytes)
+
     suspend fun disconnect() = protobufClient.disconnect()
 }
