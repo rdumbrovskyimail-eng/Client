@@ -22,20 +22,58 @@ enum class ClientRole(val value: String) {
 
 sealed interface GeminiEvent {
     data object Connected : GeminiEvent
+
     data object SetupComplete : GeminiEvent
+
     data object Interrupted : GeminiEvent
+
     data object GenerationComplete : GeminiEvent
+
     data object TurnComplete : GeminiEvent
-    data class ModelText(val text: String) : GeminiEvent
-    data class InputTranscript(val text: String, val interim: Boolean) : GeminiEvent
-    data class OutputTranscript(val text: String) : GeminiEvent
-    data class ToolCall(val calls: List<FunctionCall>) : GeminiEvent
-    data class ToolCallCancelled(val ids: List<String>) : GeminiEvent
-    data class GoAway(val millisLeft: Long) : GeminiEvent
-    data class ResumptionHandle(val handle: String) : GeminiEvent
-    data class Usage(val totalTokens: Int) : GeminiEvent
-    data class Error(val message: String, val fatal: Boolean) : GeminiEvent
-    data class Disconnected(val code: Int, val reason: String, val epoch: Long) : GeminiEvent
+
+    data class ModelText(
+        val text: String
+    ) : GeminiEvent
+
+    data class InputTranscript(
+        val text: String,
+        val interim: Boolean
+    ) : GeminiEvent
+
+    data class OutputTranscript(
+        val text: String
+    ) : GeminiEvent
+
+    data class ToolCall(
+        val calls: List<FunctionCall>
+    ) : GeminiEvent
+
+    data class ToolCallCancelled(
+        val ids: List<String>
+    ) : GeminiEvent
+
+    data class GoAway(
+        val millisLeft: Long
+    ) : GeminiEvent
+
+    data class ResumptionHandle(
+        val handle: String
+    ) : GeminiEvent
+
+    data class Usage(
+        val totalTokens: Int
+    ) : GeminiEvent
+
+    data class Error(
+        val message: String,
+        val fatal: Boolean
+    ) : GeminiEvent
+
+    data class Disconnected(
+        val code: Int,
+        val reason: String,
+        val epoch: Long
+    ) : GeminiEvent
 }
 
 data class FunctionCall(
@@ -43,8 +81,14 @@ data class FunctionCall(
     val id: String?,
     val args: JsonObject
 ) {
-    fun getString(key: String, default: String = ""): String =
-        args[key]?.jsonPrimitive?.content ?: default
+    fun getString(
+        key: String,
+        default: String = ""
+    ): String =
+        args[key]
+            ?.jsonPrimitive
+            ?.content
+            ?: default
 }
 
 data class FunctionResponsePart(
@@ -57,7 +101,8 @@ data class ToolResponse(
     val id: String?,
     val response: JsonObject,
     val parts: List<FunctionResponsePart> = emptyList(),
-    val scheduling: FunctionResponseScheduling = FunctionResponseScheduling.WHEN_IDLE,
+    val scheduling: FunctionResponseScheduling =
+        FunctionResponseScheduling.WHEN_IDLE,
     val willContinue: Boolean = false
 )
 
@@ -66,7 +111,7 @@ data class ClientTurn(
     val text: String
 )
 
-// AUD-005.2: Тройка pcm + epoch + generation
+// AUD-005.2
 class AudioFrame(
     val pcm: ByteArray,
     val epoch: Long,
@@ -82,12 +127,16 @@ data class TranscriptionSettings(
 
 data class RealtimeInputSettings(
     val aadEnabled: Boolean = true,
-    val startSensitivity: String = "START_SENSITIVITY_HIGH",
-    val endSensitivity: String = "END_SENSITIVITY_LOW",
+    val startSensitivity: String =
+        "START_SENSITIVITY_HIGH",
+    val endSensitivity: String =
+        "END_SENSITIVITY_LOW",
     val prefixPaddingMs: Int = 60,
     val silenceDurationMs: Int = 600,
-    val activityHandling: String = "START_OF_ACTIVITY_INTERRUPTS",
-    val turnCoverage: String = "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
+    val activityHandling: String =
+        "START_OF_ACTIVITY_INTERRUPTS",
+    val turnCoverage: String =
+        "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
 )
 
 data class CompressionSettings(
@@ -103,42 +152,108 @@ data class LiveConfig(
     val voiceName: String = "Charon",
     val speechLanguage: String? = null,
     val temperature: Float = 0.5f,
-    val mediaResolution: String = "MEDIA_RESOLUTION_HIGH",
-    val inputTranscription: TranscriptionSettings = TranscriptionSettings(),
-    val outputTranscription: TranscriptionSettings = TranscriptionSettings(),
-    val realtimeInput: RealtimeInputSettings = RealtimeInputSettings(),
-    val compression: CompressionSettings = CompressionSettings(),
-    val sessionResumptionEnabled: Boolean = true,
+    val mediaResolution: String =
+        "MEDIA_RESOLUTION_HIGH",
+    val inputTranscription:
+        TranscriptionSettings =
+        TranscriptionSettings(),
+    val outputTranscription:
+        TranscriptionSettings =
+        TranscriptionSettings(),
+    val realtimeInput:
+        RealtimeInputSettings =
+        RealtimeInputSettings(),
+    val compression:
+        CompressionSettings =
+        CompressionSettings(),
+    val sessionResumptionEnabled: Boolean =
+        true,
     val resumptionHandle: String? = null,
     val toolsJson: JsonArray? = null,
     val enableGoogleSearch: Boolean = false,
-    val initialHistory: List<ClientTurn> = emptyList()
+    val initialHistory: List<ClientTurn> =
+        emptyList()
 )
 
 @Singleton
 class GeminiLiveClient @Inject constructor(
-    private val protobufClient: GeminiProtobufLiveClient
+    private val protobufClient:
+        GeminiProtobufLiveClient
 ) {
-    val events: Flow<GeminiEvent> get() = protobufClient.events
-    val audio: ReceiveChannel<AudioFrame> get() = protobufClient.audio
-    val isReady: Boolean get() = protobufClient.isReady
-    val epoch: Long get() = protobufClient.epoch
-    val audioGeneration: Long get() = protobufClient.audioGeneration
 
-    suspend fun connect(cfg: LiveConfig) = protobufClient.connect(cfg)
-    fun sendAudio(pcm: ByteArray) = protobufClient.sendAudioPcm(pcm)
-    fun sendRealtimeText(text: String) = protobufClient.sendRealtimeText(text)
-    fun sendRealtimeImage(jpegBytes: ByteArray) = protobufClient.sendRealtimeImage(jpegBytes)
-    fun sendActivityStart() = protobufClient.sendActivityStart()
-    fun sendActivityEnd() = protobufClient.sendActivityEnd()
-    fun sendClientContent(turns: List<ClientTurn>, turnComplete: Boolean = true) =
-        protobufClient.sendClientContent(turns, turnComplete)
-    fun sendAudioStreamEnd() = protobufClient.sendAudioStreamEnd()
-    fun sendToolResponses(responses: List<ToolResponse>) = protobufClient.sendToolResponses(responses)
+    val events: Flow<GeminiEvent>
+        get() = protobufClient.events
 
-    // AUD-005.3: Возвращает Long
-    fun invalidateAudio(): Long = protobufClient.invalidateAudio()
-    fun releaseAudio(bytes: Int) = protobufClient.releaseAudio(bytes)
+    val audio: ReceiveChannel<AudioFrame>
+        get() = protobufClient.audio
 
-    suspend fun disconnect() = protobufClient.disconnect()
+    val isReady: Boolean
+        get() = protobufClient.isReady
+
+    val epoch: Long
+        get() = protobufClient.epoch
+
+    val audioGeneration: Long
+        get() = protobufClient.audioGeneration
+
+    suspend fun connect(
+        cfg: LiveConfig
+    ) =
+        protobufClient.connect(cfg)
+
+    // AUD-067
+    suspend fun sendAudio(
+        pcm: ByteArray
+    ) =
+        protobufClient.sendAudioPcm(pcm)
+
+    fun sendRealtimeText(
+        text: String
+    ) =
+        protobufClient.sendRealtimeText(text)
+
+    fun sendRealtimeImage(
+        jpegBytes: ByteArray
+    ) =
+        protobufClient.sendRealtimeImage(jpegBytes)
+
+    // AUD-067
+    suspend fun sendActivityStart() =
+        protobufClient.sendActivityStart()
+
+    // AUD-067
+    suspend fun sendActivityEnd() =
+        protobufClient.sendActivityEnd()
+
+    fun sendClientContent(
+        turns: List<ClientTurn>,
+        turnComplete: Boolean = true
+    ) =
+        protobufClient.sendClientContent(
+            turns,
+            turnComplete
+        )
+
+    // AUD-067
+    suspend fun sendAudioStreamEnd() =
+        protobufClient.sendAudioStreamEnd()
+
+    fun sendToolResponses(
+        responses: List<ToolResponse>
+    ) =
+        protobufClient.sendToolResponses(
+            responses
+        )
+
+    // AUD-005.3
+    fun invalidateAudio(): Long =
+        protobufClient.invalidateAudio()
+
+    fun releaseAudio(
+        bytes: Int
+    ) =
+        protobufClient.releaseAudio(bytes)
+
+    suspend fun disconnect() =
+        protobufClient.disconnect()
 }
