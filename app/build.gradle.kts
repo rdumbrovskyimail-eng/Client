@@ -1,3 +1,4 @@
+// >>> FILE: app/build.gradle.kts
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -143,7 +144,6 @@ android {
             isMinifyEnabled = false
         }
     }
-
     tasks.matching { task ->
         task.name == "assembleRelease" ||
         task.name == "bundleRelease" ||
