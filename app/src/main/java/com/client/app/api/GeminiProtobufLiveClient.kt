@@ -5,12 +5,13 @@ import android.util.Base64
 import kotlinx.coroutines.*
 import com.client.app.audio.NativeAudioBridge
 import com.client.app.logging.AppLogManager
-import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.*
@@ -62,6 +63,8 @@ class GeminiProtobufLiveClient @Inject constructor(
         // protect against unbounded incoming model audio backlog.
         private const val MAX_AI_AUDIO_BACKLOG_BYTES =
             4L * 1024L * 1024L
+
+        private const val MAX_DATA_EVENTS_IN_FLIGHT = 256
     }
 
     private val json =
@@ -233,16 +236,45 @@ class GeminiProtobufLiveClient @Inject constructor(
     private val queuedAudioBytes =
         AtomicLong(0L)
 
+    // AUD-006:
+    // One FIFO event ingress preserves the actual server delivery order.
+    // Control events are never rejected. High-frequency data events are
+    // bounded by count and are dropped newest when the data budget is full.
+    // This is deliberately implemented above the Channel rather than with
+    // an eviction policy so an evicted event can never leak ownership
+    // or reorder lifecycle events.
+    private data class QueuedEvent(
+        val epoch: Long,
+        val event: GeminiEvent,
+        val isDataPlane: Boolean
+    )
+
+    private val pendingDataEvents =
+        AtomicLong(0L)
+
     private val _events =
-        MutableSharedFlow<GeminiEvent>(
-            replay = 0,
-            extraBufferCapacity = 512,
-            onBufferOverflow =
-                BufferOverflow.DROP_OLDEST
+        Channel<QueuedEvent>(
+            Channel.UNLIMITED
         )
 
     val events: Flow<GeminiEvent> =
-        _events.asSharedFlow()
+        _events
+            .receiveAsFlow()
+            .onEach { queued ->
+                if (queued.isDataPlane) {
+                    pendingDataEvents.updateAndGet {
+                        (it - 1L).coerceAtLeast(0L)
+                    }
+                }
+            }
+            .filter { queued ->
+                // Old callbacks can still be physically present in the FIFO
+                // after a reconnect. Filter by epoch at consumption so a
+                // stale Interrupted/TurnComplete/etc. can never mutate the
+                // new session state.
+                queued.epoch == epoch
+            }
+            .map { it.event }
 
     // AI output audio is independently bounded by byte accounting.
     private val _audio =
@@ -281,6 +313,48 @@ class GeminiProtobufLiveClient @Inject constructor(
     @Volatile
     private var audioWriterChannel:
         Channel<AudioOutboundCommand>? = null
+
+    private fun emitControlEvent(
+        event: GeminiEvent,
+        eventEpoch: Long
+    ) {
+        _events.trySend(
+            QueuedEvent(
+                epoch = eventEpoch,
+                event = event,
+                isDataPlane = false
+            )
+        )
+    }
+
+    private fun emitDataEvent(
+        event: GeminiEvent,
+        eventEpoch: Long
+    ) {
+        while (true) {
+            val current = pendingDataEvents.get()
+            if (current >= MAX_DATA_EVENTS_IN_FLIGHT) {
+                return
+            }
+            if (pendingDataEvents.compareAndSet(current, current + 1L)) {
+                break
+            }
+        }
+
+        val result = _events.trySend(
+            QueuedEvent(
+                epoch = eventEpoch,
+                event = event,
+                isDataPlane = true
+            )
+        )
+
+        if (result.isFailure) {
+            pendingDataEvents.updateAndGet {
+                (it - 1L).coerceAtLeast(0L)
+            }
+        }
+    }
 
     fun invalidateAudio(): Long {
         val newGeneration =
@@ -394,8 +468,9 @@ class GeminiProtobufLiveClient @Inject constructor(
                             "Соединение открыто! HTTP ${response.code} ${response.message}"
                         )
 
-                        _events.tryEmit(
-                            GeminiEvent.Connected
+                        emitControlEvent(
+                            GeminiEvent.Connected,
+                            myEpoch
                         )
 
                         val setupMsg =
@@ -494,12 +569,13 @@ class GeminiProtobufLiveClient @Inject constructor(
                         isReady = false
                         stopAudioWriter()
 
-                        _events.tryEmit(
+                        emitControlEvent(
                             GeminiEvent.Disconnected(
                                 code,
                                 reason,
                                 myEpoch
-                            )
+                            ),
+                            myEpoch
                         )
                     }
 
@@ -536,19 +612,21 @@ class GeminiProtobufLiveClient @Inject constructor(
                             httpCode == 403 ||
                             httpCode == 404
 
-                        _events.tryEmit(
+                        emitControlEvent(
                             GeminiEvent.Error(
                                 "Сетевой сбой ($httpCode): ${t.localizedMessage}",
                                 fatal
-                            )
+                            ),
+                            myEpoch
                         )
 
-                        _events.tryEmit(
+                        emitControlEvent(
                             GeminiEvent.Disconnected(
                                 httpCode ?: 1006,
                                 t.message.orEmpty(),
                                 myEpoch
-                            )
+                            ),
+                            myEpoch
                         )
                     }
                 }
@@ -1628,8 +1706,9 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 isReady = true
 
-                _events.tryEmit(
-                    GeminiEvent.SetupComplete
+                emitControlEvent(
+                    GeminiEvent.SetupComplete,
+                    myEpoch
                 )
             }
 
@@ -1640,8 +1719,9 @@ class GeminiProtobufLiveClient @Inject constructor(
                 ?.intOrNull
                 ?.let {
 
-                    _events.tryEmit(
-                        GeminiEvent.Usage(it)
+                    emitDataEvent(
+                        GeminiEvent.Usage(it),
+                        myEpoch
                     )
                 }
 
@@ -1684,10 +1764,9 @@ class GeminiProtobufLiveClient @Inject constructor(
                         "Получен сигнал GoAway: осталось $timeLeftMs мс"
                     )
 
-                    _events.tryEmit(
-                        GeminiEvent.GoAway(
-                            timeLeftMs
-                        )
+                    emitControlEvent(
+                        GeminiEvent.GoAway(timeLeftMs),
+                        myEpoch
                     )
                 }
 
@@ -1712,10 +1791,11 @@ class GeminiProtobufLiveClient @Inject constructor(
                         handle.isNotBlank()
                     ) {
 
-                        _events.tryEmit(
+                        emitControlEvent(
                             GeminiEvent.ResumptionHandle(
                                 handle
-                            )
+                            ),
+                            myEpoch
                         )
                     }
                 }
@@ -1760,10 +1840,11 @@ class GeminiProtobufLiveClient @Inject constructor(
                         calls.isNotEmpty()
                     ) {
 
-                        _events.tryEmit(
+                        emitControlEvent(
                             GeminiEvent.ToolCall(
                                 calls
-                            )
+                            ),
+                            myEpoch
                         )
                     }
                 }
@@ -1784,10 +1865,11 @@ class GeminiProtobufLiveClient @Inject constructor(
                         ids.isNotEmpty()
                     ) {
 
-                        _events.tryEmit(
+                        emitControlEvent(
                             GeminiEvent.ToolCallCancelled(
                                 ids
-                            )
+                            ),
+                            myEpoch
                         )
                     }
                 }
@@ -1803,8 +1885,9 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                     if (interrupted) {
 
-                        _events.tryEmit(
-                            GeminiEvent.Interrupted
+                        emitControlEvent(
+                            GeminiEvent.Interrupted,
+                            myEpoch
                         )
 
                         return
@@ -1816,8 +1899,9 @@ class GeminiProtobufLiveClient @Inject constructor(
                             ?.booleanOrNull == true
                     ) {
 
-                        _events.tryEmit(
-                            GeminiEvent.GenerationComplete
+                        emitControlEvent(
+                            GeminiEvent.GenerationComplete,
+                            myEpoch
                         )
                     }
 
@@ -1827,8 +1911,9 @@ class GeminiProtobufLiveClient @Inject constructor(
                             ?.booleanOrNull == true
                     ) {
 
-                        _events.tryEmit(
-                            GeminiEvent.TurnComplete
+                        emitControlEvent(
+                            GeminiEvent.TurnComplete,
+                            myEpoch
                         )
                     }
 
@@ -1843,11 +1928,12 @@ class GeminiProtobufLiveClient @Inject constructor(
                                 it.isNotBlank()
                             ) {
 
-                                _events.tryEmit(
+                                emitDataEvent(
                                     GeminiEvent.InputTranscript(
                                         it,
                                         interim = true
-                                    )
+                                    ),
+                                    myEpoch
                                 )
                             }
                         }
@@ -1863,11 +1949,12 @@ class GeminiProtobufLiveClient @Inject constructor(
                                 it.isNotBlank()
                             ) {
 
-                                _events.tryEmit(
+                                emitControlEvent(
                                     GeminiEvent.InputTranscript(
                                         it,
                                         interim = false
-                                    )
+                                    ),
+                                    myEpoch
                                 )
                             }
                         }
@@ -1883,10 +1970,11 @@ class GeminiProtobufLiveClient @Inject constructor(
                                 it.isNotBlank()
                             ) {
 
-                                _events.tryEmit(
+                                emitControlEvent(
                                     GeminiEvent.OutputTranscript(
                                         it
-                                    )
+                                    ),
+                                    myEpoch
                                 )
                             }
                         }
@@ -1916,10 +2004,11 @@ class GeminiProtobufLiveClient @Inject constructor(
                                             text.isNotBlank()
                                         ) {
 
-                                            _events.tryEmit(
+                                            emitDataEvent(
                                                 GeminiEvent.ModelText(
                                                     text
-                                                )
+                                                ),
+                                                myEpoch
                                             )
                                         }
                                     }
