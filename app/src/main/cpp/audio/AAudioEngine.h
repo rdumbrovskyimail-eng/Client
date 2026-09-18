@@ -1,4 +1,4 @@
-// >>> FILE: app/src/main/cpp/audio/AAudioEngine.h
+
 #pragma once
 
 #include <aaudio/AAudio.h>
@@ -23,6 +23,40 @@ constexpr size_t PLAYBACK_DSP_MAX_OUTPUT_FRAMES = 8192;
 constexpr size_t EARCON_SCRATCH_MAX_FRAMES = 2048;
 constexpr size_t CAPTURE_RAW_SCRATCH_FRAMES = 2048;
 
+struct Biquad {
+    float b0{1.0f};
+    float b1{0.0f};
+    float b2{0.0f};
+    float a1{0.0f};
+    float a2{0.0f};
+    float w1{0.0f};
+    float w2{0.0f};
+
+    void reset();
+    inline float process(float in) {
+        const float w0 = in - a1 * w1 - a2 * w2;
+        const float out = b0 * w0 + b1 * w1 + b2 * w2;
+        w2 = w1;
+        w1 = w0;
+        return out;
+    }
+
+    void makeLowShelf(float fc, float gainDb, float fs);
+    void makeHighShelf(float fc, float gainDb, float fs);
+};
+
+class AnalogVoiceEnhancer {
+public:
+    AnalogVoiceEnhancer();
+    void reset(int32_t sampleRate);
+    void process(int16_t* samples, size_t numFrames, int32_t sampleRate);
+
+private:
+    int32_t currentRate_{48000};
+    Biquad lowShelf_;
+    Biquad highShelf_;
+};
+
 class AAudioEngine {
 public:
     static AAudioEngine& getInstance();
@@ -34,6 +68,10 @@ public:
 
     bool start();
     void stop();
+
+    bool startPlayback();
+    bool startCapture();
+    void stopCapture();
 
     // AUD-005: generation строго обязателен
     size_t writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation);
@@ -89,6 +127,11 @@ private:
                     int32_t outputDeviceId);
 
     void stopLocked();
+    void stopCaptureLocked();
+    void stopPlaybackLocked();
+
+    bool waitForStreamState(AAudioStream* stream, aaudio_stream_state_t desired, int timeoutMs);
+    bool flushOutputStreamLocked(bool resumeAfterFlush);
 
     aaudio_result_t openPlaybackStreamWithFallback(
         int32_t targetPlaybackSampleRate,
@@ -201,6 +244,11 @@ private:
     std::vector<int16_t> captureRawScratchBuffer_;
     std::vector<int16_t> captureDecimateBuffer_;
     std::vector<int16_t> captureInputScratchBuffer_;
+
+    // Stateful playback DSP belongs to this engine instance. Lifecycle code
+    // only resets it while the playback worker is quiescent; the worker itself
+    // owns normal-time processing. This removes the global DSP state race.
+    AnalogVoiceEnhancer voiceEnhancer_;
 
     PolyphaseResampler24To16 resampler24To16_;
     HermiteResampler24To48 resampler24To48_;
