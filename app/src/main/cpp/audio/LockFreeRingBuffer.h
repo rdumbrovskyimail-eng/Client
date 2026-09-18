@@ -12,140 +12,197 @@ namespace client::audio {
 
 template <typename T, size_t Capacity>
 class LockFreeRingBuffer {
-    static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be a power of two");
+    static_assert(
+        (Capacity & (Capacity - 1)) == 0,
+        "Capacity must be a power of two"
+    );
 
 public:
-    LockFreeRingBuffer() : buffer_(Capacity) {
+    LockFreeRingBuffer()
+        : buffer_(Capacity) {
         head_.store(0, std::memory_order_relaxed);
         tail_.store(0, std::memory_order_relaxed);
-        flushGeneration_.store(0, std::memory_order_relaxed);
-        flushAcknowledgedGeneration_.store(0, std::memory_order_relaxed);
     }
 
+    // Strict SPSC contract:
+    //
+    //   exactly one producer may call write()
+    //   exactly one consumer may call read()
+    //
+    //   producer owns tail_
+    //   consumer owns head_
+    //
+    // Lifecycle-only discard/clear operations require full quiescence
+    // of both producer and consumer.
     size_t write(const T* data, size_t count) {
-        if (data == nullptr || count == 0) return 0;
-
-        const size_t current_tail = tail_.load(std::memory_order_relaxed);
-        const size_t current_head = head_.load(std::memory_order_acquire);
-
-        const size_t used = current_tail - current_head;
-        const size_t free_space = (used >= Capacity) ? 0 : (Capacity - used);
-        const size_t to_write = std::min(count, free_space);
-
-        if (to_write == 0) return 0;
-
-        const size_t mask = Capacity - 1;
-        const size_t tail_idx = current_tail & mask;
-        const size_t first_chunk = std::min(to_write, Capacity - tail_idx);
-
-        std::memcpy(&buffer_[tail_idx], data, first_chunk * sizeof(T));
-        if (to_write > first_chunk) {
-            std::memcpy(&buffer_[0], data + first_chunk, (to_write - first_chunk) * sizeof(T));
-        }
-
-        tail_.store(current_tail + to_write, std::memory_order_release);
-        return to_write;
-    }
-
-    size_t read(T* data, size_t count) {
-        if (data == nullptr || count == 0) return 0;
-
-        const uint64_t requested = flushGeneration_.load(std::memory_order_acquire);
-        const uint64_t acknowledged = flushAcknowledgedGeneration_.load(std::memory_order_relaxed);
-
-        if (requested != acknowledged) {
-            const size_t t = tail_.load(std::memory_order_acquire);
-            head_.store(t, std::memory_order_release);
-            flushAcknowledgedGeneration_.store(requested, std::memory_order_release);
+        if (data == nullptr || count == 0) {
             return 0;
         }
 
-        const size_t current_head = head_.load(std::memory_order_relaxed);
-        const size_t current_tail = tail_.load(std::memory_order_acquire);
+        const size_t currentTail =
+            tail_.load(std::memory_order_relaxed);
 
-        const size_t available = current_tail - current_head;
-        const size_t to_read = std::min(count, available);
+        const size_t currentHead =
+            head_.load(std::memory_order_acquire);
 
-        if (to_read == 0) return 0;
+        const size_t used = currentTail - currentHead;
+
+        const size_t freeSpace =
+            (used >= Capacity)
+                ? 0
+                : (Capacity - used);
+
+        const size_t toWrite =
+            std::min(count, freeSpace);
+
+        if (toWrite == 0) {
+            return 0;
+        }
 
         const size_t mask = Capacity - 1;
-        const size_t head_idx = current_head & mask;
-        const size_t first_chunk = std::min(to_read, Capacity - head_idx);
+        const size_t tailIndex = currentTail & mask;
 
-        std::memcpy(data, &buffer_[head_idx], first_chunk * sizeof(T));
-        if (to_read > first_chunk) {
-            std::memcpy(data + first_chunk, &buffer_[0], (to_read - first_chunk) * sizeof(T));
+        const size_t firstChunk =
+            std::min(toWrite, Capacity - tailIndex);
+
+        std::memcpy(
+            &buffer_[tailIndex],
+            data,
+            firstChunk * sizeof(T)
+        );
+
+        if (toWrite > firstChunk) {
+            std::memcpy(
+                &buffer_[0],
+                data + firstChunk,
+                (toWrite - firstChunk) * sizeof(T)
+            );
         }
 
-        head_.store(current_head + to_read, std::memory_order_release);
-        return to_read;
+        tail_.store(
+            currentTail + toWrite,
+            std::memory_order_release
+        );
+
+        return toWrite;
     }
 
+    size_t read(T* data, size_t count) {
+        if (data == nullptr || count == 0) {
+            return 0;
+        }
+
+        const size_t currentHead =
+            head_.load(std::memory_order_relaxed);
+
+        const size_t currentTail =
+            tail_.load(std::memory_order_acquire);
+
+        const size_t available =
+            currentTail - currentHead;
+
+        const size_t toRead =
+            std::min(count, available);
+
+        if (toRead == 0) {
+            return 0;
+        }
+
+        const size_t mask = Capacity - 1;
+        const size_t headIndex = currentHead & mask;
+
+        const size_t firstChunk =
+            std::min(toRead, Capacity - headIndex);
+
+        std::memcpy(
+            data,
+            &buffer_[headIndex],
+            firstChunk * sizeof(T)
+        );
+
+        if (toRead > firstChunk) {
+            std::memcpy(
+                data + firstChunk,
+                &buffer_[0],
+                (toRead - firstChunk) * sizeof(T)
+            );
+        }
+
+        // IMPORTANT:
+        // Only the consumer writes head_.
+        head_.store(
+            currentHead + toRead,
+            std::memory_order_release
+        );
+
+        return toRead;
+    }
+
+    // Lifecycle-only operation.
+    //
+    // Caller MUST guarantee that neither producer nor consumer is
+    // concurrently touching this queue.
+    void discardAllQuiesced() {
+        const size_t tail =
+            tail_.load(std::memory_order_acquire);
+
+        head_.store(
+            tail,
+            std::memory_order_release
+        );
+    }
+
+    // Retained for lifecycle code.
+    // Same full-quiescence requirement.
     void discardAll() {
-        const size_t t = tail_.load(std::memory_order_acquire);
-        head_.store(t, std::memory_order_release);
-        const uint64_t requested = flushGeneration_.load(std::memory_order_acquire);
-        flushAcknowledgedGeneration_.store(requested, std::memory_order_release);
+        discardAllQuiesced();
     }
 
+    // Lifecycle-only.
     void clear() {
-        head_.store(0, std::memory_order_relaxed);
-        tail_.store(0, std::memory_order_relaxed);
-        flushGeneration_.store(0, std::memory_order_relaxed);
-        flushAcknowledgedGeneration_.store(0, std::memory_order_relaxed);
+        head_.store(
+            0,
+            std::memory_order_relaxed
+        );
+
+        tail_.store(
+            0,
+            std::memory_order_relaxed
+        );
     }
 
-    uint64_t requestFlush(uint64_t generation) {
-        if (generation == 0) {
-            return flushGeneration_.load(std::memory_order_acquire);
-        }
-
-        uint64_t current = flushGeneration_.load(std::memory_order_acquire);
-        while (generation > current) {
-            if (flushGeneration_.compare_exchange_weak(
-                    current, generation,
-                    std::memory_order_release,
-                    std::memory_order_acquire)) {
-                return generation;
-            }
-        }
-        return current;
-    }
-
-    uint64_t getFlushGeneration() const {
-        return flushGeneration_.load(std::memory_order_acquire);
-    }
-
-    uint64_t getFlushAcknowledgedGeneration() const {
-        return flushAcknowledgedGeneration_.load(std::memory_order_acquire);
-    }
-
-    bool isFlushAcknowledged(uint64_t generation) const {
-        return flushAcknowledgedGeneration_.load(std::memory_order_acquire) >= generation;
-    }
-
-    // AUD-002: Consumer side: own head relaxed, producer tail acquire
     size_t availableRead() const {
-        const size_t h = head_.load(std::memory_order_relaxed);
-        const size_t t = tail_.load(std::memory_order_acquire);
-        return (t - h);
+        const size_t h =
+            head_.load(std::memory_order_relaxed);
+
+        const size_t t =
+            tail_.load(std::memory_order_acquire);
+
+        return t - h;
     }
 
-    // AUD-002: Producer side: own tail relaxed, consumer head acquire
     size_t availableWrite() const {
-        const size_t h = head_.load(std::memory_order_acquire);
-        const size_t t = tail_.load(std::memory_order_relaxed);
+        const size_t h =
+            head_.load(std::memory_order_acquire);
+
+        const size_t t =
+            tail_.load(std::memory_order_relaxed);
+
         const size_t used = t - h;
-        return (used >= Capacity) ? 0 : (Capacity - used);
+
+        return (used >= Capacity)
+            ? 0
+            : (Capacity - used);
     }
 
 private:
     std::vector<T> buffer_;
 
-    alignas(64) std::atomic<size_t> head_{0};
-    alignas(64) std::atomic<size_t> tail_{0};
-    alignas(64) std::atomic<uint64_t> flushGeneration_{0};
-    alignas(64) std::atomic<uint64_t> flushAcknowledgedGeneration_{0};
+    alignas(64)
+    std::atomic<size_t> head_{0};
+
+    alignas(64)
+    std::atomic<size_t> tail_{0};
 };
 
 } // namespace client::audio
