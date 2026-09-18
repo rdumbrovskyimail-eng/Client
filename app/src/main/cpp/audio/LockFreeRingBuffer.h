@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/cpp/audio/LockFreeRingBuffer.h
 #pragma once
 
 #include <atomic>
@@ -143,7 +144,6 @@ public:
                 (toRead - firstChunk) * sizeof(T)
             );
         }
-
         // IMPORTANT:
         // Only the consumer writes head_.
         head_.store(
@@ -227,7 +227,6 @@ public:
 
 private:
     std::vector<T> buffer_;
-
     alignas(64)
     std::atomic<size_t> head_{0};
 
