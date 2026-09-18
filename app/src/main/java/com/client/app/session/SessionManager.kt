@@ -170,6 +170,12 @@ class SessionManager @Inject constructor(
     @Volatile private var reconnectAttempts = 0
     @Volatile private var pendingGoAway = false
     @Volatile private var activeConnectUsedResumption = false
+
+    // Single source of truth for the user's desired session connectivity.
+    // Reconnect, event, and UI paths all consult this flag to distinguish
+    // an intentional stop from an unexpected transport disconnect.
+    @Volatile private var connectionDesired = false
+
     @Volatile private var userMicDesired = false
     @Volatile private var hasReceivedAudioTranscript = false
 
