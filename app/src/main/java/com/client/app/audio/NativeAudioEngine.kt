@@ -222,6 +222,12 @@ class NativeAudioEngine @Inject constructor(
     private val captureDirectMutex =
         Mutex()
 
+    // Serializes all playback-affecting native operations and the
+    // generation/flush transaction. ReentrantLock is required because
+    // invalidateAndFlushPlayback() is intentionally non-suspending.
+    private val playbackOperationLock =
+        ReentrantLock()
+
     private val routeTransitionChannel =
         Channel<RouteTransitionRequest>(
             Channel.CONFLATED
