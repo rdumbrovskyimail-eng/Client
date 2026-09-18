@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/cpp/audio/LockFreeRingBuffer.h
 #pragma once
 
 #include <atomic>
@@ -6,15 +5,25 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <type_traits>
 #include <cstdint>
+#include <limits>
 
 namespace client::audio {
 
 template <typename T, size_t Capacity>
 class LockFreeRingBuffer {
     static_assert(
+        std::is_trivially_copyable_v<T>,
+        "LockFreeRingBuffer requires trivially copyable elements"
+    );
+    static_assert(
         (Capacity & (Capacity - 1)) == 0,
         "Capacity must be a power of two"
+    );
+    static_assert(
+        Capacity < (std::numeric_limits<size_t>::max() / 2),
+        "Capacity must be small enough for unambiguous monotonic index arithmetic"
     );
 
 public:
@@ -98,8 +107,15 @@ public:
         const size_t currentTail =
             tail_.load(std::memory_order_acquire);
 
-        const size_t available =
+        // Monotonic indices intentionally use unsigned wraparound arithmetic.
+        // The invariant is that producer/consumer distance never exceeds
+        // Capacity. Clamp defensively so a corrupted invariant cannot turn
+        // into an oversized memcpy.
+        const size_t distance =
             currentTail - currentHead;
+
+        const size_t available =
+            std::min(distance, Capacity);
 
         const size_t toRead =
             std::min(count, available);
@@ -140,59 +156,73 @@ public:
 
     // Lifecycle-only operation.
     //
-    // Caller MUST guarantee that neither producer nor consumer is
-    // concurrently touching this queue.
-    void discardAllQuiesced() {
+    // PRECONDITION: the queue is fully quiescent. Neither the producer nor
+    // the consumer may be executing write()/read() concurrently.
+    //
+    // This function intentionally has a quiescence-specific name so that a
+    // lifecycle reset cannot be mistaken for a concurrent queue operation.
+    void discardAllQuiesced() noexcept {
+        // PRECONDITION: neither side is executing read()/write().
+        // The AAudio playback producer additionally serializes its commit
+        // with playbackControlMutex_, which is held by flushPlayback().
         const size_t tail =
-            tail_.load(std::memory_order_acquire);
+            tail_.load(std::memory_order_seq_cst);
 
         head_.store(
             tail,
-            std::memory_order_release
+            std::memory_order_seq_cst
         );
     }
 
-    // Retained for lifecycle code.
-    // Same full-quiescence requirement.
-    void discardAll() {
-        discardAllQuiesced();
-    }
-
-    // Lifecycle-only.
-    void clear() {
+    // Lifecycle-only operation.
+    //
+    // PRECONDITION: full quiescence of both sides. Resetting both indices is
+    // safe only while no producer/consumer is accessing the queue.
+    void resetQuiesced() noexcept {
         head_.store(
             0,
-            std::memory_order_relaxed
+            std::memory_order_seq_cst
         );
 
         tail_.store(
             0,
-            std::memory_order_relaxed
+            std::memory_order_seq_cst
         );
     }
 
     size_t availableRead() const {
+        // Consumer view: head is owned locally; tail is published by the
+        // producer with release, therefore acquire is required for the
+        // producer's committed payload/index.
         const size_t h =
             head_.load(std::memory_order_relaxed);
 
         const size_t t =
             tail_.load(std::memory_order_acquire);
 
-        return t - h;
+        const size_t distance =
+            t - h;
+
+        return std::min(distance, Capacity);
     }
 
     size_t availableWrite() const {
+        // Producer view: tail is owned locally; head is published by the
+        // consumer with release, therefore acquire is required before
+        // reusing the freed slots.
         const size_t h =
             head_.load(std::memory_order_acquire);
 
         const size_t t =
             tail_.load(std::memory_order_relaxed);
 
-        const size_t used = t - h;
+        const size_t distance =
+            t - h;
 
-        return (used >= Capacity)
-            ? 0
-            : (Capacity - used);
+        const size_t used =
+            std::min(distance, Capacity);
+
+        return Capacity - used;
     }
 
 private:
