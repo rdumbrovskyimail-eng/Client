@@ -81,6 +81,7 @@ data class ToolCallKey(
     val epoch: Long,
     val callId: String
 )
+
 @Singleton
 class SessionManager @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -259,7 +260,7 @@ class SessionManager @Inject constructor(
             _state.update { it.copy(error = "Нет соединения с сервером") }
             return@launch
         }
-        
+
         client.sendClientContent(
             turns = listOf(ClientTurn(role = ClientRole.USER, text = trimmed)),
             turnComplete = true
@@ -342,7 +343,13 @@ class SessionManager @Inject constructor(
             val apiKey = cryptoManager.decrypt(prefs[KEY_API]?.trim().orEmpty())
             val forvoOn = prefs[KEY_ENABLE_FORVO] ?: false
 
-            addMessage(ChatMessage(role = ClientRole.USER, text = text.ifEmpty { "Изучи приложенный документ." }, attachmentNames = processed.accepted))
+            addMessage(
+                ChatMessage(
+                    role = ClientRole.USER,
+                    text = text.ifEmpty { "Изучи приложенный документ." },
+                    attachmentNames = processed.accepted
+                )
+            )
 
             val result = extractor.analyze(
                 apiKey = apiKey,
@@ -360,17 +367,27 @@ class SessionManager @Inject constructor(
                     }
                     if (!ensureLive()) return
                     client.sendClientContent(
-                        turns = listOf(ClientTurn(role = ClientRole.USER, text = a.fullText.take(15000))),
+                        turns = listOf(
+                            ClientTurn(
+                                role = ClientRole.USER,
+                                text = a.fullText.take(15000)
+                            )
+                        ),
                         turnComplete = true
                     )
                 }
+
                 is AnalysisResult.Failure -> {
-                    _state.update { it.copy(error = "Ошибка анализа: ${result.reason}") }
+                    _state.update {
+                        it.copy(error = "Ошибка анализа: ${result.reason}")
+                    }
                 }
             }
         } catch (e: Exception) {
             logger.e("Attachment error", e)
-            _state.update { it.copy(error = "Сбой обработки файлов: ${e.localizedMessage}") }
+            _state.update {
+                it.copy(error = "Сбой обработки файлов: ${e.localizedMessage}")
+            }
         } finally {
             _state.update { it.copy(isAnalyzing = false) }
         }
@@ -378,6 +395,7 @@ class SessionManager @Inject constructor(
 
     private suspend fun ensureLive(): Boolean {
         if (client.isReady) return true
+
         if (_state.value.link == LinkState.IDLE) {
             mutex.withLock {
                 userStopped = false
@@ -385,8 +403,11 @@ class SessionManager @Inject constructor(
                 startInternal(resume = false)
             }
         }
+
         return withTimeoutOrNull(8000L) {
-            while (!client.isReady) delay(40)
+            while (!client.isReady) {
+                delay(40)
+            }
             true
         } == true
     }
@@ -395,20 +416,33 @@ class SessionManager @Inject constructor(
         putJsonArray("functionDeclarations") {
             addJsonObject {
                 put("name", "lookup_pronunciation")
-                put("description", "Запрашивает аудиозаписи произношения слов носителями языка из базы Forvo.")
+                put(
+                    "description",
+                    "Запрашивает аудиозаписи произношения слов носителями языка из базы Forvo."
+                )
                 put("behavior", "NON_BLOCKING")
+
                 putJsonObject("parameters") {
                     put("type", "OBJECT")
+
                     putJsonObject("properties") {
                         putJsonObject("words") {
                             put("type", "STRING")
-                            put("description", "Слово или список слов через запятую для поиска произношения.")
+                            put(
+                                "description",
+                                "Слово или список слов через запятую для поиска произношения."
+                            )
                         }
+
                         putJsonObject("language") {
                             put("type", "STRING")
-                            put("description", "Двухбуквенный код языка ISO 639-1 (например, 'de', 'en', 'fr', 'es'). По умолчанию 'de'.")
+                            put(
+                                "description",
+                                "Двухбуквенный код языка ISO 639-1 (например, 'de', 'en', 'fr', 'es'). По умолчанию 'de'."
+                            )
                         }
                     }
+
                     putJsonArray("required") {
                         add(JsonPrimitive("words"))
                     }
@@ -416,6 +450,7 @@ class SessionManager @Inject constructor(
             }
         }
     }
+
     private fun recentHistory(maxTurns: Int): List<ClientTurn> {
         val raw = _state.value.messages
             .filter { !it.interim && it.text.isNotBlank() }
@@ -423,87 +458,158 @@ class SessionManager @Inject constructor(
         if (raw.isEmpty()) return emptyList()
 
         val merged = mutableListOf<ClientTurn>()
+
         for (msg in raw) {
             val last = merged.lastOrNull()
+
             if (last != null && last.role == msg.role) {
-                merged[merged.size - 1] = ClientTurn(msg.role, "${last.text}\n\n${msg.text.trim()}")
+                merged[merged.size - 1] = ClientTurn(
+                    msg.role,
+                    "${last.text}\n\n${msg.text.trim()}"
+                )
             } else {
-                merged.add(ClientTurn(msg.role, msg.text.trim()))
+                merged.add(
+                    ClientTurn(
+                        msg.role,
+                        msg.text.trim()
+                    )
+                )
             }
         }
 
-        var slice = merged.takeLast(maxTurns.coerceIn(1, 100))
+        var slice = merged.takeLast(
+            maxTurns.coerceIn(1, 100)
+        )
+
         while (slice.isNotEmpty() && slice.first().role != ClientRole.USER) {
             slice = slice.drop(1)
         }
+
         return slice
     }
 
     private suspend fun startInternal(resume: Boolean) {
         activeConnectUsedResumption = resume
+
         synchronized(reconnectGuard) {
             goAwayJob?.cancel()
             goAwayJob = null
         }
+
         pendingGoAway = false
         hasReceivedAudioTranscript = false
         isManualActivityActive.set(false)
 
         val prefs = dataStore.data.first()
-        val apiKey = cryptoManager.decrypt(prefs[KEY_API]?.trim().orEmpty())
+        val apiKey = cryptoManager.decrypt(
+            prefs[KEY_API]?.trim().orEmpty()
+        )
+
         if (apiKey.isEmpty()) {
-            _state.update { it.copy(error = "Укажите Gemini API Key в Настройках", link = LinkState.IDLE) }
+            _state.update {
+                it.copy(
+                    error = "Укажите Gemini API Key в Настройках",
+                    link = LinkState.IDLE
+                )
+            }
             return
         }
 
         val voice = prefs[KEY_VOICE]?.ifBlank { null } ?: "Charon"
-        val speechLang = prefs[KEY_SPEECH_LANGUAGE]?.takeIf { it.isNotBlank() }
+        val speechLang = prefs[KEY_SPEECH_LANGUAGE]
+            ?.takeIf { it.isNotBlank() }
         val temperature = prefs[KEY_TEMPERATURE] ?: 0.5f
-        val mediaResolution = prefs[KEY_MEDIA_RESOLUTION] ?: "MEDIA_RESOLUTION_HIGH"
+        val mediaResolution =
+            prefs[KEY_MEDIA_RESOLUTION] ?: "MEDIA_RESOLUTION_HIGH"
 
         val inputTx = TranscriptionSettings(
             enabled = prefs[KEY_INPUT_TRANSCRIPTION_ENABLED] ?: true,
-            languageCodes = prefs[KEY_INPUT_TRANSCRIPTION_LANGUAGES]?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() } ?: emptyList(),
-            customVocabulary = prefs[KEY_INPUT_TRANSCRIPTION_VOCAB]?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() }?.take(1000) ?: emptyList(),
+            languageCodes =
+                prefs[KEY_INPUT_TRANSCRIPTION_LANGUAGES]
+                    ?.split(",")
+                    ?.map { it.trim() }
+                    ?.filter { it.isNotBlank() }
+                    ?: emptyList(),
+            customVocabulary =
+                prefs[KEY_INPUT_TRANSCRIPTION_VOCAB]
+                    ?.split(",")
+                    ?.map { it.trim() }
+                    ?.filter { it.isNotBlank() }
+                    ?.take(1000)
+                    ?: emptyList(),
             mode = prefs[KEY_INPUT_TRANSCRIPTION_MODE] ?: "VERBATIM"
         )
 
         val outputTx = TranscriptionSettings(
             enabled = prefs[KEY_OUTPUT_TRANSCRIPTION_ENABLED] ?: true,
-            languageCodes = prefs[KEY_OUTPUT_TRANSCRIPTION_LANGUAGES]?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() } ?: emptyList(),
-            customVocabulary = prefs[KEY_OUTPUT_TRANSCRIPTION_VOCAB]?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() }?.take(1000) ?: emptyList(),
+            languageCodes =
+                prefs[KEY_OUTPUT_TRANSCRIPTION_LANGUAGES]
+                    ?.split(",")
+                    ?.map { it.trim() }
+                    ?.filter { it.isNotBlank() }
+                    ?: emptyList(),
+            customVocabulary =
+                prefs[KEY_OUTPUT_TRANSCRIPTION_VOCAB]
+                    ?.split(",")
+                    ?.map { it.trim() }
+                    ?.filter { it.isNotBlank() }
+                    ?.take(1000)
+                    ?: emptyList(),
             mode = prefs[KEY_OUTPUT_TRANSCRIPTION_MODE] ?: "VERBATIM"
         )
 
         val aadEnabled = prefs[KEY_AAD_ENABLED] ?: true
         currentAadEnabled = aadEnabled
-        
+
         audioEngine.isAadMode = aadEnabled
 
         val realtimeInput = RealtimeInputSettings(
             aadEnabled = aadEnabled,
-            startSensitivity = prefs[KEY_AAD_START_SENSITIVITY] ?: "START_SENSITIVITY_HIGH",
-            endSensitivity = prefs[KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_LOW",
-            prefixPaddingMs = prefs[KEY_PREFIX_PADDING_MS] ?: 60,
-            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 600,
-            activityHandling = prefs[KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
-            turnCoverage = prefs[KEY_TURN_COVERAGE] ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
+            startSensitivity =
+                prefs[KEY_AAD_START_SENSITIVITY]
+                    ?: "START_SENSITIVITY_HIGH",
+            endSensitivity =
+                prefs[KEY_AAD_END_SENSITIVITY]
+                    ?: "END_SENSITIVITY_LOW",
+            prefixPaddingMs =
+                prefs[KEY_PREFIX_PADDING_MS] ?: 60,
+            silenceDurationMs =
+                prefs[KEY_SILENCE_DURATION_MS] ?: 600,
+            activityHandling =
+                prefs[KEY_ACTIVITY_HANDLING]
+                    ?: "START_OF_ACTIVITY_INTERRUPTS",
+            turnCoverage =
+                prefs[KEY_TURN_COVERAGE]
+                    ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
         )
 
         val compression = CompressionSettings(
             enabled = prefs[KEY_COMPRESSION_ENABLED] ?: true,
-            triggerTokens = prefs[KEY_COMPRESSION_TRIGGER_TOKENS] ?: 0,
-            targetTokens = prefs[KEY_COMPRESSION_TARGET_TOKENS] ?: 0
+            triggerTokens =
+                prefs[KEY_COMPRESSION_TRIGGER_TOKENS] ?: 0,
+            targetTokens =
+                prefs[KEY_COMPRESSION_TARGET_TOKENS] ?: 0
         )
 
-        val resumptionEnabled = prefs[KEY_SESSION_RESUMPTION_ENABLED] ?: true
-        val maxHistoryTurns = prefs[KEY_INITIAL_HISTORY_TURNS] ?: 20
+        val resumptionEnabled =
+            prefs[KEY_SESSION_RESUMPTION_ENABLED] ?: true
+        val maxHistoryTurns =
+            prefs[KEY_INITIAL_HISTORY_TURNS] ?: 20
 
-        audioEngine.setVolume(prefs[KEY_VOLUME] ?: 1.0f)
-        audioEngine.setMicGain(prefs[KEY_MIC_GAIN] ?: 1.0f)
+        audioEngine.setVolume(
+            prefs[KEY_VOLUME] ?: 1.0f
+        )
+        audioEngine.setMicGain(
+            prefs[KEY_MIC_GAIN] ?: 1.0f
+        )
 
         if (!audioEngine.start()) {
-            _state.update { it.copy(error = "Сбой инициализации аудиодрайвера", link = LinkState.IDLE) }
+            _state.update {
+                it.copy(
+                    error = "Сбой инициализации аудиодрайвера",
+                    link = LinkState.IDLE
+                )
+            }
             return
         }
 
@@ -512,17 +618,29 @@ class SessionManager @Inject constructor(
         }
 
         _state.update {
-            it.copy(link = if (resume) LinkState.RECONNECTING else LinkState.CONNECTING, error = null)
+            it.copy(
+                link = if (resume) {
+                    LinkState.RECONNECTING
+                } else {
+                    LinkState.CONNECTING
+                },
+                error = null
+            )
         }
 
-        val forvoEnabled = prefs[KEY_ENABLE_FORVO] ?: false
-        val searchEnabled = prefs[KEY_ENABLE_SEARCH] ?: false
+        val forvoEnabled =
+            prefs[KEY_ENABLE_FORVO] ?: false
+        val searchEnabled =
+            prefs[KEY_ENABLE_SEARCH] ?: false
 
-        val dynamicTools = if (forvoEnabled) {
-            buildJsonArray { add(buildForvoToolDeclaration()) }
-        } else {
-            null
-        }
+        val dynamicTools =
+            if (forvoEnabled) {
+                buildJsonArray {
+                    add(buildForvoToolDeclaration())
+                }
+            } else {
+                null
+            }
 
         client.connect(
             LiveConfig(
@@ -538,10 +656,20 @@ class SessionManager @Inject constructor(
                 realtimeInput = realtimeInput,
                 compression = compression,
                 sessionResumptionEnabled = resumptionEnabled,
-                resumptionHandle = if (resume && resumptionEnabled) resumptionHandle else null,
+                resumptionHandle =
+                    if (resume && resumptionEnabled) {
+                        resumptionHandle
+                    } else {
+                        null
+                    },
                 toolsJson = dynamicTools,
                 enableGoogleSearch = searchEnabled,
-                initialHistory = if (resume) emptyList() else recentHistory(maxHistoryTurns)
+                initialHistory =
+                    if (resume) {
+                        emptyList()
+                    } else {
+                        recentHistory(maxHistoryTurns)
+                    }
             )
         )
     }
@@ -549,7 +677,9 @@ class SessionManager @Inject constructor(
     private suspend fun stopInternal(full: Boolean) {
         pendingGoAway = false
         hasReceivedAudioTranscript = false
+
         cancelReconnectWork()
+
         if (full) {
             cancelAllPendingToolJobs()
         }
@@ -565,8 +695,13 @@ class SessionManager @Inject constructor(
             val newGen = client.invalidateAudio()
             audioEngine.flushPlayback(newGen)
         }
+
         _state.update {
-            it.copy(link = LinkState.IDLE, isAiSpeaking = false, isMicActive = false)
+            it.copy(
+                link = LinkState.IDLE,
+                isAiSpeaking = false,
+                isMicActive = false
+            )
         }
     }
 
@@ -579,11 +714,14 @@ class SessionManager @Inject constructor(
     private fun cancelReconnectWork() {
         synchronized(reconnectGuard) {
             reconnectToken.incrementAndGet()
+
             reconnectJob?.cancel()
             reconnectJob = null
+
             goAwayJob?.cancel()
             goAwayJob = null
         }
+
         pendingGoAway = false
     }
 
@@ -594,6 +732,7 @@ class SessionManager @Inject constructor(
         if (userStopped) return
 
         val token: Long
+
         synchronized(reconnectGuard) {
             if (
                 _state.value.link == LinkState.IDLE ||
@@ -613,8 +752,11 @@ class SessionManager @Inject constructor(
                         ) {
                             userStopped = true
                             stopInternal(full = true)
+
                             _state.update {
-                                it.copy(error = "Соединение потеряно: $reason")
+                                it.copy(
+                                    error = "Соединение потеряно: $reason"
+                                )
                             }
                         }
                     }
@@ -623,21 +765,35 @@ class SessionManager @Inject constructor(
             }
 
             token = reconnectToken.incrementAndGet()
+
             reconnectJob = scope.launch {
                 try {
                     val attempt = ++reconnectAttempts
+
                     _state.update {
                         it.copy(link = LinkState.RECONNECTING)
                     }
 
                     val baseDelay =
                         minOf(
-                            400L * (1L shl (attempt - 1).coerceAtMost(4)),
+                            400L *
+                                (
+                                    1L shl
+                                        (attempt - 1)
+                                            .coerceAtMost(4)
+                                ),
                             6000L
                         )
 
                     val jitteredDelay =
-                        (baseDelay * (0.8 + Math.random() * 0.4)).toLong()
+                        (
+                            baseDelay *
+                                (
+                                    0.8 +
+                                        Math.random() *
+                                        0.4
+                                )
+                            ).toLong()
 
                     delay(jitteredDelay)
 
@@ -668,7 +824,7 @@ class SessionManager @Inject constructor(
 
                             val useResume =
                                 resumptionHandle != null &&
-                                attempt <= 2
+                                    attempt <= 2
 
                             startInternal(
                                 resume = useResume
@@ -688,6 +844,7 @@ class SessionManager @Inject constructor(
                             reconnectJob = null
                         }
                     }
+
                     if (
                         !userStopped &&
                         _state.value.link != LinkState.IDLE
@@ -699,6 +856,7 @@ class SessionManager @Inject constructor(
                             resumptionHandle = null
                             activeConnectUsedResumption = false
                         }
+
                         scheduleReconnect(
                             "ошибка попытки reconnect: ${t.localizedMessage}",
                             client.epoch
@@ -720,68 +878,120 @@ class SessionManager @Inject constructor(
             if (currentAadEnabled) {
                 client.sendAudioStreamEnd()
             } else {
-                if (isManualActivityActive.compareAndSet(true, false) && client.isReady) {
+                if (
+                    isManualActivityActive.compareAndSet(
+                        true,
+                        false
+                    ) &&
+                    client.isReady
+                ) {
                     client.sendActivityEnd()
                 }
             }
-        } ?: logger.w("SessionManager: bounded mic activity finalization timed out")
+        } ?: logger.w(
+            "SessionManager: bounded mic activity finalization timed out"
+        )
     }
 
     private suspend fun startMic() = micMutex.withLock {
         if (_state.value.isMicActive) return@withLock
+
         userMicDesired = true
         isManualActivityActive.set(false)
 
         if (!audioEngine.start()) {
-            _state.update { it.copy(error = "Микрофон недоступен") }
+            _state.update {
+                it.copy(error = "Микрофон недоступен")
+            }
             return@withLock
         }
-        _state.update { it.copy(isMicActive = true) }
+
+        _state.update {
+            it.copy(isMicActive = true)
+        }
 
         micJob = scope.launch {
             for (event in audioEngine.micOutput) {
                 if (!isActive) break
+
                 when (event) {
                     is AudioStreamEvent.SpeechStart -> {
-                        if (!currentAadEnabled && client.isReady) {
-                            if (isManualActivityActive.compareAndSet(false, true)) {
-                                logger.d("SessionManager: VAD SpeechStart (Manual VAD) -> sendActivityStart")
+                        if (
+                            !currentAadEnabled &&
+                            client.isReady
+                        ) {
+                            if (
+                                isManualActivityActive.compareAndSet(
+                                    false,
+                                    true
+                                )
+                            ) {
+                                logger.d(
+                                    "SessionManager: VAD SpeechStart (Manual VAD) -> sendActivityStart"
+                                )
                                 client.sendActivityStart()
                             }
                         }
                     }
+
                     is AudioStreamEvent.Audio -> {
                         try {
                             if (!forvoPlayer.isPlaying.value) {
-                                if (currentAadEnabled || isManualActivityActive.get()) {
+                                if (
+                                    currentAadEnabled ||
+                                    isManualActivityActive.get()
+                                ) {
                                     client.sendAudioPcm(event.pcm)
                                 }
                             }
                         } finally {
-                            audioEngine.releaseCapturedBuffer(event.pcm)
+                            audioEngine.releaseCapturedBuffer(
+                                event.pcm
+                            )
                         }
                     }
+
                     is AudioStreamEvent.SpeechEnd -> {
                         if (!currentAadEnabled) {
-                            if (isManualActivityActive.compareAndSet(true, false) && client.isReady) {
+                            if (
+                                isManualActivityActive.compareAndSet(
+                                    true,
+                                    false
+                                ) &&
+                                client.isReady
+                            ) {
                                 withTimeoutOrNull(500L) {
                                     client.sendActivityEnd()
-                                } ?: logger.w("SessionManager: SpeechEnd activityEnd timed out")
+                                } ?: logger.w(
+                                    "SessionManager: SpeechEnd activityEnd timed out"
+                                )
                             }
                         }
                     }
+
                     is AudioStreamEvent.StreamStop -> {
                         if (currentAadEnabled) {
                             withTimeoutOrNull(500L) {
                                 client.sendAudioStreamEnd()
-                            } ?: logger.w("SessionManager: StreamStop audioStreamEnd timed out")
+                            } ?: logger.w(
+                                "SessionManager: StreamStop audioStreamEnd timed out"
+                            )
                         } else {
-                            if (isManualActivityActive.compareAndSet(true, false) && client.isReady) {
+                            if (
+                                isManualActivityActive.compareAndSet(
+                                    true,
+                                    false
+                                ) &&
+                                client.isReady
+                            ) {
                                 withTimeoutOrNull(500L) {
                                     client.sendActivityEnd()
-                                } ?: logger.w("SessionManager: StreamStop activityEnd timed out")
+                                } ?: logger.w(
+                                    "SessionManager: StreamStop activityEnd timed out"
+                                )
                             }
                         }
+
                         break
                     }
                 }
@@ -795,34 +1005,54 @@ class SessionManager @Inject constructor(
         if (userInitiated) {
             userMicDesired = false
         }
+
         if (!_state.value.isMicActive) {
             return@withLock
         }
 
-        val producerResult = audioEngine.stopCaptureGraceful(gracefulTimeoutMs = 1500L)
-        if (producerResult == CaptureShutdownResult.FORCED_TIMEOUT) {
-            logger.w("SessionManager: producer shutdown forced")
+        val producerResult =
+            audioEngine.stopCaptureGraceful(
+                gracefulTimeoutMs = 1500L
+            )
+
+        if (
+            producerResult ==
+            CaptureShutdownResult.FORCED_TIMEOUT
+        ) {
+            logger.w(
+                "SessionManager: producer shutdown forced"
+            )
         }
 
         val consumerJob = micJob
-        val consumerCompleted = if (consumerJob == null) {
-            true
-        } else {
-            withTimeoutOrNull(1500L) {
-                consumerJob.join()
+
+        val consumerCompleted =
+            if (consumerJob == null) {
                 true
-            } ?: false
-        }
+            } else {
+                withTimeoutOrNull(1500L) {
+                    consumerJob.join()
+                    true
+                } ?: false
+            }
+
         if (!consumerCompleted && consumerJob != null) {
-            logger.w("SessionManager: micJob consumer timeout; forcing bounded cancellation")
+            logger.w(
+                "SessionManager: micJob consumer timeout; forcing bounded cancellation"
+            )
+
             consumerJob.cancel()
-            val cancelledAndJoined = withTimeoutOrNull(100L) {
-                consumerJob.join()
-                true
-            } ?: false
+
+            val cancelledAndJoined =
+                withTimeoutOrNull(100L) {
+                    consumerJob.join()
+                    true
+                } ?: false
 
             if (!cancelledAndJoined) {
-                logger.e("SessionManager: micJob did not terminate after bounded cancellation")
+                logger.e(
+                    "SessionManager: micJob did not terminate after bounded cancellation"
+                )
             }
 
             finalizeMicActivityBounded()
@@ -843,8 +1073,14 @@ class SessionManager @Inject constructor(
                 if (frame.epoch != client.epoch) continue
                 if (frame.generation != client.audioGeneration) continue
 
-                _state.update { it.copy(isAiSpeaking = true) }
-                audioEngine.enqueuePlayback(frame.pcm, frame.generation)
+                _state.update {
+                    it.copy(isAiSpeaking = true)
+                }
+
+                audioEngine.enqueuePlayback(
+                    frame.pcm,
+                    frame.generation
+                )
             } finally {
                 client.releaseAudio(frame.pcm.size)
             }
@@ -855,10 +1091,14 @@ class SessionManager @Inject constructor(
     private fun observeBargeIn() = scope.launch {
         audioEngine.bargeInEvents.collect {
             val newGen = client.invalidateAudio()
+
             audioEngine.flushPlayback(newGen)
             audioEngine.triggerBargeInEarcon()
 
-            _state.update { it.copy(isAiSpeaking = false) }
+            _state.update {
+                it.copy(isAiSpeaking = false)
+            }
+
             streamingRole = null
             hasReceivedAudioTranscript = false
         }
@@ -866,9 +1106,18 @@ class SessionManager @Inject constructor(
 
     private fun observeFocus() = scope.launch {
         audioEngine.focusLost.collect { lost ->
-            if (lost && _state.value.isMicActive) {
+            if (
+                lost &&
+                _state.value.isMicActive
+            ) {
                 stopMic(userInitiated = false)
-                _state.update { it.copy(error = "Аудио прервано другим приложением или вызовом") }
+
+                _state.update {
+                    it.copy(
+                        error =
+                            "Аудио прервано другим приложением или вызовом"
+                    )
+                }
             }
         }
     }
@@ -879,52 +1128,100 @@ class SessionManager @Inject constructor(
                 is GeminiEvent.SetupComplete -> {
                     reconnectAttempts = 0
                     pendingGoAway = false
+
                     synchronized(reconnectGuard) {
                         goAwayJob?.cancel()
                         goAwayJob = null
                     }
-                    _state.update { it.copy(link = LinkState.LIVE, error = null) }
-                    if (userMicDesired) scope.launch { startMic() }
+
+                    _state.update {
+                        it.copy(
+                            link = LinkState.LIVE,
+                            error = null
+                        )
+                    }
+
+                    if (userMicDesired) {
+                        scope.launch {
+                            startMic()
+                        }
+                    }
                 }
-                is GeminiEvent.ResumptionHandle -> resumptionHandle = event.handle
+
+                is GeminiEvent.ResumptionHandle -> {
+                    resumptionHandle = event.handle
+                }
+
                 is GeminiEvent.GoAway -> {
                     val sourceEpoch = client.epoch
                     pendingGoAway = true
 
                     synchronized(reconnectGuard) {
                         goAwayJob?.cancel()
+
                         goAwayJob = scope.launch {
                             try {
-                                delay(maxOf(event.millisLeft - 2000L, 1000L))
+                                delay(
+                                    maxOf(
+                                        event.millisLeft - 2000L,
+                                        1000L
+                                    )
+                                )
+
                                 if (
                                     pendingGoAway &&
                                     !userStopped &&
                                     client.epoch == sourceEpoch
                                 ) {
                                     pendingGoAway = false
+
                                     scheduleReconnect(
                                         "дедлайн goAway",
                                         sourceEpoch
                                     )
                                 }
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (t: Throwable) {
+                                logger.e(
+                                    "SessionManager: GoAway scheduler failed",
+                                    t
+                                )
+                            } finally {
+                                synchronized(reconnectGuard) {
+                                    if (
+                                        goAwayJob ==
+                                        coroutineContext[Job]
+                                    ) {
+                                        goAwayJob = null
+                                    }
+                                }
                             }
                         }
                     }
                 }
+
                 // AUD-005.12: Единый вызов invalidateAudio() при Interrupted через SessionManager
                 is GeminiEvent.Interrupted -> {
                     val newGen = client.invalidateAudio()
+
                     audioEngine.flushPlayback(newGen)
                     audioEngine.resetBargeInState()
-                    _state.update { it.copy(isAiSpeaking = false) }
+
+                    _state.update {
+                        it.copy(isAiSpeaking = false)
+                    }
+
                     streamingRole = null
                     hasReceivedAudioTranscript = false
                 }
+
                 is GeminiEvent.GenerationComplete -> {
                     streamingRole = null
                     hasReceivedAudioTranscript = false
                     audioEngine.resetBargeInState()
                 }
+
                 is GeminiEvent.TurnComplete -> {
                     streamingRole = null
                     hasReceivedAudioTranscript = false
@@ -932,7 +1229,9 @@ class SessionManager @Inject constructor(
 
                     val shouldPlanGoAway = pendingGoAway
                     val sourceEpoch = client.epoch
+
                     pendingGoAway = false
+
                     synchronized(reconnectGuard) {
                         goAwayJob?.cancel()
                         goAwayJob = null
@@ -940,7 +1239,10 @@ class SessionManager @Inject constructor(
 
                     scope.launch {
                         delay(80)
-                        _state.update { it.copy(isAiSpeaking = false) }
+
+                        _state.update {
+                            it.copy(isAiSpeaking = false)
+                        }
 
                         if (
                             shouldPlanGoAway &&
@@ -955,41 +1257,86 @@ class SessionManager @Inject constructor(
                         }
                     }
                 }
-                is GeminiEvent.InputTranscript -> appendTranscript(ClientRole.USER, event.text, event.interim)
+
+                is GeminiEvent.InputTranscript -> {
+                    appendTranscript(
+                        ClientRole.USER,
+                        event.text,
+                        event.interim
+                    )
+                }
+
                 is GeminiEvent.OutputTranscript -> {
                     hasReceivedAudioTranscript = true
-                    appendTranscript(ClientRole.MODEL, event.text, false)
+
+                    appendTranscript(
+                        ClientRole.MODEL,
+                        event.text,
+                        false
+                    )
                 }
+
                 is GeminiEvent.ModelText -> Unit
-                is GeminiEvent.Usage -> _state.update { it.copy(tokensUsed = event.totalTokens) }
-                is GeminiEvent.ToolCall -> handleToolCall(event.calls)
-                is GeminiEvent.ToolCallCancelled -> {
-                    val currentEpoch = client.epoch
-                    event.ids.forEach { id ->
-                        val key = ToolCallKey(currentEpoch, id)
-                        cancelledToolCallKeys.add(key)
-                        activeToolJobs.remove(key)?.cancel()
+
+                is GeminiEvent.Usage -> {
+                    _state.update {
+                        it.copy(
+                            tokensUsed = event.totalTokens
+                        )
                     }
                 }
+
+                is GeminiEvent.ToolCall -> {
+                    handleToolCall(event.calls)
+                }
+
+                is GeminiEvent.ToolCallCancelled -> {
+                    val currentEpoch = client.epoch
+
+                    event.ids.forEach { id ->
+                        val key = ToolCallKey(
+                            currentEpoch,
+                            id
+                        )
+
+                        cancelledToolCallKeys.add(key)
+                        activeToolJobs
+                            .remove(key)
+                            ?.cancel()
+                    }
+                }
+
                 is GeminiEvent.Error -> {
-                    _state.update { it.copy(error = event.message) }
+                    _state.update {
+                        it.copy(error = event.message)
+                    }
+
                     if (activeConnectUsedResumption) {
                         resumptionHandle = null
                         activeConnectUsedResumption = false
                     }
+
                     if (event.fatal) {
                         userStopped = true
-                        scope.launch { mutex.withLock { stopInternal(full = true) } }
+
+                        scope.launch {
+                            mutex.withLock {
+                                stopInternal(full = true)
+                            }
+                        }
                     }
                 }
+
                 is GeminiEvent.Disconnected -> {
-                    if (event.epoch != client.epoch) return@collect
+                    if (event.epoch != client.epoch) {
+                        return@collect
+                    }
 
                     val authOrClientFatal =
                         event.code == 400 ||
-                        event.code == 401 ||
-                        event.code == 403 ||
-                        event.code == 404
+                            event.code == 401 ||
+                            event.code == 403 ||
+                            event.code == 404
 
                     if (activeConnectUsedResumption) {
                         resumptionHandle = null
@@ -999,11 +1346,13 @@ class SessionManager @Inject constructor(
                     if (authOrClientFatal) {
                         userStopped = true
                         cancelReconnectWork()
+
                         scope.launch {
                             mutex.withLock {
                                 stopInternal(full = true)
                             }
                         }
+
                         return@collect
                     }
 
@@ -1014,30 +1363,45 @@ class SessionManager @Inject constructor(
                         )
                     }
                 }
+
                 else -> Unit
             }
         }
     }
 
-    private fun handleToolCall(calls: List<FunctionCall>) {
+    private fun handleToolCall(
+        calls: List<FunctionCall>
+    ) {
         val currentEpoch = client.epoch
+
         for (call in calls) {
             val callId = call.id
+
             if (callId.isNullOrBlank()) {
                 client.sendToolResponses(
                     listOf(
                         ToolResponse(
                             name = call.name,
                             id = null,
-                            response = buildJsonObject { put("error", "missing_call_id") },
-                            scheduling = FunctionResponseScheduling.SILENT
+                            response = buildJsonObject {
+                                put(
+                                    "error",
+                                    "missing_call_id"
+                                )
+                            },
+                            scheduling =
+                                FunctionResponseScheduling.SILENT
                         )
                     )
                 )
+
                 continue
             }
 
-            val key = ToolCallKey(currentEpoch, callId)
+            val key = ToolCallKey(
+                currentEpoch,
+                callId
+            )
 
             if (call.name != "lookup_pronunciation") {
                 client.sendToolResponses(
@@ -1045,86 +1409,177 @@ class SessionManager @Inject constructor(
                         ToolResponse(
                             name = call.name,
                             id = callId,
-                            response = buildJsonObject { put("error", "unknown_tool") },
-                            scheduling = FunctionResponseScheduling.SILENT
+                            response = buildJsonObject {
+                                put(
+                                    "error",
+                                    "unknown_tool"
+                                )
+                            },
+                            scheduling =
+                                FunctionResponseScheduling.SILENT
                         )
                     )
                 )
+
                 continue
             }
 
             val rawWords = call.getString("words")
-            val lang = call.getString("language", default = "de").ifBlank { "de" }
+
+            val lang = call.getString(
+                "language",
+                default = "de"
+            ).ifBlank {
+                "de"
+            }
 
             val list = runCatching {
-                Json.parseToJsonElement(rawWords).jsonArray.map { it.jsonPrimitive.content }
-            }.getOrElse { rawWords.split(",").map { it.trim() } }
+                Json.parseToJsonElement(rawWords)
+                    .jsonArray
+                    .map {
+                        it.jsonPrimitive.content
+                    }
+            }.getOrElse {
+                rawWords
+                    .split(",")
+                    .map { it.trim() }
+            }
                 .filter { it.isNotBlank() }
-                .distinctBy { it.lowercase() }
+                .distinctBy {
+                    it.lowercase()
+                }
                 .take(40)
-            val job = scope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
-                try {
-                    if (list.isNotEmpty()) {
-                        val existing = _state.value.forvoWords.map { it.query.lowercase() }.toSet()
-                        val fresh = list.filter { it.lowercase() !in existing }
-                        if (fresh.isNotEmpty()) {
-                            _state.update { s ->
-                                s.copy(forvoWords = s.forvoWords + fresh.map {
-                                    ForvoWord(word = it, query = it, language = lang)
-                                })
-                            }
-                            forvoRepo.lookupBatch(fresh, lang) { q, res ->
-                                if (currentEpoch != client.epoch || cancelledToolCallKeys.contains(key) || !coroutineContext.isActive) {
-                                    return@lookupBatch
+
+            val job =
+                scope.launch(
+                    Dispatchers.IO,
+                    start = CoroutineStart.LAZY
+                ) {
+                    try {
+                        if (list.isNotEmpty()) {
+                            val existing =
+                                _state.value.forvoWords
+                                    .map {
+                                        it.query.lowercase()
+                                    }
+                                    .toSet()
+
+                            val fresh =
+                                list.filter {
+                                    it.lowercase() !in existing
                                 }
+
+                            if (fresh.isNotEmpty()) {
                                 _state.update { s ->
-                                    s.copy(forvoWords = s.forvoWords.map { w ->
-                                        if (!w.query.equals(q, true)) w
-                                        else when (res) {
-                                            is ForvoResult.Found -> w.copy(
-                                                audioUrl = res.pronunciation.mp3Url,
-                                                isLoading = false, notFound = false
-                                            )
-                                            else -> w.copy(isLoading = false, notFound = true)
-                                        }
-                                    })
+                                    s.copy(
+                                        forvoWords =
+                                            s.forvoWords +
+                                                fresh.map {
+                                                    ForvoWord(
+                                                        word = it,
+                                                        query = it,
+                                                        language = lang
+                                                    )
+                                                }
+                                    )
+                                }
+
+                                forvoRepo.lookupBatch(
+                                    fresh,
+                                    lang
+                                ) { q, res ->
+                                    if (
+                                        currentEpoch != client.epoch ||
+                                        cancelledToolCallKeys.contains(key) ||
+                                        !coroutineContext.isActive
+                                    ) {
+                                        return@lookupBatch
+                                    }
+
+                                    _state.update { s ->
+                                        s.copy(
+                                            forvoWords =
+                                                s.forvoWords.map { w ->
+                                                    if (
+                                                        !w.query.equals(
+                                                            q,
+                                                            true
+                                                        )
+                                                    ) {
+                                                        w
+                                                    } else {
+                                                        when (res) {
+                                                            is ForvoResult.Found ->
+                                                                w.copy(
+                                                                    audioUrl =
+                                                                        res.pronunciation.mp3Url,
+                                                                    isLoading = false,
+                                                                    notFound = false
+                                                                )
+
+                                                            else ->
+                                                                w.copy(
+                                                                    isLoading = false,
+                                                                    notFound = true
+                                                                )
+                                                        }
+                                                    }
+                                                }
+                                        )
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    if (currentEpoch != client.epoch || cancelledToolCallKeys.contains(key) || !isActive) {
-                        return@launch
-                    }
+                        if (
+                            currentEpoch != client.epoch ||
+                            cancelledToolCallKeys.contains(key) ||
+                            !isActive
+                        ) {
+                            return@launch
+                        }
 
-                    val respPayload = buildJsonObject {
-                        put("status", "ok")
-                        put("accepted_words_count", list.size)
-                    }
+                        val respPayload =
+                            buildJsonObject {
+                                put("status", "ok")
+                                put(
+                                    "accepted_words_count",
+                                    list.size
+                                )
+                            }
 
-                    client.sendToolResponses(
-                        listOf(
-                            ToolResponse(
-                                name = call.name,
-                                id = callId,
-                                response = respPayload,
-                                scheduling = FunctionResponseScheduling.WHEN_IDLE,
-                                willContinue = false
+                        client.sendToolResponses(
+                            listOf(
+                                ToolResponse(
+                                    name = call.name,
+                                    id = callId,
+                                    response = respPayload,
+                                    scheduling =
+                                        FunctionResponseScheduling.WHEN_IDLE,
+                                    willContinue = false
+                                )
                             )
                         )
-                    )
-                } finally {
-                    activeToolJobs.remove(key)
+                    } finally {
+                        activeToolJobs.remove(key)
+                    }
                 }
-            }
 
-            val existing = activeToolJobs.putIfAbsent(key, job)
+            val existing =
+                activeToolJobs.putIfAbsent(
+                    key,
+                    job
+                )
+
             if (existing == null) {
                 if (currentEpoch == client.epoch) {
                     job.start()
                 } else {
                     job.cancel()
-                    activeToolJobs.remove(key, job)
+                    activeToolJobs.remove(
+                        key,
+                        job
+                    )
                 }
             } else {
                 job.cancel()
@@ -1132,44 +1587,118 @@ class SessionManager @Inject constructor(
         }
     }
 
-    private fun appendTranscript(role: ClientRole, text: String, interim: Boolean) {
+    private fun appendTranscript(
+        role: ClientRole,
+        text: String,
+        interim: Boolean
+    ) {
         _state.update { s ->
             val list = s.messages.toMutableList()
+
             if (interim) {
-                val idx = list.indexOfLast { it.role == role && it.interim }
-                val msg = ChatMessage(role = role, text = text, interim = true)
-                if (idx >= 0) list[idx] = list[idx].copy(text = text) else list.add(msg)
-                return@update s.copy(messages = list.takeLast(MAX_MESSAGES))
+                val idx =
+                    list.indexOfLast {
+                        it.role == role &&
+                            it.interim
+                    }
+
+                val msg = ChatMessage(
+                    role = role,
+                    text = text,
+                    interim = true
+                )
+
+                if (idx >= 0) {
+                    list[idx] =
+                        list[idx].copy(
+                            text = text
+                        )
+                } else {
+                    list.add(msg)
+                }
+
+                return@update s.copy(
+                    messages =
+                        list.takeLast(MAX_MESSAGES)
+                )
             }
-            list.removeAll { it.role == role && it.interim }
+
+            list.removeAll {
+                it.role == role &&
+                    it.interim
+            }
+
             val last = list.lastOrNull()
-            if (streamingRole == role && last != null && last.role == role && !last.interim) {
-                list[list.size - 1] = last.copy(text = last.text + text)
+
+            if (
+                streamingRole == role &&
+                last != null &&
+                last.role == role &&
+                !last.interim
+            ) {
+                list[list.size - 1] =
+                    last.copy(
+                        text =
+                            last.text + text
+                    )
             } else {
-                list.add(ChatMessage(role = role, text = text))
+                list.add(
+                    ChatMessage(
+                        role = role,
+                        text = text
+                    )
+                )
+
                 streamingRole = role
             }
-            s.copy(messages = list.takeLast(MAX_MESSAGES))
+
+            s.copy(
+                messages =
+                    list.takeLast(MAX_MESSAGES)
+            )
         }
     }
 
-    private fun addMessage(msg: ChatMessage) {
+    private fun addMessage(
+        msg: ChatMessage
+    ) {
         streamingRole = null
         hasReceivedAudioTranscript = false
-        _state.update { it.copy(messages = (it.messages + msg).takeLast(MAX_MESSAGES)) }
+
+        _state.update {
+            it.copy(
+                messages =
+                    (
+                        it.messages + msg
+                    ).takeLast(MAX_MESSAGES)
+            )
+        }
     }
 
     private fun observeSettings() = scope.launch {
         dataStore.data.collect { prefs ->
-            audioEngine.setVolume(prefs[KEY_VOLUME] ?: 1.0f)
-            audioEngine.setMicGain(prefs[KEY_MIC_GAIN] ?: 1.0f)
+            audioEngine.setVolume(
+                prefs[KEY_VOLUME] ?: 1.0f
+            )
+
+            audioEngine.setMicGain(
+                prefs[KEY_MIC_GAIN] ?: 1.0f
+            )
         }
     }
 
     private fun startForegroundService() {
-        val intent = Intent(context, LiveSessionForegroundService::class.java)
+        val intent =
+            Intent(
+                context,
+                LiveSessionForegroundService::class.java
+            )
+
         runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (
+                Build.VERSION.SDK_INT >=
+                Build.VERSION_CODES.O
+            ) {
                 context.startForegroundService(intent)
             } else {
                 context.startService(intent)
@@ -1178,6 +1707,13 @@ class SessionManager @Inject constructor(
     }
 
     private fun stopForegroundService() {
-        runCatching { context.stopService(Intent(context, LiveSessionForegroundService::class.java)) }
+        runCatching {
+            context.stopService(
+                Intent(
+                    context,
+                    LiveSessionForegroundService::class.java
+                )
+            )
+        }
     }
 }
