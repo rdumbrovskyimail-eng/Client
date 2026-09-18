@@ -1,4 +1,4 @@
-// >>> FILE: app/src/main/java/com/client/app/audio/NativeAudioEngine.kt
+
 package com.client.app.audio
 
 import android.content.Context
@@ -24,6 +24,7 @@ import java.nio.ByteOrder
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -206,6 +207,15 @@ class NativeAudioEngine @Inject constructor(
 
     private var spectrumJob:
         Job? = null
+
+    private var healthJob:
+        Job? = null
+
+    // Identifies the currently active capture loop. Failure cleanup checks
+    // this token so an old loop can never stop a newer capture session.
+    private val captureInstanceId =
+        AtomicLong(0L)
+
     private val audioLifecycleMutex =
         Mutex()
 
@@ -217,9 +227,25 @@ class NativeAudioEngine @Inject constructor(
             Channel.CONFLATED
         )
 
-    // Internal route lifecycle generation.
+    // Internal route lifecycle generation. This is deliberately separate from
+    // playbackGeneration: route transitions and playback invalidation are two
+    // independent synchronization domains.
     private val engineGeneration =
         AtomicLong(0)
+
+    // P0-09/P0-10: the single authoritative playback-generation owner.
+    // The native flush is performed before this value is published, so there is
+    // no Kotlin-visible "new generation" window during which old native audio
+    // can still be considered current.
+    private val playbackGeneration =
+        AtomicLong(1L)
+
+    private val playbackStartGeneration =
+        AtomicLong(0L)
+
+
+    val currentPlaybackGeneration: Long
+        get() = playbackGeneration.get()
 
     @Volatile
     private var streamStopGeneration:
@@ -281,14 +307,6 @@ class NativeAudioEngine @Inject constructor(
     private var bargeInLeaseJob:
         Job? = null
 
-    // IMPORTANT:
-    // This is the same generation domain that comes from
-    // GeminiProtobufLiveClient AudioFrame.generation.
-    //
-    // engineGeneration above is intentionally NOT compared
-    // with this value.
-    private val currentPlaybackGeneration =
-        AtomicLong(0L)
     init {
         engineScope.launch {
             for (
@@ -426,55 +444,44 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    suspend fun start():
-        Boolean =
+    /**
+     * Compatibility entry point for legacy callers. New lifecycle code must
+     * use startPlayback() and startCapture() independently.
+     */
+    suspend fun start(): Boolean {
+        if (!startPlayback()) return false
+        if (startCapture()) return true
+        stop()
+        return false
+    }
+
+    /**
+     * Starts the playback side without opening/starting microphone capture.
+     * SessionManager uses this while a Live session is connecting or idle at
+     * the microphone level.
+     */
+    suspend fun startPlayback(): Boolean =
         audioLifecycleMutex.withLock {
-
             withContext(Dispatchers.IO) {
-
-                if (_isCapturing.value) {
+                if (_isPlaying.value) {
                     return@withContext true
                 }
 
                 if (!requestAudioFocus()) {
-
                     logger.e(
                         "NativeAudioEngine: Сбой запроса AudioFocus"
                     )
-
                     return@withContext false
                 }
 
-                // AUD-070:
-                // Do not silently hide a broken production VAD model.
-                if (!vadDetector.prepare()) {
-
-                    logger.e(
-                        "NativeAudioEngine: Silero VAD model is unavailable or invalid"
-                    )
-
-                    router.stop()
-                    abandonAudioFocus()
-
-                    return@withContext false
-                }
-
-                vadDetector.resetState()
-                resetBargeInState()
-
-                val currentGen =
-                    engineGeneration.get()
-
-                streamStopGeneration =
-                    -1L
+                streamStopGeneration = -1L
 
                 router.start { profile ->
-
                     routeTransitionChannel
                         .trySend(
                             RouteTransitionRequest(
                                 profile,
-                                currentGen
+                                engineGeneration.get()
                             )
                         )
                 }
@@ -484,32 +491,30 @@ class NativeAudioEngine @Inject constructor(
 
                 val inited =
                     captureDirectMutex.withLock {
-
-                        bridge.initAudioRoute(
-                            isBluetooth =
-                                profile.path ==
-                                    AudioRoutePath
-                                        .CMF_BUDS_WIRELESS,
-
-                            sampleRate =
-                                profile.sampleRateOut,
-
-                            inputDeviceId =
-                                profile.inputDeviceId,
-                            outputDeviceId =
-                                profile.outputDeviceId
-                        )
+                        playbackOperationLock.lock()
+                        try {
+                            bridge.initAudioRoute(
+                                isBluetooth =
+                                    profile.path ==
+                                        AudioRoutePath.CMF_BUDS_WIRELESS,
+                                sampleRate =
+                                    profile.sampleRateOut,
+                                inputDeviceId =
+                                    profile.inputDeviceId,
+                                outputDeviceId =
+                                    profile.outputDeviceId
+                            )
+                        } finally {
+                            playbackOperationLock.unlock()
+                        }
                     }
 
                 if (!inited) {
-
                     logger.e(
-                        "NativeAudioEngine: Сбой инициализации audio route"
+                        "NativeAudioEngine: Сбой инициализации playback route"
                     )
-
                     router.stop()
                     abandonAudioFocus()
-
                     return@withContext false
                 }
 
@@ -518,38 +523,117 @@ class NativeAudioEngine @Inject constructor(
                     profile.vadThresholdEnd
                 )
 
+                // Establish the current native playback epoch before the first
+                // callback can consume application audio. No generation is
+                // incremented here; this is only initial physical alignment.
+                captureDirectMutex.withLock {
+                    playbackOperationLock.lock()
+                    try {
+                        bridge.flushPlayback(currentPlaybackGeneration)
+                    } finally {
+                        playbackOperationLock.unlock()
+                    }
+                }
+
                 val started =
                     captureDirectMutex.withLock {
-                        bridge.startAudio()
+                        playbackOperationLock.lock()
+                        try {
+                            bridge.startPlaybackAudio()
+                        } finally {
+                            playbackOperationLock.unlock()
+                        }
                     }
 
                 if (!started) {
-
                     logger.e(
-                        "NativeAudioEngine: Сбой запуска AAudio"
+                        "NativeAudioEngine: Сбой запуска playback AAudio"
                     )
-
+                    captureDirectMutex.withLock {
+                        playbackOperationLock.lock()
+                        try {
+                            bridge.stopAudio()
+                        } finally {
+                            playbackOperationLock.unlock()
+                        }
+                    }
                     router.stop()
                     abandonAudioFocus()
-
                     return@withContext false
                 }
 
-                _isCapturing.value =
-                    true
-                _isPlaying.value =
-                    true
-
+                _isPlaying.value = true
                 startLoops()
+                true
+            }
+        }
 
+    /**
+     * Starts only microphone capture. Playback owns the initialized audio
+     * route and remains untouched by this operation.
+     */
+    suspend fun startCapture(): Boolean =
+        audioLifecycleMutex.withLock {
+            withContext(Dispatchers.IO) {
+                if (_isCapturing.value) {
+                    return@withContext true
+                }
+
+                if (!_isPlaying.value) {
+                    logger.e(
+                        "NativeAudioEngine: Нельзя запустить capture без активного playback"
+                    )
+                    return@withContext false
+                }
+
+                if (!vadDetector.prepare()) {
+                    logger.e(
+                        "NativeAudioEngine: Silero VAD model is unavailable or invalid"
+                    )
+                    return@withContext false
+                }
+
+                vadDetector.resetState()
+                resetBargeInState()
+
+                val profile =
+                    router.currentProfile.value
+                vadDetector.setThresholds(
+                    profile.vadThresholdStart,
+                    profile.vadThresholdEnd
+                )
+
+                streamStopGeneration = -1L
+
+                val started =
+                    captureDirectMutex.withLock {
+                        bridge.startCaptureAudio()
+                    }
+
+                if (!started) {
+                    logger.e(
+                        "NativeAudioEngine: Сбой запуска capture AAudio"
+                    )
+                    return@withContext false
+                }
+
+                _isCapturing.value = true
+                captureInstanceId.incrementAndGet()
+                startLoops()
                 true
             }
         }
 
     private fun startLoops() {
 
-        captureJob =
-            engineScope.launch {
+        if (
+            _isCapturing.value &&
+            captureJob?.isActive != true
+        ) {
+            val instanceId = captureInstanceId.get()
+
+            captureJob =
+                engineScope.launch {
 
                 Process.setThreadPriority(
                     Process.THREAD_PRIORITY_URGENT_AUDIO
@@ -557,32 +641,11 @@ class NativeAudioEngine @Inject constructor(
 
                 var isSpeechActiveManual =
                     false
-                while (
-                    isActive &&
-                    _isCapturing.value
-                ) {
-
-                    if (
-                        bridge.isAudioDisconnected()
+                try {
+                    while (
+                        isActive &&
+                        _isCapturing.value
                     ) {
-
-                        logger.w(
-                            "NativeAudioEngine: Обнаружен дисконнект AAudio, восстанавливаем поток..."
-                        )
-
-                        applyRouteInternal(
-                            RouteTransitionRequest(
-                                router
-                                    .currentProfile
-                                    .value,
-                                engineGeneration.get()
-                            )
-                        )
-
-                        delay(50)
-
-                        continue
-                    }
 
                     captureDirectBuffer.clear()
 
@@ -947,10 +1010,40 @@ class NativeAudioEngine @Inject constructor(
                         delay(2)
                     }
                 }
+            } catch (t: Throwable) {
+                if (t !is CancellationException) {
+                    logger.e(
+                        "NativeAudioEngine: capture loop failed",
+                        t
+                    )
+                }
+                throw t
+            } finally {
+                if (captureInstanceId.get() == instanceId) {
+                    _isCapturing.value = false
+                    enqueueStreamStopOnce(engineGeneration.get())
+                    runCatching {
+                        captureDirectMutex.withLock {
+                            bridge.stopCaptureAudio()
+                        }
+                    }.onFailure {
+                        logger.e(
+                            "NativeAudioEngine: failed to stop capture after loop termination",
+                            it
+                        )
+                    }
+                }
             }
+        }
 
-        spectrumJob =
-            engineScope.launch {
+        }
+
+        if (
+            _isPlaying.value &&
+            spectrumJob?.isActive != true
+        ) {
+            spectrumJob =
+                engineScope.launch {
 
                 var tick = 0
                 while (isActive) {
@@ -999,6 +1092,44 @@ class NativeAudioEngine @Inject constructor(
                     delay(8)
                 }
             }
+        }
+
+        if (
+            _isPlaying.value &&
+            healthJob?.isActive != true
+        ) {
+            healthJob =
+                engineScope.launch {
+                    while (
+                        isActive &&
+                        (_isPlaying.value || _isCapturing.value)
+                    ) {
+                        try {
+                            if (bridge.isAudioDisconnected()) {
+                                logger.w(
+                                    "NativeAudioEngine: AAudio health fault detected; restarting active streams"
+                                )
+
+                                applyRouteInternal(
+                                    RouteTransitionRequest(
+                                        router.currentProfile.value,
+                                        engineGeneration.get()
+                                    )
+                                )
+                            }
+                        } catch (t: Throwable) {
+                            if (t !is CancellationException) {
+                                logger.e(
+                                    "NativeAudioEngine: audio recovery attempt failed",
+                                    t
+                                )
+                            }
+                        }
+
+                        delay(100)
+                    }
+                }
+        }
     }
 
     private suspend fun applyRouteInternal(
@@ -1025,48 +1156,72 @@ class NativeAudioEngine @Inject constructor(
                     return@withContext
                 }
 
+                val keepPlaying = _isPlaying.value
+                val keepCapturing = _isCapturing.value
+
+                if (keepPlaying) {
+                    invalidateAndFlushPlayback("route recovery")
+                }
+
                 captureDirectMutex.withLock {
+                    playbackOperationLock.lock()
+                    try {
+                        // initAudioRoute() closes/recreates both AAudio streams.
+                        // Restart only the logical streams that were active before
+                        // the transition; capture may remain OFF while playback
+                        // continues.
+                        bridge.stopAudio()
 
-                    bridge.stopAudio()
+                        val success =
+                            bridge.initAudioRoute(
+                                isBluetooth =
+                                    req.profile.path ==
+                                        AudioRoutePath
+                                            .CMF_BUDS_WIRELESS,
+                                sampleRate =
+                                    req.profile.sampleRateOut,
 
-                    val success =
-                        bridge.initAudioRoute(
-                            isBluetooth =
-                                req.profile.path ==
-                                    AudioRoutePath
-                                        .CMF_BUDS_WIRELESS,
-                            sampleRate =
-                                req.profile.sampleRateOut,
+                                inputDeviceId =
+                                    req.profile.inputDeviceId,
 
-                            inputDeviceId =
-                                req.profile.inputDeviceId,
+                                outputDeviceId =
+                                    req.profile.outputDeviceId
+                            )
 
-                            outputDeviceId =
-                                req.profile.outputDeviceId
-                        )
+                        if (!success) {
+                            logger.e(
+                                "NativeAudioEngine: route reinitialization failed"
+                            )
+                        } else {
+                            vadDetector.setThresholds(
+                                req.profile
+                                    .vadThresholdStart,
 
-                    if (!success) {
+                                req.profile
+                                    .vadThresholdEnd
+                            )
 
-                        logger.e(
-                            "NativeAudioEngine: route reinitialization failed"
-                        )
+                            val playbackRecovered =
+                                !keepPlaying || bridge.startPlaybackAudio()
 
-                        return@withLock
-                    }
+                            if (!playbackRecovered) {
+                                logger.e(
+                                    "NativeAudioEngine: не удалось восстановить playback после смены route; health loop повторит попытку"
+                                )
+                            }
 
-                    vadDetector.setThresholds(
-                        req.profile
-                            .vadThresholdStart,
-
-                        req.profile
-                            .vadThresholdEnd
-                    )
-
-                    if (
-                        _isCapturing.value
-                    ) {
-
-                        bridge.startAudio()
+                            if (keepCapturing) {
+                                val captureRecovered =
+                                    bridge.startCaptureAudio()
+                                if (!captureRecovered) {
+                                    logger.e(
+                                        "NativeAudioEngine: не удалось восстановить capture после смены route; health loop повторит попытку"
+                                    )
+                                }
+                            }
+                        }
+                    } finally {
+                        playbackOperationLock.unlock()
                     }
                 }
             }
@@ -1130,6 +1285,7 @@ class NativeAudioEngine @Inject constructor(
 
                 _isCapturing.value =
                     false
+                captureInstanceId.incrementAndGet()
 
                 val job =
                     captureJob
@@ -1165,6 +1321,12 @@ class NativeAudioEngine @Inject constructor(
 
                 captureJob = null
 
+                // AAudio requestStop is asynchronous; do it only after the
+                // Kotlin capture consumer has stopped touching the stream.
+                captureDirectMutex.withLock {
+                    bridge.stopCaptureAudio()
+                }
+
                 synchronized(
                     poolLock
                 ) {
@@ -1194,26 +1356,6 @@ class NativeAudioEngine @Inject constructor(
         audioLifecycleMutex.withLock {
 
             withContext(Dispatchers.IO) {
-
-                if (
-                    !_isCapturing.value &&
-                    !_isPlaying.value
-                ) {
-
-                    engineGeneration
-                        .incrementAndGet()
-
-                    streamStopGeneration =
-                        -1L
-
-                    while (
-                        routeTransitionChannel
-                            .tryReceive()
-                            .isSuccess
-                    ) {}
-
-                    return@withContext
-                }
 
                 _isCapturing.value =
                     false
@@ -1258,9 +1400,23 @@ class NativeAudioEngine @Inject constructor(
 
                 spectrumJob = null
 
-                captureDirectMutex.withLock {
+                healthJob?.let {
+                    if (it.isActive) {
+                        it.cancel()
+                        withTimeoutOrNull(500L) {
+                            it.join()
+                        }
+                    }
+                }
+                healthJob = null
 
-                    bridge.stopAudio()
+                captureDirectMutex.withLock {
+                    playbackOperationLock.lock()
+                    try {
+                        bridge.stopAudio()
+                    } finally {
+                        playbackOperationLock.unlock()
+                    }
                 }
                 abandonAudioFocus()
 
@@ -1312,12 +1468,34 @@ class NativeAudioEngine @Inject constructor(
             )
         )
 
+    // P0-09/P0-10: one owner, one transition operation.
+    // The generation change and the physical native flush are serialized with
+    // every other playback-affecting native operation. The new generation is
+    // published only after native flush returns.
+    fun invalidateAndFlushPlayback(reason: String = ""): Long {
+        playbackOperationLock.lock()
+        try {
+            val current = playbackGeneration.get()
+            val next =
+                if (current == Long.MAX_VALUE) 1L
+                else current + 1L
+
+            bridge.flushPlayback(next)
+            playbackGeneration.set(next)
+
+            _outLevel.value = 0f
+            logger.d(
+                "NativeAudioEngine: playback generation committed [Gen=$next, Reason='$reason']"
+            )
+            return next
+        } finally {
+            playbackOperationLock.unlock()
+        }
+    }
+
     // AUD-005.5 + AUD-068
     //
-    // Compare only within the playback-generation domain shared with
-    // GeminiLiveClient.
-    //
-    // engineGeneration is NOT used here.
+    // Playback may only consume the currently authoritative generation.
     suspend fun enqueuePlayback(
         pcm: ByteArray,
         generation: Long
@@ -1330,32 +1508,18 @@ class NativeAudioEngine @Inject constructor(
             return
         }
 
-        val acceptedGeneration =
-            currentPlaybackGeneration
-                .updateAndGet { current ->
-                    maxOf(
-                        current,
-                        generation
-                    )
-                }
-
         if (
-            generation <
-                acceptedGeneration
+            isBargeInActive ||
+            generation != currentPlaybackGeneration
         ) {
             return
         }
 
         if (
-            isBargeInActive
+            playbackStartGeneration.getAndSet(
+                generation
+            ) != generation
         ) {
-            return
-        }
-
-        if (
-            _outLevel.value < 0.02f
-        ) {
-
             lastPlaybackStartMs =
                 SystemClock.elapsedRealtime()
         }
@@ -1371,14 +1535,8 @@ class NativeAudioEngine @Inject constructor(
         ) {
 
             if (
-                isBargeInActive
-            ) {
-                return
-            }
-
-            if (
-                generation !=
-                    currentPlaybackGeneration.get()
+                isBargeInActive ||
+                generation != currentPlaybackGeneration
             ) {
                 return
             }
@@ -1400,26 +1558,6 @@ class NativeAudioEngine @Inject constructor(
                 delay(4)
             }
         }
-    }
-
-    fun flushPlayback(
-        generation: Long
-    ) {
-
-        currentPlaybackGeneration
-            .updateAndGet { current ->
-                maxOf(
-                    current,
-                    generation
-                )
-            }
-
-        bridge.flushPlayback(
-            generation
-        )
-
-        _outLevel.value =
-            0f
     }
 
     fun triggerBargeInEarcon() {
@@ -1524,6 +1662,11 @@ class NativeAudioEngine @Inject constructor(
             }
         }
         queuedMicOutputBytes.set(0L)
+    }
+
+    /** Drops any capture events left after a consumer-side shutdown. */
+    fun drainPendingMicOutput() {
+        drainMicOutput()
     }
 
     // AUD-013:
