@@ -82,6 +82,19 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Ensure Android NDK 30.0.16248370
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [[ -z "$SDKMANAGER" ]]; then
+            SDKMANAGER="${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "ndk;30.0.16248370"
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -100,18 +113,52 @@ jobs:
       - name: Validate Gradle Wrapper Integrity
         uses: gradle/actions/wrapper-validation@v4
 
-      - name: Build Debug APK
+      - name: Prepare production signing
+        shell: bash
+        env:
+          ANDROID_RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          ./gradlew assembleDebug \
+          set -euo pipefail
+          test -n "$ANDROID_RELEASE_KEYSTORE_BASE64"
+          test -n "$KEYSTORE_PASSWORD"
+          test -n "$KEY_ALIAS"
+          test -n "$KEY_PASSWORD"
+          printf '%s' "$ANDROID_RELEASE_KEYSTORE_BASE64" | base64 --decode > release.keystore
+          chmod 600 release.keystore
+          keytool -list -keystore release.keystore -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+
+      - name: Build Release APK
+        run: |
+          ./gradlew assembleRelease \
             --build-cache \
             --max-workers=4 \
             --no-daemon \
             -Dorg.gradle.jvmargs="-Xmx4g -XX:+UseParallelGC"
 
+      - name: Verify 16 KB ELF and APK alignment
+        shell: bash
+        run: |
+          chmod +x tools/verify-16k-elf-alignment.sh
+          tools/verify-16k-elf-alignment.sh \
+            app/build/outputs/apk/release/app-release.apk \
+            30.0.16248370
+
+      - name: Verify Release APK signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
+          APKSIGNER="$(find "$SDK_ROOT/build-tools" -mindepth 2 -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)"
+          test -x "$APKSIGNER"
+          "$APKSIGNER" verify --verbose app/build/outputs/apk/release/app-release.apk
+
       - name: Calculate APK Size
         id: apk_info
         run: |
-          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+          APK_PATH="app/build/outputs/apk/release/app-release.apk"
 
           if [ -f "$APK_PATH" ]; then
             SIZE_BYTES="$(stat -c%s "$APK_PATH")"
@@ -146,6 +193,6 @@ jobs:
             - **Barge-In:** bounded local recovery
             - **Network:** ordered realtime PCM backpressure
             - **Audio batching:** 40 ms @ 16 kHz PCM16
-          files: app/build/outputs/apk/debug/app-debug.apk
+          files: app/build/outputs/apk/release/app-release.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
