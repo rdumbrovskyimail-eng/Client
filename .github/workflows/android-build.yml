@@ -38,12 +38,15 @@ jobs:
             git lfs pull --include="$MODEL_PATH" || true
           fi
 
-          # 2. Проверяем: если файла нет, он пустой (<500 КБ) или это текстовый LFS-указатель
+          # 2. Проверяем: если файла нет, он пустой (<500 КБ)
+          # или это текстовый LFS-указатель.
           NEED_DOWNLOAD=0
+
           if [ ! -f "$MODEL_PATH" ]; then
             NEED_DOWNLOAD=1
           else
             FILE_SIZE="$(stat -c%s "$MODEL_PATH" 2>/dev/null || echo 0)"
+
             if [ "$FILE_SIZE" -lt 500000 ]; then
               NEED_DOWNLOAD=1
             elif head -c 64 "$MODEL_PATH" 2>/dev/null | grep -q "git-lfs.github.com/spec"; then
@@ -51,16 +54,19 @@ jobs:
             fi
           fi
 
-          # 3. Скачиваем официальную модель Silero V5 ONNX, если нормальный файл отсутствует
+          # 3. Скачиваем официальную модель Silero V5 ONNX,
+          # если нормальный бинарник отсутствует.
           if [ "$NEED_DOWNLOAD" -eq 1 ]; then
             echo "▶ Загружаем официальную модель Silero V5 ONNX..."
+
             curl -fL --retry 3 --retry-delay 2 \
               "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx" \
               -o "$MODEL_PATH"
           fi
 
-          # 4. Финальная проверка размера
+          # 4. Финальная проверка размера.
           SIZE_BYTES="$(stat -c%s "$MODEL_PATH")"
+
           echo "Размер модели Silero V5: $SIZE_BYTES байт"
 
           if [ "$SIZE_BYTES" -lt 500000 ]; then
@@ -86,13 +92,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
+
           SDKMANAGER="$(command -v sdkmanager || true)"
+
           if [[ -z "$SDKMANAGER" ]]; then
             SDKMANAGER="${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
           fi
+
           test -x "$SDKMANAGER"
+
           yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+
           "$SDKMANAGER" "ndk;30.0.16248370"
 
       - name: Setup Gradle
@@ -105,7 +117,10 @@ jobs:
         run: |
           if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
             echo "▶ gradle-wrapper.jar не найден в репозитории. Генерируем через Gradle CLI..."
-            gradle wrapper --gradle-version 8.14.3 --distribution-type bin
+
+            gradle wrapper \
+              --gradle-version 8.14.3 \
+              --distribution-type bin
           fi
 
           chmod +x gradlew
@@ -113,26 +128,16 @@ jobs:
       - name: Validate Gradle Wrapper Integrity
         uses: gradle/actions/wrapper-validation@v4
 
-      - name: Prepare production signing
-        shell: bash
-        env:
-          ANDROID_RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      # Для обычной CI-проверки production keystore НЕ требуется.
+      #
+      # Debug APK автоматически подписывается Android Gradle Plugin
+      # стандартным debug-сертификатом.
+      #
+      # Production signing должен выполняться отдельным release pipeline,
+      # когда действительно требуется production APK.
+      - name: Build Debug APK
         run: |
-          set -euo pipefail
-          test -n "$ANDROID_RELEASE_KEYSTORE_BASE64"
-          test -n "$KEYSTORE_PASSWORD"
-          test -n "$KEY_ALIAS"
-          test -n "$KEY_PASSWORD"
-          printf '%s' "$ANDROID_RELEASE_KEYSTORE_BASE64" | base64 --decode > release.keystore
-          chmod 600 release.keystore
-          keytool -list -keystore release.keystore -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
-
-      - name: Build Release APK
-        run: |
-          ./gradlew assembleRelease \
+          ./gradlew assembleDebug \
             --build-cache \
             --max-workers=4 \
             --no-daemon \
@@ -142,26 +147,43 @@ jobs:
         shell: bash
         run: |
           chmod +x tools/verify-16k-elf-alignment.sh
+
           tools/verify-16k-elf-alignment.sh \
-            app/build/outputs/apk/release/app-release.apk \
+            app/build/outputs/apk/debug/app-debug.apk \
             30.0.16248370
 
-      - name: Verify Release APK signature
+      - name: Verify Debug APK signature
         shell: bash
         run: |
           set -euo pipefail
+
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
-          APKSIGNER="$(find "$SDK_ROOT/build-tools" -mindepth 2 -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)"
+
+          APKSIGNER="$(
+            find "$SDK_ROOT/build-tools" \
+              -mindepth 2 \
+              -maxdepth 2 \
+              -type f \
+              -name apksigner \
+              | sort -V \
+              | tail -n 1
+          )"
+
           test -x "$APKSIGNER"
-          "$APKSIGNER" verify --verbose app/build/outputs/apk/release/app-release.apk
+
+          "$APKSIGNER" verify \
+            --verbose \
+            app/build/outputs/apk/debug/app-debug.apk
 
       - name: Calculate APK Size
         id: apk_info
         run: |
-          APK_PATH="app/build/outputs/apk/release/app-release.apk"
+          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
 
           if [ -f "$APK_PATH" ]; then
+
             SIZE_BYTES="$(stat -c%s "$APK_PATH")"
+
             SIZE_MB="$(
               awk "BEGIN {
                 printf \"%.2f\", $SIZE_BYTES / 1048576
@@ -169,30 +191,26 @@ jobs:
             )"
 
             echo "apk_size=${SIZE_MB} MB" >> "$GITHUB_OUTPUT"
+
             echo "▶ Размер APK: ${SIZE_MB} MB"
+
           else
+
             echo "❌ Ошибка: APK не найден!"
+
             exit 1
+
           fi
 
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: "Gemini Live Ultra v1.0.${{ github.run_number }}"
-          make_latest: true
-          body: |
-            ### 🚀 Gemini Live Ultra
+          name: client-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
 
-            - **Коммит:** `${{ github.sha }}`
-            - **Размер APK:** ${{ steps.apk_info.outputs.apk_size }}
-            - **VAD:** Silero V5 LFS-validated ONNX
-            - **Аудиоядро:** AAudio realtime engine + SPSC playback
-            - **Playback:** generation-based flush/quiescence
-            - **Barge-In:** bounded local recovery
-            - **Network:** ordered realtime PCM backpressure
-            - **Audio batching:** 40 ms @ 16 kHz PCM16
-          files: app/build/outputs/apk/release/app-release.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # GitHub Release здесь намеренно НЕ создаём.
+      #
+      # Этот CI предназначен для compile/build/ABI/alignment проверки.
+      # Production release с настоящим signing key должен быть отдельным
+      # workflow и не должен блокировать обычную разработку.
