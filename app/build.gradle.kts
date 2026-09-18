@@ -1,4 +1,3 @@
-// >>> FILE: app/build.gradle.kts
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -11,6 +10,7 @@ plugins {
 android {
     namespace = "com.client.app"
     compileSdk = 36
+    ndkVersion = "30.0.16248370"
 
     defaultConfig {
         applicationId = "com.client.app"
@@ -66,38 +66,60 @@ android {
         compose = true
     }
 
+    // AUD-011: release signing is explicit and has NO debug fallback.
+    // Missing keystore or any required credential makes release validation fail.
     signingConfigs {
         create("release") {
-            val keystoreFile =
-                file("../release.keystore")
+            val keystorePath =
+                providers.environmentVariable("RELEASE_KEYSTORE_PATH")
+                    .orNull
+                    ?: rootProject.file("release.keystore").absolutePath
 
-            if (keystoreFile.exists()) {
+            val keystoreFile = file(keystorePath)
+            val storePassword =
+                providers.environmentVariable("KEYSTORE_PASSWORD").orNull
+            val keyAlias =
+                providers.environmentVariable("KEY_ALIAS").orNull
+            val keyPassword =
+                providers.environmentVariable("KEY_PASSWORD").orNull
 
+            if (
+                keystoreFile.isFile &&
+                !storePassword.isNullOrBlank() &&
+                !keyAlias.isNullOrBlank() &&
+                !keyPassword.isNullOrBlank()
+            ) {
                 storeFile = keystoreFile
-
-                storePassword =
-                    System.getenv(
-                        "KEYSTORE_PASSWORD"
-                    ) ?: "android"
-
-                keyAlias =
-                    System.getenv(
-                        "KEY_ALIAS"
-                    ) ?: "androiddebugkey"
-
-                keyPassword =
-                    System.getenv(
-                        "KEY_PASSWORD"
-                    ) ?: "android"
-
-            } else {
-
-                initWith(
-                    getByName("debug")
-                )
+                this.storePassword = storePassword
+                this.keyAlias = keyAlias
+                this.keyPassword = keyPassword
             }
         }
     }
+
+    val validateReleaseSigning =
+        tasks.register("validateReleaseSigning") {
+            doLast {
+                val keystorePath =
+                    System.getenv("RELEASE_KEYSTORE_PATH")
+                        ?.takeIf { it.isNotBlank() }
+                        ?: rootProject.file("release.keystore").absolutePath
+
+                val keystoreFile = file(keystorePath)
+                require(keystoreFile.isFile) {
+                    "AUD-011: production release keystore is missing: $keystorePath"
+                }
+                require(!System.getenv("KEYSTORE_PASSWORD").isNullOrBlank()) {
+                    "AUD-011: KEYSTORE_PASSWORD is missing"
+                }
+                require(!System.getenv("KEY_ALIAS").isNullOrBlank()) {
+                    "AUD-011: KEY_ALIAS is missing"
+                }
+                require(!System.getenv("KEY_PASSWORD").isNullOrBlank()) {
+                    "AUD-011: KEY_PASSWORD is missing"
+                }
+            }
+        }
 
     buildTypes {
         release {
@@ -122,6 +144,14 @@ android {
         }
     }
 
+    tasks.matching { task ->
+        task.name == "assembleRelease" ||
+        task.name == "bundleRelease" ||
+        task.name == "signRelease"
+    }.configureEach {
+        dependsOn(validateReleaseSigning)
+    }
+
     compileOptions {
         sourceCompatibility =
             JavaVersion.VERSION_17
@@ -131,6 +161,12 @@ android {
     }
 
     packaging {
+        // AUD-061: keep native libraries uncompressed so AGP can preserve
+        // 16 KB zip alignment for APK/AAB packaging.
+        jniLibs {
+            useLegacyPackaging = false
+        }
+
         resources {
             excludes += setOf(
                 "META-INF/INDEX.LIST",
@@ -240,7 +276,7 @@ dependencies {
     )
 
     implementation(
-        "com.microsoft.onnxruntime:onnxruntime-android:1.20.0"
+        "com.microsoft.onnxruntime:onnxruntime-android:1.29.0"
     )
 
     implementation(
