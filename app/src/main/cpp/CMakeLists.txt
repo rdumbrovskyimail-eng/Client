@@ -21,10 +21,14 @@ if(${ANDROID_ABI} STREQUAL "arm64-v8a")
         -flto
         -fno-omit-frame-pointer # Источник 58: сохранение указателя кадра для информативных краш-логов
     )
-    # Выравнивание страниц под стандарт Android 15/16 Baklava (16 KB Page Alignment)
+    # AUD-061:
+    # Explicit 16 KB ELF segment alignment. NDK r28+ also defaults to
+    # 16 KB-compatible alignment, but keep the flags explicit so this
+    # target remains correct if the toolchain is changed later.
     add_link_options(
         -Wl,--gc-sections
         -Wl,-z,max-page-size=16384
+        -Wl,-z,common-page-size=16384
         -flto
     )
 endif()
@@ -35,7 +39,6 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/dsp
     ${CMAKE_CURRENT_SOURCE_DIR}/jni
 )
-
 add_library(client_core SHARED
     ${CMAKE_CURRENT_SOURCE_DIR}/jni/NativeBridge.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/audio/AAudioEngine.cpp
