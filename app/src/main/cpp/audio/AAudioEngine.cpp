@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/cpp/audio/AAudioEngine.cpp
 #include "AAudioEngine.h"
 #include "NativeLogQueue.h"
 #include "dsp/NeonDspUtils.h"
@@ -38,254 +37,76 @@
     __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "%s", _buf); \
     client::logging::NativeLogQueue::getInstance().push(6, LOG_TAG, _buf); \
 } while (0)
-namespace {
-
-struct Biquad {
-    float b0{1.0f};
-    float b1{0.0f};
-    float b2{0.0f};
-
-    float a1{0.0f};
-    float a2{0.0f};
-
-    float w1{0.0f};
-    float w2{0.0f};
-
-    void reset() {
-        w1 = 0.0f;
-        w2 = 0.0f;
-    }
-
-    inline float process(float in) {
-        float w0 = in - a1 * w1 - a2 * w2;
-        float out =
-            b0 * w0 +
-            b1 * w1 +
-            b2 * w2;
-
-        w2 = w1;
-        w1 = w0;
-
-        return out;
-    }
-
-    void makeLowShelf(float fc, float gainDb, float fs) {
-        float A = std::pow(10.0f, gainDb / 40.0f);
-        float omega = 2.0f * 3.14159265f * fc / fs;
-        float sn = std::sin(omega);
-        float cs = std::cos(omega);
-
-        float alpha =
-            sn / 2.0f *
-            std::sqrt(
-                (A + 1.0f / A) *
-                (1.0f / 0.9f - 1.0f) +
-                2.0f
-            );
-
-        float beta =
-            2.0f * std::sqrt(A) * alpha;
-
-        float a0 =
-            (A + 1.0f) +
-            (A - 1.0f) * cs +
-            beta;
-
-        b0 =
-            (A *
-             ((A + 1.0f) -
-              (A - 1.0f) * cs +
-              beta)) / a0;
-
-        b1 =
-            (2.0f * A *
-             ((A - 1.0f) -
-              (A + 1.0f) * cs)) / a0;
-
-        b2 =
-            (A *
-             ((A + 1.0f) -
-              (A - 1.0f) * cs -
-              beta)) / a0;
-
-        a1 =
-            (-2.0f *
-             ((A - 1.0f) +
-              (A + 1.0f) * cs)) / a0;
-
-        a2 =
-            ((A + 1.0f) +
-             (A - 1.0f) * cs -
-             beta) / a0;
-    }
-
-    void makeHighShelf(float fc, float gainDb, float fs) {
-        float A = std::pow(10.0f, gainDb / 40.0f);
-        float omega = 2.0f * 3.14159265f * fc / fs;
-        float sn = std::sin(omega);
-        float cs = std::cos(omega);
-
-        float alpha =
-            sn / 2.0f *
-            std::sqrt(
-                (A + 1.0f / A) *
-                (1.0f / 0.9f - 1.0f) +
-                2.0f
-            );
-
-        float beta =
-            2.0f * std::sqrt(A) * alpha;
-
-        float a0 =
-            (A + 1.0f) -
-            (A - 1.0f) * cs +
-            beta;
-
-        b0 =
-            (A *
-             ((A + 1.0f) +
-              (A - 1.0f) * cs +
-              beta)) / a0;
-
-        b1 =
-            (-2.0f * A *
-             ((A - 1.0f) +
-              (A + 1.0f) * cs)) / a0;
-
-        b2 =
-            (A *
-             ((A + 1.0f) -
-              (A - 1.0f) * cs -
-              beta)) / a0;
-
-        a1 =
-            (2.0f *
-             ((A - 1.0f) -
-              (A + 1.0f) * cs)) / a0;
-        a2 =
-            ((A + 1.0f) -
-             (A - 1.0f) * cs -
-             beta) / a0;
-    }
-};
-
-class AnalogVoiceEnhancer {
-public:
-    AnalogVoiceEnhancer() {
-        reset(48000);
-    }
-
-    void reset(int32_t sampleRate) {
-        currentRate_ = sampleRate;
-
-        float fs =
-            static_cast<float>(
-                sampleRate > 0
-                    ? sampleRate
-                    : 48000
-            );
-
-        lowShelf_.reset();
-        highShelf_.reset();
-
-        lowShelf_.makeLowShelf(
-            160.0f,
-            3.5f,
-            fs
-        );
-
-        float highFc =
-            std::min(
-                5000.0f,
-                fs * 0.44f
-            );
-
-        highShelf_.makeHighShelf(
-            highFc,
-            3.2f,
-            fs
-        );
-    }
-
-    void process(
-        int16_t* samples,
-        size_t numFrames,
-        int32_t sampleRate) {
-
-        if (samples == nullptr || numFrames == 0) {
-            return;
-        }
-
-        if (sampleRate != currentRate_ &&
-            sampleRate > 0) {
-            reset(sampleRate);
-        }
-
-        constexpr float PRE_DRIVE = 1.48f;
-        constexpr float INV_32768 = 1.0f / 32768.0f;
-
-        for (size_t i = 0;
-             i < numFrames;
-             ++i) {
-
-            float x =
-                static_cast<float>(samples[i]) *
-                INV_32768 *
-                PRE_DRIVE;
-
-            x = lowShelf_.process(x);
-            x = highShelf_.process(x);
-
-            x = x + 0.12f * (x * x);
-
-            float absX = std::abs(x);
-
-            float y =
-                (absX < 1.0f)
-                ? (x - 0.22f * x * x * x)
-                : (
-                    (x > 0.0f ? 1.0f : -1.0f) *
-                    (
-                        0.78f +
-                        0.22f *
-                        (
-                            1.0f -
-                            std::exp(
-                                -2.0f *
-                                (absX - 1.0f)
-                            )
-                        )
-                    )
-                  );
-
-            int32_t outSample =
-                static_cast<int32_t>(
-                    y * 32767.0f
-                );
-
-            samples[i] =
-                static_cast<int16_t>(
-                    std::clamp(
-                        outSample,
-                        -32768,
-                        32767
-                    )
-                );
-        }
-    }
-
-private:
-    int32_t currentRate_{48000};
-
-    Biquad lowShelf_;
-    Biquad highShelf_;
-};
-
-static AnalogVoiceEnhancer s_voiceEnhancer;
-
-} // namespace
-
 namespace client::audio {
+
+void Biquad::reset() {
+    w1 = 0.0f;
+    w2 = 0.0f;
+}
+
+void Biquad::makeLowShelf(float fc, float gainDb, float fs) {
+    const float A = std::pow(10.0f, gainDb / 40.0f);
+    const float omega = 2.0f * 3.14159265f * fc / fs;
+    const float sn = std::sin(omega);
+    const float cs = std::cos(omega);
+    const float alpha = sn / 2.0f * std::sqrt((A + 1.0f / A) * (1.0f / 0.9f - 1.0f) + 2.0f);
+    const float beta = 2.0f * std::sqrt(A) * alpha;
+    const float a0 = (A + 1.0f) + (A - 1.0f) * cs + beta;
+    b0 = (A * ((A + 1.0f) - (A - 1.0f) * cs + beta)) / a0;
+    b1 = (2.0f * A * ((A - 1.0f) - (A + 1.0f) * cs)) / a0;
+    b2 = (A * ((A + 1.0f) - (A - 1.0f) * cs - beta)) / a0;
+    a1 = (-2.0f * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
+    a2 = ((A + 1.0f) + (A - 1.0f) * cs - beta) / a0;
+}
+
+void Biquad::makeHighShelf(float fc, float gainDb, float fs) {
+    const float A = std::pow(10.0f, gainDb / 40.0f);
+    const float omega = 2.0f * 3.14159265f * fc / fs;
+    const float sn = std::sin(omega);
+    const float cs = std::cos(omega);
+    const float alpha = sn / 2.0f * std::sqrt((A + 1.0f / A) * (1.0f / 0.9f - 1.0f) + 2.0f);
+    const float beta = 2.0f * std::sqrt(A) * alpha;
+    const float a0 = (A + 1.0f) - (A - 1.0f) * cs + beta;
+    b0 = (A * ((A + 1.0f) + (A - 1.0f) * cs + beta)) / a0;
+    b1 = (-2.0f * A * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
+    b2 = (A * ((A + 1.0f) + (A - 1.0f) * cs - beta)) / a0;
+    a1 = (2.0f * ((A - 1.0f) - (A + 1.0f) * cs)) / a0;
+    a2 = ((A + 1.0f) - (A - 1.0f) * cs - beta) / a0;
+}
+
+AnalogVoiceEnhancer::AnalogVoiceEnhancer() {
+    reset(48000);
+}
+
+void AnalogVoiceEnhancer::reset(int32_t sampleRate) {
+    currentRate_ = sampleRate > 0 ? sampleRate : 48000;
+    const float fs = static_cast<float>(currentRate_);
+    lowShelf_.reset();
+    highShelf_.reset();
+    lowShelf_.makeLowShelf(160.0f, 3.5f, fs);
+    highShelf_.makeHighShelf(std::min(5000.0f, fs * 0.44f), 3.2f, fs);
+}
+
+void AnalogVoiceEnhancer::process(int16_t* samples, size_t numFrames, int32_t sampleRate) {
+    if (samples == nullptr || numFrames == 0) return;
+    if (sampleRate > 0 && sampleRate != currentRate_) reset(sampleRate);
+    constexpr float PRE_DRIVE = 1.48f;
+    constexpr float INV_32768 = 1.0f / 32768.0f;
+    for (size_t i = 0; i < numFrames; ++i) {
+        float x = static_cast<float>(samples[i]) * INV_32768 * PRE_DRIVE;
+        x = lowShelf_.process(x);
+        x = highShelf_.process(x);
+        x = x + 0.12f * (x * x);
+        const float absX = std::abs(x);
+        const float y = (absX < 1.0f)
+            ? (x - 0.22f * x * x * x)
+            : ((x > 0.0f ? 1.0f : -1.0f) *
+               (0.78f + 0.22f * (1.0f - std::exp(-2.0f * (absX - 1.0f)))));
+        const int32_t outSample = static_cast<int32_t>(y * 32767.0f);
+        samples[i] = static_cast<int16_t>(std::clamp(outSample, -32768, 32767));
+    }
+}
+
 
 AAudioEngine& AAudioEngine::getInstance() {
     static AAudioEngine instance;
@@ -363,14 +184,10 @@ bool AAudioEngine::initLocked(
 
         resetEarcon();
 
-        s_voiceEnhancer.reset(
+        voiceEnhancer_.reset(
             targetPlaybackSampleRate);
 
         fftPos_ = 0;
-
-        playbackEpoch_.store(
-            0,
-            std::memory_order_release);
 
         inputIngressBlocked_.store(
             false,
@@ -807,101 +624,144 @@ AAudioEngine::openPlaybackStreamWithFallback(
     return res;
 }
 
-bool AAudioEngine::start() {
-    std::lock_guard<std::mutex> lock(
-        lifecycleMutex_);
+bool AAudioEngine::waitForStreamState(
+    AAudioStream* stream,
+    aaudio_stream_state_t desired,
+    int timeoutMs) {
 
-    if (isRunning_.load()) {
-        return true;
+    if (stream == nullptr) return false;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(std::max(timeoutMs, 0));
+    aaudio_stream_state_t state = AAudioStream_getState(stream);
+
+    while (state != desired) {
+        if (state == AAUDIO_STREAM_STATE_CLOSED ||
+            state == AAUDIO_STREAM_STATE_DISCONNECTED) return false;
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return false;
+        const auto remainingNs = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
+        aaudio_stream_state_t nextState = state;
+        const aaudio_result_t result = AAudioStream_waitForStateChange(
+            stream, state, &nextState, std::min<int64_t>(remainingNs, 5'000'000LL));
+        if (result != AAUDIO_OK) return false;
+        state = nextState;
     }
+    return true;
+}
 
-    if (!captureStream_ ||
-        !playbackStream_) {
+bool AAudioEngine::startPlayback() {
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
 
-        LOGI(
-            "start() called with null streams, reinitializing...");
+    if (playbackDspRunning_.load(std::memory_order_acquire)) return true;
 
-        if (!initLocked(
-                isBluetoothMode_.load(),
-                playbackSampleRate_.load(),
-                actualInputDeviceId_.load(),
-                actualOutputDeviceId_.load())) {
-
+    if (!captureStream_ || !playbackStream_) {
+        if (!initLocked(isBluetoothMode_.load(), playbackSampleRate_.load(),
+                        actualInputDeviceId_.load(), actualOutputDeviceId_.load())) {
             return false;
         }
     }
-    // AUD-063:
-    // Keep the realtime playback callback quiesced while lifecycle
-    // code clears queues and starts the stream.
+
     blockPlaybackCallbackAndWait();
-
-    captureDroppedFrames_.store(
-        0,
-        std::memory_order_relaxed);
-
-    captureRawBuffer_.resetQuiesced();
-    captureBuffer_.resetQuiesced();
     playbackDspInputBuffer_.resetQuiesced();
     playbackBuffer_.resetQuiesced();
 
-    aaudio_result_t res =
-        AAudioStream_requestStart(
-            captureStream_);
-
-    if (res != AAUDIO_OK) {
-        LOGE(
-            "AAudioStream_requestStart(capture) failed: %d (%s)",
-            res,
-            AAudio_convertResultToText(res));
-
-        stopLocked();
+    const aaudio_result_t result = AAudioStream_requestStart(playbackStream_);
+    if (result != AAUDIO_OK) {
+        LOGE("AAudioStream_requestStart(playback) failed: %d (%s)", result, AAudio_convertResultToText(result));
+        AAudioStream_close(playbackStream_);
+        playbackStream_ = nullptr;
+        isDisconnected_.store(true, std::memory_order_release);
+        unblockPlaybackCallback();
+        return false;
+    }
+    if (!waitForStreamState(playbackStream_, AAUDIO_STREAM_STATE_STARTED, 500)) {
+        LOGE("Playback stream did not reach STARTED within 500 ms");
+        AAudioStream_close(playbackStream_);
+        playbackStream_ = nullptr;
+        isDisconnected_.store(true, std::memory_order_release);
+        unblockPlaybackCallback();
         return false;
     }
 
-    res =
-        AAudioStream_requestStart(
-            playbackStream_);
-
-    if (res != AAUDIO_OK) {
-        LOGE(
-            "AAudioStream_requestStart(playback) failed: %d (%s)",
-            res,
-            AAudio_convertResultToText(res));
-
-        AAudioStream_requestStop(
-            captureStream_);
-
-        stopLocked();
+    playbackDspRunning_.store(true, std::memory_order_release);
+    try {
+        playbackDspThread_ = std::thread(&AAudioEngine::playbackDspThreadLoop, this);
+    } catch (...) {
+        playbackDspRunning_.store(false, std::memory_order_release);
+        playbackDspCv_.notify_all();
+        if (playbackStream_) {
+            // A failed flush must fail closed: requestStop() would drain and
+            // could therefore play stale samples. Closing the stream is the
+            // safe terminal action for this startup failure.
+            AAudioStream_close(playbackStream_);
+            playbackStream_ = nullptr;
+        }
+        isDisconnected_.store(true, std::memory_order_release);
+        unblockPlaybackCallback();
         return false;
     }
 
-    playbackDspRunning_.store(
-        true,
-        std::memory_order_release);
-
-    playbackDspThread_ =
-        std::thread(
-            &AAudioEngine::playbackDspThreadLoop,
-            this);
-
-    captureDspRunning_.store(
-        true,
-        std::memory_order_release);
-
-    captureDspThread_ =
-        std::thread(
-            &AAudioEngine::captureDspThreadLoop,
-            this);
-    isRunning_.store(
-        true,
-        std::memory_order_release);
-
+    isRunning_.store(true, std::memory_order_release);
     unblockPlaybackCallback();
-
-    LOGI(
-        "AAudioEngine, Playback DSP worker and Capture DSP worker started successfully");
-
     return true;
+}
+
+bool AAudioEngine::startCapture() {
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+
+    if (captureDspRunning_.load(std::memory_order_acquire)) return true;
+    if (!captureStream_) return false;
+
+    const aaudio_stream_state_t state = AAudioStream_getState(captureStream_);
+    if (state != AAUDIO_STREAM_STATE_OPEN && state != AAUDIO_STREAM_STATE_STOPPED) {
+        if (!waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 500)) return false;
+    }
+
+    captureDroppedFrames_.store(0, std::memory_order_relaxed);
+    captureRawBuffer_.resetQuiesced();
+    captureBuffer_.resetQuiesced();
+
+    const aaudio_result_t result = AAudioStream_requestStart(captureStream_);
+    if (result != AAUDIO_OK) {
+        LOGE("AAudioStream_requestStart(capture) failed: %d (%s)", result, AAudio_convertResultToText(result));
+        AAudioStream_close(captureStream_);
+        captureStream_ = nullptr;
+        return false;
+    }
+    if (!waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STARTED, 500)) {
+        LOGE("Capture stream did not reach STARTED within 500 ms");
+        AAudioStream_requestStop(captureStream_);
+        waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 200);
+        AAudioStream_close(captureStream_);
+        captureStream_ = nullptr;
+        return false;
+    }
+
+    captureDspRunning_.store(true, std::memory_order_release);
+    try {
+        captureDspThread_ = std::thread(&AAudioEngine::captureDspThreadLoop, this);
+    } catch (...) {
+        captureDspRunning_.store(false, std::memory_order_release);
+        captureDspCv_.notify_all();
+        if (captureStream_) {
+            AAudioStream_requestStop(captureStream_);
+            waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 500);
+            AAudioStream_close(captureStream_);
+            captureStream_ = nullptr;
+        }
+        isDisconnected_.store(true, std::memory_order_release);
+        return false;
+    }
+
+    isRunning_.store(true, std::memory_order_release);
+    return true;
+}
+
+bool AAudioEngine::start() {
+    if (!startPlayback()) return false;
+    if (startCapture()) return true;
+    stop();
+    return false;
 }
 
 void AAudioEngine::stop() {
@@ -911,115 +771,135 @@ void AAudioEngine::stop() {
     stopLocked();
 }
 
-void AAudioEngine::stopLocked() {
-    // AUD-063:
-    // Quiesce playback callback before touching stream lifecycle or
-    // consumer-owned playbackBuffer_.
-    blockPlaybackCallbackAndWait();
+bool AAudioEngine::flushOutputStreamLocked(bool resumeAfterFlush) {
+    if (playbackStream_ == nullptr) return true;
+    aaudio_stream_state_t state = AAudioStream_getState(playbackStream_);
+    if (state == AAUDIO_STREAM_STATE_CLOSED || state == AAUDIO_STREAM_STATE_DISCONNECTED) return false;
 
-    bool wasRunning =
-        isRunning_.exchange(false);
+    const bool wasStarted =
+        state == AAUDIO_STREAM_STATE_STARTED ||
+        state == AAUDIO_STREAM_STATE_STARTING ||
+        state == AAUDIO_STREAM_STATE_PAUSING;
 
-    if (!wasRunning &&
-        !captureStream_ &&
-        !playbackStream_ &&
-        !playbackDspRunning_.load() &&
-        !captureDspRunning_.load()) {
-
-        return;
+    if (state == AAUDIO_STREAM_STATE_STARTING) {
+        if (!waitForStreamState(playbackStream_, AAUDIO_STREAM_STATE_STARTED, 500)) return false;
+        state = AAUDIO_STREAM_STATE_STARTED;
+    }
+    if (state == AAUDIO_STREAM_STATE_STARTED) {
+        if (AAudioStream_requestPause(playbackStream_) != AAUDIO_OK) return false;
+        if (!waitForStreamState(playbackStream_, AAUDIO_STREAM_STATE_PAUSED, 500)) return false;
+        state = AAUDIO_STREAM_STATE_PAUSED;
+    } else if (state == AAUDIO_STREAM_STATE_PAUSING) {
+        if (!waitForStreamState(playbackStream_, AAUDIO_STREAM_STATE_PAUSED, 500)) return false;
+        state = AAUDIO_STREAM_STATE_PAUSED;
     }
 
-    LOGI(
-        "Stopping AAudioEngine (stopLocked)...");
-
-    if (captureDspRunning_.load(
-            std::memory_order_acquire)) {
-
-        captureDspRunning_.store(
-            false,
-            std::memory_order_release);
-
-        captureDspCv_.notify_all();
-
-        if (captureDspThread_.joinable()) {
-            captureDspThread_.join();
+    if (state == AAUDIO_STREAM_STATE_PAUSED ||
+        state == AAUDIO_STREAM_STATE_OPEN ||
+        state == AAUDIO_STREAM_STATE_STOPPED ||
+        state == AAUDIO_STREAM_STATE_FLUSHED) {
+        if (state != AAUDIO_STREAM_STATE_FLUSHED) {
+            if (AAudioStream_requestFlush(playbackStream_) != AAUDIO_OK) return false;
+            if (!waitForStreamState(playbackStream_, AAUDIO_STREAM_STATE_FLUSHED, 500)) return false;
         }
+    } else {
+        return false;
     }
 
-    if (playbackDspRunning_.load(
-            std::memory_order_acquire)) {
-
-        playbackDspRunning_.store(
-            false,
-            std::memory_order_release);
-
-        playbackDspCv_.notify_all();
-        playbackIngressCv_.notify_all();
-
-        if (playbackDspThread_.joinable()) {
-            playbackDspThread_.join();
-        }
+    if (resumeAfterFlush && wasStarted) {
+        if (AAudioStream_requestStart(playbackStream_) != AAUDIO_OK) return false;
+        if (!waitForStreamState(playbackStream_, AAUDIO_STREAM_STATE_STARTED, 500)) return false;
     }
+    return true;
+}
+
+void AAudioEngine::stopCaptureLocked() {
+    captureDspRunning_.store(false, std::memory_order_release);
+    captureDspCv_.notify_all();
+    if (captureDspThread_.joinable()) captureDspThread_.join();
 
     if (captureStream_) {
-        AAudioStream_requestStop(
-            captureStream_);
-
-        AAudioStream_close(
-            captureStream_);
-
-        captureStream_ = nullptr;
+        const aaudio_result_t res = AAudioStream_requestStop(captureStream_);
+        if (res != AAUDIO_OK) {
+            LOGW("AAudioStream_requestStop(capture) returned %d (%s)", res, AAudio_convertResultToText(res));
+        }
+        if (!waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 500)) {
+            LOGW("Capture stream did not reach STOPPED within 500 ms; closing anyway");
+            AAudioStream_close(captureStream_);
+            captureStream_ = nullptr;
+        }
     }
 
+    captureRawBuffer_.resetQuiesced();
+    captureBuffer_.resetQuiesced();
+    micRms_.store(0.0f, std::memory_order_relaxed);
+}
+
+void AAudioEngine::stopPlaybackLocked() {
+    blockPlaybackCallbackAndWait();
+    playbackDspRunning_.store(false, std::memory_order_release);
+    playbackDspCv_.notify_all();
+    playbackIngressCv_.notify_all();
+    if (playbackDspThread_.joinable()) playbackDspThread_.join();
+
     if (playbackStream_) {
-        AAudioStream_requestStop(
-            playbackStream_);
-
-        AAudioStream_close(
-            playbackStream_);
-
+        if (!flushOutputStreamLocked(false)) {
+            LOGW("Playback physical flush failed during stop; closing stream");
+        }
+        AAudioStream_close(playbackStream_);
         playbackStream_ = nullptr;
     }
 
-    {
-        std::scoped_lock lock(
-            playbackControlMutex_,
-            playbackJniWriteMutex_);
+    playbackDspInputBuffer_.resetQuiesced();
+    playbackBuffer_.resetQuiesced();
+    outRms_.store(0.0f, std::memory_order_relaxed);
+}
 
+void AAudioEngine::stopLocked() {
+    blockPlaybackCallbackAndWait();
+    const bool hadState =
+        isRunning_.exchange(false, std::memory_order_acq_rel) ||
+        captureStream_ != nullptr ||
+        playbackStream_ != nullptr ||
+        captureDspRunning_.load(std::memory_order_acquire) ||
+        playbackDspRunning_.load(std::memory_order_acquire);
+
+    if (!hadState) {
+        unblockPlaybackCallback();
+        return;
+    }
+
+    stopCaptureLocked();
+    stopPlaybackLocked();
+
+    {
+        std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
         resampler24To16_.reset();
         resampler24To48_.reset();
         captureDecimator48To16_.reset();
         captureResampler24To16_.reset();
-
         resetEarcon();
-
-        s_voiceEnhancer.reset(48000);
-
+        voiceEnhancer_.reset(48000);
         fftPos_ = 0;
-        inputIngressBlocked_.store(
-            false,
-            std::memory_order_release);
+        inputIngressBlocked_.store(false, std::memory_order_release);
     }
 
     captureRawBuffer_.resetQuiesced();
     captureBuffer_.resetQuiesced();
     playbackDspInputBuffer_.resetQuiesced();
     playbackBuffer_.resetQuiesced();
+    micRms_.store(0.0f, std::memory_order_relaxed);
+    outRms_.store(0.0f, std::memory_order_relaxed);
+    isMmapExclusiveActive_.store(false, std::memory_order_relaxed);
+    unblockPlaybackCallback();
+}
 
-    micRms_.store(
-        0.0f,
-        std::memory_order_relaxed);
-
-    outRms_.store(
-        0.0f,
-        std::memory_order_relaxed);
-
-    isMmapExclusiveActive_.store(
-        false,
-        std::memory_order_relaxed);
-
-    LOGI(
-        "AAudioEngine stopped cleanly");
+void AAudioEngine::stopCapture() {
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+    stopCaptureLocked();
+    if (!playbackDspRunning_.load(std::memory_order_acquire)) {
+        isRunning_.store(false, std::memory_order_release);
+    }
 }
 
 // AUD-003:
@@ -1029,6 +909,8 @@ void AAudioEngine::captureDspThreadLoop() {
         "AudioCapWorker");
 
     dsp::enableHardwareFtz();
+
+    try {
 
     while (
         captureDspRunning_.load(
@@ -1252,6 +1134,17 @@ void AAudioEngine::captureDspThreadLoop() {
                 finalFrames);
         }
     }
+    } catch (const std::exception& e) {
+        LOGE("AAudioEngine: capture DSP worker exception: %s", e.what());
+        isDisconnected_.store(true, std::memory_order_release);
+    } catch (...) {
+        LOGE("AAudioEngine: capture DSP worker unknown exception");
+        isDisconnected_.store(true, std::memory_order_release);
+    }
+
+    captureDspRunning_.store(false, std::memory_order_release);
+    captureDspCv_.notify_all();
+
 }
 
 // AUD-062:
@@ -1261,6 +1154,8 @@ void AAudioEngine::playbackDspThreadLoop() {
         "AudioDspWorker");
 
     dsp::enableHardwareFtz();
+
+    try {
 
     constexpr size_t TARGET_BUFFER_MS = 40;
     int16_t* input =
@@ -1291,7 +1186,7 @@ void AAudioEngine::playbackDspThreadLoop() {
                     actualPlaybackSampleRate_.load(
                         std::memory_order_acquire));
 
-            s_voiceEnhancer.reset(
+            voiceEnhancer_.reset(
                 currentRate);
 
             resampler24To48_.reset();
@@ -1614,7 +1509,7 @@ void AAudioEngine::playbackDspThreadLoop() {
             continue;
         }
 
-        s_voiceEnhancer.process(
+        voiceEnhancer_.process(
             output,
             outputFrames,
             actualRate);
@@ -1709,9 +1604,8 @@ void AAudioEngine::playbackDspThreadLoop() {
                 commitLock(
                     playbackControlMutex_);
 
-            if (playbackEpoch_.load(
-                    std::memory_order_acquire)
-                == activeEpoch) {
+            if (playbackDspRunning_.load(std::memory_order_acquire) &&
+                playbackEpoch_.load(std::memory_order_acquire) == activeEpoch) {
 
                 if (outputFrames >
                     playbackBuffer_.availableWrite()) {
@@ -1739,6 +1633,17 @@ void AAudioEngine::playbackDspThreadLoop() {
             }
         }
     }
+    } catch (const std::exception& e) {
+        LOGE("AAudioEngine: playback DSP worker exception: %s", e.what());
+        isDisconnected_.store(true, std::memory_order_release);
+    } catch (...) {
+        LOGE("AAudioEngine: playback DSP worker unknown exception");
+        isDisconnected_.store(true, std::memory_order_release);
+    }
+
+    playbackDspRunning_.store(false, std::memory_order_release);
+    playbackDspCv_.notify_all();
+
 }
 size_t AAudioEngine::writePlaybackPcm(
     const int16_t* pcm,
@@ -1852,65 +1757,49 @@ void AAudioEngine::flushPlayback(
     uint64_t generation) {
 
     if (generation == 0) {
-
-        LOGE(
-            "flushPlayback called without authoritative generation");
-
+        LOGE("flushPlayback called without authoritative generation");
         return;
     }
 
-    std::scoped_lock lock(
-        playbackControlMutex_,
-        playbackJniWriteMutex_);
+    std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
+    const uint64_t currentEpoch = playbackEpoch_.load(std::memory_order_acquire);
+    if (generation <= currentEpoch) return;
 
-    const uint64_t currentEpoch =
-        playbackEpoch_.load(
-            std::memory_order_acquire);
-
-    if (generation <= currentEpoch) {
-
-        LOGW(
-            "flushPlayback called with non-monotonic generation=%llu <= currentEpoch=%llu",
-            static_cast<unsigned long long>(
-                generation),
-            static_cast<unsigned long long>(
-                currentEpoch));
-
-        return;
-    }
-
-    inputIngressBlocked_.store(
-        true,
-        std::memory_order_release);
-
+    inputIngressBlocked_.store(true, std::memory_order_release);
     blockPlaybackCallbackAndWait();
 
-    // SPSC consumer ownership is now quiescent.
+    const bool wasPlaybackActive = playbackDspRunning_.load(std::memory_order_acquire);
+    bool physicalOk = true;
+    if (playbackStream_) {
+        physicalOk = flushOutputStreamLocked(wasPlaybackActive);
+    }
+
     playbackBuffer_.discardAllQuiesced();
+    playbackEpoch_.store(generation, std::memory_order_release);
+    earconRequested_.store(false, std::memory_order_release);
+    outRms_.store(0.0f, std::memory_order_relaxed);
 
-    // playbackDspInputBuffer_ is intentionally NOT reset here:
-    // its consumer is playbackDspThreadLoop itself.
-    // That worker sees the new epoch and discards stale input itself.
-    playbackEpoch_.store(
-        generation,
-        std::memory_order_release);
+    if (!physicalOk) {
+        // Fail closed. requestStop() drains buffered audio and is therefore
+        // unsafe for a stale-audio barrier. Closing the stream prevents any
+        // residual application or hardware-buffered samples from reaching
+        // the DAC while the recovery path recreates the route.
+        playbackDspRunning_.store(false, std::memory_order_release);
+        playbackDspCv_.notify_all();
 
-    earconRequested_.store(
-        false,
-        std::memory_order_release);
+        if (playbackStream_) {
+            AAudioStream_close(playbackStream_);
+            playbackStream_ = nullptr;
+        }
 
-    outRms_.store(
-        0.0f,
-        std::memory_order_relaxed);
+        isMmapExclusiveActive_.store(false, std::memory_order_release);
+        isDisconnected_.store(true, std::memory_order_release);
+        LOGW("AAudioEngine: physical playback flush failed; stream closed for fail-closed recovery");
+    }
 
     playbackDspCv_.notify_all();
     playbackIngressCv_.notify_all();
-
     unblockPlaybackCallback();
-    LOGI(
-        "AAudioEngine: flush committed. Authoritative Epoch=%llu",
-        static_cast<unsigned long long>(
-            generation));
 }
 
 void AAudioEngine::triggerBargeInEarcon() {
