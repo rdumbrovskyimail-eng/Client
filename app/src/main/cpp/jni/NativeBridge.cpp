@@ -1,4 +1,5 @@
-// >>> FILE: app/src/main/cpp/jni/NativeBridge.cpp
+
+
 #include <jni.h>
 #include <cstdio>
 #include <string>
@@ -54,10 +55,10 @@ Java_com_client_app_audio_NativeAudioBridge_getHardwareCoreInfo(JNIEnv *env, job
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_client_app_audio_NativeAudioBridge_initAudioRoute(
-    JNIEnv * /* env */, jobject /* this */, 
+    JNIEnv * /* env */, jobject /* this */,
     jboolean isBluetooth, jint sampleRate, jint inputDeviceId, jint outputDeviceId) {
-    
-    LOGI("initAudioRoute called: isBluetooth=%d, sampleRate=%d, inDevId=%d, outDevId=%d", 
+
+    LOGI("initAudioRoute called: isBluetooth=%d, sampleRate=%d, inDevId=%d, outDevId=%d",
          (int)isBluetooth, (int)sampleRate, (int)inputDeviceId, (int)outputDeviceId);
 
     return static_cast<jboolean>(AAudioEngine::getInstance().init(
@@ -69,6 +70,24 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_client_app_audio_NativeAudioBridge_startAudio(JNIEnv * /* env */, jobject /* this */) {
     LOGI("startAudio called");
     return static_cast<jboolean>(AAudioEngine::getInstance().start());
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_startPlaybackAudio(JNIEnv * /* env */, jobject /* this */) {
+    LOGI("startPlaybackAudio called");
+    return static_cast<jboolean>(AAudioEngine::getInstance().startPlayback());
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_startCaptureAudio(JNIEnv * /* env */, jobject /* this */) {
+    LOGI("startCaptureAudio called");
+    return static_cast<jboolean>(AAudioEngine::getInstance().startCapture());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_client_app_audio_NativeAudioBridge_stopCaptureAudio(JNIEnv * /* env */, jobject /* this */) {
+    LOGI("stopCaptureAudio called");
+    AAudioEngine::getInstance().stopCapture();
 }
 
 extern "C" JNIEXPORT void JNICALL
