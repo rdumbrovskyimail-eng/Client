@@ -101,6 +101,13 @@ class NativeAudioEngine @Inject constructor(
 
         private const val PRE_ROLL_FRAMES_CAPACITY =
             20
+
+        // AUD-013:
+        // Bound queued capture memory without ever blocking the realtime
+        // capture producer on a slow Kotlin/network consumer. At 16 kHz
+        // mono PCM16 this is ~16 seconds of audio.
+        private const val MAX_MIC_OUTPUT_BACKLOG_BYTES =
+            512L * 1024L
     }
 
     private val audioManager =
@@ -163,12 +170,16 @@ class NativeAudioEngine @Inject constructor(
         SharedFlow<Boolean> =
         _focusLost.asSharedFlow()
 
+    // AUD-013:
+    // Never suspend the capture producer on a bounded channel. Backlog is
+    // explicitly accounted in bytes and has a hard memory ceiling.
     private val _micOutput =
         Channel<AudioStreamEvent>(
-            capacity = 512,
-            onBufferOverflow =
-                BufferOverflow.SUSPEND
+            Channel.UNLIMITED
         )
+
+    private val queuedMicOutputBytes =
+        AtomicLong(0L)
 
     val micOutput:
         ReceiveChannel<AudioStreamEvent> =
@@ -671,15 +682,7 @@ class NativeAudioEngine @Inject constructor(
                         )
 
                         val currentAudioBytes =
-                            if (
-                                validPcm === frame
-                            ) {
-                                frame.copyOf(
-                                    bytesRead
-                                )
-                            } else {
-                                validPcm
-                            }
+                            validPcm
 
                         if (isAadMode) {
 
@@ -753,11 +756,12 @@ class NativeAudioEngine @Inject constructor(
                                             preRoll
                                         ) {
 
-                                            _micOutput.send(
+                                            sendMicEvent(
                                                 AudioStreamEvent
                                                     .Audio(pf)
                                             )
                                         }
+
                                     }
 
                                 } else if (
@@ -795,7 +799,7 @@ class NativeAudioEngine @Inject constructor(
                                 isBargeInActive
                             ) {
 
-                                _micOutput.send(
+                                sendMicEvent(
                                     AudioStreamEvent
                                         .Audio(
                                             currentAudioBytes
@@ -825,8 +829,10 @@ class NativeAudioEngine @Inject constructor(
                                             maxPreRoll
                                     ) {
 
-                                        leadInBuffer
-                                            .removeFirst()
+                                        recycleBuffer(
+                                            leadInBuffer
+                                                .removeFirst()
+                                        )
                                     }
                                 }
                             }
@@ -835,7 +841,7 @@ class NativeAudioEngine @Inject constructor(
                                 speechEndedOnFrame
                             ) {
 
-                                _micOutput.send(
+                                sendMicEvent(
                                     AudioStreamEvent
                                         .SpeechEnd
                                 )
@@ -868,7 +874,7 @@ class NativeAudioEngine @Inject constructor(
                                     }
                                 }
 
-                                _micOutput.send(
+                                sendMicEvent(
                                     AudioStreamEvent
                                         .SpeechStart
                                 )
@@ -878,13 +884,13 @@ class NativeAudioEngine @Inject constructor(
                                     preRoll
                                 ) {
 
-                                    _micOutput.send(
+                                    sendMicEvent(
                                         AudioStreamEvent
                                             .Audio(pf)
                                     )
                                 }
 
-                                _micOutput.send(
+                                sendMicEvent(
                                     AudioStreamEvent
                                         .Audio(
                                             currentAudioBytes
@@ -898,7 +904,7 @@ class NativeAudioEngine @Inject constructor(
                                 isSpeechActiveManual
                             ) {
 
-                                _micOutput.send(
+                                sendMicEvent(
                                     AudioStreamEvent
                                         .Audio(
                                             currentAudioBytes
@@ -921,8 +927,10 @@ class NativeAudioEngine @Inject constructor(
                                             PRE_ROLL_FRAMES_CAPACITY
                                     ) {
 
-                                        leadInBuffer
-                                            .removeFirst()
+                                        recycleBuffer(
+                                            leadInBuffer
+                                                .removeFirst()
+                                        )
                                     }
                                 }
                             }
@@ -931,7 +939,7 @@ class NativeAudioEngine @Inject constructor(
                                 speechEndedOnFrame
                             ) {
 
-                                _micOutput.send(
+                                sendMicEvent(
                                     AudioStreamEvent
                                         .SpeechEnd
                                 )
@@ -941,9 +949,9 @@ class NativeAudioEngine @Inject constructor(
                             }
                         }
 
-                        recycleBuffer(
-                            frame
-                        )
+                        if (currentAudioBytes !== frame) {
+                            recycleBuffer(frame)
+                        }
 
                     } else {
 
@@ -1112,40 +1120,16 @@ class NativeAudioEngine @Inject constructor(
         }
 
         val enqueued =
-            withTimeoutOrNull(500L) {
-
-                _micOutput.send(
-                    AudioStreamEvent
-                        .StreamStop
-                )
-
-                true
-            } ?: false
-
-        if (enqueued) {
-
-            streamStopGeneration =
-                generation
-
-            return true
-        }
-
-        _micOutput.tryReceive()
-
-        if (
-            _micOutput.trySend(
+            sendMicEvent(
                 AudioStreamEvent
                     .StreamStop
-            ).isSuccess
-        ) {
+            )
 
-            streamStopGeneration =
-                generation
-
-            return true
+        if (enqueued) {
+            streamStopGeneration = generation
         }
 
-        return false
+        return enqueued
     }
 
     suspend fun stopCaptureGraceful(
@@ -1201,7 +1185,7 @@ class NativeAudioEngine @Inject constructor(
                     poolLock
                 ) {
 
-                    leadInBuffer.clear()
+                    recycleLeadInBuffersLocked()
                 }
 
                 val currentGeneration =
@@ -1314,14 +1298,10 @@ class NativeAudioEngine @Inject constructor(
                     poolLock
                 ) {
 
-                    leadInBuffer.clear()
+                    recycleLeadInBuffersLocked()
                 }
 
-                while (
-                    _micOutput
-                        .tryReceive()
-                        .isSuccess
-                ) {}
+                drainMicOutput()
 
                 while (
                     routeTransitionChannel
@@ -1555,6 +1535,100 @@ class NativeAudioEngine @Inject constructor(
             null
     }
 
+    private fun drainMicOutput() {
+        while (true) {
+            val result = _micOutput.tryReceive()
+            val event = result.getOrNull() ?: break
+            if (event is AudioStreamEvent.Audio) {
+                releaseCapturedBuffer(event.pcm)
+            }
+        }
+        queuedMicOutputBytes.set(0L)
+    }
+
+    // AUD-013:
+    // Capture-side events are enqueued without suspension. Audio buffers are
+    // owned by the channel until SessionManager calls releaseCapturedBuffer().
+    private fun sendMicEvent(
+        event: AudioStreamEvent
+    ): Boolean {
+
+        if (event is AudioStreamEvent.Audio) {
+            if (!_isCapturing.value) {
+                recycleBuffer(event.pcm)
+                return false
+            }
+
+            val bytes = event.pcm.size.toLong()
+            val next = queuedMicOutputBytes.addAndGet(bytes)
+
+            if (next > MAX_MIC_OUTPUT_BACKLOG_BYTES) {
+                queuedMicOutputBytes.addAndGet(-bytes)
+                recycleBuffer(event.pcm)
+
+                logger.e(
+                    "NativeAudioEngine: mic output backlog exceeded ${MAX_MIC_OUTPUT_BACKLOG_BYTES} bytes; stopping capture producer"
+                )
+
+                _isCapturing.value = false
+
+                if (streamStopGeneration != engineGeneration.get()) {
+                    if (
+                        _micOutput
+                            .trySend(
+                                AudioStreamEvent.StreamStop
+                            )
+                            .isSuccess
+                    ) {
+                        streamStopGeneration =
+                            engineGeneration.get()
+                    }
+                }
+
+                return false
+            }
+        }
+
+        val result = _micOutput.trySend(event)
+
+        if (result.isFailure && event is AudioStreamEvent.Audio) {
+            releaseCapturedBuffer(event.pcm)
+        }
+
+        return result.isSuccess
+    }
+
+    private fun decrementQueuedMicOutputBytes(
+        bytes: Long
+    ) {
+        if (bytes <= 0L) return
+
+        while (true) {
+            val current = queuedMicOutputBytes.get()
+            val next = (current - bytes).coerceAtLeast(0L)
+            if (queuedMicOutputBytes.compareAndSet(current, next)) {
+                return
+            }
+        }
+    }
+
+    // Called by the single consumer after it has finished sending one PCM
+    // frame downstream. This is the ownership hand-off point for pooled
+    // capture buffers.
+    fun releaseCapturedBuffer(
+        pcm: ByteArray
+    ) {
+        val bytes = pcm.size.toLong()
+        decrementQueuedMicOutputBytes(bytes)
+        recycleBuffer(pcm)
+    }
+
+    private fun recycleLeadInBuffersLocked() {
+        while (leadInBuffer.isNotEmpty()) {
+            recycleBuffer(leadInBuffer.removeFirst())
+        }
+    }
+
     private fun obtainBuffer():
         ByteArray =
         synchronized(poolLock) {
@@ -1576,6 +1650,7 @@ class NativeAudioEngine @Inject constructor(
         synchronized(poolLock) {
 
             if (
+                buf.size == BURST_BYTES &&
                 bufferPool.size < 64
             ) {
                 bufferPool.addLast(
