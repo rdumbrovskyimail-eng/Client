@@ -6,6 +6,7 @@ import com.client.app.util.AppLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -47,7 +48,6 @@ class VocabularyExtractor @Inject constructor(
     companion object {
         private const val ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
         
-        // Полная миграция на gemini-3.8-flash; устаревшие версии 2.5 удалены
         const val DEFAULT_MODEL = "gemini-3.8-flash"
         private const val FALLBACK_MODEL = "gemini-3.8-flash"
         
