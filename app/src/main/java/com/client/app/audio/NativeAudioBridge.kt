@@ -1,4 +1,4 @@
-// >>> FILE: app/src/main/java/com/client/app/audio/NativeAudioBridge.kt
+
 package com.client.app.audio
 
 import javax.inject.Inject
@@ -22,7 +22,11 @@ class NativeAudioBridge @Inject constructor() {
         outputDeviceId: Int = 0
     ): Boolean
 
+    /** Legacy all-duplex start; new lifecycle code uses explicit methods. */
     external fun startAudio(): Boolean
+    external fun startPlaybackAudio(): Boolean
+    external fun startCaptureAudio(): Boolean
+    external fun stopCaptureAudio()
     external fun stopAudio()
     external fun isAudioDisconnected(): Boolean
     external fun setVolume(volume: Float)
