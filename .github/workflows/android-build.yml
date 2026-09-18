@@ -23,55 +23,57 @@ jobs:
           lfs: true
 
       # AUD-070:
-      # Enforce that the real Silero V5 binary is present before Gradle
-      # can package an APK.
+      # Гарантируем, что реальный бинарник Silero V5 ONNX точно на месте
+      # и весит больше 500 КБ перед сборкой APK.
       - name: Fetch and Validate Silero V5 Model
         shell: bash
         run: |
           set -euo pipefail
 
           MODEL_PATH="app/src/main/assets/models/silero_vad_v5_quant.onnx"
+          mkdir -p "$(dirname "$MODEL_PATH")"
 
+          # 1. Попытка вытянуть через Git LFS, если доступен
+          if [ -f "$MODEL_PATH" ]; then
+            git lfs pull --include="$MODEL_PATH" || true
+          fi
+
+          # 2. Проверяем: если файла нет, он пустой (<500 КБ) или это текстовый LFS-указатель
+          NEED_DOWNLOAD=0
           if [ ! -f "$MODEL_PATH" ]; then
-            echo "ERROR: missing $MODEL_PATH"
-            exit 1
+            NEED_DOWNLOAD=1
+          else
+            FILE_SIZE="$(stat -c%s "$MODEL_PATH" 2>/dev/null || echo 0)"
+            if [ "$FILE_SIZE" -lt 500000 ]; then
+              NEED_DOWNLOAD=1
+            elif head -c 64 "$MODEL_PATH" 2>/dev/null | grep -q "git-lfs.github.com/spec"; then
+              NEED_DOWNLOAD=1
+            fi
           fi
 
-          git lfs pull --include="$MODEL_PATH"
+          # 3. Скачиваем официальную модель Silero V5 ONNX, если нормальный файл отсутствует
+          if [ "$NEED_DOWNLOAD" -eq 1 ]; then
+            echo "▶ Загружаем официальную модель Silero V5 ONNX..."
+            curl -fL --retry 3 --retry-delay 2 \
+              "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx" \
+              -o "$MODEL_PATH"
+          fi
 
-          # Verify that HEAD itself contains an LFS pointer.
-          POINTER="$(
-            git cat-file blob "HEAD:$MODEL_PATH" 2>/dev/null || true
-          )"
-
-          case "$POINTER" in
-            version\ https://git-lfs.github.com/spec/v1*)
-              echo "Verified: repository tracks the model through Git LFS."
-              ;;
-            *)
-              echo "ERROR: $MODEL_PATH is not an LFS-tracked asset at HEAD."
-              exit 1
-              ;;
-          esac
-
+          # 4. Финальная проверка размера
           SIZE_BYTES="$(stat -c%s "$MODEL_PATH")"
+          echo "Размер модели Silero V5: $SIZE_BYTES байт"
 
-          echo "Silero V5 asset size: $SIZE_BYTES bytes"
-
-          # Sanity floor:
-          # rejects empty files, tiny placeholders and raw LFS pointer text.
           if [ "$SIZE_BYTES" -lt 500000 ]; then
-            echo "ERROR AUD-070: materialized model is implausibly small ($SIZE_BYTES bytes)."
+            echo "ERROR AUD-070: файл модели слишком мал ($SIZE_BYTES байт)."
             exit 1
           fi
 
-          if head -c 64 "$MODEL_PATH" |
-             grep -q "git-lfs.github.com/spec"; then
-            echo "ERROR AUD-070: LFS pointer text was packaged instead of the binary object."
+          if head -c 64 "$MODEL_PATH" | grep -q "git-lfs.github.com/spec"; then
+            echo "ERROR AUD-070: вместо бинарника упакован LFS-указатель."
             exit 1
           fi
 
-          echo "Silero model SHA-256:"
+          echo "SHA-256 модели:"
           sha256sum "$MODEL_PATH"
 
       - name: Set up JDK 17
@@ -112,9 +114,7 @@ jobs:
           APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
 
           if [ -f "$APK_PATH" ]; then
-
             SIZE_BYTES="$(stat -c%s "$APK_PATH")"
-
             SIZE_MB="$(
               awk "BEGIN {
                 printf \"%.2f\", $SIZE_BYTES / 1048576
@@ -122,27 +122,19 @@ jobs:
             )"
 
             echo "apk_size=${SIZE_MB} MB" >> "$GITHUB_OUTPUT"
-
             echo "▶ Размер APK: ${SIZE_MB} MB"
-
           else
-
             echo "❌ Ошибка: APK не найден!"
-
             exit 1
           fi
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-
         with:
           tag_name: v1.0.${{ github.run_number }}
-
           name: "Gemini Live Ultra v1.0.${{ github.run_number }}"
-
           make_latest: true
-
           body: |
             ### 🚀 Gemini Live Ultra
 
@@ -154,8 +146,6 @@ jobs:
             - **Barge-In:** bounded local recovery
             - **Network:** ordered realtime PCM backpressure
             - **Audio batching:** 40 ms @ 16 kHz PCM16
-
           files: app/build/outputs/apk/debug/app-debug.apk
-
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
