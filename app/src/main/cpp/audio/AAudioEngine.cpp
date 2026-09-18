@@ -18,7 +18,6 @@
 #undef LOGI
 #undef LOGW
 #undef LOGE
-
 #define LOGI(...) do { \
     char _buf[256]; \
     snprintf(_buf, sizeof(_buf), __VA_ARGS__); \
@@ -39,7 +38,6 @@
     __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "%s", _buf); \
     client::logging::NativeLogQueue::getInstance().push(6, LOG_TAG, _buf); \
 } while (0)
-
 namespace {
 
 struct Biquad {
@@ -60,7 +58,6 @@ struct Biquad {
 
     inline float process(float in) {
         float w0 = in - a1 * w1 - a2 * w2;
-
         float out =
             b0 * w0 +
             b1 * w1 +
@@ -165,7 +162,6 @@ struct Biquad {
             (2.0f *
              ((A - 1.0f) -
               (A + 1.0f) * cs)) / a0;
-
         a2 =
             ((A + 1.0f) -
              (A - 1.0f) * cs -
@@ -333,7 +329,6 @@ bool AAudioEngine::init(
     int32_t targetPlaybackSampleRate,
     int32_t inputDeviceId,
     int32_t outputDeviceId) {
-
     std::lock_guard<std::mutex> lock(
         lifecycleMutex_);
 
@@ -386,10 +381,10 @@ bool AAudioEngine::initLocked(
         0,
         std::memory_order_relaxed);
 
-    captureRawBuffer_.clear();
-    captureBuffer_.clear();
-    playbackDspInputBuffer_.clear();
-    playbackBuffer_.clear();
+    captureRawBuffer_.resetQuiesced();
+    captureBuffer_.resetQuiesced();
+    playbackDspInputBuffer_.resetQuiesced();
+    playbackBuffer_.resetQuiesced();
 
     isBluetoothMode_.store(
         isBluetoothMode,
@@ -543,7 +538,6 @@ bool AAudioEngine::initLocked(
     if (inCapacity > 0 &&
         static_cast<size_t>(inCapacity * 4) >
             neededCaptureScratch) {
-
         neededCaptureScratch =
             static_cast<size_t>(
                 inCapacity * 4);
@@ -585,7 +579,6 @@ bool AAudioEngine::initLocked(
 
     if (captureRawScratchBuffer_.size() <
         CAPTURE_RAW_SCRATCH_FRAMES) {
-
         captureRawScratchBuffer_.resize(
             CAPTURE_RAW_SCRATCH_FRAMES,
             0);
@@ -837,7 +830,6 @@ bool AAudioEngine::start() {
             return false;
         }
     }
-
     // AUD-063:
     // Keep the realtime playback callback quiesced while lifecycle
     // code clears queues and starts the stream.
@@ -847,10 +839,10 @@ bool AAudioEngine::start() {
         0,
         std::memory_order_relaxed);
 
-    captureRawBuffer_.clear();
-    captureBuffer_.clear();
-    playbackDspInputBuffer_.clear();
-    playbackBuffer_.clear();
+    captureRawBuffer_.resetQuiesced();
+    captureBuffer_.resetQuiesced();
+    playbackDspInputBuffer_.resetQuiesced();
+    playbackBuffer_.resetQuiesced();
 
     aaudio_result_t res =
         AAudioStream_requestStart(
@@ -900,7 +892,6 @@ bool AAudioEngine::start() {
         std::thread(
             &AAudioEngine::captureDspThreadLoop,
             this);
-
     isRunning_.store(
         true,
         std::memory_order_release);
@@ -1005,16 +996,15 @@ void AAudioEngine::stopLocked() {
         s_voiceEnhancer.reset(48000);
 
         fftPos_ = 0;
-
         inputIngressBlocked_.store(
             false,
             std::memory_order_release);
     }
 
-    captureRawBuffer_.clear();
-    captureBuffer_.clear();
-    playbackDspInputBuffer_.clear();
-    playbackBuffer_.clear();
+    captureRawBuffer_.resetQuiesced();
+    captureBuffer_.resetQuiesced();
+    playbackDspInputBuffer_.resetQuiesced();
+    playbackBuffer_.resetQuiesced();
 
     micRms_.store(
         0.0f,
@@ -1047,7 +1037,6 @@ void AAudioEngine::captureDspThreadLoop() {
         const int32_t channels =
             actualCaptureChannels_.load(
                 std::memory_order_relaxed);
-
         const size_t ch =
             static_cast<size_t>(
                 channels > 0
@@ -1110,7 +1099,6 @@ void AAudioEngine::captureDspThreadLoop() {
         const float gain =
             micGain_.load(
                 std::memory_order_relaxed);
-
         const bool applyGain =
             std::abs(gain - 1.0f) > 0.001f;
 
@@ -1131,7 +1119,6 @@ void AAudioEngine::captureDspThreadLoop() {
                         static_cast<int32_t>(
                             inPtr[i * 2 + 1])
                     ) / 2;
-
                 if (applyGain) {
                     mixed =
                         static_cast<int32_t>(
@@ -1215,7 +1202,6 @@ void AAudioEngine::captureDspThreadLoop() {
 
             finalPcm = decBuf;
             finalFrames = processed;
-
         } else if (capRate == 8000) {
 
             int16_t* upBuf =
@@ -1236,7 +1222,6 @@ void AAudioEngine::captureDspThreadLoop() {
                     (i + 1 < chunkFrames)
                         ? monoBuf[i + 1]
                         : current;
-
                 upBuf[outIdx++] =
                     current;
 
@@ -1278,7 +1263,6 @@ void AAudioEngine::playbackDspThreadLoop() {
     dsp::enableHardwareFtz();
 
     constexpr size_t TARGET_BUFFER_MS = 40;
-
     int16_t* input =
         playbackDspInputScratch_.data();
 
@@ -1299,7 +1283,6 @@ void AAudioEngine::playbackDspThreadLoop() {
         const uint64_t activeEpoch =
             playbackEpoch_.load(
                 std::memory_order_acquire);
-
         if (activeEpoch != workerDspEpoch) {
 
             const int32_t currentRate =
@@ -1320,17 +1303,24 @@ void AAudioEngine::playbackDspThreadLoop() {
                 fftBuffer_.begin(),
                 fftBuffer_.end(),
                 0.0f);
+            // Quiesce the JNI producer side before resetting the SPSC queue.
+            // flushPlayback() sets inputIngressBlocked_ before publishing the
+            // new epoch and serializes with this mutex; taking it here makes
+            // the quiescence precondition explicit even if this worker reaches
+            // the epoch transition slightly later.
+            {
+                std::lock_guard<std::mutex>
+                    ingressLock(
+                        playbackJniWriteMutex_);
 
-            // playbackDspInputBuffer_ consumer ownership belongs to
-            // this worker, so it is safe to discard it here after
-            // observing the generation transition.
-            playbackDspInputBuffer_.discardAll();
+                playbackDspInputBuffer_.discardAllQuiesced();
 
-            workerDspEpoch = activeEpoch;
+                workerDspEpoch = activeEpoch;
 
-            inputIngressBlocked_.store(
-                false,
-                std::memory_order_release);
+                inputIngressBlocked_.store(
+                    false,
+                    std::memory_order_release);
+            }
 
             playbackIngressCv_.notify_all();
         }
@@ -1360,66 +1350,65 @@ void AAudioEngine::playbackDspThreadLoop() {
                          1000.0f)),
                     earconScratch_.size());
 
-            if (playbackBuffer_.availableWrite() >=
-                earconFrames) {
+            // Synthesize into the private scratch buffer first. The
+            // availability check and producer commit below are one critical
+            // section relative to flushPlayback().
+            for (size_t i = 0;
+                 i < earconFrames;
+                 ++i) {
 
-                for (size_t i = 0;
-                     i < earconFrames;
-                     ++i) {
+                const float t =
+                    static_cast<float>(i) /
+                    static_cast<float>(actualRate);
 
-                    const float t =
-                        static_cast<float>(i) /
-                        static_cast<float>(
-                            actualRate);
-
-                    const float env =
-                        std::cos(
-                            (
-                                3.14159265f *
-                                static_cast<float>(i)
-                            ) /
-                            (
-                                2.0f *
-                                static_cast<float>(
-                                    earconFrames)
-                            ));
-
-                    const float sample =
-                        std::sin(
-                            2.0f *
+                const float env =
+                    std::cos(
+                        (
                             3.14159265f *
-                            EARCON_FREQ_HZ *
-                            t
-                        ) *
-                        env *
-                        env *
-                        12000.0f;
+                            static_cast<float>(i)
+                        ) /
+                        (
+                            2.0f *
+                            static_cast<float>(earconFrames)
+                        ));
 
-                    earconBuf[i] =
-                        static_cast<int16_t>(
-                            std::clamp(
-                                sample,
-                                -32768.0f,
-                                32767.0f));
-                }
+                const float sample =
+                    std::sin(
+                        2.0f *
+                        3.14159265f *
+                        EARCON_FREQ_HZ *
+                        t
+                    ) *
+                    env *
+                    env *
+                    12000.0f;
 
-                {
-                    std::lock_guard<std::mutex>
-                        commitLock(
-                            playbackControlMutex_);
+                earconBuf[i] =
+                    static_cast<int16_t>(
+                        std::clamp(
+                            sample,
+                            -32768.0f,
+                            32767.0f));
+            }
 
-                    if (playbackEpoch_.load(
-                            std::memory_order_acquire)
-                        == activeEpoch) {
+            std::lock_guard<std::mutex>
+                commitLock(playbackControlMutex_);
 
-                        playbackBuffer_.write(
-                            earconBuf,
-                            earconFrames);
+            if (playbackEpoch_.load(
+                    std::memory_order_acquire)
+                == activeEpoch &&
+                playbackBuffer_.availableWrite() >=
+                    earconFrames) {
 
-                        earconRequested_.store(
-                            false,
-                            std::memory_order_release);
-                    }
+                const size_t written =
+                    playbackBuffer_.write(
+                        earconBuf,
+                        earconFrames);
+
+                if (written == earconFrames) {
+                    earconRequested_.store(
+                        false,
+                        std::memory_order_release);
                 }
             }
         }
@@ -1439,7 +1428,6 @@ void AAudioEngine::playbackDspThreadLoop() {
 
         const size_t freeSpace =
             playbackBuffer_.availableWrite();
-
         // AUD-062:
         // The worker sleeps once the hardware-facing playback buffer
         // reaches its target watermark.
@@ -1460,7 +1448,6 @@ void AAudioEngine::playbackDspThreadLoop() {
                  activeEpoch,
                  targetBufferFrames,
                  maxOutputFrames]() {
-
                     if (!playbackDspRunning_.load(
                             std::memory_order_acquire)) {
                         return true;
@@ -1691,7 +1678,6 @@ void AAudioEngine::playbackDspThreadLoop() {
                         output[i]) *
                     (1.0f / 32768.0f);
             }
-
             if (fftPos_ >= requiredAccum) {
 
                 if (fftProcessor_) {
@@ -1754,7 +1740,6 @@ void AAudioEngine::playbackDspThreadLoop() {
         }
     }
 }
-
 size_t AAudioEngine::writePlaybackPcm(
     const int16_t* pcm,
     size_t frames,
@@ -1851,6 +1836,7 @@ size_t AAudioEngine::readCapturePcm(
 }
 
 // AUD-063:
+// AUD-022:
 //
 // Never wait for a callback-generated flush ACK.
 //
@@ -1921,7 +1907,6 @@ void AAudioEngine::flushPlayback(
     playbackIngressCv_.notify_all();
 
     unblockPlaybackCallback();
-
     LOGI(
         "AAudioEngine: flush committed. Authoritative Epoch=%llu",
         static_cast<unsigned long long>(
@@ -2152,7 +2137,6 @@ AAudioEngine::playbackCallback(
 
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
-
     const size_t read =
         engine->playbackBuffer_.read(
             samples,
