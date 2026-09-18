@@ -1,4 +1,4 @@
-// >>> FILE: app/src/main/java/com/client/app/api/GeminiLiveClient.kt
+
 package com.client.app.api
 
 import kotlinx.coroutines.flow.Flow
@@ -197,9 +197,13 @@ class GeminiLiveClient @Inject constructor(
         get() = protobufClient.audioGeneration
 
     suspend fun connect(
-        cfg: LiveConfig
+        cfg: LiveConfig,
+        beforeOpen: (suspend () -> Unit)? = null
     ) =
-        protobufClient.connect(cfg)
+        protobufClient.connect(
+            cfg,
+            beforeOpen
+        )
 
     // AUD-067
     suspend fun sendAudio(
