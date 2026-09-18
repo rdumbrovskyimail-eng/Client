@@ -27,7 +27,7 @@ class AAudioEngine {
 public:
     static AAudioEngine& getInstance();
 
-    bool init(bool isBluetoothMode = false, 
+    bool init(bool isBluetoothMode = false,
               int32_t targetPlaybackSampleRate = SAMPLE_RATE_GEMINI_OUT,
               int32_t inputDeviceId = AAUDIO_UNSPECIFIED,
               int32_t outputDeviceId = AAUDIO_UNSPECIFIED);
@@ -52,15 +52,30 @@ public:
     bool isMmapActive() const { return isMmapExclusiveActive_.load(std::memory_order_relaxed); }
     bool isDisconnected() const { return isDisconnected_.load(std::memory_order_relaxed); }
 
-    int32_t getActualCaptureSampleRate() const { return actualCaptureSampleRate_.load(std::memory_order_relaxed); }
-    int32_t getActualCaptureChannels() const { return actualCaptureChannels_.load(std::memory_order_relaxed); }
-    int32_t getActualPlaybackSampleRate() const { return actualPlaybackSampleRate_.load(std::memory_order_relaxed); }
+    int32_t getActualCaptureSampleRate() const {
+        return actualCaptureSampleRate_.load(std::memory_order_relaxed);
+    }
 
-    int32_t getActiveInputDeviceId() const { return actualInputDeviceId_.load(std::memory_order_relaxed); }
-    int32_t getActiveOutputDeviceId() const { return actualOutputDeviceId_.load(std::memory_order_relaxed); }
+    int32_t getActualCaptureChannels() const {
+        return actualCaptureChannels_.load(std::memory_order_relaxed);
+    }
+
+    int32_t getActualPlaybackSampleRate() const {
+        return actualPlaybackSampleRate_.load(std::memory_order_relaxed);
+    }
+
+    int32_t getActiveInputDeviceId() const {
+        return actualInputDeviceId_.load(std::memory_order_relaxed);
+    }
+
+    int32_t getActiveOutputDeviceId() const {
+        return actualOutputDeviceId_.load(std::memory_order_relaxed);
+    }
 
     // AUD-004: Метрика отброшенных входных аудио-фреймов
-    uint64_t getCaptureDroppedFrames() const { return captureDroppedFrames_.load(std::memory_order_relaxed); }
+    uint64_t getCaptureDroppedFrames() const {
+        return captureDroppedFrames_.load(std::memory_order_relaxed);
+    }
 
     void getSpectrumData(dsp::SpectrumSnapshot& outSnapshot);
 
@@ -68,35 +83,60 @@ private:
     AAudioEngine();
     ~AAudioEngine();
 
-    bool initLocked(bool isBluetoothMode, int32_t targetPlaybackSampleRate,
-                    int32_t inputDeviceId, int32_t outputDeviceId);
+    bool initLocked(bool isBluetoothMode,
+                    int32_t targetPlaybackSampleRate,
+                    int32_t inputDeviceId,
+                    int32_t outputDeviceId);
 
     void stopLocked();
 
-    aaudio_result_t openPlaybackStreamWithFallback(int32_t targetPlaybackSampleRate,
-                                                   int32_t outputDeviceId,
-                                                   bool isBluetooth);
+    aaudio_result_t openPlaybackStreamWithFallback(
+        int32_t targetPlaybackSampleRate,
+        int32_t outputDeviceId,
+        bool isBluetooth);
 
     void playbackDspThreadLoop();
     void captureDspThreadLoop();
 
     static aaudio_data_callback_result_t captureCallback(
-        AAudioStream* stream, void* userData, void* audioData, int32_t numFrames);
+        AAudioStream* stream,
+        void* userData,
+        void* audioData,
+        int32_t numFrames);
 
     static aaudio_data_callback_result_t playbackCallback(
-        AAudioStream* stream, void* userData, void* audioData, int32_t numFrames);
+        AAudioStream* stream,
+        void* userData,
+        void* audioData,
+        int32_t numFrames);
 
     static void errorCallback(
-        AAudioStream* stream, void* userData, aaudio_result_t error);
+        AAudioStream* stream,
+        void* userData,
+        aaudio_result_t error);
+
+    // AUD-063:
+    // High bit blocks new callback entries.
+    // Low 31 bits count callbacks already inside the critical section.
+    //
+    // This lets lifecycle code quiesce the playback consumer without
+    // modifying the SPSC consumer index while the callback is active.
+    static constexpr uint32_t PLAYBACK_CALLBACK_BLOCKED = 0x80000000u;
+    static constexpr uint32_t PLAYBACK_CALLBACK_COUNT_MASK = 0x7fffffffu;
+
+    bool tryEnterPlaybackCallback();
+    void leavePlaybackCallback();
+    void blockPlaybackCallbackAndWait();
+    void unblockPlaybackCallback();
 
     AAudioStream* captureStream_{nullptr};
     AAudioStream* playbackStream_{nullptr};
 
-    // AUD-003: SPSC очереди захвата
+    // AUD-003: SPSC queues захвата
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_CAPTURE> captureRawBuffer_;
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_CAPTURE> captureBuffer_;
 
-    // AUD-001: SPSC очереди воспроизведения
+    // AUD-001: SPSC queues воспроизведения
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_PLAYBACK> playbackDspInputBuffer_;
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_PLAYBACK> playbackBuffer_;
 
@@ -106,6 +146,7 @@ private:
     std::atomic<bool> isBluetoothMode_{false};
     std::atomic<bool> isMmapExclusiveActive_{false};
     std::atomic<bool> isDisconnected_{false};
+
     std::atomic<int32_t> playbackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
 
     std::atomic<int32_t> actualCaptureSampleRate_{SAMPLE_RATE_GEMINI_IN};
@@ -135,8 +176,13 @@ private:
 
     alignas(64) std::atomic<uint64_t> playbackEpoch_{0};
 
+    // AUD-063: realtime callback admission/quiescence state.
+    alignas(64)
+    std::atomic<uint32_t> playbackCallbackState_{PLAYBACK_CALLBACK_BLOCKED};
+
     std::mutex playbackControlMutex_;
     std::mutex playbackJniWriteMutex_;
+
     std::mutex playbackIngressMutex_;
     std::condition_variable playbackIngressCv_;
     std::atomic<bool> inputIngressBlocked_{false};
@@ -148,6 +194,7 @@ private:
     std::vector<int16_t> playbackDspInputScratch_;
     std::vector<int16_t> playbackDspOutputScratch_;
     std::vector<int16_t> earconScratch_;
+
     std::vector<float> fftBuffer_;
     size_t fftPos_{0};
 
