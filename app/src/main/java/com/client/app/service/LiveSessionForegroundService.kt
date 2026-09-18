@@ -1,4 +1,4 @@
-// >>> FILE: app/src/main/java/com/client/app/service/LiveSessionForegroundService.kt
+
 package com.client.app.service
 
 import android.Manifest
@@ -20,6 +20,9 @@ import com.client.app.MainActivity
 import com.client.app.session.SessionManager
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -39,36 +42,40 @@ class LiveSessionForegroundService : Service() {
         private const val NOTIFICATION_ID = 101
         private const val CHANNEL_ID = "live_client_voice_channel"
         private const val WAKELOCK_TIMEOUT_MS = 15 * 60 * 1000L // 15 минут
+
+        private val _isServiceActive = MutableStateFlow(false)
+        val isServiceActive: StateFlow<Boolean> = _isServiceActive.asStateFlow()
     }
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         initMediaSession()
-        acquireHardwareLocks()
         promoteToForeground()
+        if (_isServiceActive.value) {
+            acquireHardwareLocks()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            // SessionManager owns the shutdown ordering. Do not stop the
+            // service here, otherwise the service could disappear before
+            // capture/playback/WebSocket cleanup has completed.
             sessionManager.stopSession()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
-            }
-            stopSelf()
             return START_NOT_STICKY
         }
 
         promoteToForeground()
+        if (_isServiceActive.value) {
+            acquireHardwareLocks()
+        }
         return START_NOT_STICKY
     }
 
     /**
-     * Ключевой механизм обхода One UI App Freezer:
-     * Активная MediaSession со статусом STATE_PLAYING блокирует перевод cgroup процесса в статус FROZEN.
+     * Exposes the active session to Android media controls while the Live
+     * foreground service owns the background audio lifecycle.
      */
     private fun initMediaSession() {
         runCatching {
@@ -92,53 +99,71 @@ class LiveSessionForegroundService : Service() {
     }
 
     private fun acquireHardwareLocks() {
-        // 1. Аппаратный процессорный замок с пролонгацией
-        val pm = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "client:live_session_cpu").apply {
-            setReferenceCounted(false)
-            acquire(WAKELOCK_TIMEOUT_MS)
-        }
+        if (wakeLock?.isHeld != true) {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "client:live_session_cpu"
+            ).apply {
+                setReferenceCounted(false)
+                acquire(WAKELOCK_TIMEOUT_MS)
+            }
 
-        renewJob = serviceScope.launch {
-            while (isActive) {
-                delay(8 * 60 * 1000L) // Обновление каждые 8 минут
-                runCatching { wakeLock?.acquire(WAKELOCK_TIMEOUT_MS) }
+            if (renewJob?.isActive != true) {
+                renewJob = serviceScope.launch {
+                    while (isActive) {
+                        delay(8 * 60 * 1000L)
+                        runCatching {
+                            if (wakeLock?.isHeld != true) {
+                                wakeLock?.acquire(WAKELOCK_TIMEOUT_MS)
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        // 2. Радиочастотный замок Wi-Fi 7 (FastConnect 7800 Low Latency Lock)
-        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-        wifiLock = wm?.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "client:live_session_wifi")?.apply {
-            setReferenceCounted(false)
-            acquire()
+        if (wifiLock?.isHeld != true) {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            wifiLock = wm?.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
+                "client:live_session_wifi"
+            )?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
         }
     }
 
     private fun promoteToForeground() {
         val notification = buildNotification()
-
         val hasMic = ContextCompat.checkSelfPermission(
-            this, Manifest.permission.RECORD_AUDIO
+            this,
+            Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
 
         runCatching {
-            when {
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
-                    val type = if (hasMic) {
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-                    } else {
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-                    }
-                    startForeground(NOTIFICATION_ID, notification, type)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                if (hasMic) {
+                    type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
                 }
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
-                    startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-                }
-                else -> {
-                    startForeground(NOTIFICATION_ID, notification)
-                }
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    type
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification
+                )
             }
+            _isServiceActive.value = true
         }.onFailure {
+            _isServiceActive.value = false
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
             stopSelf()
         }
     }
@@ -181,7 +206,7 @@ class LiveSessionForegroundService : Service() {
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Gemini Live Ultra активен")
-            .setContentText("Аппаратный дуплекс и микрофон S23 Ultra задействованы")
+            .setContentText("Фоновая Gemini Live-сессия активна")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(openAppPendingIntent)
             .setOngoing(true)
@@ -204,6 +229,7 @@ class LiveSessionForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        _isServiceActive.value = false
         super.onDestroy()
         renewJob?.cancel()
         serviceScope.cancel()
