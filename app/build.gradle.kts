@@ -1,3 +1,5 @@
+// >>> FILE: app/build.gradle.kts
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -66,19 +68,6 @@ android {
         compose = true
     }
 
-    /*
-     * Production signing is intentionally NOT required here.
-     *
-     * The normal CI pipeline builds assembleDebug.
-     *
-     * Debug APK signing is automatically provided by the Android Gradle
-     * Plugin using the standard debug keystore.
-     *
-     * Production signing can be configured separately for a dedicated
-     * release pipeline without making ordinary compilation dependent on
-     * production credentials.
-     */
-
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -90,6 +79,14 @@ android {
                 ),
                 "proguard-rules.pro"
             )
+
+            // Production signing is intentionally not configured here.
+            //
+            // This CI pipeline builds the debug APK for compilation,
+            // native-code, packaging and 16 KiB validation.
+            //
+            // Production signing can be supplied separately when an
+            // actual production release is created.
         }
 
         debug {
@@ -109,7 +106,7 @@ android {
         // AUD-061:
         //
         // Keep native libraries uncompressed so AGP can preserve
-        // 16 KB zip alignment for APK/AAB packaging.
+        // 16 KiB zip alignment for APK/AAB packaging.
         jniLibs {
             useLegacyPackaging = false
         }
@@ -126,8 +123,11 @@ android {
 
 kotlin {
     compilerOptions {
+        // IMPORTANT:
+        // jvmTarget expects Kotlin's JvmTarget type,
+        // not Gradle's JavaLanguageVersion.
         jvmTarget.set(
-            org.gradle.jvm.toolchain.JavaLanguageVersion.of(17)
+            org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
         )
 
         freeCompilerArgs.addAll(
