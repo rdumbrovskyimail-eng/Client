@@ -1,3 +1,8 @@
+######################################################################
+### FILE 04: app/src/main/java/com/client/app/audio/AudioDeviceRouter.kt
+######################################################################
+
+### BEGIN FULL FILE
 // >>> FILE: app/src/main/java/com/client/app/audio/AudioDeviceRouter.kt
 package com.client.app.audio
 
@@ -18,7 +23,9 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 enum class AudioRoutePath {
-    SPEAKER_EXCLUSIVE, // Samsung Galaxy S23 Ultra Native MMAP Exclusive (48 кГц / 4.2 мс)
+    // Requests AAudio EXCLUSIVE for the built-in speaker; actual sharing mode
+    // and MMAP usage are verified by AAudioEngine after stream open.
+    SPEAKER_EXCLUSIVE,
     CMF_BUDS_WIRELESS  // Nothing CMF Buds 2 (LE Audio LC3 / BT SCO)
 }
 
@@ -51,6 +58,7 @@ class AudioDeviceRouter @Inject constructor(
     val currentProfile: StateFlow<RouteProfile> = _currentProfile.asStateFlow()
 
     private var onRouteChangedListener: ((RouteProfile) -> Unit)? = null
+    private var isCallbackRegistered = false
 
     private data class RouteFingerprint(
         val path: AudioRoutePath,
@@ -71,8 +79,14 @@ class AudioDeviceRouter @Inject constructor(
     }
 
     fun start(onRouteChange: (RouteProfile) -> Unit) = synchronized(routeLock) {
-        this.onRouteChangedListener = onRouteChange
+        // start()/stop()/route callbacks share one ownership lock so a new
+        // router session cannot race cleanup from the previous one.
+        onRouteChangedListener = onRouteChange
 
+        if (isCallbackRegistered) {
+            runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
+            isCallbackRegistered = false
+        }
         routerScope?.cancel()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         routerScope = scope
@@ -85,20 +99,42 @@ class AudioDeviceRouter @Inject constructor(
                 }
         }
 
-        audioManager.registerAudioDeviceCallback(deviceCallback, null)
+        try {
+            audioManager.registerAudioDeviceCallback(deviceCallback, null)
+            isCallbackRegistered = true
+        } catch (t: Throwable) {
+            routerScope = null
+            scope.cancel()
+            onRouteChangedListener = null
+            logger.e("AudioDeviceRouter: не удалось зарегистрировать AudioDeviceCallback", t)
+            throw t
+        }
 
-        val initialProfile = evaluateActiveProfileLocked()
-        activeFingerprint = RouteFingerprint(
-            path = initialProfile.path,
-            inDevId = initialProfile.inputDeviceId,
-            outDevId = initialProfile.outputDeviceId,
-            sampleRate = initialProfile.sampleRateOut
-        )
-        _currentProfile.value = initialProfile
+        try {
+            val initialProfile = evaluateActiveProfileLocked()
+            activeFingerprint = RouteFingerprint(
+                path = initialProfile.path,
+                inDevId = initialProfile.inputDeviceId,
+                outDevId = initialProfile.outputDeviceId,
+                sampleRate = initialProfile.sampleRateOut
+            )
+            _currentProfile.value = initialProfile
+        } catch (t: Throwable) {
+            runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
+            isCallbackRegistered = false
+            onRouteChangedListener = null
+            routerScope = null
+            scope.cancel()
+            logger.e("AudioDeviceRouter: initial route evaluation failed", t)
+            throw t
+        }
     }
 
-    fun stop() {
-        audioManager.unregisterAudioDeviceCallback(deviceCallback)
+    fun stop() = synchronized(routeLock) {
+        if (isCallbackRegistered) {
+            runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
+            isCallbackRegistered = false
+        }
         onRouteChangedListener = null
         routerScope?.cancel()
         routerScope = null
@@ -107,8 +143,12 @@ class AudioDeviceRouter @Inject constructor(
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             runCatching { audioManager.clearCommunicationDevice() }
         }
-        if (audioManager.mode != AudioManager.MODE_NORMAL) {
-            audioManager.mode = AudioManager.MODE_NORMAL
+        runCatching {
+            if (audioManager.mode != AudioManager.MODE_NORMAL) {
+                audioManager.mode = AudioManager.MODE_NORMAL
+            }
+        }.onFailure {
+            logger.w("AudioDeviceRouter: не удалось вернуть AudioManager.MODE_NORMAL: ${it.message}")
         }
     }
 
@@ -126,19 +166,27 @@ class AudioDeviceRouter @Inject constructor(
     }
 
     private fun evaluateActiveRouteInternal() = synchronized(routeLock) {
-        val newProfile = evaluateActiveProfileLocked()
-        val newFingerprint = RouteFingerprint(
-            path = newProfile.path,
-            inDevId = newProfile.inputDeviceId,
-            outDevId = newProfile.outputDeviceId,
-            sampleRate = newProfile.sampleRateOut
-        )
+        if (routerScope == null || onRouteChangedListener == null) return@synchronized
 
-        if (activeFingerprint != newFingerprint) {
-            activeFingerprint = newFingerprint
-            _currentProfile.value = newProfile
-            logger.d("AudioDeviceRouter: Аппаратный профиль зафиксирован -> ${newProfile.path} [InId=${newProfile.inputDeviceId}, OutId=${newProfile.outputDeviceId}, Rate=${newProfile.sampleRateOut}Hz]")
-            onRouteChangedListener?.invoke(newProfile)
+        runCatching {
+            val newProfile = evaluateActiveProfileLocked()
+            val newFingerprint = RouteFingerprint(
+                path = newProfile.path,
+                inDevId = newProfile.inputDeviceId,
+                outDevId = newProfile.outputDeviceId,
+                sampleRate = newProfile.sampleRateOut
+            )
+
+            if (activeFingerprint != newFingerprint) {
+                activeFingerprint = newFingerprint
+                _currentProfile.value = newProfile
+                logger.d("AudioDeviceRouter: Аппаратный профиль зафиксирован -> ${newProfile.path} [InId=${newProfile.inputDeviceId}, OutId=${newProfile.outputDeviceId}, Rate=${newProfile.sampleRateOut}Hz]")
+                onRouteChangedListener?.invoke(newProfile)
+            }
+        }.onFailure {
+            // A transient permission/device query failure must not terminate
+            // the long-lived debounce collector. The next device event retries.
+            logger.w("AudioDeviceRouter: ошибка проверки маршрута: ${it.message}")
         }
     }
 
@@ -197,7 +245,9 @@ class AudioDeviceRouter @Inject constructor(
                 vadThresholdStart = 0.40f,
                 vadThresholdEnd = 0.20f,
                 deviceName = btOutputDevice.productName.toString().ifBlank { "CMF Buds 2 (Wireless)" },
-                inputDeviceId = btInputDevice?.id ?: 0,
+                // API 31+ setCommunicationDevice() selects the matching communication
+                // source automatically. Avoid pinning a potentially stale input ID.
+                inputDeviceId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) 0 else btInputDevice?.id ?: 0,
                 outputDeviceId = btOutputDevice.id
             )
         } else {
@@ -206,16 +256,18 @@ class AudioDeviceRouter @Inject constructor(
         }
     }
 
-    private fun bindBluetoothCommunication(device: AudioDeviceInfo): Boolean {
+    private fun bindBluetoothCommunication(device: AudioDeviceInfo): Boolean = runCatching {
         if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         }
 
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val currentComm = audioManager.communicationDevice
             if (currentComm?.id == device.id) {
                 true
             } else {
+                // On API 31+, Android selects the matching communication input
+                // automatically from the requested output communication device.
                 audioManager.setCommunicationDevice(device)
             }
         } else {
@@ -226,20 +278,25 @@ class AudioDeviceRouter @Inject constructor(
             }
             true
         }
-    }
+    }.onFailure {
+        logger.w("AudioDeviceRouter: не удалось привязать Bluetooth communication device: ${it.message}")
+    }.getOrDefault(false)
 
     private fun bindSpeakerCommunication() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val speaker = audioManager.availableCommunicationDevices.firstOrNull {
-                it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-            }
+            val speaker = runCatching {
+                audioManager.availableCommunicationDevices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                }
+            }.getOrNull()
             if (speaker != null) {
                 val currentComm = audioManager.communicationDevice
                 if (currentComm?.id != speaker.id) {
-                    audioManager.setCommunicationDevice(speaker)
+                    runCatching { audioManager.setCommunicationDevice(speaker) }
+                        .onFailure { logger.w("AudioDeviceRouter: не удалось выбрать встроенный динамик: ${it.message}") }
                 }
             } else {
-                audioManager.clearCommunicationDevice()
+                runCatching { audioManager.clearCommunicationDevice() }
             }
         } else {
             @Suppress("DEPRECATION")
@@ -274,3 +331,4 @@ class AudioDeviceRouter @Inject constructor(
         )
     }
 }
+### END FULL FILE
