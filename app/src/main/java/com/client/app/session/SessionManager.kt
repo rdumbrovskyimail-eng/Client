@@ -1,4 +1,3 @@
-FULL PATH: GeminiClient_Block1_Final/app/src/main/java/com/client/app/session/SessionManager.kt
 
 package com.client.app.session
 
