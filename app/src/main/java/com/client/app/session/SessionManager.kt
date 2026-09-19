@@ -1,3 +1,8 @@
+######################################################################
+### FILE 07: app/src/main/java/com/client/app/session/SessionManager.kt
+######################################################################
+
+### BEGIN FULL FILE
 package com.client.app.session
 
 import android.content.Context
@@ -96,6 +101,7 @@ class SessionManager @Inject constructor(
 ) {
     companion object {
         val KEY_API = stringPreferencesKey("gemini_api_key")
+        val KEY_LIVE_MODEL = stringPreferencesKey("gemini_live_model")
         val KEY_ANALYZER_MODEL = stringPreferencesKey("analyzer_model")
         val KEY_SYSTEM_PROMPT = stringPreferencesKey("gemini_system_prompt")
         val KEY_VOICE = stringPreferencesKey("gemini_voice")
@@ -213,40 +219,55 @@ class SessionManager @Inject constructor(
                 reconnectAttempts = 0
                 resumptionHandle = null
                 cancelReconnectWork()
-                startInternal(resume = false)
+                try {
+                    startInternal(resume = false)
+                } catch (cancelled: CancellationException) {
+                    connectionDesired = false
+                    cancelReconnectWork()
+                    throw cancelled
+                } catch (t: Throwable) {
+                    connectionDesired = false
+                    cancelReconnectWork()
+                    logger.e("SessionManager: initial connection start failed", t)
+                }
             }
         }
     }
 
     fun toggleMic() = scope.launch {
-        micMutex.withLock {
-            val physicallyActive =
-                _state.value.isMicActive ||
-                    audioEngine.isCapturing.value
+        // Session intent and microphone intent are one state domain. Always
+        // acquire locks in the same order: session -> mic. This prevents
+        // connect/disconnect/reconnect from racing a user mic toggle.
+        mutex.withLock {
+            micMutex.withLock {
+                val physicallyActive =
+                    _state.value.isMicActive ||
+                        audioEngine.isCapturing.value
 
-            if (physicallyActive) {
-                userMicDesired = false
-                stopMicLocked()
-                return@withLock
-            }
+                if (physicallyActive) {
+                    userMicDesired = false
+                    stopMicLocked()
+                    return@withLock
+                }
 
-            userMicDesired = !userMicDesired
-            if (!userMicDesired) {
-                _state.update { it.copy(error = null) }
-                return@withLock
-            }
+                userMicDesired = !userMicDesired
+                if (!userMicDesired) {
+                    _state.update { it.copy(error = null) }
+                    return@withLock
+                }
 
-            if (connectionDesired &&
-                _state.value.link == LinkState.LIVE &&
-                client.isReady
-            ) {
-                startMicLocked()
-            } else {
-                _state.update {
-                    it.copy(
-                        error =
-                            "Сессия ещё не готова: микрофон будет запущен после подключения"
-                    )
+                if (connectionDesired &&
+                    _state.value.link == LinkState.LIVE &&
+                    client.isReady
+                ) {
+                    startMicLocked()
+                } else {
+                    _state.update {
+                        it.copy(
+                            error =
+                                "Сессия ещё не готова: микрофон будет запущен после подключения"
+                        )
+                    }
                 }
             }
         }
@@ -260,27 +281,31 @@ class SessionManager @Inject constructor(
         }
     }
 
-    fun applyPrompt(newPrompt: String) {
-        val current = _state.value
-        val changed = current.activePrompt != newPrompt
-        val shouldRestart =
-            changed &&
-                current.link != LinkState.IDLE
+    fun applyPrompt(newPrompt: String) = scope.launch {
+        mutex.withLock {
+            val changed = _state.value.activePrompt != newPrompt
+            if (!changed) return@withLock
 
-        _state.update { it.copy(activePrompt = newPrompt) }
-        if (!shouldRestart) return
+            val shouldRestart = _state.value.link != LinkState.IDLE
+            _state.update { it.copy(activePrompt = newPrompt) }
 
-        scope.launch {
-            mutex.withLock {
-                if (!connectionDesired || _state.value.link == LinkState.IDLE) {
-                    return@withLock
-                }
+            if (!shouldRestart || !connectionDesired) return@withLock
 
-                resumptionHandle = null
-                cancelReconnectWork()
-                stopInternal(full = false)
-                if (connectionDesired) {
+            resumptionHandle = null
+            cancelReconnectWork()
+            stopInternal(full = false)
+
+            if (connectionDesired) {
+                try {
                     startInternal(resume = false)
+                } catch (cancelled: CancellationException) {
+                    connectionDesired = false
+                    cancelReconnectWork()
+                    throw cancelled
+                } catch (t: Throwable) {
+                    connectionDesired = false
+                    cancelReconnectWork()
+                    logger.e("SessionManager: prompt restart failed", t)
                 }
             }
         }
@@ -447,22 +472,46 @@ class SessionManager @Inject constructor(
     }
 
     private suspend fun ensureLive(): Boolean {
-        if (client.isReady) return true
+        val targetEpoch = mutex.withLock {
+            if (client.isReady && _state.value.link == LinkState.LIVE) {
+                return@withLock client.epoch
+            }
 
-        if (_state.value.link == LinkState.IDLE) {
-            mutex.withLock {
-                if (_state.value.link == LinkState.IDLE) {
-                    connectionDesired = true
+            if (_state.value.link == LinkState.IDLE) {
+                connectionDesired = true
+                try {
                     startInternal(resume = false)
+                } catch (cancelled: CancellationException) {
+                    connectionDesired = false
+                    cancelReconnectWork()
+                    throw cancelled
+                } catch (t: Throwable) {
+                    connectionDesired = false
+                    cancelReconnectWork()
+                    logger.e("SessionManager: ensureLive startup failed", t)
+                    return@withLock null
                 }
             }
-        }
+
+            if (!connectionDesired || _state.value.link == LinkState.IDLE) {
+                return@withLock null
+            }
+
+            client.epoch
+        } ?: return false
 
         return withTimeoutOrNull(8000L) {
-            while (!client.isReady) {
+            while (true) {
+                val readyForTarget = mutex.withLock {
+                    connectionDesired &&
+                        _state.value.link == LinkState.LIVE &&
+                        client.isReady &&
+                        client.epoch == targetEpoch
+                }
+
+                if (readyForTarget) return@withTimeoutOrNull true
                 delay(40)
             }
-            true
         } == true
     }
 
@@ -560,14 +609,24 @@ class SessionManager @Inject constructor(
         )
 
         if (apiKey.isEmpty()) {
+            connectionDesired = false
+            userMicDesired = false
+            cancelReconnectWork()
             _state.update {
                 it.copy(
                     error = "Укажите Gemini API Key в Настройках",
-                    link = LinkState.IDLE
+                    link = LinkState.IDLE,
+                    isMicActive = false,
+                    isAiSpeaking = false
                 )
             }
             return
         }
+
+        val liveModel = prefs[KEY_LIVE_MODEL]
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: DEFAULT_LIVE_MODEL
 
         val voice = prefs[KEY_VOICE]?.ifBlank { null } ?: "Charon"
         val speechLang = prefs[KEY_SPEECH_LANGUAGE]
@@ -672,6 +731,7 @@ class SessionManager @Inject constructor(
             audioEngine.stop()
             if (startingFreshSession) {
                 connectionDesired = false
+                cancelReconnectWork()
                 stopForegroundService()
                 _state.update {
                     it.copy(
@@ -701,6 +761,8 @@ class SessionManager @Inject constructor(
             // route open or device transition.
             audioEngine.stop()
             if (startingFreshSession) {
+                connectionDesired = false
+                cancelReconnectWork()
                 stopForegroundService()
             }
             _state.update {
@@ -741,7 +803,7 @@ class SessionManager @Inject constructor(
             client.connect(
                 LiveConfig(
                     apiKey = apiKey,
-                    model = DEFAULT_LIVE_MODEL,
+                    model = liveModel,
                     systemInstruction = _state.value.activePrompt,
                     voiceName = voice,
                     speechLanguage = speechLang,
@@ -776,6 +838,8 @@ class SessionManager @Inject constructor(
         } catch (cancelled: CancellationException) {
             runCatching { client.disconnect() }
             if (startingFreshSession) {
+                connectionDesired = false
+                cancelReconnectWork()
                 runCatching { invalidateAndFlushAudio("connect cancellation") }
                 audioEngine.stop()
                 stopForegroundService()
@@ -830,28 +894,61 @@ class SessionManager @Inject constructor(
         cancelReconnectWork()
         cancelAllPendingToolJobs()
 
-        // All microphone transitions are serialized by micMutex. Capture is
-        // physically stopped before the transport is detached.
-        micMutex.withLock {
-            stopMicLocked()
+        // Shutdown is a terminal transition. It must complete even if the
+        // caller coroutine is cancelled while waiting for a bounded cleanup
+        // operation; otherwise the state could remain CONNECTING/LIVE while
+        // hardware or transport resources are already partially detached.
+        withContext(NonCancellable) {
+            try {
+                // All microphone transitions are serialized by micMutex. Capture
+                // is physically stopped before the transport is detached.
+                micMutex.withLock {
+                    stopMicLocked()
+                }
+            } catch (t: Throwable) {
+                logger.e("SessionManager: microphone shutdown failed", t)
+            }
+
+            try {
+                // Advance the WebSocket epoch and detach the old socket first.
+                client.disconnect()
+            } catch (t: Throwable) {
+                logger.e("SessionManager: transport shutdown failed", t)
+            }
+
+            try {
+                // NativeAudioEngine owns the physical playback fence.
+                invalidateAndFlushAudio(
+                    if (full) "session shutdown" else "session reset"
+                )
+            } catch (t: Throwable) {
+                logger.e("SessionManager: playback flush during shutdown failed", t)
+            }
+
+            isManualActivityActive.set(false)
+
+            if (full) {
+                reconnectAttempts = 0
+                resumptionHandle = null
+                activeConnectUsedResumption = false
+
+                try {
+                    audioEngine.stop()
+                } catch (t: Throwable) {
+                    logger.e("SessionManager: audio engine shutdown failed", t)
+                }
+
+                try {
+                    stopForegroundService()
+                } catch (t: Throwable) {
+                    logger.e("SessionManager: foreground service shutdown failed", t)
+                }
+            }
         }
 
-        // Advance the WebSocket epoch and detach the old socket first.
-        client.disconnect()
-
-        // One owner / one operation: NativeAudioEngine performs the physical
-        // playback fence before publishing the next generation.
-        invalidateAndFlushAudio(
-            if (full) "session shutdown" else "session reset"
-        )
-
-        isManualActivityActive.set(false)
-
-        if (full) {
-            audioEngine.stop()
-            stopForegroundService()
-        }
-
+        // Final state is published even when one cleanup operation failed.
+        // Callers holding session mutex therefore always get a deterministic
+        // terminal state instead of a half-shutdown session.
         _state.update {
             it.copy(
                 link = LinkState.IDLE,
@@ -893,6 +990,7 @@ class SessionManager @Inject constructor(
 
         synchronized(reconnectGuard) {
             if (
+                !connectionDesired ||
                 _state.value.link == LinkState.IDLE ||
                 client.epoch != sourceEpoch ||
                 reconnectJob?.isActive == true
@@ -927,11 +1025,32 @@ class SessionManager @Inject constructor(
 
             reconnectJob = scope.launch {
                 try {
-                    val attempt = ++reconnectAttempts
-
-                    _state.update {
-                        it.copy(link = LinkState.RECONNECTING)
+                    val attempt = synchronized(reconnectGuard) {
+                        if (
+                            token != reconnectToken.get() ||
+                            !connectionDesired
+                        ) {
+                            return@launch
+                        }
+                        ++reconnectAttempts
                     }
+
+                    val stateAccepted = mutex.withLock {
+                        if (
+                            token != reconnectToken.get() ||
+                            !connectionDesired ||
+                            client.epoch != sourceEpoch ||
+                            _state.value.link == LinkState.IDLE
+                        ) {
+                            false
+                        } else {
+                            _state.update {
+                                it.copy(link = LinkState.RECONNECTING)
+                            }
+                            true
+                        }
+                    }
+                    if (!stateAccepted) return@launch
 
                     val baseDelay =
                         minOf(
@@ -972,15 +1091,11 @@ class SessionManager @Inject constructor(
                             client.epoch == sourceEpoch &&
                             _state.value.link != LinkState.IDLE
                         ) {
-                            // Commit the attempt before entering client.connect().
-                            // This prevents the new socket's immediate failure
-                            // from being suppressed by the old scheduler job.
-                            synchronized(reconnectGuard) {
-                                if (token == reconnectToken.get()) {
-                                    reconnectJob = null
-                                }
-                            }
-
+                            // The reconnect Job remains the owner for the whole
+                            // client.connect() call. Release that ownership only
+                            // after the call returns, while session mutex is still
+                            // held, so an immediate Disconnected event cannot race
+                            // the owner release and get suppressed by scheduleReconnect().
                             val useResume =
                                 resumptionHandle != null &&
                                     attempt <= 2
@@ -988,6 +1103,12 @@ class SessionManager @Inject constructor(
                             startInternal(
                                 resume = useResume
                             )
+
+                            synchronized(reconnectGuard) {
+                                if (token == reconnectToken.get()) {
+                                    reconnectJob = null
+                                }
+                            }
                         }
                     }
                 } catch (cancelled: CancellationException) {
@@ -1004,10 +1125,15 @@ class SessionManager @Inject constructor(
                         }
                     }
 
-                    if (
-                        connectionDesired &&
-                        _state.value.link != LinkState.IDLE
-                    ) {
+                    val retryEpoch = mutex.withLock {
+                        if (
+                            token != reconnectToken.get() ||
+                            !connectionDesired ||
+                            _state.value.link == LinkState.IDLE
+                        ) {
+                            return@withLock null
+                        }
+
                         if (activeConnectUsedResumption) {
                             // A failed resume attempt invalidates the handle.
                             // The next attempt starts a clean resumable-disabled
@@ -1016,9 +1142,13 @@ class SessionManager @Inject constructor(
                             activeConnectUsedResumption = false
                         }
 
+                        client.epoch
+                    }
+
+                    retryEpoch?.let { epoch ->
                         scheduleReconnect(
                             "ошибка попытки reconnect: ${t.localizedMessage}",
-                            client.epoch
+                            epoch
                         )
                     }
                 } finally {
@@ -1052,8 +1182,10 @@ class SessionManager @Inject constructor(
         )
     }
 
-    private suspend fun startMic() = micMutex.withLock {
-        startMicLocked()
+    private suspend fun startMic() = mutex.withLock {
+        micMutex.withLock {
+            startMicLocked()
+        }
     }
 
     private suspend fun startMicLocked() {
@@ -1153,47 +1285,56 @@ class SessionManager @Inject constructor(
 
     private suspend fun stopMic(
         userInitiated: Boolean = false
-    ) = micMutex.withLock {
-        if (userInitiated) {
-            userMicDesired = false
+    ) = mutex.withLock {
+        micMutex.withLock {
+            if (userInitiated) {
+                userMicDesired = false
+            }
+            stopMicLocked()
         }
-        stopMicLocked()
     }
 
     private suspend fun stopMicLocked() {
         val hasPhysicalCapture =
             _state.value.isMicActive || audioEngine.isCapturing.value
 
-        if (!hasPhysicalCapture) {
-            micJob = null
-            return
-        }
-
-        val producerResult = audioEngine.stopCaptureGraceful(1500L)
-        if (producerResult == CaptureShutdownResult.FORCED_TIMEOUT) {
-            logger.w("SessionManager: producer shutdown forced")
+        // A dead/failed producer does not imply that the consumer coroutine is
+        // dead. The mic consumer owns the channel and must always be joined or
+        // cancelled explicitly; otherwise it can survive as a zombie collector.
+        if (hasPhysicalCapture) {
+            val producerResult = audioEngine.stopCaptureGraceful(1500L)
+            if (producerResult == CaptureShutdownResult.FORCED_TIMEOUT) {
+                logger.w("SessionManager: producer shutdown forced")
+            }
         }
 
         val consumerJob = micJob
-        val consumerCompleted =
-            if (consumerJob == null) {
-                true
-            } else {
-                withTimeoutOrNull(1500L) {
-                    consumerJob.join()
-                    true
-                } ?: false
-            }
+        var consumerCompleted = true
 
-        if (!consumerCompleted && consumerJob != null) {
-            logger.w(
-                "SessionManager: mic consumer timeout; forcing bounded cancellation"
-            )
-            consumerJob.cancel()
-            if (withTimeoutOrNull(100L) { consumerJob.join(); true } != true) {
-                logger.e("SessionManager: mic consumer did not terminate after cancellation")
+        if (consumerJob != null) {
+            consumerCompleted = withTimeoutOrNull(1500L) {
+                consumerJob.join()
+                true
+            } ?: false
+
+            if (!consumerCompleted) {
+                logger.w(
+                    "SessionManager: mic consumer timeout; forcing bounded cancellation"
+                )
+                consumerJob.cancel()
+                consumerCompleted =
+                    withTimeoutOrNull(200L) {
+                        consumerJob.join()
+                        true
+                    } ?: false
+
+                if (!consumerCompleted) {
+                    logger.e(
+                        "SessionManager: mic consumer did not terminate after cancellation"
+                    )
+                    finalizeMicActivityBounded()
+                }
             }
-            finalizeMicActivityBounded()
         }
 
         micJob = null
@@ -1258,14 +1399,17 @@ class SessionManager @Inject constructor(
 
     private fun observeEvents() = scope.launch {
         client.events.collect { envelope ->
-            // The transport filters stale events at delivery time; keep the
-            // source epoch explicit here as a second consumer-side guard.
-            if (envelope.epoch != client.epoch) return@collect
+            // The transport filters stale events at delivery time. SessionManager
+            // repeats the epoch check while holding the same state mutex used by
+            // connect/disconnect/reconnect decisions, closing the TOCTOU window
+            // between validation and state mutation.
+            mutex.withLock {
+                if (envelope.epoch != client.epoch) return@withLock
 
-            val event = envelope.event
-            val eventEpoch = envelope.epoch
+                val event = envelope.event
+                val eventEpoch = envelope.epoch
 
-            when (event) {
+                when (event) {
                 is GeminiEvent.SetupComplete -> {
                     reconnectAttempts = 0
                     pendingGoAway = false
@@ -1387,16 +1531,22 @@ class SessionManager @Inject constructor(
                     scope.launch {
                         delay(80)
 
-                        _state.update {
-                            it.copy(isAiSpeaking = false)
+                        val shouldReconnect = mutex.withLock {
+                            if (
+                                !connectionDesired ||
+                                client.epoch != sourceEpoch ||
+                                _state.value.link == LinkState.IDLE
+                            ) {
+                                false
+                            } else {
+                                _state.update {
+                                    it.copy(isAiSpeaking = false)
+                                }
+                                shouldPlanGoAway
+                            }
                         }
 
-                        if (
-                            shouldPlanGoAway &&
-                            connectionDesired &&
-                            client.epoch == sourceEpoch &&
-                            _state.value.link != LinkState.IDLE
-                        ) {
+                        if (shouldReconnect) {
                             scheduleReconnect(
                                 "плановый переход goAway",
                                 sourceEpoch
@@ -1475,18 +1625,14 @@ class SessionManager @Inject constructor(
                         activeConnectUsedResumption = false
                         connectionDesired = false
                         userMicDesired = false
-
-                        scope.launch {
-                            mutex.withLock {
-                                stopInternal(full = true)
-                            }
-                        }
+                        cancelReconnectWork()
+                        stopInternal(full = true)
                     }
                 }
 
                 is GeminiEvent.Disconnected -> {
                     if (event.epoch != client.epoch) {
-                        return@collect
+                        return@withLock
                     }
 
                     val isResumeFailure = activeConnectUsedResumption
@@ -1509,14 +1655,9 @@ class SessionManager @Inject constructor(
                         connectionDesired = false
                         userMicDesired = false
                         cancelReconnectWork()
+                        stopInternal(full = true)
 
-                        scope.launch {
-                            mutex.withLock {
-                                stopInternal(full = true)
-                            }
-                        }
-
-                        return@collect
+                        return@withLock
                     }
 
                     if (connectionDesired) {
@@ -1524,7 +1665,12 @@ class SessionManager @Inject constructor(
                             _state.value.isMicActive ||
                             audioEngine.isCapturing.value
                         ) {
-                            stopMic(userInitiated = false)
+                            // observeEvents already owns session mutex. Acquire only
+                            // the microphone mutex here to preserve lock ordering
+                            // without attempting a non-reentrant session lock.
+                            micMutex.withLock {
+                                stopMicLocked()
+                            }
                         }
 
                         scheduleReconnect(
@@ -1540,6 +1686,7 @@ class SessionManager @Inject constructor(
                 }
 
                 else -> Unit
+                }
             }
         }
     }
@@ -1903,4 +2050,4 @@ class SessionManager @Inject constructor(
         }
     }
 }
-
+### END FULL FILE
