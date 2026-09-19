@@ -1,4 +1,3 @@
-
 package com.client.app.api
 
 import kotlinx.coroutines.flow.Flow
@@ -57,7 +56,8 @@ sealed interface GeminiEvent {
     ) : GeminiEvent
 
     data class ResumptionHandle(
-        val handle: String
+        val handle: String?,
+        val resumable: Boolean
     ) : GeminiEvent
 
     data class Usage(
@@ -116,6 +116,11 @@ class AudioFrame(
     val pcm: ByteArray,
     val epoch: Long,
     val generation: Long
+)
+
+data class GeminiEventEnvelope(
+    val epoch: Long,
+    val event: GeminiEvent
 )
 
 data class TranscriptionSettings(
@@ -181,7 +186,7 @@ class GeminiLiveClient @Inject constructor(
         GeminiProtobufLiveClient
 ) {
 
-    val events: Flow<GeminiEvent>
+    val events: Flow<GeminiEventEnvelope>
         get() = protobufClient.events
 
     val audio: ReceiveChannel<AudioFrame>
