@@ -1,3 +1,8 @@
+######################################################################
+### FILE 03: app/src/main/cpp/jni/NativeBridge.cpp
+######################################################################
+
+### BEGIN FULL FILE
 
 
 #include <jni.h>
@@ -38,17 +43,19 @@ using namespace client::audio;
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_client_app_audio_NativeAudioBridge_getHardwareCoreInfo(JNIEnv *env, jobject /* this */) {
     auto& engine = AAudioEngine::getInstance();
-    bool isMmap = engine.isMmapActive();
-    int32_t inRate = engine.getActualCaptureSampleRate();
-    int32_t outRate = engine.getActualPlaybackSampleRate();
-    int32_t inDevId = engine.getActiveInputDeviceId();
-    int32_t outDevId = engine.getActiveOutputDeviceId();
+    const bool isMmap = engine.isMmapActive();
+    const bool isExclusive = engine.isExclusiveSharingActive();
+    const int32_t inRate = engine.getActualCaptureSampleRate();
+    const int32_t outRate = engine.getActualPlaybackSampleRate();
+    const int32_t inDevId = engine.getActiveInputDeviceId();
+    const int32_t outDevId = engine.getActiveOutputDeviceId();
 
     char infoBuf[256];
     snprintf(infoBuf, sizeof(infoBuf),
-             "Qualcomm SD8 Gen2 - %s [In:%dHz/ID:%d -> Out:%dHz/ID:%d]",
-             isMmap ? "MMAP Exclusive Direct (4.2ms)" : "Low-Latency Shared (BT/Voice)",
-             inRate, inDevId, outRate, outDevId);
+             "Qualcomm SD8 Gen2 - [In:%dHz/ID:%d -> Out:%dHz/ID:%d, Exclusive:%s, MMAP:%s]",
+             inRate, inDevId, outRate, outDevId,
+             isExclusive ? "yes" : "no",
+             isMmap ? "yes" : "no");
 
     return env->NewStringUTF(infoBuf);
 }
@@ -82,6 +89,51 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_client_app_audio_NativeAudioBridge_startCaptureAudio(JNIEnv * /* env */, jobject /* this */) {
     LOGI("startCaptureAudio called");
     return static_cast<jboolean>(AAudioEngine::getInstance().startCapture());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getActualPlaybackSampleRate(JNIEnv * /* env */, jobject /* this */) {
+    return AAudioEngine::getInstance().getActualPlaybackSampleRate();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getActualPlaybackChannels(JNIEnv * /* env */, jobject /* this */) {
+    return AAudioEngine::getInstance().getActualPlaybackChannels();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getActualPlaybackFormat(JNIEnv * /* env */, jobject /* this */) {
+    return AAudioEngine::getInstance().getActualPlaybackFormat();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getActualCaptureSampleRate(JNIEnv * /* env */, jobject /* this */) {
+    return AAudioEngine::getInstance().getActualCaptureSampleRate();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getActualCaptureChannels(JNIEnv * /* env */, jobject /* this */) {
+    return AAudioEngine::getInstance().getActualCaptureChannels();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getActiveInputDeviceId(JNIEnv * /* env */, jobject /* this */) {
+    return AAudioEngine::getInstance().getActiveInputDeviceId();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getActiveOutputDeviceId(JNIEnv * /* env */, jobject /* this */) {
+    return AAudioEngine::getInstance().getActiveOutputDeviceId();
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_isMmapActive(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jboolean>(AAudioEngine::getInstance().isMmapActive());
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_isExclusiveSharingActive(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jboolean>(AAudioEngine::getInstance().isExclusiveSharingActive());
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -270,3 +322,4 @@ Java_com_client_app_audio_NativeAudioBridge_drainNativeLogs(JNIEnv *env, jobject
     env->DeleteLocalRef(stringClass);
     return resultArray;
 }
+### END FULL FILE
