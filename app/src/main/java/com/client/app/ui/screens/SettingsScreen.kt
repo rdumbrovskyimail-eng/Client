@@ -45,6 +45,8 @@ fun SettingsScreen(
     var showGeminiKey by remember { mutableStateOf(false) }
     var showForvoKey by remember { mutableStateOf(false) }
 
+    val liveModels = SettingsViewModel.LIVE_MODEL_OPTIONS
+
     var volumeDraft by remember(settings.volume) { mutableFloatStateOf(settings.volume) }
     var micGainDraft by remember(settings.micGain) { mutableFloatStateOf(settings.micGain) }
     var tempDraft by remember(settings.temperature) { mutableFloatStateOf(settings.temperature) }
@@ -129,10 +131,25 @@ fun SettingsScreen(
                 )
 
                 Spacer(Modifier.height(10.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Live модель:", color = Color(0xFFA1A1AA), fontSize = 13.sp)
-                    Spacer(Modifier.width(8.dp))
-                    Text(settings.liveModel, color = Color(0xFF34D399), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                Text("Live модель:", color = Color(0xFFA1A1AA), fontSize = 12.sp)
+                Spacer(Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    liveModels.forEach { model ->
+                        FilterChip(
+                            selected = settings.liveModel == model,
+                            onClick = { viewModel.setLiveModel(model) },
+                            label = {
+                                Text(
+                                    model,
+                                    fontSize = 10.sp
+                                )
+                            },
+                            colors = chipColors()
+                        )
+                    }
                 }
                 Spacer(Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
