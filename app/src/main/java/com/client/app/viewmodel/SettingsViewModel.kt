@@ -64,6 +64,14 @@ class SettingsViewModel @Inject constructor(
 ) : ViewModel() {
 
     companion object {
+        /** Models currently documented for Live API audio sessions. */
+        val LIVE_MODEL_OPTIONS = listOf(
+            SessionManager.DEFAULT_LIVE_MODEL,
+            "gemini-3.8-live-extended-thinking",
+            "gemini-3.1-flash-live-preview",
+            "gemini-2.5-flash-native-audio-preview-12-2025"
+        )
+
         val VALID_SPEECH_LANGUAGES = setOf(
             "ar-SA", "bg-BG", "bn-BD", "cs-CZ", "da-DK", "de-DE", "el-GR", "en-AU",
             "en-GB", "en-IN", "en-US", "es-ES", "es-US", "fi-FI", "fil-PH", "fr-CA",
@@ -89,7 +97,10 @@ class SettingsViewModel @Inject constructor(
                 _settings.update {
                     it.copy(
                         apiKey = cryptoManager.decrypt(p[SessionManager.KEY_API].orEmpty()),
-                        liveModel = SessionManager.DEFAULT_LIVE_MODEL,
+                        liveModel = p[SessionManager.KEY_LIVE_MODEL]
+                            ?.trim()
+                            ?.takeIf { it in LIVE_MODEL_OPTIONS }
+                            ?: SessionManager.DEFAULT_LIVE_MODEL,
                         analyzerModel = p[SessionManager.KEY_ANALYZER_MODEL] ?: VocabularyExtractor.DEFAULT_MODEL,
                         voice = p[SessionManager.KEY_VOICE] ?: "Charon",
                         speechLanguage = p[SessionManager.KEY_SPEECH_LANGUAGE].orEmpty(),
@@ -164,6 +175,18 @@ class SettingsViewModel @Inject constructor(
     fun setApiKey(k: String) {
         _settings.update { it.copy(apiKey = k) }
         apiKeyDebounce.tryEmit(k)
+    }
+
+    fun setLiveModel(model: String) {
+        val normalized = model.trim()
+        if (normalized !in LIVE_MODEL_OPTIONS) return
+
+        _settings.update { it.copy(liveModel = normalized) }
+        viewModelScope.launch {
+            dataStore.edit {
+                it[SessionManager.KEY_LIVE_MODEL] = normalized
+            }
+        }
     }
 
     fun setVoice(v: String) {
@@ -290,12 +313,15 @@ class SettingsViewModel @Inject constructor(
     }
 
     fun setCompressionTokens(trigger: Int, target: Int) {
-        val validPair = if (trigger == 0 && target == 0) {
-            0 to 0
-        } else if (target > 0 && trigger > target) {
-            trigger to target
-        } else {
-            0 to 0
+        // contextWindowCompression is a wire-level oneof: persist exactly one
+        // mechanism. A positive target selects slidingWindow; otherwise a
+        // positive trigger selects triggerTokens.
+        val safeTrigger = trigger.coerceAtLeast(0)
+        val safeTarget = target.coerceAtLeast(0)
+        val validPair = when {
+            safeTarget > 0 -> 0 to safeTarget
+            safeTrigger > 0 -> safeTrigger to 0
+            else -> 0 to 0
         }
         _settings.update {
             it.copy(
