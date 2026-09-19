@@ -1,3 +1,8 @@
+######################################################################
+### FILE 02: app/src/main/cpp/audio/AAudioEngine.h
+######################################################################
+
+### BEGIN FULL FILE
 
 #pragma once
 
@@ -87,7 +92,8 @@ public:
 
     float getMicRms() const { return micRms_.load(std::memory_order_relaxed); }
     float getOutRms() const { return outRms_.load(std::memory_order_relaxed); }
-    bool isMmapActive() const { return isMmapExclusiveActive_.load(std::memory_order_relaxed); }
+    bool isMmapActive() const { return isMmapActive_.load(std::memory_order_relaxed); }
+    bool isExclusiveSharingActive() const { return isExclusiveSharingActive_.load(std::memory_order_relaxed); }
     bool isDisconnected() const { return isDisconnected_.load(std::memory_order_relaxed); }
 
     int32_t getActualCaptureSampleRate() const {
@@ -100,6 +106,14 @@ public:
 
     int32_t getActualPlaybackSampleRate() const {
         return actualPlaybackSampleRate_.load(std::memory_order_relaxed);
+    }
+
+    int32_t getActualPlaybackChannels() const {
+        return actualPlaybackChannels_.load(std::memory_order_relaxed);
+    }
+
+    int32_t getActualPlaybackFormat() const {
+        return actualPlaybackFormat_.load(std::memory_order_relaxed);
     }
 
     int32_t getActiveInputDeviceId() const {
@@ -129,8 +143,11 @@ private:
     void stopLocked();
     void stopCaptureLocked();
     void stopPlaybackLocked();
+    void closeCaptureStreamLocked();
+    void closePlaybackStreamLocked();
 
     bool waitForStreamState(AAudioStream* stream, aaudio_stream_state_t desired, int timeoutMs);
+    bool validateAndPublishPlaybackConfigLocked(int32_t requestedOutputDeviceId);
     bool flushOutputStreamLocked(bool resumeAfterFlush);
 
     aaudio_result_t openPlaybackStreamWithFallback(
@@ -175,6 +192,12 @@ private:
     AAudioStream* captureStream_{nullptr};
     AAudioStream* playbackStream_{nullptr};
 
+    // Atomic identity barriers let the error callback distinguish an old
+    // stream closing in the background from the currently active stream.
+    // The callback only publishes a recovery signal; lifecycle code owns close/reopen.
+    std::atomic<AAudioStream*> activeCaptureStream_{nullptr};
+    std::atomic<AAudioStream*> activePlaybackStream_{nullptr};
+
     // AUD-003: SPSC queues захвата
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_CAPTURE> captureRawBuffer_;
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_CAPTURE> captureBuffer_;
@@ -187,7 +210,8 @@ private:
 
     std::atomic<bool> isRunning_{false};
     std::atomic<bool> isBluetoothMode_{false};
-    std::atomic<bool> isMmapExclusiveActive_{false};
+    std::atomic<bool> isMmapActive_{false};
+    std::atomic<bool> isExclusiveSharingActive_{false};
     std::atomic<bool> isDisconnected_{false};
 
     std::atomic<int32_t> playbackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
@@ -195,9 +219,16 @@ private:
     std::atomic<int32_t> actualCaptureSampleRate_{SAMPLE_RATE_GEMINI_IN};
     std::atomic<int32_t> actualCaptureChannels_{CHANNEL_COUNT_MONO};
     std::atomic<int32_t> actualPlaybackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
+    std::atomic<int32_t> actualPlaybackChannels_{CHANNEL_COUNT_MONO};
+    std::atomic<int32_t> actualPlaybackFormat_{static_cast<int32_t>(AAUDIO_FORMAT_PCM_I16)};
 
     std::atomic<int32_t> actualInputDeviceId_{AAUDIO_UNSPECIFIED};
     std::atomic<int32_t> actualOutputDeviceId_{AAUDIO_UNSPECIFIED};
+
+    // Requested route identifiers are kept separately from actual opened IDs.
+    // This is required for independent stream reopen after a disconnect.
+    std::atomic<int32_t> requestedInputDeviceId_{AAUDIO_UNSPECIFIED};
+    std::atomic<int32_t> requestedOutputDeviceId_{AAUDIO_UNSPECIFIED};
 
     std::atomic<float> playbackVolume_{1.0f};
     std::atomic<float> micGain_{1.0f};
@@ -257,3 +288,4 @@ private:
 };
 
 } // namespace client::audio
+### END FULL FILE
