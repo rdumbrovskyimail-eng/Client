@@ -1,3 +1,14 @@
+
+============================================================
+10. COMPLETE FINAL SOURCE FILES
+============================================================
+
+
+######################################################################
+### FILE 01: app/src/main/cpp/audio/AAudioEngine.cpp
+######################################################################
+
+### BEGIN FULL FILE
 #include "AAudioEngine.h"
 #include "NativeLogQueue.h"
 #include "dsp/NeonDspUtils.h"
@@ -160,6 +171,110 @@ bool AAudioEngine::init(
         outputDeviceId);
 }
 
+void AAudioEngine::closeCaptureStreamLocked() {
+    activeCaptureStream_.store(nullptr, std::memory_order_release);
+    if (captureStream_ != nullptr) {
+        AAudioStream_close(captureStream_);
+        captureStream_ = nullptr;
+    }
+}
+
+void AAudioEngine::closePlaybackStreamLocked() {
+    activePlaybackStream_.store(nullptr, std::memory_order_release);
+    if (playbackStream_ != nullptr) {
+        AAudioStream_close(playbackStream_);
+        playbackStream_ = nullptr;
+    }
+}
+
+bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
+    closeCaptureStreamLocked();
+
+    AAudioStreamBuilder* inBuilder = nullptr;
+    if (AAudio_createStreamBuilder(&inBuilder) != AAUDIO_OK) {
+        LOGE("Failed to create capture stream builder");
+        return false;
+    }
+
+    AAudioStreamBuilder_setDirection(inBuilder, AAUDIO_DIRECTION_INPUT);
+    AAudioStreamBuilder_setPerformanceMode(inBuilder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    AAudioStreamBuilder_setSampleRate(inBuilder, SAMPLE_RATE_GEMINI_IN);
+    AAudioStreamBuilder_setChannelCount(inBuilder, CHANNEL_COUNT_MONO);
+    AAudioStreamBuilder_setFormat(inBuilder, AAUDIO_FORMAT_PCM_I16);
+
+    if (inputDeviceId > 0) {
+        AAudioStreamBuilder_setDeviceId(inBuilder, inputDeviceId);
+    }
+
+    AAudioStreamBuilder_setSharingMode(inBuilder, AAUDIO_SHARING_MODE_SHARED);
+    AAudioStreamBuilder_setInputPreset(inBuilder, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
+    AAudioStreamBuilder_setDataCallback(inBuilder, captureCallback, this);
+    AAudioStreamBuilder_setErrorCallback(inBuilder, errorCallback, this);
+
+    const aaudio_result_t res = AAudioStreamBuilder_openStream(inBuilder, &captureStream_);
+    AAudioStreamBuilder_delete(inBuilder);
+
+    if (res != AAUDIO_OK || captureStream_ == nullptr) {
+        LOGE("Failed to open capture stream: %d (%s)", res, AAudio_convertResultToText(res));
+        captureStream_ = nullptr;
+        return false;
+    }
+
+    activeCaptureStream_.store(captureStream_, std::memory_order_release);
+
+    const int32_t actualInRate = AAudioStream_getSampleRate(captureStream_);
+    const int32_t actualInChannels = AAudioStream_getChannelCount(captureStream_);
+    const aaudio_format_t actualInFormat = AAudioStream_getFormat(captureStream_);
+    const int32_t actualInDeviceId = AAudioStream_getDeviceId(captureStream_);
+
+    if (AAudioStream_getDirection(captureStream_) != AAUDIO_DIRECTION_INPUT ||
+        actualInFormat != AAUDIO_FORMAT_PCM_I16 ||
+        (actualInChannels != 1 && actualInChannels != 2) ||
+        (actualInRate != 8000 && actualInRate != 16000 &&
+         actualInRate != 24000 && actualInRate != 48000)) {
+        LOGE("AAudio capture unsupported actual config: rate=%d, channels=%d, format=%d, device=%d",
+             actualInRate, actualInChannels, static_cast<int>(actualInFormat), actualInDeviceId);
+        closeCaptureStreamLocked();
+        return false;
+    }
+
+    if (inputDeviceId > 0 && actualInDeviceId != inputDeviceId) {
+        LOGW("AAudio capture device request was not honored exactly: requested=%d actual=%d",
+             inputDeviceId, actualInDeviceId);
+    }
+
+    actualCaptureSampleRate_.store(actualInRate, std::memory_order_release);
+    actualCaptureChannels_.store(actualInChannels, std::memory_order_release);
+    actualInputDeviceId_.store(actualInDeviceId, std::memory_order_release);
+
+    const int32_t inFramesPerCallback = AAudioStream_getFramesPerDataCallback(captureStream_);
+    const int32_t inCapacity = AAudioStream_getBufferCapacityInFrames(captureStream_);
+    const int32_t inBurst = AAudioStream_getFramesPerBurst(captureStream_);
+
+    size_t neededCaptureScratch = CAPTURE_DECIMATE_CAPACITY;
+    if (inCapacity > 0) {
+        neededCaptureScratch = std::max(neededCaptureScratch, static_cast<size_t>(inCapacity) * 4u);
+    }
+    if (inFramesPerCallback > 0) {
+        neededCaptureScratch = std::max(neededCaptureScratch, static_cast<size_t>(inFramesPerCallback) * 4u);
+    }
+    if (inBurst > 0) {
+        neededCaptureScratch = std::max(neededCaptureScratch, static_cast<size_t>(inBurst) * 8u);
+    }
+
+    if (captureInputScratchBuffer_.size() < neededCaptureScratch) {
+        captureInputScratchBuffer_.resize(neededCaptureScratch, 0);
+    }
+    if (captureDecimateBuffer_.size() < neededCaptureScratch) {
+        captureDecimateBuffer_.resize(neededCaptureScratch, 0);
+    }
+    if (captureRawScratchBuffer_.size() < CAPTURE_RAW_SCRATCH_FRAMES) {
+        captureRawScratchBuffer_.resize(CAPTURE_RAW_SCRATCH_FRAMES, 0);
+    }
+
+    return true;
+}
+
 bool AAudioEngine::initLocked(
     bool isBluetoothMode,
     int32_t targetPlaybackSampleRate,
@@ -168,340 +283,72 @@ bool AAudioEngine::initLocked(
 
     stopLocked();
 
-    isDisconnected_.store(
-        false,
-        std::memory_order_release);
+    isDisconnected_.store(false, std::memory_order_release);
+    activeCaptureStream_.store(nullptr, std::memory_order_release);
+    activePlaybackStream_.store(nullptr, std::memory_order_release);
 
     {
-        std::scoped_lock lock(
-            playbackControlMutex_,
-            playbackJniWriteMutex_);
-
+        std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
         resampler24To16_.reset();
         resampler24To48_.reset();
         captureDecimator48To16_.reset();
         captureResampler24To16_.reset();
-
         resetEarcon();
-
-        voiceEnhancer_.reset(
-            targetPlaybackSampleRate);
-
+        voiceEnhancer_.reset(targetPlaybackSampleRate);
         fftPos_ = 0;
-
-        inputIngressBlocked_.store(
-            false,
-            std::memory_order_release);
+        inputIngressBlocked_.store(false, std::memory_order_release);
     }
 
-    captureDroppedFrames_.store(
-        0,
-        std::memory_order_relaxed);
-
+    captureDroppedFrames_.store(0, std::memory_order_relaxed);
     captureRawBuffer_.resetQuiesced();
     captureBuffer_.resetQuiesced();
     playbackDspInputBuffer_.resetQuiesced();
     playbackBuffer_.resetQuiesced();
 
-    isBluetoothMode_.store(
-        isBluetoothMode,
-        std::memory_order_relaxed);
+    // initAudioRoute initializes the playback side only. Capture is opened lazily
+    // by startCapture(), which makes playback-only routes a first-class lifecycle.
+    actualCaptureSampleRate_.store(0, std::memory_order_release);
+    actualCaptureChannels_.store(0, std::memory_order_release);
+    actualInputDeviceId_.store(AAUDIO_UNSPECIFIED, std::memory_order_release);
+    isBluetoothMode_.store(isBluetoothMode, std::memory_order_relaxed);
+    playbackSampleRate_.store(targetPlaybackSampleRate, std::memory_order_relaxed);
+    requestedInputDeviceId_.store(inputDeviceId, std::memory_order_release);
+    requestedOutputDeviceId_.store(outputDeviceId, std::memory_order_release);
 
-    playbackSampleRate_.store(
+    LOGI("AAudioEngine::initLocked: BT=%d, targetRate=%d, inDevId=%d, outDevId=%d",
+         (int)isBluetoothMode, targetPlaybackSampleRate, inputDeviceId, outputDeviceId);
+
+    const aaudio_result_t res = openPlaybackStreamWithFallback(
         targetPlaybackSampleRate,
-        std::memory_order_relaxed);
+        outputDeviceId,
+        isBluetoothMode);
 
-    LOGI(
-        "AAudioEngine::initLocked: BT=%d, targetRate=%d, inDevId=%d, outDevId=%d",
-        (int)isBluetoothMode,
-        targetPlaybackSampleRate,
-        inputDeviceId,
-        outputDeviceId);
-
-    AAudioStreamBuilder* inBuilder = nullptr;
-
-    if (AAudio_createStreamBuilder(
-            &inBuilder) != AAUDIO_OK) {
-
-        LOGE(
-            "Failed to create capture stream builder");
-
+    if (res != AAUDIO_OK || playbackStream_ == nullptr) {
+        LOGE("Failed to open playback stream: %d (%s)", res, AAudio_convertResultToText(res));
+        closePlaybackStreamLocked();
         return false;
     }
 
-    AAudioStreamBuilder_setDirection(
-        inBuilder,
-        AAUDIO_DIRECTION_INPUT);
-
-    AAudioStreamBuilder_setPerformanceMode(
-        inBuilder,
-        AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-
-    AAudioStreamBuilder_setSampleRate(
-        inBuilder,
-        SAMPLE_RATE_GEMINI_IN);
-
-    AAudioStreamBuilder_setChannelCount(
-        inBuilder,
-        CHANNEL_COUNT_MONO);
-
-    AAudioStreamBuilder_setFormat(
-        inBuilder,
-        AAUDIO_FORMAT_PCM_I16);
-
-    if (inputDeviceId > 0) {
-        AAudioStreamBuilder_setDeviceId(
-            inBuilder,
-            inputDeviceId);
-    }
-
-    AAudioStreamBuilder_setSharingMode(
-        inBuilder,
-        AAUDIO_SHARING_MODE_SHARED);
-
-    AAudioStreamBuilder_setInputPreset(
-        inBuilder,
-        AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
-
-    AAudioStreamBuilder_setDataCallback(
-        inBuilder,
-        captureCallback,
-        this);
-
-    AAudioStreamBuilder_setErrorCallback(
-        inBuilder,
-        errorCallback,
-        this);
-
-    aaudio_result_t res =
-        AAudioStreamBuilder_openStream(
-            inBuilder,
-            &captureStream_);
-
-    AAudioStreamBuilder_delete(
-        inBuilder);
-
-    if (res != AAUDIO_OK) {
-        LOGE(
-            "Failed to open capture stream: %d (%s)",
-            res,
-            AAudio_convertResultToText(res));
-
+    if (!validateAndPublishPlaybackConfigLocked(outputDeviceId)) {
         return false;
     }
 
-    const int32_t actualInRate =
-        AAudioStream_getSampleRate(
-            captureStream_);
+    // Use the verified hardware rate for any stateful output DSP initialization.
+    voiceEnhancer_.reset(actualPlaybackSampleRate_.load(std::memory_order_acquire));
 
-    const int32_t actualInChannels =
-        AAudioStream_getChannelCount(
-            captureStream_);
-
-    const aaudio_format_t actualInFormat =
-        AAudioStream_getFormat(
-            captureStream_);
-
-    if (actualInFormat != AAUDIO_FORMAT_PCM_I16 ||
-        (actualInChannels != 1 &&
-         actualInChannels != 2) ||
-        (actualInRate != 8000 &&
-         actualInRate != 16000 &&
-         actualInRate != 24000 &&
-         actualInRate != 48000)) {
-
-        LOGE(
-            "AAudio capture unsupported format: rate=%d, channels=%d, format=%d",
-            actualInRate,
-            actualInChannels,
-            (int)actualInFormat);
-
-        AAudioStream_close(
-            captureStream_);
-
-        captureStream_ = nullptr;
-
-        return false;
+    const int32_t playBurst = AAudioStream_getFramesPerBurst(playbackStream_);
+    const int32_t playCapacity = AAudioStream_getBufferCapacityInFrames(playbackStream_);
+    if (playBurst > 0 && playCapacity > 0) {
+        const int32_t targetBufSize = std::clamp(playBurst * 2, playBurst, playCapacity);
+        const int32_t appliedBufSize = AAudioStream_setBufferSizeInFrames(playbackStream_, targetBufSize);
+        LOGI("Playback buffer size tuned: requested=%d, applied=%d (burst=%d, capacity=%d)",
+             targetBufSize, appliedBufSize, playBurst, playCapacity);
     }
 
-    actualCaptureSampleRate_.store(
-        actualInRate,
-        std::memory_order_release);
-
-    actualCaptureChannels_.store(
-        actualInChannels,
-        std::memory_order_release);
-
-    actualInputDeviceId_.store(
-        AAudioStream_getDeviceId(
-            captureStream_),
-        std::memory_order_release);
-
-    int32_t inFramesPerCallback =
-        AAudioStream_getFramesPerDataCallback(
-            captureStream_);
-
-    int32_t inCapacity =
-        AAudioStream_getBufferCapacityInFrames(
-            captureStream_);
-
-    int32_t inBurst =
-        AAudioStream_getFramesPerBurst(
-            captureStream_);
-
-    size_t neededCaptureScratch =
-        CAPTURE_DECIMATE_CAPACITY;
-
-    if (inCapacity > 0 &&
-        static_cast<size_t>(inCapacity * 4) >
-            neededCaptureScratch) {
-        neededCaptureScratch =
-            static_cast<size_t>(
-                inCapacity * 4);
-    }
-
-    if (inFramesPerCallback > 0 &&
-        static_cast<size_t>(inFramesPerCallback * 4) >
-            neededCaptureScratch) {
-
-        neededCaptureScratch =
-            static_cast<size_t>(
-                inFramesPerCallback * 4);
-    }
-
-    if (inBurst > 0 &&
-        static_cast<size_t>(inBurst * 8) >
-            neededCaptureScratch) {
-
-        neededCaptureScratch =
-            static_cast<size_t>(
-                inBurst * 8);
-    }
-
-    if (captureInputScratchBuffer_.size() <
-        neededCaptureScratch) {
-
-        captureInputScratchBuffer_.resize(
-            neededCaptureScratch,
-            0);
-    }
-
-    if (captureDecimateBuffer_.size() <
-        neededCaptureScratch) {
-
-        captureDecimateBuffer_.resize(
-            neededCaptureScratch,
-            0);
-    }
-
-    if (captureRawScratchBuffer_.size() <
-        CAPTURE_RAW_SCRATCH_FRAMES) {
-        captureRawScratchBuffer_.resize(
-            CAPTURE_RAW_SCRATCH_FRAMES,
-            0);
-    }
-
-    res =
-        openPlaybackStreamWithFallback(
-            targetPlaybackSampleRate,
-            outputDeviceId,
-            isBluetoothMode);
-
-    if (res != AAUDIO_OK) {
-        LOGE(
-            "Failed to open playback stream: %d (%s)",
-            res,
-            AAudio_convertResultToText(res));
-
-        AAudioStream_close(
-            captureStream_);
-
-        captureStream_ = nullptr;
-
-        return false;
-    }
-
-    actualPlaybackSampleRate_.store(
-        AAudioStream_getSampleRate(
-            playbackStream_),
-        std::memory_order_release);
-
-    actualOutputDeviceId_.store(
-        AAudioStream_getDeviceId(
-            playbackStream_),
-        std::memory_order_release);
-
-    isMmapExclusiveActive_.store(
-        !isBluetoothMode &&
-        (
-            AAudioStream_getSharingMode(
-                playbackStream_) ==
-            AAUDIO_SHARING_MODE_EXCLUSIVE
-        ),
-        std::memory_order_relaxed);
-
-    const int32_t playBurst =
-        AAudioStream_getFramesPerBurst(
-            playbackStream_);
-
-    const int32_t playCapacity =
-        AAudioStream_getBufferCapacityInFrames(
-            playbackStream_);
-
-    if (playBurst > 0 &&
-        playCapacity > 0) {
-
-        const int32_t targetBufSize =
-            std::clamp(
-                playBurst * 2,
-                playBurst,
-                playCapacity);
-
-        const int32_t appliedBufSize =
-            AAudioStream_setBufferSizeInFrames(
-                playbackStream_,
-                targetBufSize);
-
-        LOGI(
-            "Playback buffer size tuned: requested=%d, applied=%d (burst=%d, capacity=%d)",
-            targetBufSize,
-            appliedBufSize,
-            playBurst,
-            playCapacity);
-    }
-
-    if (playbackDspInputScratch_.size() <
-        PLAYBACK_DSP_INPUT_CHUNK_FRAMES) {
-
-        playbackDspInputScratch_.resize(
-            PLAYBACK_DSP_INPUT_CHUNK_FRAMES,
-            0);
-    }
-
-    if (playbackDspOutputScratch_.size() <
-        PLAYBACK_DSP_MAX_OUTPUT_FRAMES) {
-
-        playbackDspOutputScratch_.resize(
-            PLAYBACK_DSP_MAX_OUTPUT_FRAMES,
-            0);
-    }
-
-    if (earconScratch_.size() <
-        EARCON_SCRATCH_MAX_FRAMES) {
-
-        earconScratch_.resize(
-            EARCON_SCRATCH_MAX_FRAMES,
-            0);
-    }
-
-    LOGI(
-        "AAudio Initialized: CapRate=%d (Ch=%d, DevId=%d), PlayRate=%d (DevId=%d), MMAP=%d",
-        actualCaptureSampleRate_.load(),
-        actualCaptureChannels_.load(),
-        actualInputDeviceId_.load(),
-        actualPlaybackSampleRate_.load(),
-        actualOutputDeviceId_.load(),
-        isMmapExclusiveActive_.load());
+    LOGI("AAudio Initialized: CapRate=%d (Ch=%d, DevId=%d), PlayRate=%d (Ch=%d, Fmt=%d, DevId=%d), EXCLUSIVE=%d, MMAP=%d",
+         actualCaptureSampleRate_.load(), actualCaptureChannels_.load(), actualInputDeviceId_.load(),
+         actualPlaybackSampleRate_.load(), actualPlaybackChannels_.load(), actualPlaybackFormat_.load(),
+         actualOutputDeviceId_.load(), isExclusiveSharingActive_.load(), isMmapActive_.load());
 
     return true;
 }
@@ -577,12 +424,7 @@ AAudioEngine::openPlaybackStreamWithFallback(
             errorCallback,
             this);
 
-        if (playbackStream_ != nullptr) {
-            AAudioStream_close(
-                playbackStream_);
-
-            playbackStream_ = nullptr;
-        }
+        closePlaybackStreamLocked();
 
         aaudio_result_t openRes =
             AAudioStreamBuilder_openStream(
@@ -592,13 +434,30 @@ AAudioEngine::openPlaybackStreamWithFallback(
         AAudioStreamBuilder_delete(
             outBuilder);
 
-        if (openRes != AAUDIO_OK &&
-            playbackStream_ != nullptr) {
+        if (openRes == AAUDIO_OK && playbackStream_ != nullptr) {
+            activePlaybackStream_.store(playbackStream_, std::memory_order_release);
 
-            AAudioStream_close(
-                playbackStream_);
+            const int32_t openedRate = AAudioStream_getSampleRate(playbackStream_);
+            const int32_t openedChannels = AAudioStream_getChannelCount(playbackStream_);
+            const aaudio_format_t openedFormat = AAudioStream_getFormat(playbackStream_);
 
-            playbackStream_ = nullptr;
+            if (AAudioStream_getDirection(playbackStream_) != AAUDIO_DIRECTION_OUTPUT ||
+                openedRate <= 0 ||
+                openedChannels != CHANNEL_COUNT_MONO ||
+                openedFormat != AAUDIO_FORMAT_PCM_I16) {
+                LOGW(
+                    "Playback candidate rejected: rate=%d channels=%d format=%d mode=%d",
+                    openedRate,
+                    openedChannels,
+                    static_cast<int>(openedFormat),
+                    static_cast<int>(sharingMode));
+                closePlaybackStreamLocked();
+                openRes = AAUDIO_ERROR_INVALID_FORMAT;
+            }
+        }
+
+        if (openRes != AAUDIO_OK && playbackStream_ != nullptr) {
+            closePlaybackStreamLocked();
         }
 
         return openRes;
@@ -624,6 +483,44 @@ AAudioEngine::openPlaybackStreamWithFallback(
     return res;
 }
 
+bool AAudioEngine::validateAndPublishPlaybackConfigLocked(int32_t requestedOutputDeviceId) {
+    if (playbackStream_ == nullptr) return false;
+
+    const int32_t actualRate = AAudioStream_getSampleRate(playbackStream_);
+    const int32_t actualChannels = AAudioStream_getChannelCount(playbackStream_);
+    const aaudio_format_t actualFormat = AAudioStream_getFormat(playbackStream_);
+    const int32_t actualDeviceId = AAudioStream_getDeviceId(playbackStream_);
+
+    if (AAudioStream_getDirection(playbackStream_) != AAUDIO_DIRECTION_OUTPUT ||
+        actualRate <= 0 ||
+        actualChannels != CHANNEL_COUNT_MONO ||
+        actualFormat != AAUDIO_FORMAT_PCM_I16) {
+        LOGE(
+            "AAudio playback unsupported actual config: rate=%d channels=%d format=%d device=%d",
+            actualRate, actualChannels, static_cast<int>(actualFormat), actualDeviceId);
+        closePlaybackStreamLocked();
+        return false;
+    }
+
+    if (requestedOutputDeviceId > 0 && actualDeviceId != requestedOutputDeviceId) {
+        LOGW(
+            "AAudio playback device request was not honored exactly: requested=%d actual=%d",
+            requestedOutputDeviceId, actualDeviceId);
+    }
+
+    actualPlaybackSampleRate_.store(actualRate, std::memory_order_release);
+    actualPlaybackChannels_.store(actualChannels, std::memory_order_release);
+    actualPlaybackFormat_.store(static_cast<int32_t>(actualFormat), std::memory_order_release);
+    actualOutputDeviceId_.store(actualDeviceId, std::memory_order_release);
+    isExclusiveSharingActive_.store(
+        AAudioStream_getSharingMode(playbackStream_) == AAUDIO_SHARING_MODE_EXCLUSIVE,
+        std::memory_order_release);
+    isMmapActive_.store(
+        AAudioStream_isMMapUsed(playbackStream_),
+        std::memory_order_release);
+    return true;
+}
+
 bool AAudioEngine::waitForStreamState(
     AAudioStream* stream,
     aaudio_stream_state_t desired,
@@ -641,10 +538,21 @@ bool AAudioEngine::waitForStreamState(
         if (now >= deadline) return false;
         const auto remainingNs = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
         aaudio_stream_state_t nextState = state;
+        const int64_t waitNs = std::min<int64_t>(remainingNs, 20'000'000LL);
         const aaudio_result_t result = AAudioStream_waitForStateChange(
-            stream, state, &nextState, std::min<int64_t>(remainingNs, 5'000'000LL));
-        if (result != AAUDIO_OK) return false;
-        state = nextState;
+            stream, state, &nextState, waitNs);
+
+        if (result == AAUDIO_OK) {
+            state = nextState;
+        } else if (result == AAUDIO_ERROR_TIMEOUT) {
+            // This timeout is only the polling slice. Re-read the authoritative
+            // stream state and continue until the outer deadline expires.
+            state = AAudioStream_getState(stream);
+        } else {
+            LOGW("AAudioStream_waitForStateChange error: %d (%s)",
+                 result, AAudio_convertResultToText(result));
+            return false;
+        }
     }
     return true;
 }
@@ -654,10 +562,38 @@ bool AAudioEngine::startPlayback() {
 
     if (playbackDspRunning_.load(std::memory_order_acquire)) return true;
 
-    if (!captureStream_ || !playbackStream_) {
-        if (!initLocked(isBluetoothMode_.load(), playbackSampleRate_.load(),
-                        actualInputDeviceId_.load(), actualOutputDeviceId_.load())) {
+    if (!playbackStream_) {
+        const aaudio_result_t reopen = openPlaybackStreamWithFallback(
+            playbackSampleRate_.load(std::memory_order_acquire),
+            requestedOutputDeviceId_.load(std::memory_order_acquire),
+            isBluetoothMode_.load(std::memory_order_acquire));
+        if (reopen != AAUDIO_OK || playbackStream_ == nullptr ||
+            !validateAndPublishPlaybackConfigLocked(
+                requestedOutputDeviceId_.load(std::memory_order_acquire))) {
+            LOGE("startPlayback: failed to independently reopen playback stream: %d (%s)",
+                 reopen, AAudio_convertResultToText(reopen));
+            closePlaybackStreamLocked();
             return false;
+        }
+        voiceEnhancer_.reset(actualPlaybackSampleRate_.load(std::memory_order_acquire));
+    } else {
+        const aaudio_stream_state_t state = AAudioStream_getState(playbackStream_);
+        if (state == AAUDIO_STREAM_STATE_DISCONNECTED ||
+            state == AAUDIO_STREAM_STATE_CLOSED) {
+            closePlaybackStreamLocked();
+            const aaudio_result_t reopen = openPlaybackStreamWithFallback(
+                playbackSampleRate_.load(std::memory_order_acquire),
+                requestedOutputDeviceId_.load(std::memory_order_acquire),
+                isBluetoothMode_.load(std::memory_order_acquire));
+            if (reopen != AAUDIO_OK || playbackStream_ == nullptr ||
+                !validateAndPublishPlaybackConfigLocked(
+                    requestedOutputDeviceId_.load(std::memory_order_acquire))) {
+                LOGE("startPlayback: failed to recover disconnected playback stream: %d (%s)",
+                     reopen, AAudio_convertResultToText(reopen));
+                closePlaybackStreamLocked();
+                return false;
+            }
+            voiceEnhancer_.reset(actualPlaybackSampleRate_.load(std::memory_order_acquire));
         }
     }
 
@@ -668,16 +604,14 @@ bool AAudioEngine::startPlayback() {
     const aaudio_result_t result = AAudioStream_requestStart(playbackStream_);
     if (result != AAUDIO_OK) {
         LOGE("AAudioStream_requestStart(playback) failed: %d (%s)", result, AAudio_convertResultToText(result));
-        AAudioStream_close(playbackStream_);
-        playbackStream_ = nullptr;
+        closePlaybackStreamLocked();
         isDisconnected_.store(true, std::memory_order_release);
         unblockPlaybackCallback();
         return false;
     }
     if (!waitForStreamState(playbackStream_, AAUDIO_STREAM_STATE_STARTED, 500)) {
         LOGE("Playback stream did not reach STARTED within 500 ms");
-        AAudioStream_close(playbackStream_);
-        playbackStream_ = nullptr;
+        closePlaybackStreamLocked();
         isDisconnected_.store(true, std::memory_order_release);
         unblockPlaybackCallback();
         return false;
@@ -693,8 +627,7 @@ bool AAudioEngine::startPlayback() {
             // A failed flush must fail closed: requestStop() would drain and
             // could therefore play stale samples. Closing the stream is the
             // safe terminal action for this startup failure.
-            AAudioStream_close(playbackStream_);
-            playbackStream_ = nullptr;
+            closePlaybackStreamLocked();
         }
         isDisconnected_.store(true, std::memory_order_release);
         unblockPlaybackCallback();
@@ -710,11 +643,22 @@ bool AAudioEngine::startCapture() {
     std::lock_guard<std::mutex> lock(lifecycleMutex_);
 
     if (captureDspRunning_.load(std::memory_order_acquire)) return true;
-    if (!captureStream_) return false;
 
-    const aaudio_stream_state_t state = AAudioStream_getState(captureStream_);
-    if (state != AAUDIO_STREAM_STATE_OPEN && state != AAUDIO_STREAM_STATE_STOPPED) {
-        if (!waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 500)) return false;
+    if (!captureStream_) {
+        if (!openCaptureStreamLocked(requestedInputDeviceId_.load(std::memory_order_relaxed))) {
+            LOGE("startCapture: failed to reopen capture stream");
+            return false;
+        }
+    } else {
+        const aaudio_stream_state_t state = AAudioStream_getState(captureStream_);
+        if (state != AAUDIO_STREAM_STATE_OPEN && state != AAUDIO_STREAM_STATE_STOPPED) {
+            if (!waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 500)) {
+                closeCaptureStreamLocked();
+                if (!openCaptureStreamLocked(requestedInputDeviceId_.load(std::memory_order_relaxed))) {
+                    return false;
+                }
+            }
+        }
     }
 
     captureDroppedFrames_.store(0, std::memory_order_relaxed);
@@ -724,16 +668,16 @@ bool AAudioEngine::startCapture() {
     const aaudio_result_t result = AAudioStream_requestStart(captureStream_);
     if (result != AAUDIO_OK) {
         LOGE("AAudioStream_requestStart(capture) failed: %d (%s)", result, AAudio_convertResultToText(result));
-        AAudioStream_close(captureStream_);
-        captureStream_ = nullptr;
+        closeCaptureStreamLocked();
+        isDisconnected_.store(true, std::memory_order_release);
         return false;
     }
     if (!waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STARTED, 500)) {
         LOGE("Capture stream did not reach STARTED within 500 ms");
         AAudioStream_requestStop(captureStream_);
         waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 200);
-        AAudioStream_close(captureStream_);
-        captureStream_ = nullptr;
+        closeCaptureStreamLocked();
+        isDisconnected_.store(true, std::memory_order_release);
         return false;
     }
 
@@ -746,8 +690,7 @@ bool AAudioEngine::startCapture() {
         if (captureStream_) {
             AAudioStream_requestStop(captureStream_);
             waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 500);
-            AAudioStream_close(captureStream_);
-            captureStream_ = nullptr;
+            closeCaptureStreamLocked();
         }
         isDisconnected_.store(true, std::memory_order_release);
         return false;
@@ -825,8 +768,7 @@ void AAudioEngine::stopCaptureLocked() {
         }
         if (!waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 500)) {
             LOGW("Capture stream did not reach STOPPED within 500 ms; closing anyway");
-            AAudioStream_close(captureStream_);
-            captureStream_ = nullptr;
+            closeCaptureStreamLocked();
         }
     }
 
@@ -846,8 +788,7 @@ void AAudioEngine::stopPlaybackLocked() {
         if (!flushOutputStreamLocked(false)) {
             LOGW("Playback physical flush failed during stop; closing stream");
         }
-        AAudioStream_close(playbackStream_);
-        playbackStream_ = nullptr;
+        closePlaybackStreamLocked();
     }
 
     playbackDspInputBuffer_.resetQuiesced();
@@ -890,7 +831,12 @@ void AAudioEngine::stopLocked() {
     playbackBuffer_.resetQuiesced();
     micRms_.store(0.0f, std::memory_order_relaxed);
     outRms_.store(0.0f, std::memory_order_relaxed);
-    isMmapExclusiveActive_.store(false, std::memory_order_relaxed);
+    isMmapActive_.store(false, std::memory_order_relaxed);
+    isExclusiveSharingActive_.store(false, std::memory_order_relaxed);
+    actualPlaybackChannels_.store(0, std::memory_order_relaxed);
+    actualPlaybackFormat_.store(0, std::memory_order_relaxed);
+    actualPlaybackSampleRate_.store(0, std::memory_order_relaxed);
+    actualOutputDeviceId_.store(AAUDIO_UNSPECIFIED, std::memory_order_relaxed);
     unblockPlaybackCallback();
 }
 
@@ -1788,11 +1734,11 @@ void AAudioEngine::flushPlayback(
         playbackDspCv_.notify_all();
 
         if (playbackStream_) {
-            AAudioStream_close(playbackStream_);
-            playbackStream_ = nullptr;
+            closePlaybackStreamLocked();
         }
 
-        isMmapExclusiveActive_.store(false, std::memory_order_release);
+        isMmapActive_.store(false, std::memory_order_release);
+        isExclusiveSharingActive_.store(false, std::memory_order_release);
         isDisconnected_.store(true, std::memory_order_release);
         LOGW("AAudioEngine: physical playback flush failed; stream closed for fail-closed recovery");
     }
@@ -2046,35 +1992,27 @@ AAudioEngine::playbackCallback(
 }
 
 void AAudioEngine::errorCallback(
-    AAudioStream* /*stream*/,
+    AAudioStream* stream,
     void* userData,
     aaudio_result_t error) {
 
-    char errBuf[64];
+    auto* engine =
+        static_cast<AAudioEngine*>(userData);
+    if (engine == nullptr || error == AAUDIO_OK) return;
 
-    snprintf(
-        errBuf,
-        sizeof(errBuf),
-        "AAudio stream error: %d",
-        error);
+    const AAudioStream* activeCapture =
+        engine->activeCaptureStream_.load(std::memory_order_acquire);
+    const AAudioStream* activePlayback =
+        engine->activePlaybackStream_.load(std::memory_order_acquire);
 
-    client::logging::NativeLogQueue::getInstance()
-        .push(
-            5,
-            LOG_TAG,
-            errBuf);
-
-    if (error ==
-        AAUDIO_ERROR_DISCONNECTED) {
-
-        auto* engine =
-            static_cast<AAudioEngine*>(
-                userData);
-
-        engine->isDisconnected_.store(
-            true,
-            std::memory_order_release);
+    // AAudio error callback is not a lifecycle-management context. Publish
+    // only an atomic recovery signal here; stop/close/reopen happens elsewhere.
+    // The stream identity check prevents a late callback from an old, already
+    // replaced stream from poisoning a newly opened route.
+    if (stream == activeCapture || stream == activePlayback) {
+        engine->isDisconnected_.store(true, std::memory_order_release);
     }
 }
 
 } // namespace client::audio
+### END FULL FILE
