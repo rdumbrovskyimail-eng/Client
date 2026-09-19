@@ -1,4 +1,3 @@
-
 package com.client.app.api
 
 import android.util.Base64
@@ -7,6 +6,7 @@ import com.client.app.audio.NativeAudioBridge
 import com.client.app.audio.NativeAudioEngine
 import com.client.app.logging.AppLogManager
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ChannelResult
 import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.flow.Flow
@@ -228,6 +228,12 @@ class GeminiProtobufLiveClient @Inject constructor(
     var epoch: Long = 0L
         private set
 
+    // Serializes transport identity changes with parser-side destructive
+    // state transitions. A WebSocket callback can arrive concurrently with
+    // reconnect/close, so epoch + socket identity must be checked atomically
+    // for side effects that touch global transport state.
+    private val sessionStateLock = Any()
+
     // AUD-005.3:
     // The playback-generation authority lives outside the transport so there
     // is exactly one generation domain shared by all invalidation sources.
@@ -258,7 +264,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             Channel.UNLIMITED
         )
 
-    val events: Flow<GeminiEvent> =
+    val events: Flow<GeminiEventEnvelope> =
         _events
             .receiveAsFlow()
             .onEach { queued ->
@@ -270,12 +276,18 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
             .filter { queued ->
                 // Old callbacks can still be physically present in the FIFO
-                // after a reconnect. Filter by epoch at consumption so a
-                // stale Interrupted/TurnComplete/etc. can never mutate the
-                // new session state.
+                // after a reconnect. Filter by epoch at consumption so stale
+                // events are not normally delivered to SessionManager. The
+                // explicit envelope keeps the source epoch available for a
+                // second validation at the consumer boundary.
                 queued.epoch == epoch
             }
-            .map { it.event }
+            .map {
+                GeminiEventEnvelope(
+                    epoch = it.epoch,
+                    event = it.event
+                )
+            }
 
     // AI output audio is independently bounded by byte accounting.
     private val _audio =
@@ -319,6 +331,8 @@ class GeminiProtobufLiveClient @Inject constructor(
         event: GeminiEvent,
         eventEpoch: Long
     ) {
+        if (eventEpoch != epoch) return
+
         _events.trySend(
             QueuedEvent(
                 epoch = eventEpoch,
@@ -332,6 +346,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         event: GeminiEvent,
         eventEpoch: Long
     ) {
+        if (eventEpoch != epoch) return
         while (true) {
             val current = pendingDataEvents.get()
             if (current >= MAX_DATA_EVENTS_IN_FLIGHT) {
@@ -391,6 +406,11 @@ class GeminiProtobufLiveClient @Inject constructor(
         beforeOpen: (suspend () -> Unit)? = null
     ) = wsMutex.withLock {
 
+        // Reject an impossible compression union before touching the current
+        // live session. A bad new configuration must not tear down a healthy
+        // existing connection.
+        validateCompressionConfig(cfg)
+
         // closeInternal() advances the session epoch before closing the old
         // socket. Old callbacks therefore become stale before the new socket
         // is exposed to the rest of the app. Playback generation is managed
@@ -402,8 +422,10 @@ class GeminiProtobufLiveClient @Inject constructor(
         // receive server audio.
         beforeOpen?.invoke()
 
-        isReady = false
-        activeConfig = cfg
+        synchronized(sessionStateLock) {
+            isReady = false
+            activeConfig = cfg
+        }
 
         synchronized(batchLock) {
             isAudioStreamEnded = true
@@ -451,13 +473,25 @@ class GeminiProtobufLiveClient @Inject constructor(
                         response: Response
                     ) {
 
-                        if (myEpoch != epoch) {
-                            ws.close(
-                                1000,
-                                "stale"
-                            )
-                            return
+                        synchronized(sessionStateLock) {
+                            if (myEpoch != epoch) {
+                                ws.close(
+                                    1000,
+                                    "stale"
+                                )
+                                return
+                            }
+
+                            // Publish the socket before sending setup so a very
+                            // fast setupComplete response cannot race with
+                            // connect()'s return path and be mistaken for stale.
+                            webSocket = ws
                         }
+
+                        startAudioWriter(
+                            ws,
+                            myEpoch
+                        )
 
                         logManager.net(
                             "WebSocket:Open",
@@ -478,7 +512,24 @@ class GeminiProtobufLiveClient @Inject constructor(
                             setupMsg
                         )
 
-                        ws.send(setupMsg)
+                        val setupAccepted =
+                            synchronized(sessionStateLock) {
+                                if (myEpoch != epoch || webSocket !== ws) {
+                                    false
+                                } else {
+                                    synchronized(outboundSendLock) {
+                                        ws.send(setupMsg)
+                                    }
+                                }
+                            }
+
+                        if (!setupAccepted) {
+                            logManager.e(
+                                "WebSocket:Setup",
+                                "OkHttp отверг setup-сообщение; закрываем сессию"
+                            )
+                            ws.cancel()
+                        }
                     }
 
                     override fun onMessage(
@@ -506,7 +557,8 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                             parseServerJsonMessage(
                                 text,
-                                myEpoch
+                                myEpoch,
+                                ws
                             )
                         }
                     }
@@ -525,7 +577,8 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                             parseServerJsonMessage(
                                 bytes.utf8(),
-                                myEpoch
+                                myEpoch,
+                                ws
                             )
                         }
                     }
@@ -562,8 +615,16 @@ class GeminiProtobufLiveClient @Inject constructor(
                             return
                         }
 
-                        isReady = false
-                        stopAudioWriter()
+                        synchronized(sessionStateLock) {
+                            if (myEpoch != epoch || webSocket !== ws) {
+                                return
+                            }
+                            isReady = false
+                        }
+                        stopAudioWriter(
+                            expectedWs = ws,
+                            expectedEpoch = myEpoch
+                        )
 
                         emitControlEvent(
                             GeminiEvent.Disconnected(
@@ -599,14 +660,20 @@ class GeminiProtobufLiveClient @Inject constructor(
                             return
                         }
 
-                        isReady = false
-                        stopAudioWriter()
+                        synchronized(sessionStateLock) {
+                            if (myEpoch != epoch || webSocket !== ws) {
+                                return
+                            }
+                            isReady = false
+                        }
+                        stopAudioWriter(
+                            expectedWs = ws,
+                            expectedEpoch = myEpoch
+                        )
 
                         val fatal =
-                            httpCode == 400 ||
                             httpCode == 401 ||
-                            httpCode == 403 ||
-                            httpCode == 404
+                            httpCode == 403
 
                         emitControlEvent(
                             GeminiEvent.Error(
@@ -628,12 +695,10 @@ class GeminiProtobufLiveClient @Inject constructor(
                 }
             )
 
-        webSocket = ws
-
-        startAudioWriter(
-            ws,
-            myEpoch
-        )
+        // onOpen() publishes the socket and starts its writer before setup is
+        // sent. Keeping this return path free of writer replacement avoids a
+        // race where a fast setupComplete callback could create the writer
+        // and this path could immediately replace it.
     }
 
     private fun startAudioWriter(
@@ -655,16 +720,23 @@ class GeminiProtobufLiveClient @Inject constructor(
                     AUDIO_COMMAND_CHANNEL_CAPACITY
             )
 
-        audioWriterScope = scope
-        audioWriterChannel = channel
+        synchronized(sessionStateLock) {
+            if (writerEpoch != epoch || webSocket !== ws) {
+                channel.close()
+                scope.cancel()
+                return
+            }
+            audioWriterScope = scope
+            audioWriterChannel = channel
+        }
 
         scope.launch {
             try {
                 while (true) {
                     // Keep the bounded pre-ready queue fully bounded: do not
                     // dequeue the first command until setupComplete has been
-                    // observed. With a 10-command channel and 40 ms PCM batches
-                    // this is a deterministic ~400 ms pre-ready ceiling.
+                    // observed. With a 32-command channel and 40 ms PCM batches
+                    // this is a deterministic ~1.28 s pre-ready ceiling.
                     if (!awaitWriterReady(ws, writerEpoch)) {
                         break
                     }
@@ -754,7 +826,22 @@ class GeminiProtobufLiveClient @Inject constructor(
                                 }.toString()
                         }
 
-                    if (!ws.send(jsonMessage)) {
+                    val sendAccepted =
+                        synchronized(sessionStateLock) {
+                            if (
+                                writerEpoch != epoch ||
+                                !isReady ||
+                                webSocket !== ws
+                            ) {
+                                false
+                            } else {
+                                synchronized(outboundSendLock) {
+                                    ws.send(jsonMessage)
+                                }
+                            }
+                        }
+
+                    if (!sendAccepted) {
                         logManager.w(
                             "WebSocket:AudioWriter",
                             "OkHttp отверг outbound audio/control command"
@@ -781,11 +868,13 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 // Never clear a newer writer that may already have replaced
                 // this one after reconnect.
-                if (audioWriterChannel === channel) {
-                    audioWriterChannel = null
-                }
-                if (audioWriterScope === scope) {
-                    audioWriterScope = null
+                synchronized(sessionStateLock) {
+                    if (audioWriterChannel === channel) {
+                        audioWriterChannel = null
+                    }
+                    if (audioWriterScope === scope) {
+                        audioWriterScope = null
+                    }
                 }
             }
         }
@@ -830,12 +919,30 @@ class GeminiProtobufLiveClient @Inject constructor(
         )
     }
 
-    private fun stopAudioWriter() {
-        audioWriterChannel?.close()
-        audioWriterChannel = null
+    private val outboundSendLock = Any()
 
-        audioWriterScope?.cancel()
-        audioWriterScope = null
+    private fun stopAudioWriter(
+        expectedWs: WebSocket? = null,
+        expectedEpoch: Long? = null
+    ) {
+        synchronized(sessionStateLock) {
+            if (expectedWs != null) {
+                if (expectedEpoch == null ||
+                    expectedEpoch != epoch ||
+                    webSocket !== expectedWs
+                ) {
+                    return
+                }
+            }
+
+            val channel = audioWriterChannel
+            val scope = audioWriterScope
+            audioWriterChannel = null
+            audioWriterScope = null
+
+            channel?.close()
+            scope?.cancel()
+        }
     }
 
     // AUD-067:
@@ -959,6 +1066,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         text: String
     ) {
 
+        val sendEpoch = epoch
         val ws =
             webSocket ?: return
 
@@ -993,14 +1101,23 @@ class GeminiProtobufLiveClient @Inject constructor(
             jsonMessage
         )
 
-        ws.send(
-            jsonMessage
-        )
+        synchronized(sessionStateLock) {
+            if (
+                sendEpoch == epoch &&
+                isReady &&
+                webSocket === ws
+            ) {
+                synchronized(outboundSendLock) {
+                    ws.send(jsonMessage)
+                }
+            }
+        }
     }
 
     fun sendRealtimeImage(
         jpegBytes: ByteArray
     ) {
+        val sendEpoch = epoch
         val ws =
             webSocket ?: return
 
@@ -1008,6 +1125,17 @@ class GeminiProtobufLiveClient @Inject constructor(
             !isReady ||
             jpegBytes.isEmpty()
         ) {
+            return
+        }
+
+        // Video is an optional realtime producer. Unlike PCM/control, it may
+        // be safely shed when the OkHttp outbound queue is congested. This keeps
+        // transient image bursts from competing with the voice transport.
+        if (ws.queueSize() > MAX_QUEUE_BYTES) {
+            logManager.w(
+                "WebSocket:TxImage",
+                "Очередь WebSocket перегружена; realtime image пропущен"
+            )
             return
         }
 
@@ -1047,9 +1175,17 @@ class GeminiProtobufLiveClient @Inject constructor(
             "Отправка изображения (${jpegBytes.size} байт)"
         )
 
-        ws.send(
-            jsonMessage
-        )
+        synchronized(sessionStateLock) {
+            if (
+                sendEpoch == epoch &&
+                isReady &&
+                webSocket === ws
+            ) {
+                synchronized(outboundSendLock) {
+                    ws.send(jsonMessage)
+                }
+            }
+        }
     }
 
     // Manual VAD activity markers are serialized through the same
@@ -1058,9 +1194,27 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         audioOutboundMutex.withLock {
 
-            val channel =
-                audioWriterChannel
-                    ?: return
+            val writerEpoch = epoch
+            val ws = webSocket
+                ?: return
+            val channel = audioWriterChannel
+                ?: return
+
+            // A new manually-delimited activity starts a new logical input
+            // segment. Any sub-threshold bytes left from a previous segment
+            // must never leak into this one.
+            synchronized(batchLock) {
+                isAudioStreamEnded = false
+                audioBatchBuffer.reset()
+            }
+
+            if (
+                writerEpoch != epoch ||
+                webSocket !== ws ||
+                audioWriterChannel !== channel
+            ) {
+                return
+            }
 
             try {
                 channel.send(
@@ -1078,11 +1232,41 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         audioOutboundMutex.withLock {
 
-            val channel =
-                audioWriterChannel
-                    ?: return
+            val writerEpoch = epoch
+            val ws = webSocket
+                ?: return
+            val channel = audioWriterChannel
+                ?: return
+
+            val tailPayload =
+                synchronized(batchLock) {
+                    isAudioStreamEnded = true
+                    if (audioBatchBuffer.size() == 0) {
+                        null
+                    } else {
+                        audioBatchBuffer
+                            .toByteArray()
+                            .also {
+                                audioBatchBuffer.reset()
+                            }
+                    }
+                }
+
+            if (
+                writerEpoch != epoch ||
+                webSocket !== ws ||
+                audioWriterChannel !== channel
+            ) {
+                return
+            }
 
             try {
+                if (tailPayload != null) {
+                    channel.send(
+                        AudioOutboundCommand.Pcm(tailPayload)
+                    )
+                }
+
                 channel.send(
                     AudioOutboundCommand.ActivityEnd
                 )
@@ -1099,6 +1283,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         turnComplete: Boolean = true
     ) {
 
+        val sendEpoch = epoch
         val ws =
             webSocket ?: return
 
@@ -1110,18 +1295,22 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
 
         sendClientContentInternal(
-            turns,
-            turnComplete
+            turns = turns,
+            turnComplete = turnComplete,
+            targetWebSocket = ws,
+            expectedEpoch = sendEpoch
         )
     }
 
     private fun sendClientContentInternal(
         turns: List<ClientTurn>,
-        turnComplete: Boolean
-    ) {
+        turnComplete: Boolean,
+        targetWebSocket: WebSocket? = null,
+        expectedEpoch: Long = epoch
+    ): Boolean {
 
         val ws =
-            webSocket ?: return
+            targetWebSocket ?: webSocket ?: return false
 
         val jsonMessage =
             buildJsonObject {
@@ -1172,15 +1361,26 @@ class GeminiProtobufLiveClient @Inject constructor(
             jsonMessage
         )
 
-        ws.send(
-            jsonMessage
-        )
+        return synchronized(sessionStateLock) {
+            if (
+                expectedEpoch == epoch &&
+                webSocket === ws &&
+                (targetWebSocket != null || isReady)
+            ) {
+                synchronized(outboundSendLock) {
+                    ws.send(jsonMessage)
+                }
+            } else {
+                false
+            }
+        }
     }
 
     fun sendToolResponses(
         responses: List<ToolResponse>
     ) {
 
+        val sendEpoch = epoch
         val ws =
             webSocket ?: return
 
@@ -1286,9 +1486,36 @@ class GeminiProtobufLiveClient @Inject constructor(
             jsonMessage
         )
 
-        ws.send(
-            jsonMessage
-        )
+        synchronized(sessionStateLock) {
+            if (
+                sendEpoch == epoch &&
+                isReady &&
+                webSocket === ws
+            ) {
+                synchronized(outboundSendLock) {
+                    ws.send(jsonMessage)
+                }
+            }
+        }
+    }
+
+    private fun validateCompressionConfig(
+        cfg: LiveConfig
+    ) {
+        val trigger = cfg.compression.triggerTokens
+        val target = cfg.compression.targetTokens
+
+        require(trigger >= 0) {
+            "contextWindowCompression.triggerTokens must be >= 0"
+        }
+        require(target >= 0) {
+            "contextWindowCompression.slidingWindow.targetTokens must be >= 0"
+        }
+        // The wire schema is a oneof. Legacy/local settings may contain both
+        // values; that should be normalized rather than crash a healthy session.
+        // The build path gives slidingWindow.targetTokens precedence because it
+        // is the more specific retention target.
+
     }
 
     private fun buildSetupMessage(
@@ -1480,21 +1707,21 @@ class GeminiProtobufLiveClient @Inject constructor(
                         val trigger = cfg.compression.triggerTokens
                         val target = cfg.compression.targetTokens
 
-                        when {
-                            trigger > 0 -> {
-                                putJsonObject("contextWindowCompression") {
-                                    putJsonObject("compressionMechanism") {
-                                        put("triggerTokens", trigger)
+                        putJsonObject("contextWindowCompression") {
+                            when {
+                                // Oneof normalization: never emit both union members.
+                                target > 0 -> {
+                                    putJsonObject("slidingWindow") {
+                                        put("targetTokens", target)
                                     }
                                 }
-                            }
-                            target > 0 -> {
-                                putJsonObject("contextWindowCompression") {
-                                    putJsonObject("compressionMechanism") {
-                                        putJsonObject("slidingWindow") {
-                                            put("targetTokens", target)
-                                        }
-                                    }
+                                trigger > 0 -> {
+                                    put("triggerTokens", trigger)
+                                }
+                                else -> {
+                                    // Empty slidingWindow enables compression using
+                                    // the documented server defaults.
+                                    putJsonObject("slidingWindow") {}
                                 }
                             }
                         }
@@ -1620,23 +1847,15 @@ class GeminiProtobufLiveClient @Inject constructor(
                     if (
                         cfg.sessionResumptionEnabled
                     ) {
-
-                        cfg.resumptionHandle
-                            ?.takeIf {
-                                it.isNotBlank()
-                            }
-                            ?.let { handle ->
-
-                                putJsonObject(
-                                    "sessionResumption"
-                                ) {
-
-                                    put(
-                                        "handle",
-                                        handle
-                                    )
+                        putJsonObject(
+                            "sessionResumption"
+                        ) {
+                            cfg.resumptionHandle
+                                ?.takeIf { it.isNotBlank() }
+                                ?.let { handle ->
+                                    put("handle", handle)
                                 }
-                            }
+                        }
                     }
 
                     if (
@@ -1661,7 +1880,8 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     private fun parseServerJsonMessage(
         rawJson: String,
-        myEpoch: Long
+        myEpoch: Long,
+        sourceWebSocket: WebSocket
     ) {
 
         try {
@@ -1677,40 +1897,63 @@ class GeminiProtobufLiveClient @Inject constructor(
                 )
             ) {
 
-                logManager.i(
-                    "GeminiLive",
-                    "Сессия 3.8 готова: setupComplete получен"
-                )
+                synchronized(sessionStateLock) {
+                    if (
+                        myEpoch != epoch ||
+                        webSocket !== sourceWebSocket ||
+                        isReady
+                    ) {
+                        return
+                    }
 
-                val history =
-                    activeConfig?.initialHistory
-
-                if (
-                    !history.isNullOrEmpty()
-                ) {
-
-                    val bounded =
-                        history.takeLast(
-                            MAX_INITIAL_HISTORY_TURNS
-                        )
-
-                    sendClientContentInternal(
-                        bounded,
-                        turnComplete = true
+                    logManager.i(
+                        "GeminiLive",
+                        "Сессия 3.8 готова: setupComplete получен"
                     )
 
-                    logManager.net(
-                        "WebSocket:History",
-                        "Первоначальная история (${bounded.size} ходов) внедрена до готовности сессии"
+                    val history =
+                        activeConfig?.initialHistory
+
+                    if (!history.isNullOrEmpty()) {
+                        val bounded =
+                            history.takeLast(
+                                MAX_INITIAL_HISTORY_TURNS
+                            )
+
+                        // This send is deliberately performed before isReady
+                        // becomes visible to the realtime writer. The server
+                        // explicitly waits for initial clientContent to finish
+                        // before realtimeInput is accepted as the live turn.
+                        val historyAccepted =
+                            sendClientContentInternal(
+                                turns = bounded,
+                                turnComplete = true,
+                                targetWebSocket = sourceWebSocket,
+                                expectedEpoch = myEpoch
+                            )
+
+                        if (!historyAccepted) {
+                            logManager.e(
+                                "GeminiLive",
+                                "Не удалось отправить initial history; сессия не переводится в READY"
+                            )
+                            sourceWebSocket.close(1011, "initial history send failed")
+                            return
+                        }
+
+                        logManager.net(
+                            "WebSocket:History",
+                            "Первоначальная история (${bounded.size} ходов) внедрена после setupComplete"
+                        )
+                    }
+
+                    isReady = true
+
+                    emitControlEvent(
+                        GeminiEvent.SetupComplete,
+                        myEpoch
                     )
                 }
-
-                isReady = true
-
-                emitControlEvent(
-                    GeminiEvent.SetupComplete,
-                    myEpoch
-                )
             }
 
             root["usageMetadata"]
@@ -1787,18 +2030,13 @@ class GeminiProtobufLiveClient @Inject constructor(
                             ?.booleanOrNull
                             ?: true
 
-                    if (
-                        resumable &&
-                        handle.isNotBlank()
-                    ) {
-
-                        emitControlEvent(
-                            GeminiEvent.ResumptionHandle(
-                                handle
-                            ),
-                            myEpoch
-                        )
-                    }
+                    emitControlEvent(
+                        GeminiEvent.ResumptionHandle(
+                            handle = handle.takeIf { it.isNotBlank() },
+                            resumable = resumable
+                        ),
+                        myEpoch
+                    )
                 }
 
             root["toolCall"]
@@ -1915,11 +2153,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                         )
                     }
 
-                    sc["interimInputTranscription"]
-                        ?.jsonObject
-                        ?.get("text")
-                        ?.jsonPrimitive
-                        ?.contentOrNull
+                    extractTranscriptText(sc["interimInputTranscription"])
                         ?.let {
 
                             if (
@@ -1936,11 +2170,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                             }
                         }
 
-                    sc["inputTranscription"]
-                        ?.jsonObject
-                        ?.get("text")
-                        ?.jsonPrimitive
-                        ?.contentOrNull
+                    extractTranscriptText(sc["inputTranscription"])
                         ?.let {
 
                             if (
@@ -1957,11 +2187,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                             }
                         }
 
-                    sc["outputTranscription"]
-                        ?.jsonObject
-                        ?.get("text")
-                        ?.jsonPrimitive
-                        ?.contentOrNull
+                    extractTranscriptText(sc["outputTranscription"])
                         ?.let {
 
                             if (
@@ -1977,11 +2203,16 @@ class GeminiProtobufLiveClient @Inject constructor(
                             }
                         }
 
-                    sc["modelTurn"]
-                        ?.jsonObject
-                        ?.get("parts")
-                        ?.jsonArray
-                        ?.forEach { partEl ->
+                    // Google documents `interrupted=true` as the signal to
+                    // stop and flush the current playback queue. The same
+                    // server event may still contain the tail of the cancelled
+                    // model turn; never enqueue that stale audio.
+                    if (!interrupted) {
+                        sc["modelTurn"]
+                            ?.jsonObject
+                            ?.get("parts")
+                            ?.jsonArray
+                            ?.forEach { partEl ->
 
                             val part =
                                 partEl.jsonObject
@@ -2039,51 +2270,71 @@ class GeminiProtobufLiveClient @Inject constructor(
                                                 Base64.NO_WRAP
                                             )
 
+                                        // Playback generation is independent of
+                                        // transport epoch and can change during
+                                        // the lifetime of one WebSocket (for
+                                        // example after local barge-in). Sample
+                                        // it for each accepted server audio part.
                                         val currentGen =
                                             audioEngine.currentPlaybackGeneration
 
-                                        val newBacklog =
-                                            queuedAudioBytes
-                                                .addAndGet(
-                                                    pcmBytes.size
-                                                        .toLong()
-                                                )
+                                        var backlogOverflow = false
+                                        var sendResult: ChannelResult<Unit>? = null
 
-                                        if (
-                                            newBacklog >
-                                            MAX_AI_AUDIO_BACKLOG_BYTES
-                                        ) {
+                                        synchronized(sessionStateLock) {
+                                            if (
+                                                myEpoch == epoch &&
+                                                webSocket === sourceWebSocket
+                                            ) {
+                                                val newBacklog =
+                                                    queuedAudioBytes
+                                                        .addAndGet(
+                                                            pcmBytes.size
+                                                                .toLong()
+                                                        )
 
-                                            queuedAudioBytes
-                                                .addAndGet(
-                                                    -pcmBytes.size
-                                                        .toLong()
-                                                )
+                                                if (
+                                                    newBacklog >
+                                                    MAX_AI_AUDIO_BACKLOG_BYTES
+                                                ) {
+                                                    queuedAudioBytes
+                                                        .addAndGet(
+                                                            -pcmBytes.size
+                                                                .toLong()
+                                                        )
+                                                    backlogOverflow = true
+                                                } else {
+                                                    sendResult = _audio.trySend(
+                                                        AudioFrame(
+                                                            pcmBytes,
+                                                            myEpoch,
+                                                            currentGen
+                                                        )
+                                                    )
+                                                }
+                                            }
+                                        }
 
+                                        if (backlogOverflow) {
                                             logManager.w(
                                                 "AudioStream",
-                                                "Превышен лимит бэклога ($newBacklog > $MAX_AI_AUDIO_BACKLOG_BYTES). Controlled recovery."
+                                                "Превышен лимит бэклога. Controlled recovery."
                                             )
-
-                                            audioEngine.invalidateAndFlushPlayback(
-                                                "server audio backlog overflow"
-                                            )
-
-                                            // Drop the current PCM part only.
-                                            // The rest of this server message is
-                                            // still parsed: a message can carry
-                                            // multiple serverContent fields/parts.
+                                            if (
+                                                myEpoch == epoch &&
+                                                webSocket === sourceWebSocket
+                                            ) {
+                                                audioEngine.invalidateAndFlushPlayback(
+                                                    "server audio backlog overflow"
+                                                )
+                                            }
                                             return@forEach
                                         }
 
-                                        val sendResult =
-                                            _audio.trySend(
-                                                AudioFrame(
-                                                    pcmBytes,
-                                                    myEpoch,
-                                                    currentGen
-                                                )
-                                            )
+                                        if (sendResult == null) {
+                                            releaseAudio(pcmBytes.size)
+                                            return@forEach
+                                        }
 
                                         if (
                                             sendResult.isFailure
@@ -2098,6 +2349,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                                     }
                                 }
                         }
+                    }
                 }
 
         } catch (e: Exception) {
@@ -2110,19 +2362,36 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
     }
 
+
+    private fun extractTranscriptText(element: JsonElement?): String? {
+        return when (element) {
+            is JsonObject ->
+                element["text"]
+                    ?.jsonPrimitive
+                    ?.contentOrNull
+            is JsonPrimitive ->
+                element.contentOrNull
+            else -> null
+        }
+    }
+
     private fun closeInternal() {
-        val ws = webSocket
+        val ws: WebSocket?
+        val newEpoch: Long
 
         // Invalidate the old session BEFORE closing its socket. OkHttp may
-        // invoke callbacks asynchronously during close; the new epoch makes
-        // those callbacks stale immediately.
-        val newEpoch =
-            epochGen.incrementAndGet()
-        epoch = newEpoch
+        // invoke callbacks asynchronously during close; the new epoch and
+        // socket identity become stale atomically.
+        synchronized(sessionStateLock) {
+            ws = webSocket
+            newEpoch =
+                epochGen.incrementAndGet()
+            epoch = newEpoch
 
-        webSocket = null
-        isReady = false
-        activeConfig = null
+            webSocket = null
+            isReady = false
+            activeConfig = null
+        }
 
         synchronized(batchLock) {
             isAudioStreamEnded = true
@@ -2130,6 +2399,27 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
 
         stopAudioWriter()
+
+        // The current consumer may still own a frame concurrently, but the
+        // frame carries its epoch and SessionManager will drop it after the
+        // epoch fence. All frames remaining in the transport queue must be
+        // explicitly released here so the byte watermark cannot poison the
+        // next connection.
+        while (true) {
+            val frame = _audio.tryReceive().getOrNull() ?: break
+            releaseAudio(frame.pcm.size)
+        }
+
+        // Remove stale events from the FIFO as well. Otherwise setting the
+        // pending-data counter to zero while stale data events remain queued
+        // would let their later delivery decrement the counter that belongs
+        // to the next epoch.
+        while (true) {
+            _events.tryReceive().getOrNull() ?: break
+        }
+
+        queuedAudioBytes.set(0L)
+        pendingDataEvents.set(0L)
 
         runCatching {
             ws?.close(
