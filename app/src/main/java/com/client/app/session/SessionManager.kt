@@ -1,4 +1,3 @@
-
 package com.client.app.session
 
 import android.content.Context
@@ -165,6 +164,7 @@ class SessionManager @Inject constructor(
     private var goAwayJob: Job? = null
     private val reconnectGuard = Any()
     private val reconnectToken = AtomicLong(0L)
+    private val goAwayToken = AtomicLong(0L)
     @Volatile private var streamingRole: ClientRole? = null
     @Volatile private var resumptionHandle: String? = null
     @Volatile private var reconnectAttempts = 0
@@ -178,6 +178,7 @@ class SessionManager @Inject constructor(
 
     @Volatile private var userMicDesired = false
     @Volatile private var hasReceivedAudioTranscript = false
+    @Volatile private var currentOutputTranscriptionEnabled = true
 
     @Volatile private var currentAadEnabled = true
     private val isManualActivityActive = AtomicBoolean(false)
@@ -593,8 +594,11 @@ class SessionManager @Inject constructor(
             mode = prefs[KEY_INPUT_TRANSCRIPTION_MODE] ?: "VERBATIM"
         )
 
+        currentOutputTranscriptionEnabled =
+            prefs[KEY_OUTPUT_TRANSCRIPTION_ENABLED] ?: true
+
         val outputTx = TranscriptionSettings(
-            enabled = prefs[KEY_OUTPUT_TRANSCRIPTION_ENABLED] ?: true,
+            enabled = currentOutputTranscriptionEnabled,
             languageCodes =
                 prefs[KEY_OUTPUT_TRANSCRIPTION_LANGUAGES]
                     ?.split(",")
@@ -824,10 +828,7 @@ class SessionManager @Inject constructor(
         hasReceivedAudioTranscript = false
 
         cancelReconnectWork()
-
-        if (full) {
-            cancelAllPendingToolJobs()
-        }
+        cancelAllPendingToolJobs()
 
         // All microphone transitions are serialized by micMutex. Capture is
         // physically stopped before the transport is detached.
@@ -870,6 +871,7 @@ class SessionManager @Inject constructor(
     private fun cancelReconnectWork() {
         synchronized(reconnectGuard) {
             reconnectToken.incrementAndGet()
+            goAwayToken.incrementAndGet()
 
             reconnectJob?.cancel()
             reconnectJob = null
@@ -1255,11 +1257,19 @@ class SessionManager @Inject constructor(
     }
 
     private fun observeEvents() = scope.launch {
-        client.events.collect { event ->
+        client.events.collect { envelope ->
+            // The transport filters stale events at delivery time; keep the
+            // source epoch explicit here as a second consumer-side guard.
+            if (envelope.epoch != client.epoch) return@collect
+
+            val event = envelope.event
+            val eventEpoch = envelope.epoch
+
             when (event) {
                 is GeminiEvent.SetupComplete -> {
                     reconnectAttempts = 0
                     pendingGoAway = false
+                    goAwayToken.incrementAndGet()
 
                     synchronized(reconnectGuard) {
                         goAwayJob?.cancel()
@@ -1281,11 +1291,17 @@ class SessionManager @Inject constructor(
                 }
 
                 is GeminiEvent.ResumptionHandle -> {
-                    resumptionHandle = event.handle
+                    resumptionHandle =
+                        if (event.resumable && !event.handle.isNullOrBlank()) {
+                            event.handle
+                        } else {
+                            null
+                        }
                 }
 
                 is GeminiEvent.GoAway -> {
-                    val sourceEpoch = client.epoch
+                    val sourceEpoch = eventEpoch
+                    val timerToken = goAwayToken.incrementAndGet()
                     pendingGoAway = true
 
                     synchronized(reconnectGuard) {
@@ -1301,11 +1317,13 @@ class SessionManager @Inject constructor(
                                 )
 
                                 if (
+                                    timerToken == goAwayToken.get() &&
                                     pendingGoAway &&
                                     connectionDesired &&
                                     client.epoch == sourceEpoch
                                 ) {
                                     pendingGoAway = false
+                                    goAwayToken.incrementAndGet()
 
                                     scheduleReconnect(
                                         "дедлайн goAway",
@@ -1321,10 +1339,7 @@ class SessionManager @Inject constructor(
                                 )
                             } finally {
                                 synchronized(reconnectGuard) {
-                                    if (
-                                        goAwayJob ==
-                                        coroutineContext[Job]
-                                    ) {
+                                    if (goAwayJob == coroutineContext[Job]) {
                                         goAwayJob = null
                                     }
                                 }
@@ -1359,9 +1374,10 @@ class SessionManager @Inject constructor(
                     audioEngine.resetBargeInState()
 
                     val shouldPlanGoAway = pendingGoAway
-                    val sourceEpoch = client.epoch
+                    val sourceEpoch = eventEpoch
 
                     pendingGoAway = false
+                    goAwayToken.incrementAndGet()
 
                     synchronized(reconnectGuard) {
                         goAwayJob?.cancel()
@@ -1407,7 +1423,19 @@ class SessionManager @Inject constructor(
                     )
                 }
 
-                is GeminiEvent.ModelText -> Unit
+                is GeminiEvent.ModelText -> {
+                    // The Live API does not guarantee ordering between
+                    // modelTurn parts and output transcription. Use the
+                    // configured feature flag, not event timing, to decide
+                    // whether ModelText is the UI fallback.
+                    if (!currentOutputTranscriptionEnabled) {
+                        appendTranscript(
+                            ClientRole.MODEL,
+                            event.text,
+                            false
+                        )
+                    }
+                }
 
                 is GeminiEvent.Usage -> {
                     _state.update {
@@ -1418,15 +1446,16 @@ class SessionManager @Inject constructor(
                 }
 
                 is GeminiEvent.ToolCall -> {
-                    handleToolCall(event.calls)
+                    handleToolCall(
+                        calls = event.calls,
+                        sourceEpoch = eventEpoch
+                    )
                 }
 
                 is GeminiEvent.ToolCallCancelled -> {
-                    val currentEpoch = client.epoch
-
                     event.ids.forEach { id ->
                         val key = ToolCallKey(
-                            currentEpoch,
+                            eventEpoch,
                             id
                         )
 
@@ -1442,12 +1471,8 @@ class SessionManager @Inject constructor(
                         it.copy(error = event.message)
                     }
 
-                    if (activeConnectUsedResumption) {
-                        resumptionHandle = null
-                        activeConnectUsedResumption = false
-                    }
-
                     if (event.fatal) {
+                        activeConnectUsedResumption = false
                         connectionDesired = false
                         userMicDesired = false
 
@@ -1464,16 +1489,21 @@ class SessionManager @Inject constructor(
                         return@collect
                     }
 
-                    val authOrClientFatal =
-                        event.code == 400 ||
-                            event.code == 401 ||
-                            event.code == 403 ||
-                            event.code == 404
+                    val isResumeFailure = activeConnectUsedResumption
 
-                    if (activeConnectUsedResumption) {
+                    if (isResumeFailure) {
                         resumptionHandle = null
                         activeConnectUsedResumption = false
                     }
+
+                    val authOrClientFatal =
+                        !isResumeFailure &&
+                            (
+                                event.code == 400 ||
+                                    event.code == 401 ||
+                                    event.code == 403 ||
+                                    event.code == 404
+                            )
 
                     if (authOrClientFatal) {
                         connectionDesired = false
@@ -1498,7 +1528,12 @@ class SessionManager @Inject constructor(
                         }
 
                         scheduleReconnect(
-                            reason = "код ${event.code}",
+                            reason =
+                                if (isResumeFailure) {
+                                    "resumption недействителен (код ${event.code})"
+                                } else {
+                                    "код ${event.code}"
+                                },
                             sourceEpoch = event.epoch
                         )
                     }
@@ -1510,9 +1545,12 @@ class SessionManager @Inject constructor(
     }
 
     private fun handleToolCall(
-        calls: List<FunctionCall>
+        calls: List<FunctionCall>,
+        sourceEpoch: Long
     ) {
-        val currentEpoch = client.epoch
+        if (sourceEpoch != client.epoch) return
+
+        val currentEpoch = sourceEpoch
 
         for (call in calls) {
             val callId = call.id
@@ -1865,3 +1903,4 @@ class SessionManager @Inject constructor(
         }
     }
 }
+
