@@ -1,3 +1,8 @@
+######################################################################
+### FILE 05: app/src/main/java/com/client/app/audio/NativeAudioBridge.kt
+######################################################################
+
+### BEGIN FULL FILE
 
 package com.client.app.audio
 
@@ -29,6 +34,15 @@ class NativeAudioBridge @Inject constructor() {
     external fun stopCaptureAudio()
     external fun stopAudio()
     external fun isAudioDisconnected(): Boolean
+    external fun getActualPlaybackSampleRate(): Int
+    external fun getActualPlaybackChannels(): Int
+    external fun getActualPlaybackFormat(): Int
+    external fun getActualCaptureSampleRate(): Int
+    external fun getActualCaptureChannels(): Int
+    external fun getActiveInputDeviceId(): Int
+    external fun getActiveOutputDeviceId(): Int
+    external fun isMmapActive(): Boolean
+    external fun isExclusiveSharingActive(): Boolean
     external fun setVolume(volume: Float)
     external fun setMicGain(gain: Float)
 
@@ -55,3 +69,4 @@ class NativeAudioBridge @Inject constructor() {
     external fun getSpectrumData(outArray: FloatArray)
     external fun drainNativeLogs(): Array<String>?
 }
+### END FULL FILE
