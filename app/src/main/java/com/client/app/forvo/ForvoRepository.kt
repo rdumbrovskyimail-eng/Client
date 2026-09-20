@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/java/com/client/app/forvo/ForvoRepository.kt
 package com.client.app.forvo
 
 import androidx.datastore.core.DataStore
@@ -153,9 +152,6 @@ class ForvoRepository @Inject constructor(
                     val body = resp.body?.string().orEmpty()
                     if (!resp.isSuccessful) return@use ForvoResult.Failed("HTTP ${resp.code}")
 
-                    // Ошибка №6 [DEFECT]: Учитываем списание квоты сразу за совершенный поисковый запрос к API
-                    registerSuccessfulPlayback()
-
                     val root = json.parseToJsonElement(body).jsonObject
 
                     // Ошибка №5 [DEFECT]: Валидация ошибок Forvo для исключения отравления Negative Cache (misses)
@@ -209,8 +205,14 @@ class ForvoRepository @Inject constructor(
     private suspend fun readApiKey(): String =
         cryptoManager.decrypt(dataStore.data.first()[KEY_FORVO_API]?.trim().orEmpty())
 
-    private suspend fun readHost(): String =
-        dataStore.data.first()[KEY_FORVO_HOST]?.trim()?.ifBlank { HOST_FREE } ?: HOST_FREE
+    private suspend fun readHost(): String {
+        val configured = dataStore.data.first()[KEY_FORVO_HOST]?.trim().orEmpty()
+        return when (configured.removeSuffix("/")) {
+            HOST_FREE,
+            "https://api.forvo.com" -> configured.removeSuffix("/")
+            else -> HOST_FREE
+        }
+    }
 
     private fun cleanWord(raw: String, lang: String): String {
         val normalized = Normalizer.normalize(raw.trim(), Normalizer.Form.NFC)
