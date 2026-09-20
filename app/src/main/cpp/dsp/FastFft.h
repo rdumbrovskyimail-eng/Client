@@ -1,9 +1,9 @@
-// >>> FILE: app/src/main/cpp/dsp/FastFft.h
 #pragma once
 
 #include <cstddef>
 #include <atomic>
 #include <cstdint>
+#include <array>
 #include "audio/AudioConstants.h"
 
 namespace client::dsp {
@@ -31,12 +31,21 @@ private:
 
     float smoothedBands_[audio::SPECTRUM_BANDS]{0.0f};
 
-    // ERR-05 & Ошибка №29: Тройной буфер Дэвида Андерсона с атомарным флагом публикации
-    alignas(64) SpectrumSnapshot pool_[3];
-    mutable std::atomic<size_t> readyIdx_{0}; // Разделяемый слот готовности
-    mutable std::atomic<bool> hasNewData_{false}; // Флаг наличия свежего расчета БПФ
-    size_t writeIdx_{1};                      // Приватный рабочий слот писателя (аудиопоток)
-    mutable size_t readIdx_{2};               // Приватный рабочий слот читателя (UI-поток)
+    // ERR-05 / concurrency fix:
+    // A snapshot is published with a seqlock. The payload itself is stored as
+    // atomic scalar values, so a concurrent UI read can never race a writer.
+    alignas(64)
+    std::array<std::atomic<float>, audio::SPECTRUM_BANDS> snapshotBands_{};
+
+    std::atomic<float> snapshotMicRms_{0.0f};
+    std::atomic<float> snapshotOutRms_{0.0f};
+
+    // Even = stable snapshot, odd = writer is publishing.
+    mutable std::atomic<uint32_t> snapshotSeq_{0};
+
+    // Last snapshot that passed the stability check. Used only on bounded
+    // fallback so callers never receive a mixed-epoch snapshot.
+    mutable SpectrumSnapshot lastStableSnapshot_{};
 };
 
 } // namespace client::dsp
