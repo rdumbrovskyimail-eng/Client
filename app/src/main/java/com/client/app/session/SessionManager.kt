@@ -43,6 +43,7 @@ data class ChatMessage(
     val role: ClientRole,
     val text: String,
     val attachmentNames: List<String> = emptyList(),
+    val modelReplayText: String? = null,
     val interim: Boolean = false,
     val timestamp: Long = System.currentTimeMillis()
 )
@@ -129,6 +130,12 @@ class SessionManager @Inject constructor(
         val KEY_COMPRESSION_TARGET_TOKENS = intPreferencesKey("gemini_compression_target_tokens")
 
         val KEY_SESSION_RESUMPTION_ENABLED = booleanPreferencesKey("gemini_session_resumption_enabled")
+        val KEY_SESSION_RESUMPTION_HANDLE = stringPreferencesKey("gemini_session_resumption_handle")
+        val KEY_SESSION_RESUMPTION_TIMESTAMP =
+            longPreferencesKey("gemini_resumption_timestamp")
+        private const val MAX_RESUMPTION_AGE_MS =
+            2L * 60 * 60 * 1000L
+
         val KEY_INITIAL_HISTORY_TURNS = intPreferencesKey("gemini_initial_history_turns")
 
         val KEY_ENABLE_FORVO = booleanPreferencesKey("enable_forvo")
@@ -152,6 +159,8 @@ class SessionManager @Inject constructor(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + coroutineExceptionHandler)
     private val mutex = Mutex()
     private val micMutex = Mutex()
+    private val commandMutex = Mutex()
+    private val transcriptLock = Any()
     private val userTurnMutex = Mutex()
 
 
@@ -169,7 +178,6 @@ class SessionManager @Inject constructor(
     private val reconnectGuard = Any()
     private val reconnectToken = AtomicLong(0L)
     private val goAwayToken = AtomicLong(0L)
-    @Volatile private var streamingRole: ClientRole? = null
     @Volatile private var resumptionHandle: String? = null
     @Volatile private var reconnectAttempts = 0
     @Volatile private var pendingGoAway = false
@@ -181,7 +189,7 @@ class SessionManager @Inject constructor(
     @Volatile private var connectionDesired = false
 
     @Volatile private var userMicDesired = false
-    @Volatile private var hasReceivedAudioTranscript = false
+    private var transcriptStreamGenerationId: Long = -1L
     @Volatile private var currentOutputTranscriptionEnabled = true
 
     @Volatile private var currentAadEnabled = true
@@ -212,6 +220,7 @@ class SessionManager @Inject constructor(
     }
 
     fun toggleConnection() = scope.launch {
+        commandMutex.withLock {
         mutex.withLock {
             if (_state.value.link != LinkState.IDLE) {
                 connectionDesired = false
@@ -236,9 +245,11 @@ class SessionManager @Inject constructor(
                 }
             }
         }
+        }
     }
 
     fun toggleMic() = scope.launch {
+        commandMutex.withLock {
         // Session intent and microphone intent are one state domain. Always
         // acquire locks in the same order: session -> mic. This prevents
         // connect/disconnect/reconnect from racing a user mic toggle.
@@ -275,17 +286,21 @@ class SessionManager @Inject constructor(
                 }
             }
         }
+        }
     }
 
     fun stopSession() = scope.launch {
+        commandMutex.withLock {
         mutex.withLock {
             connectionDesired = false
             userMicDesired = false
             stopInternal(full = true)
         }
+        }
     }
 
     fun applyPrompt(newPrompt: String) = scope.launch {
+        commandMutex.withLock {
         mutex.withLock {
             val changed = _state.value.activePrompt != newPrompt
             if (!changed) return@withLock
@@ -296,6 +311,10 @@ class SessionManager @Inject constructor(
             if (!shouldRestart || !connectionDesired) return@withLock
 
             resumptionHandle = null
+            dataStore.edit {
+                remove(KEY_SESSION_RESUMPTION_HANDLE)
+                remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+            }
             cancelReconnectWork()
             stopInternal(full = false)
 
@@ -313,6 +332,7 @@ class SessionManager @Inject constructor(
                 }
             }
         }
+        }
     }
 
     private suspend fun invalidateAndFlushAudio(reason: String): Long =
@@ -322,6 +342,7 @@ class SessionManager @Inject constructor(
 
 
     fun sendText(text: String, uris: List<Uri> = emptyList()) = scope.launch {
+        commandMutex.withLock {
         userTurnMutex.withLock {
             val trimmed = text.trim()
             if (trimmed.isEmpty() && uris.isEmpty()) return@withLock
@@ -337,8 +358,7 @@ class SessionManager @Inject constructor(
             }
 
             addMessage(ChatMessage(role = ClientRole.USER, text = trimmed))
-            streamingRole = null
-            hasReceivedAudioTranscript = false
+            resetTranscriptRuntime()
             turnCompleteSeen = false
             interactionStatus = null
 
@@ -352,9 +372,11 @@ class SessionManager @Inject constructor(
                 turnComplete = true
             )
         }
+        }
     }
 
     fun playForvo(word: ForvoWord) = scope.launch {
+        commandMutex.withLock {
         val url = forvoRepo.freshUrl(word.query, word.language) ?: run {
             _state.update { it.copy(error = "Ссылка Forvo недоступна или устарела") }
             return@launch
@@ -369,6 +391,7 @@ class SessionManager @Inject constructor(
         if (wasMic && userMicDesired && connectionDesired) {
             delay(200)
             startMic()
+        }
         }
     }
 
@@ -429,11 +452,14 @@ class SessionManager @Inject constructor(
             val apiKey = cryptoManager.decrypt(prefs[KEY_API]?.trim().orEmpty())
             val forvoOn = prefs[KEY_ENABLE_FORVO] ?: false
 
+            val displayText = text.ifEmpty { "Изучи приложенный документ." }
+
             addMessage(
                 ChatMessage(
                     role = ClientRole.USER,
-                    text = text.ifEmpty { "Изучи приложенный документ." },
-                    attachmentNames = processed.accepted
+                    text = displayText,
+                    attachmentNames = processed.accepted,
+                    modelReplayText = processed.extractedText.takeIf { it.isNotBlank() }?.take(15000)
                 )
             )
 
@@ -448,6 +474,22 @@ class SessionManager @Inject constructor(
             when (result) {
                 is AnalysisResult.Success -> {
                     val a = result.analysis
+                    synchronized(transcriptLock) {
+                        _state.update { current ->
+                            val idx = current.messages.indexOfLast {
+                                it.role == ClientRole.USER &&
+                                    it.attachmentNames == processed.accepted &&
+                                    it.text == displayText
+                            }
+                            if (idx < 0) current else {
+                                val updated = current.messages.toMutableList()
+                                updated[idx] = updated[idx].copy(
+                                    modelReplayText = a.fullText.take(15000)
+                                )
+                                current.copy(messages = updated)
+                            }
+                        }
+                    }
                     if (forvoOn && a.vocabulary.isNotEmpty()) {
                         scope.launch { resolveForvo(a.vocabulary, a.language) }
                     }
@@ -538,10 +580,11 @@ class SessionManager @Inject constructor(
 
                     putJsonObject("properties") {
                         putJsonObject("words") {
-                            put("type", "STRING")
+                            put("type", "ARRAY")
+                            putJsonObject("items") { put("type", "STRING") }
                             put(
                                 "description",
-                                "Слово или список слов через запятую для поиска произношения."
+                                "Список слов для поиска произношения."
                             )
                         }
 
@@ -568,39 +611,36 @@ class SessionManager @Inject constructor(
 
         if (raw.isEmpty()) return emptyList()
 
-        val merged = mutableListOf<ClientTurn>()
-
-        for (msg in raw) {
-            val last = merged.lastOrNull()
-
-            if (last != null && last.role == msg.role) {
-                merged[merged.size - 1] = ClientTurn(
-                    msg.role,
-                    "${last.text}\n\n${msg.text.trim()}"
-                )
-            } else {
-                merged.add(
-                    ClientTurn(
-                        msg.role,
-                        msg.text.trim()
-                    )
-                )
+        val candidates = raw
+            .takeLast(maxTurns.coerceIn(1, 100))
+            .map {
+                val replayText = it.modelReplayText?.takeIf { value -> value.isNotBlank() } ?: it.text
+                ClientTurn(it.role, replayText.trim())
             }
+
+        val firstUser = candidates.indexOfFirst { it.role == ClientRole.USER }
+        if (firstUser < 0) return emptyList()
+
+        val maxHistoryChars = (131_072 * 3)
+            .coerceAtMost(240_000)
+        val out = ArrayDeque<ClientTurn>()
+        var chars = 0
+
+        for (turn in candidates.drop(firstUser).asReversed()) {
+            val cost = turn.text.length
+            if (out.isNotEmpty() && chars + cost > maxHistoryChars) break
+            if (out.isEmpty() && cost > maxHistoryChars) {
+                out.addFirst(turn.copy(text = turn.text.take(maxHistoryChars)))
+                break
+            }
+            out.addFirst(turn)
+            chars += cost
         }
-
-        var slice = merged.takeLast(
-            maxTurns.coerceIn(1, 100)
-        )
-
-        while (slice.isNotEmpty() && slice.first().role != ClientRole.USER) {
-            slice = slice.drop(1)
-        }
-
-        return slice
+        return out.toList()
     }
 
     private suspend fun startInternal(resume: Boolean) {
-        activeConnectUsedResumption = resume
+        activeConnectUsedResumption = resume && (resumptionHandle?.isNotBlank() == true)
 
         synchronized(reconnectGuard) {
             goAwayJob?.cancel()
@@ -608,10 +648,41 @@ class SessionManager @Inject constructor(
         }
 
         pendingGoAway = false
-        hasReceivedAudioTranscript = false
+        resetTranscriptRuntime()
         isManualActivityActive.set(false)
 
         val prefs = dataStore.data.first()
+        val storedResumeHandle = cryptoManager.decrypt(
+            prefs[KEY_SESSION_RESUMPTION_HANDLE]?.trim().orEmpty()
+        )
+        val storedResumeTimestamp =
+            prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] ?: 0L
+        val storedResumeFresh =
+            storedResumeTimestamp > 0L &&
+                (System.currentTimeMillis() -
+                    storedResumeTimestamp)
+                    .coerceAtLeast(0L) <=
+                    MAX_RESUMPTION_AGE_MS
+
+        if (
+            resumptionHandle.isNullOrBlank() &&
+            storedResumeHandle.isNotBlank() &&
+            prefs[KEY_SESSION_RESUMPTION_ENABLED] != false &&
+            storedResumeFresh
+        ) {
+            resumptionHandle = storedResumeHandle
+        } else if (
+            prefs[KEY_SESSION_RESUMPTION_ENABLED] != false &&
+            storedResumeHandle.isNotBlank() &&
+            !storedResumeFresh
+        ) {
+            dataStore.edit {
+                remove(KEY_SESSION_RESUMPTION_HANDLE)
+                remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+            }
+        }
+        activeConnectUsedResumption = resume && (resumptionHandle?.isNotBlank() == true)
+
         val apiKey = cryptoManager.decrypt(
             prefs[KEY_API]?.trim().orEmpty()
         )
@@ -765,9 +836,12 @@ class SessionManager @Inject constructor(
         // from an allowed visible/user-initiated context before microphone use.
         // Starting the FGS before audio initialization also gives the audio
         // layer a stable lifecycle owner.
-        if (!ensureForegroundServiceActive()) {
-            audioEngine.stop()
-            if (startingFreshSession) {
+        if (startingFreshSession) {
+            // Android 12+ restricts background FGS starts, and microphone FGS
+            // starts have stricter while-in-use rules. Only the direct fresh
+            // user-initiated start is allowed to request the service here.
+            if (!ensureForegroundServiceActive()) {
+                audioEngine.stop()
                 connectionDesired = false
                 cancelReconnectWork()
                 stopForegroundService()
@@ -781,16 +855,23 @@ class SessionManager @Inject constructor(
                 }
                 return
             }
-
+        } else if (!LiveSessionForegroundService.isServiceActive.value) {
+            // Never attempt a microphone FGS start from a reconnect/background
+            // coroutine. The safe recovery action is to end this logical
+            // session and require a visible user action before a new FGS start.
+            audioEngine.stop()
+            connectionDesired = false
+            userMicDesired = false
+            cancelReconnectWork()
             _state.update {
                 it.copy(
-                    link = LinkState.RECONNECTING,
+                    link = LinkState.IDLE,
                     isMicActive = false,
                     isAiSpeaking = false,
-                    error = "Foreground service не перешёл в активное состояние"
+                    error = "Сессия остановлена: запустите её из приложения снова"
                 )
             }
-            throw IllegalStateException("Foreground service is not active")
+            return
         }
 
         if (!audioEngine.startPlayback()) {
@@ -931,7 +1012,7 @@ class SessionManager @Inject constructor(
 
     private suspend fun stopInternal(full: Boolean) {
         pendingGoAway = false
-        hasReceivedAudioTranscript = false
+        resetTranscriptRuntime()
 
         cancelReconnectWork()
         cancelAllPendingToolJobs()
@@ -973,6 +1054,10 @@ class SessionManager @Inject constructor(
                 reconnectAttempts = 0
                 resumptionHandle = null
                 activeConnectUsedResumption = false
+                dataStore.edit {
+                    it.remove(KEY_SESSION_RESUMPTION_HANDLE)
+                    it.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                }
 
                 try {
                     audioEngine.stop()
@@ -1139,8 +1224,7 @@ class SessionManager @Inject constructor(
                             // held, so an immediate Disconnected event cannot race
                             // the owner release and get suppressed by scheduleReconnect().
                             val useResume =
-                                resumptionHandle != null &&
-                                    attempt <= 2
+                                resumptionHandle != null
 
                             startInternal(
                                 resume = useResume
@@ -1176,13 +1260,12 @@ class SessionManager @Inject constructor(
                             return@withLock null
                         }
 
-                        if (activeConnectUsedResumption) {
-                            // A failed resume attempt invalidates the handle.
-                            // The next attempt starts a clean resumable-disabled
-                            // session instead of looping on the same stale handle.
-                            resumptionHandle = null
-                            activeConnectUsedResumption = false
-                        }
+                        // A generic network/setup exception does not prove that
+                        // the server-side resumption handle is invalid. Google
+                        // documents a validity window for the handle; retain it
+                        // across transient failures and clear it only when the
+                        // server explicitly rejects/invalidate it.
+                        activeConnectUsedResumption = false
 
                         client.epoch
                     }
@@ -1406,7 +1489,7 @@ class SessionManager @Inject constructor(
                             frame.generation
                         )
                     } finally {
-                        client.releaseAudio(frame.pcm.size)
+                        client.releaseAudio(frame)
                     }
                 }
 
@@ -1418,11 +1501,19 @@ class SessionManager @Inject constructor(
                 throw cancelled
             } catch (t: Throwable) {
                 // The supervisor must not leave the SessionManager apparently
-                // LIVE with a dead audio consumer.
+                // LIVE with a dead audio consumer. Force a transport boundary
+                // so a resumed observer starts from a fresh epoch.
                 logger.e(
                     "SessionManager: audio observer crashed; restarting consumer",
                     t
                 )
+                val shouldRecover = mutex.withLock {
+                    if (connectionDesired && _state.value.link != LinkState.IDLE) {
+                        _state.update { it.copy(link = LinkState.RECONNECTING, isAiSpeaking = false) }
+                        true
+                    } else false
+                }
+                if (shouldRecover) runCatching { client.disconnect() }
                 delay(100L)
             }
         }
@@ -1438,25 +1529,51 @@ class SessionManager @Inject constructor(
                 it.copy(isAiSpeaking = false)
             }
 
-            streamingRole = null
-            hasReceivedAudioTranscript = false
+            resetTranscriptRuntime()
         }
     }
 
     private fun observeFocus() = scope.launch {
-        audioEngine.focusLost.collect { lost ->
-            if (
-                lost &&
-                (_state.value.isMicActive || audioEngine.isCapturing.value)
-            ) {
-                stopMic(userInitiated = false)
-
-                _state.update {
-                    it.copy(
-                        error =
-                            "Аудио прервано другим приложением или вызовом"
-                    )
+        audioEngine.focusEvents.collect { event ->
+            when (event) {
+                AudioFocusEvent.Gain -> {
+                    mutex.withLock {
+                        if (connectionDesired && _state.value.link == LinkState.LIVE) {
+                            if (!audioEngine.isPlaying.value) {
+                                runCatching { audioEngine.startPlayback() }
+                                    .onFailure { logger.w("SessionManager: не удалось восстановить playback после AudioFocus gain: ${it.message}") }
+                            }
+                            if (userMicDesired && client.isReady) {
+                                micMutex.withLock {
+                                    if (!_state.value.isMicActive && !audioEngine.isCapturing.value) {
+                                        startMicLocked()
+                                    }
+                                }
+                            }
+                            _state.update { it.copy(error = null) }
+                        }
+                    }
                 }
+                AudioFocusEvent.LossPermanent, AudioFocusEvent.LossTransient -> {
+                    mutex.withLock {
+                        micMutex.withLock {
+                            stopMicLocked()
+                        }
+                        invalidateAndFlushAudio("audio focus loss")
+                        _state.update {
+                            it.copy(
+                                isAiSpeaking = false,
+                                error = if (event == AudioFocusEvent.LossTransient) {
+                                    "Аудио временно прервано другим приложением или вызовом"
+                                } else {
+                                    "Аудио прервано потерей аудиофокуса"
+                                }
+                            )
+                        }
+                    }
+                }
+
+                else -> Unit
             }
         }
     }
@@ -1502,22 +1619,43 @@ class SessionManager @Inject constructor(
                                     userMicDesired &&
                                     connectionDesired
                                 ) {
-                                    scope.launch {
-                                        startMic()
+                                    micMutex.withLock {
+                                        startMicLocked()
                                     }
                                 }
                             }
 
                             is GeminiEvent.ResumptionHandle -> {
-                                resumptionHandle =
-                                    if (
-                                        event.resumable &&
-                                        !event.handle.isNullOrBlank()
-                                    ) {
-                                        event.handle
-                                    } else {
-                                        null
+                                val usableHandle =
+                                    event.handle
+                                        ?.trim()
+                                        ?.takeIf {
+                                            event.resumable &&
+                                                it.isNotBlank()
+                                        }
+
+                                resumptionHandle = usableHandle
+
+                                scope.launch {
+                                    dataStore.edit { prefs ->
+                                        if (usableHandle != null) {
+                                            prefs[KEY_SESSION_RESUMPTION_HANDLE] =
+                                                cryptoManager.encrypt(
+                                                    usableHandle
+                                                )
+                                            prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] =
+                                                System.currentTimeMillis()
+                                        } else {
+                                            prefs.remove(
+                                                KEY_SESSION_RESUMPTION_HANDLE
+                                            )
+                                            prefs.remove(
+                                                KEY_SESSION_RESUMPTION_TIMESTAMP
+                                            )
+                                        }
                                     }
+                                }
+                                activeConnectUsedResumption = false
                             }
 
                             is GeminiEvent.InteractionStatus -> {
@@ -1561,12 +1699,8 @@ class SessionManager @Inject constructor(
 
                                     goAwayJob = scope.launch {
                                         try {
-                                            delay(
-                                                maxOf(
-                                                    event.millisLeft - 2000L,
-                                                    1000L
-                                                )
-                                            )
+                                            val millisLeft = event.millisLeft ?: return@launch
+                                            delay(millisLeft.coerceAtLeast(0L))
 
                                             if (
                                                 timerToken ==
@@ -1616,8 +1750,7 @@ class SessionManager @Inject constructor(
                                     it.copy(isAiSpeaking = false)
                                 }
 
-                                streamingRole = null
-                                hasReceivedAudioTranscript = false
+                                resetTranscriptRuntime()
                                 turnCompleteSeen = false
                                 interactionStatus = null
                             }
@@ -1654,17 +1787,19 @@ class SessionManager @Inject constructor(
                                 appendTranscript(
                                     ClientRole.USER,
                                     event.text,
-                                    event.interim
+                                    event.interim,
+                                    envelope.generationId
                                 )
                             }
 
                             is GeminiEvent.OutputTranscript -> {
-                                hasReceivedAudioTranscript = true
+                                recordTranscriptGeneration(envelope.generationId)
 
                                 appendTranscript(
                                     ClientRole.MODEL,
                                     event.text,
-                                    false
+                                    false,
+                                    envelope.generationId
                                 )
                             }
 
@@ -1676,7 +1811,8 @@ class SessionManager @Inject constructor(
                                     appendTranscript(
                                         ClientRole.MODEL,
                                         event.text,
-                                        false
+                                        false,
+                                        envelope.generationId
                                     )
                                 }
                             }
@@ -1709,10 +1845,12 @@ class SessionManager @Inject constructor(
                                             callId = id
                                         )
 
-                                    cancelledToolCallKeys.add(key)
-                                    activeToolJobs
-                                        .remove(key)
-                                        ?.cancel()
+                                    toolResponseMutex.withLock {
+                                        cancelledToolCallKeys.add(key)
+                                        activeToolJobs
+                                            .remove(key)
+                                            ?.cancel()
+                                    }
                                 }
                             }
 
@@ -1750,22 +1888,24 @@ class SessionManager @Inject constructor(
                                 // is scheduled.
                                 cancelAllPendingToolJobs()
 
-                                val isResumeFailure =
-                                    activeConnectUsedResumption
+                                val resumeRejected =
+                                    activeConnectUsedResumption &&
+                                        (
+                                            event.code == 400 ||
+                                            event.code == 403 ||
+                                            event.code == 404
+                                        )
 
-                                if (isResumeFailure) {
+                                if (resumeRejected) {
                                     resumptionHandle = null
                                     activeConnectUsedResumption = false
                                 }
 
                                 val authOrClientFatal =
-                                    !isResumeFailure &&
-                                        (
-                                            event.code == 400 ||
-                                            event.code == 401 ||
-                                            event.code == 403 ||
-                                            event.code == 404
-                                        )
+                                    event.code == 400 ||
+                                    event.code == 401 ||
+                                    event.code == 403 ||
+                                    event.code == 404
 
                                 if (authOrClientFatal) {
                                     connectionDesired = false
@@ -1789,8 +1929,8 @@ class SessionManager @Inject constructor(
 
                                     scheduleReconnect(
                                         reason =
-                                            if (isResumeFailure) {
-                                                "resumption недействителен (код ${event.code})"
+                                            if (resumeRejected) {
+                                                "resumption отклонён сервером (код ${event.code})"
                                             } else {
                                                 "код ${event.code}"
                                             },
@@ -1814,6 +1954,20 @@ class SessionManager @Inject constructor(
                     "SessionManager: event observer crashed; restarting consumer",
                     t
                 )
+                val shouldRecover = mutex.withLock {
+                    if (connectionDesired && _state.value.link != LinkState.IDLE) {
+                        _state.update {
+                            it.copy(
+                                link = LinkState.RECONNECTING,
+                                isAiSpeaking = false
+                            )
+                        }
+                        true
+                    } else false
+                }
+                if (shouldRecover) {
+                    runCatching { client.disconnect() }
+                }
                 delay(100L)
             }
         }
@@ -1856,8 +2010,7 @@ class SessionManager @Inject constructor(
 
                     turnCompleteSeen = false
                     interactionStatus = null
-                    streamingRole = null
-                    hasReceivedAudioTranscript = false
+                    resetTranscriptRuntime()
                     audioEngine.resetBargeInState()
 
                     _state.update {
@@ -1901,23 +2054,7 @@ class SessionManager @Inject constructor(
             val callId = call.id
 
             if (callId.isNullOrBlank()) {
-                client.sendToolResponses(
-                    listOf(
-                        ToolResponse(
-                            name = call.name,
-                            id = null,
-                            response = buildJsonObject {
-                                put(
-                                    "error",
-                                    "missing_call_id"
-                                )
-                            },
-                            scheduling =
-                                FunctionResponseScheduling.SILENT
-                        )
-                    )
-                )
-
+                logger.w("SessionManager: игнорирован tool call без id: ${call.name}")
                 continue
             }
 
@@ -1948,7 +2085,15 @@ class SessionManager @Inject constructor(
                 continue
             }
 
-            val rawWords = call.getString("words")
+            val list = call.getStringList("words")
+                .ifEmpty {
+                    call.getString("words")
+                        .split(",", ";")
+                        .map { it.trim() }
+                }
+                .filter { it.isNotBlank() }
+                .distinctBy { it.lowercase() }
+                .take(40)
 
             val lang = call.getString(
                 "language",
@@ -1956,23 +2101,6 @@ class SessionManager @Inject constructor(
             ).ifBlank {
                 "de"
             }
-
-            val list = runCatching {
-                Json.parseToJsonElement(rawWords)
-                    .jsonArray
-                    .map {
-                        it.jsonPrimitive.content
-                    }
-            }.getOrElse {
-                rawWords
-                    .split(",")
-                    .map { it.trim() }
-            }
-                .filter { it.isNotBlank() }
-                .distinctBy {
-                    it.lowercase()
-                }
-                .take(40)
 
             val job =
                 scope.launch(
@@ -2055,25 +2183,25 @@ class SessionManager @Inject constructor(
                             }
                         }
 
-                        if (
-                            currentSessionId != client.sessionId ||
-                            currentEpoch != client.epoch ||
-                            cancelledToolCallKeys.contains(key) ||
-                            !isActive
-                        ) {
-                            return@launch
-                        }
-
-                        val respPayload =
-                            buildJsonObject {
-                                put("status", "ok")
-                                put(
-                                    "accepted_words_count",
-                                    list.size
-                                )
+                        val sent = toolResponseMutex.withLock {
+                            if (
+                                currentSessionId != client.sessionId ||
+                                currentEpoch != client.epoch ||
+                                cancelledToolCallKeys.contains(key) ||
+                                !isActive
+                            ) {
+                                return@withLock false
                             }
 
-                        val sent =
+                            val respPayload =
+                                buildJsonObject {
+                                    put("status", "ok")
+                                    put(
+                                        "accepted_words_count",
+                                        list.size
+                                    )
+                                }
+
                             client.sendToolResponses(
                                 listOf(
                                     ToolResponse(
@@ -2093,14 +2221,34 @@ class SessionManager @Inject constructor(
                                     )
                                 )
                             )
+                        }
 
                         if (!sent) {
                             logger.w(
                                 "SessionManager: FunctionResponse не отправлен для callId=$callId"
                             )
                         }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (t: Throwable) {
+                        logger.e("SessionManager: tool $callId failed", t)
+                        if (currentSessionId == client.sessionId && currentEpoch == client.epoch) {
+                            client.sendToolResponses(
+                                listOf(
+                                    ToolResponse(
+                                        name = call.name,
+                                        id = callId,
+                                        response = buildJsonObject {
+                                            put("error", t.message ?: "tool_execution_failed")
+                                        },
+                                        scheduling = if (clientCapabilitiesForCurrentSession().supportsFunctionScheduling) FunctionResponseScheduling.WHEN_IDLE else null
+                                    )
+                                )
+                            )
+                        }
                     } finally {
                         activeToolJobs.remove(key)
+                        cancelledToolCallKeys.remove(key)
                     }
                 }
 
@@ -2121,7 +2269,7 @@ class SessionManager @Inject constructor(
                     )
                 }
             } else {
-                job.cancel()
+                logger.w("SessionManager: duplicate active tool call ignored: $key")
             }
         }
     }
@@ -2129,100 +2277,106 @@ class SessionManager @Inject constructor(
     private fun appendTranscript(
         role: ClientRole,
         text: String,
-        interim: Boolean
+        interim: Boolean,
+        generationId: Long
     ) {
-        _state.update { s ->
-            val list = s.messages.toMutableList()
+        synchronized(transcriptLock) {
+            _state.update { state ->
+                val list = state.messages.toMutableList()
 
-            if (interim) {
-                val idx =
-                    list.indexOfLast {
-                        it.role == role &&
-                            it.interim
+                if (interim) {
+                    val idx = list.indexOfLast {
+                        it.role == role && it.interim
                     }
 
-                val msg = ChatMessage(
-                    role = role,
-                    text = text,
-                    interim = true
-                )
-
-                if (idx >= 0) {
-                    list[idx] =
-                        list[idx].copy(
-                            text = text
-                        )
-                } else {
-                    list.add(msg)
-                }
-
-                return@update s.copy(
-                    messages =
-                        list.takeLast(MAX_MESSAGES)
-                )
-            }
-
-            list.removeAll {
-                it.role == role &&
-                    it.interim
-            }
-
-            val last = list.lastOrNull()
-
-            if (
-                streamingRole == role &&
-                last != null &&
-                last.role == role &&
-                !last.interim
-            ) {
-                list[list.size - 1] =
-                    last.copy(
-                        text =
-                            last.text + text
-                    )
-            } else {
-                list.add(
-                    ChatMessage(
+                    val message = ChatMessage(
                         role = role,
-                        text = text
+                        text = text,
+                        interim = true
                     )
-                )
 
-                streamingRole = role
+                    if (idx >= 0) {
+                        list[idx] = list[idx].copy(text = text)
+                    } else {
+                        list.add(message)
+                    }
+
+                    state.copy(messages = list.takeLast(MAX_MESSAGES))
+                } else {
+                    list.removeAll {
+                        it.role == role && it.interim
+                    }
+
+                    val last = list.lastOrNull()
+                    if (
+                        last != null &&
+                        last.role == role &&
+                        !last.interim &&
+                        transcriptStreamGenerationId == generationId
+                    ) {
+                        list[list.lastIndex] = last.copy(text = last.text + text)
+                    } else {
+                        list.add(
+                            ChatMessage(
+                                role = role,
+                                text = text
+                            )
+                        )
+                    }
+
+                    state.copy(messages = list.takeLast(MAX_MESSAGES))
+                }
             }
 
-            s.copy(
-                messages =
-                    list.takeLast(MAX_MESSAGES)
-            )
+            transcriptStreamGenerationId = generationId
+        }
+    }
+
+    private fun resetTranscriptRuntime() {
+        synchronized(transcriptLock) {
+            transcriptStreamGenerationId = -1L
+        }
+    }
+
+    private fun recordTranscriptGeneration(generationId: Long) {
+        synchronized(transcriptLock) {
+            transcriptStreamGenerationId = generationId
         }
     }
 
     private fun addMessage(
         msg: ChatMessage
     ) {
-        streamingRole = null
-        hasReceivedAudioTranscript = false
-
-        _state.update {
-            it.copy(
-                messages =
-                    (
-                        it.messages + msg
-                    ).takeLast(MAX_MESSAGES)
-            )
+        synchronized(transcriptLock) {
+            transcriptStreamGenerationId = -1L
+            _state.update {
+                it.copy(
+                    messages =
+                        (it.messages + msg).takeLast(MAX_MESSAGES)
+                )
+            }
         }
     }
 
     private fun observeSettings() = scope.launch {
         dataStore.data.collect { prefs ->
-            audioEngine.setVolume(
-                prefs[KEY_VOLUME] ?: 1.0f
-            )
+            audioEngine.setVolume(prefs[KEY_VOLUME] ?: 1.0f)
+            audioEngine.setMicGain(prefs[KEY_MIC_GAIN] ?: 1.0f)
+            if (prefs[KEY_SESSION_RESUMPTION_ENABLED] == false) {
+                val hasStoredHandle =
+                    !prefs[KEY_SESSION_RESUMPTION_HANDLE]
+                        .isNullOrBlank()
+                val hasStoredTimestamp =
+                    prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] != null
 
-            audioEngine.setMicGain(
-                prefs[KEY_MIC_GAIN] ?: 1.0f
-            )
+                if (hasStoredHandle || hasStoredTimestamp) {
+                    dataStore.edit {
+                        remove(KEY_SESSION_RESUMPTION_HANDLE)
+                        remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                    }
+                }
+                resumptionHandle = null
+            }
         }
     }
 
