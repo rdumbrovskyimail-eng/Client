@@ -49,6 +49,12 @@ enum class CaptureShutdownResult {
     FORCED_TIMEOUT
 }
 
+sealed interface AudioFocusEvent {
+    data object LossPermanent : AudioFocusEvent
+    data object LossTransient : AudioFocusEvent
+    data object Gain : AudioFocusEvent
+}
+
 private data class RouteTransitionRequest(
     val profile: RouteProfile,
     val generation: Long
@@ -159,16 +165,14 @@ class NativeAudioEngine @Inject constructor(
         SharedFlow<Unit> =
         _bargeInEvents.asSharedFlow()
 
-    private val _focusLost =
-        MutableSharedFlow<Boolean>(
-            replay = 0,
-            extraBufferCapacity = 4,
-            onBufferOverflow =
-                BufferOverflow.DROP_OLDEST
-        )
-    val focusLost:
-        SharedFlow<Boolean> =
-        _focusLost.asSharedFlow()
+    // Audio focus is authoritative state, not a disposable event stream.
+    // StateFlow therefore cannot silently drop the transition needed by the
+    // session lifecycle when collectors are briefly busy.
+    private val _focusEvents =
+        MutableStateFlow<AudioFocusEvent>(AudioFocusEvent.Gain)
+    val focusEvents:
+        StateFlow<AudioFocusEvent> =
+        _focusEvents.asStateFlow()
 
     // AUD-013:
     // Never suspend the capture producer on a bounded channel. Backlog is
@@ -230,7 +234,7 @@ class NativeAudioEngine @Inject constructor(
 
     private val routeTransitionChannel =
         Channel<RouteTransitionRequest>(
-            Channel.CONFLATED
+            Channel.BUFFERED
         )
 
     // Internal route lifecycle generation. This is deliberately separate from
@@ -258,6 +262,15 @@ class NativeAudioEngine @Inject constructor(
     val currentPlaybackGeneration: Long
         get() = playbackGeneration.get()
 
+    fun setVadThresholds(start: Float, end: Float) {
+        desiredVadStart = start.coerceIn(0.05f, 0.95f)
+        desiredVadEnd = end.coerceIn(0.01f, desiredVadStart)
+        vadDetector.setThresholds(
+                            profile.vadThresholdStart,
+                            profile.vadThresholdEnd
+                        )
+    }
+
     @Volatile
     private var streamStopGeneration:
         Long = -1L
@@ -274,6 +287,9 @@ class NativeAudioEngine @Inject constructor(
 
     private val spectrumRawData =
         FloatArray(7)
+
+    private val spectrumUniformUpdate =
+        FloatArray(5)
 
     val spectrumUniforms =
         AtomicReference(
@@ -368,8 +384,9 @@ class NativeAudioEngine @Inject constructor(
                                     "NativeAudioEngine: AudioFocus потерян ($change)"
                                 )
 
-                                _focusLost.tryEmit(
-                                    true
+                                _focusEvents.tryEmit(
+                                    if (change == AudioManager.AUDIOFOCUS_LOSS) AudioFocusEvent.LossPermanent
+                                    else AudioFocusEvent.LossTransient
                                 )
                             }
 
@@ -379,10 +396,10 @@ class NativeAudioEngine @Inject constructor(
                                     "NativeAudioEngine: AudioFocus восстановлен"
                                 )
 
-                                _focusLost.tryEmit(
-                                    false
-                                )
+                                _focusEvents.tryEmit(AudioFocusEvent.Gain)
                             }
+
+                            else -> Unit
                         }
                     }
                     .build()
@@ -407,8 +424,9 @@ class NativeAudioEngine @Inject constructor(
                             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT
                     ) {
 
-                        _focusLost.tryEmit(
-                            true
+                        _focusEvents.tryEmit(
+                            if (change == AudioManager.AUDIOFOCUS_LOSS) AudioFocusEvent.LossPermanent
+                            else AudioFocusEvent.LossTransient
                         )
 
                     } else if (
@@ -416,9 +434,7 @@ class NativeAudioEngine @Inject constructor(
                             AudioManager.AUDIOFOCUS_GAIN
                     ) {
 
-                        _focusLost.tryEmit(
-                            false
-                        )
+                        _focusEvents.tryEmit(AudioFocusEvent.Gain)
                     }
                 },
                 AudioManager.STREAM_VOICE_CALL,
@@ -540,7 +556,7 @@ class NativeAudioEngine @Inject constructor(
                             bridge.initAudioRoute(
                                 isBluetooth =
                                     profile.path ==
-                                        AudioRoutePath.CMF_BUDS_WIRELESS,
+                                        AudioRoutePath.BLUETOOTH_COMMUNICATION,
                                 sampleRate =
                                     profile.sampleRateOut,
                                 inputDeviceId =
@@ -565,9 +581,9 @@ class NativeAudioEngine @Inject constructor(
                 logActualNativeRoute(profile, "startPlayback")
 
                 vadDetector.setThresholds(
-                    profile.vadThresholdStart,
-                    profile.vadThresholdEnd
-                )
+                            profile.vadThresholdStart,
+                            profile.vadThresholdEnd
+                        )
 
                 // Establish the current native playback epoch before the first
                 // callback can consume application audio. No generation is
@@ -656,9 +672,9 @@ class NativeAudioEngine @Inject constructor(
                 val profile =
                     router.currentProfile.value
                 vadDetector.setThresholds(
-                    profile.vadThresholdStart,
-                    profile.vadThresholdEnd
-                )
+                            profile.vadThresholdStart,
+                            profile.vadThresholdEnd
+                        )
 
                 streamStopGeneration = -1L
 
@@ -783,7 +799,7 @@ class NativeAudioEngine @Inject constructor(
                                 .value
                                 .path ==
                                 AudioRoutePath
-                                    .CMF_BUDS_WIRELESS
+                                    .BLUETOOTH_COMMUNICATION
 
                         val isAiRendering =
                             !isBluetooth &&
@@ -796,6 +812,10 @@ class NativeAudioEngine @Inject constructor(
 
                         var speechEndedOnFrame =
                             false
+
+                        if (captureInstanceId.get() != instanceId || !captureDesired.get() || !_isCapturing.value) {
+                            continue
+                        }
 
                         vadDetector.processSamples(
                             pcm16 = validPcm,
@@ -966,9 +986,10 @@ class NativeAudioEngine @Inject constructor(
                             }
 
                             if (
-                                speechEndedOnFrame
+                                speechEndedOnFrame &&
+                                _isCapturing.value &&
+                                captureInstanceId.get() == instanceId
                             ) {
-
                                 sendMicEvent(
                                     AudioStreamEvent
                                         .SpeechEnd
@@ -1064,15 +1085,15 @@ class NativeAudioEngine @Inject constructor(
                             }
 
                             if (
-                                speechEndedOnFrame
+                                speechEndedOnFrame &&
+                                _isCapturing.value &&
+                                captureInstanceId.get() == instanceId
                             ) {
-
                                 sendMicEvent(
                                     AudioStreamEvent
                                         .SpeechEnd
                                 )
-                                isSpeechActiveManual =
-                                    false
+                                isSpeechActiveManual = false
                             }
                         }
 
@@ -1127,20 +1148,17 @@ class NativeAudioEngine @Inject constructor(
                         spectrumRawData
                     )
 
-                    val updated =
-                        FloatArray(5)
-
                     System.arraycopy(
                         spectrumRawData,
                         0,
-                        updated,
+                        spectrumUniformUpdate,
                         0,
                         5
                     )
 
-                    spectrumUniforms.set(
-                        updated
-                    )
+                    // AtomicReference is published with a defensive copy so
+                    // readers never observe the mutable working buffer.
+                    spectrumUniforms.set(spectrumUniformUpdate.copyOf())
                     if (
                         tick++ % 4 == 0
                     ) {
@@ -1180,6 +1198,9 @@ class NativeAudioEngine @Inject constructor(
                         (playbackDesired.get() || captureDesired.get())
                     ) {
                         try {
+                            if (!vadDetector.isNeuralActive) {
+                                vadDetector.prepare()
+                            }
                             if (bridge.isAudioDisconnected()) {
                                 logger.w(
                                     "NativeAudioEngine: AAudio health fault detected; restarting active streams"
@@ -1278,7 +1299,7 @@ class NativeAudioEngine @Inject constructor(
 
                         val success = bridge.initAudioRoute(
                             isBluetooth =
-                                req.profile.path == AudioRoutePath.CMF_BUDS_WIRELESS,
+                                req.profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION,
                             sampleRate = req.profile.sampleRateOut,
                             inputDeviceId = req.profile.inputDeviceId,
                             outputDeviceId = req.profile.outputDeviceId
@@ -1297,9 +1318,9 @@ class NativeAudioEngine @Inject constructor(
                                 recycleLeadInBuffersLocked()
                             }
                             vadDetector.setThresholds(
-                                req.profile.vadThresholdStart,
-                                req.profile.vadThresholdEnd
-                            )
+                            profile.vadThresholdStart,
+                            profile.vadThresholdEnd
+                        )
 
                             val playbackRecovered =
                                 !keepPlaying || bridge.startPlaybackAudio()
@@ -1963,3 +1984,4 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 }
+
