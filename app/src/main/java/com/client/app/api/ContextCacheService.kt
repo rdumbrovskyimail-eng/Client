@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/java/com/client/app/api/ContextCacheService.kt
 package com.client.app.api
 
 import androidx.datastore.core.DataStore
@@ -48,17 +47,33 @@ class ContextCacheService @Inject constructor(
     suspend fun getOrCreateCache(
         apiKey: String,
         systemPrompt: String,
-        modelName: String = "gemini-3.1-flash-live-preview"
+        modelName: String = "gemini-2.5-flash"
     ): String? = withContext(Dispatchers.IO) {
         val cleanApiKey = apiKey.trim()
         if (cleanApiKey.isBlank() || systemPrompt.isBlank()) return@withContext null
+
+        val normalizedModel =
+            modelName
+                .trim()
+                .removePrefix("publishers/google/models/")
+                .removePrefix("models/")
+
+        // Gemini Live models cannot be used with the cachedContents API.
+        // Never let a Live session silently fall back to an incompatible
+        // cached-content contract.
+        if (normalizedModel.contains("-live")) {
+            logger.w(
+                "ContextCacheService: cachedContents не поддерживается для Live-модели '$normalizedModel'; кэш пропущен"
+            )
+            return@withContext null
+        }
 
         val estimatedTokens = systemPrompt.length / 4
         if (estimatedTokens < MIN_TOKENS_FOR_CACHE) {
             return@withContext null
         }
 
-        val promptHash = generateCacheFingerprint(modelName, systemPrompt)
+        val promptHash = generateCacheFingerprint(normalizedModel, systemPrompt)
         val prefs = dataStore.data.first()
         val existingId = prefs[KEY_CACHED_CONTENT_ID]
         val existingHash = prefs[KEY_CACHED_CONTENT_HASH]
@@ -71,7 +86,7 @@ class ContextCacheService @Inject constructor(
             deleteCache(cleanApiKey, existingId)
         }
 
-        val cleanModel = if (modelName.startsWith("models/")) modelName else "models/$modelName"
+        val cleanModel = "models/$normalizedModel"
         val payload = buildJsonObject {
             put("model", cleanModel)
             put("displayName", "gemini_voice_session_cache")
