@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/java/com/client/app/vad/SileroVadDetector.kt
 package com.client.app.vad
 
 import ai.onnxruntime.*
@@ -458,6 +457,7 @@ class SileroVadDetector @Inject constructor(
         }
     }
 
+    @Synchronized
     fun setThresholds(
         start: Float,
         end: Float
@@ -470,6 +470,7 @@ class SileroVadDetector @Inject constructor(
             end
     }
 
+    @Synchronized
     fun processSamples(
         pcm16: ByteArray,
         onSpeechStart: () -> Unit,
@@ -549,27 +550,22 @@ class SileroVadDetector @Inject constructor(
         onSpeechEnd: () -> Unit
     ) {
 
-        val prob =
+        val prob = try {
             if (
                 isNeuralModelLoaded &&
                 ortSession != null &&
                 ortEnvironment != null
             ) {
-
-                evaluateNeural(
-                    window
-                )
-
+                evaluateNeural(window)
             } else {
-
-                // This path is retained only as a safe internal fallback
-                // after the session has been explicitly invalidated during
-                // the lifetime of the object. NativeAudioEngine refuses
-                // startup when prepare() failed.
-                evaluateFallbackRms(
-                    window
-                )
+                evaluateFallbackRms(window)
             }
+        } catch (t: Throwable) {
+            logger.e("SileroVadDetector: V5 inference failed; switching to RMS fallback", t)
+            isNeuralModelLoaded = false
+            closeResources()
+            evaluateFallbackRms(window)
+        }
 
         _speechProbability.value =
             prob
@@ -869,6 +865,7 @@ class SileroVadDetector @Inject constructor(
         )
     }
 
+    @Synchronized
     fun resetState() {
 
         stateBuffer.fill(
