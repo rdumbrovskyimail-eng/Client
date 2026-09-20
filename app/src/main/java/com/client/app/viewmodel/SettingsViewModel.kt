@@ -5,6 +5,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.client.app.api.LiveModelCapabilitiesRegistry
 import com.client.app.attach.VocabularyExtractor
 import com.client.app.forvo.ForvoRepository
 import com.client.app.session.SessionManager
@@ -18,6 +19,7 @@ import javax.inject.Inject
 data class AppSettingsState(
     val apiKey: String = "",
     val liveModel: String = SessionManager.DEFAULT_LIVE_MODEL,
+    val thinkingLevel: String = "low",
     val analyzerModel: String = VocabularyExtractor.DEFAULT_MODEL,
     val voice: String = "Charon",
     val speechLanguage: String = "",
@@ -64,9 +66,8 @@ class SettingsViewModel @Inject constructor(
 ) : ViewModel() {
 
     companion object {
-        /** Models currently documented for Live API audio sessions. */
         val LIVE_MODEL_OPTIONS = listOf(
-            SessionManager.DEFAULT_LIVE_MODEL,
+            "gemini-3.8-live",
             "gemini-3.8-live-extended-thinking",
             "gemini-3.1-flash-live-preview",
             "gemini-2.5-flash-native-audio-preview-12-2025"
@@ -80,6 +81,8 @@ class SettingsViewModel @Inject constructor(
             "pt-BR", "pt-PT", "ro-RO", "ru-RU", "sk-SK", "sl-SI", "sv-SE", "ta-IN",
             "te-IN", "th-TH", "tr-TR", "uk-UA", "vi-VN", "zh-CN", "zh-TW"
         )
+
+        val THINKING_LEVELS = setOf("low", "medium", "high")
     }
 
     private val _settings = MutableStateFlow(AppSettingsState())
@@ -94,13 +97,22 @@ class SettingsViewModel @Inject constructor(
     init {
         viewModelScope.launch {
             dataStore.data.collect { p ->
+                val modelId = p[SessionManager.KEY_LIVE_MODEL]?.trim()?.takeIf { it in LIVE_MODEL_OPTIONS }
+                    ?: SessionManager.DEFAULT_LIVE_MODEL
+                val normalizedThinking =
+                    p[SessionManager.KEY_THINKING_LEVEL]
+                        ?.trim()
+                        ?.lowercase()
+                        ?.takeIf { it in THINKING_LEVELS }
+                        ?: "low"
+
+                val capabilities = LiveModelCapabilitiesRegistry.forModel(modelId)
+
                 _settings.update {
                     it.copy(
                         apiKey = cryptoManager.decrypt(p[SessionManager.KEY_API].orEmpty()),
-                        liveModel = p[SessionManager.KEY_LIVE_MODEL]
-                            ?.trim()
-                            ?.takeIf { it in LIVE_MODEL_OPTIONS }
-                            ?: SessionManager.DEFAULT_LIVE_MODEL,
+                        liveModel = modelId,
+                        thinkingLevel = if (capabilities.supportsThinkingConfig) normalizedThinking else "low",
                         analyzerModel = p[SessionManager.KEY_ANALYZER_MODEL] ?: VocabularyExtractor.DEFAULT_MODEL,
                         voice = p[SessionManager.KEY_VOICE] ?: "Charon",
                         speechLanguage = p[SessionManager.KEY_SPEECH_LANGUAGE].orEmpty(),
@@ -128,16 +140,16 @@ class SettingsViewModel @Inject constructor(
                         activityHandling = p[SessionManager.KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
                         turnCoverage = p[SessionManager.KEY_TURN_COVERAGE] ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO",
 
-                        compressionEnabled = p[SessionManager.KEY_COMPRESSION_ENABLED] ?: true,
+                        compressionEnabled = (p[SessionManager.KEY_COMPRESSION_ENABLED] ?: true) && true,
                         compressionTriggerTokens = p[SessionManager.KEY_COMPRESSION_TRIGGER_TOKENS] ?: 0,
                         compressionTargetTokens = p[SessionManager.KEY_COMPRESSION_TARGET_TOKENS] ?: 0,
 
-                        sessionResumptionEnabled = p[SessionManager.KEY_SESSION_RESUMPTION_ENABLED] ?: true,
+                        sessionResumptionEnabled = (p[SessionManager.KEY_SESSION_RESUMPTION_ENABLED] ?: true) && true,
                         initialHistoryTurns = p[SessionManager.KEY_INITIAL_HISTORY_TURNS] ?: 20,
 
                         enableForvo = p[SessionManager.KEY_ENABLE_FORVO] ?: false,
                         forvoApiKey = cryptoManager.decrypt(p[ForvoRepository.KEY_FORVO_API].orEmpty()),
-                        enableGoogleSearch = p[SessionManager.KEY_ENABLE_SEARCH] ?: false
+                        enableGoogleSearch = (p[SessionManager.KEY_ENABLE_SEARCH] ?: false) && true
                     )
                 }
             }
@@ -177,15 +189,25 @@ class SettingsViewModel @Inject constructor(
         apiKeyDebounce.tryEmit(k)
     }
 
+    fun setThinkingLevel(level: String) {
+        val normalized = level.trim().lowercase()
+        if (normalized !in setOf("low", "medium", "high")) return
+
+        _settings.update { it.copy(thinkingLevel = normalized) }
+        viewModelScope.launch {
+            dataStore.edit {
+                it[SessionManager.KEY_THINKING_LEVEL] = normalized
+            }
+        }
+    }
+
     fun setLiveModel(model: String) {
         val normalized = model.trim()
         if (normalized !in LIVE_MODEL_OPTIONS) return
 
         _settings.update { it.copy(liveModel = normalized) }
         viewModelScope.launch {
-            dataStore.edit {
-                it[SessionManager.KEY_LIVE_MODEL] = normalized
-            }
+            dataStore.edit { it[SessionManager.KEY_LIVE_MODEL] = normalized }
         }
     }
 
@@ -313,9 +335,6 @@ class SettingsViewModel @Inject constructor(
     }
 
     fun setCompressionTokens(trigger: Int, target: Int) {
-        // contextWindowCompression is a wire-level oneof: persist exactly one
-        // mechanism. A positive target selects slidingWindow; otherwise a
-        // positive trigger selects triggerTokens.
         val safeTrigger = trigger.coerceAtLeast(0)
         val safeTarget = target.coerceAtLeast(0)
         val validPair = when {
