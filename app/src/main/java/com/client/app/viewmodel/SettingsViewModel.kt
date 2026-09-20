@@ -357,8 +357,23 @@ class SettingsViewModel @Inject constructor(
     }
 
     fun setSessionResumptionEnabled(enabled: Boolean) {
-        _settings.update { it.copy(sessionResumptionEnabled = enabled) }
-        viewModelScope.launch { dataStore.edit { it[SessionManager.KEY_SESSION_RESUMPTION_ENABLED] = enabled } }
+        _settings.update {
+            it.copy(sessionResumptionEnabled = enabled)
+        }
+        viewModelScope.launch {
+            dataStore.edit { prefs ->
+                prefs[SessionManager.KEY_SESSION_RESUMPTION_ENABLED] =
+                    enabled
+                if (!enabled) {
+                    prefs.remove(
+                        SessionManager.KEY_SESSION_RESUMPTION_HANDLE
+                    )
+                    prefs.remove(
+                        SessionManager.KEY_SESSION_RESUMPTION_TIMESTAMP
+                    )
+                }
+            }
+        }
     }
 
     fun setInitialHistoryTurns(turns: Int) {
