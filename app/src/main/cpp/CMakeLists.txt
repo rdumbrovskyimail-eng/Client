@@ -1,17 +1,14 @@
-# >>> FILE: app/src/main/cpp/CMakeLists.txt
-cmake_minimum_required(VERSION 3.22.1)
-
 project("client_core" LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Оптимизации компилятора под Snapdragon 8 Gen 2 (SM8550-AC / Cortex-X3 / A715)
+# Generic arm64-v8a build: do not emit CPU-specific instructions that the
+# manifest/ABI would otherwise advertise as universally supported.
 if(${ANDROID_ABI} STREQUAL "arm64-v8a")
     add_compile_options(
         -O3
-        -march=armv8.2-a+fp16+dotprod
         -fvisibility=hidden
         -fno-math-errno
         -fno-trapping-math
