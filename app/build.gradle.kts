@@ -1,5 +1,3 @@
-// >>> FILE: app/build.gradle.kts
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -24,7 +22,7 @@ android {
 
         ndk {
             abiFilters.clear()
-            abiFilters.add("arm64-v8a")
+            abiFilters.addAll(listOf("arm64-v8a", "x86_64"))
         }
 
         externalNativeBuild {
@@ -68,10 +66,25 @@ android {
         compose = true
     }
 
+    signingConfigs {
+        create("ciRelease") {
+            val storeFilePath = System.getenv("RELEASE_STORE_FILE")
+            if (!storeFilePath.isNullOrBlank()) {
+                storeFile = file(storeFilePath)
+                storePassword = System.getenv("RELEASE_STORE_PASSWORD")
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS")
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            if (!System.getenv("RELEASE_STORE_FILE").isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("ciRelease")
+            }
 
             proguardFiles(
                 getDefaultProguardFile(
@@ -231,4 +244,5 @@ dependencies {
     implementation(
         "androidx.media:media:1.7.0"
     )
+    testImplementation(kotlin("test"))
 }
