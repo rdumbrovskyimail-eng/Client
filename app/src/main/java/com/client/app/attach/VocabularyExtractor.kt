@@ -129,7 +129,7 @@ class VocabularyExtractor @Inject constructor(
         isFallbackAttempt: Boolean = false
     ): AnalysisResult = withContext(Dispatchers.IO) {
         val modelId = model.removePrefix("models/").trim()
-        val url = "$ENDPOINT/$modelId:generateContent?key=${apiKey.trim()}"
+        val url = "$ENDPOINT/$modelId:generateContent"
 
         val configObj = buildJsonObject {
             put("generationConfig", buildJsonObject {
@@ -180,7 +180,7 @@ class VocabularyExtractor @Inject constructor(
 
         try {
             coroutineContext.ensureActive()
-            val req = Request.Builder().url(url).post(streamingBody).build()
+            val req = Request.Builder().url(url).header("x-goog-api-key", apiKey.trim()).post(streamingBody).build()
 
             client.newCall(req).execute().use { resp ->
                 val raw = resp.body?.string().orEmpty()
