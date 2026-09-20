@@ -1,10 +1,10 @@
-// >>> FILE: app/src/main/cpp/audio/PolyphaseResampler.h
 #pragma once
 
 #include <cstdint>
 #include <cstddef>
 #include <algorithm>
 #include <cstring>
+#include <cmath>
 
 namespace client::audio {
 
@@ -187,6 +187,145 @@ private:
     int32_t p0_{0};
     int32_t p1_{0};
     int32_t p2_{0};
+};
+
+
+/**
+ * Stateful linear streaming resampler for the generic playback path.
+ *
+ * The source clock is represented as one continuous fractional position,
+ * so a non-integer conversion ratio does not restart at zero at every chunk.
+ * This is intentionally simple and allocation-free; the fixed 24->16 and
+ * 24->48 paths above remain the higher-quality production filters.
+ */
+class StreamingLinearResampler {
+public:
+    StreamingLinearResampler() = default;
+
+    void configure(int32_t inputRate, int32_t outputRate) {
+        if (inputRate <= 0 || outputRate <= 0) {
+            reset();
+            inputRate_ = 0;
+            outputRate_ = 0;
+            return;
+        }
+
+        if (inputRate_ != inputRate || outputRate_ != outputRate) {
+            inputRate_ = inputRate;
+            outputRate_ = outputRate;
+            reset();
+        }
+    }
+
+    void reset() {
+        sourceIndex_ = 0;
+        phase_ = 0.0;
+        previousSample_ = 0;
+        hasPreviousSample_ = false;
+    }
+
+    size_t process(
+        const int16_t* in,
+        size_t inFrames,
+        int16_t* out,
+        size_t maxOutFrames) {
+
+        if (in == nullptr || out == nullptr ||
+            inFrames == 0 || maxOutFrames == 0 ||
+            inputRate_ <= 0 || outputRate_ <= 0) {
+            return 0;
+        }
+
+        const double step =
+            static_cast<double>(inputRate_) /
+            static_cast<double>(outputRate_);
+
+        // Local logical source sequence. When history exists, element 0 is
+        // the previous chunk's final sample and element 1 is in[0].
+        // phase_ is normalized to [0, 1); no absolute frame counter exists.
+        const bool hadPreviousSample = hasPreviousSample_;
+        const size_t logicalSize =
+            inFrames + (hadPreviousSample ? 1u : 0u);
+
+        size_t outCount = 0;
+
+        auto sampleAt = [&](size_t logicalIndex) -> int32_t {
+            if (hadPreviousSample && logicalIndex == 0u) {
+                return static_cast<int32_t>(previousSample_);
+            }
+
+            const size_t localIndex =
+                hadPreviousSample
+                    ? logicalIndex - 1u
+                    : logicalIndex;
+
+            if (localIndex >= inFrames) {
+                return static_cast<int32_t>(in[inFrames - 1u]);
+            }
+
+            return static_cast<int32_t>(in[localIndex]);
+        };
+
+        while (outCount < maxOutFrames) {
+            if (sourceIndex_ + 1u >= logicalSize) {
+                break;
+            }
+
+            const int32_t s0 = sampleAt(sourceIndex_);
+            const int32_t s1 = sampleAt(sourceIndex_ + 1u);
+
+            const double interpolated =
+                static_cast<double>(s0) +
+                (static_cast<double>(s1) -
+                 static_cast<double>(s0)) *
+                    phase_;
+
+            const long rounded = std::lround(interpolated);
+
+            out[outCount++] =
+                static_cast<int16_t>(
+                    std::clamp<long>(rounded, -32768L, 32767L));
+
+            // Split source advance into integer cursor motion plus a
+            // normalized fractional phase. For supported audio sample rates
+            // the integer component is safely representable by size_t.
+            const double advancedPhase = phase_ + step;
+            const double wholePart = std::floor(advancedPhase);
+            const size_t wholeFrames = static_cast<size_t>(wholePart);
+
+            phase_ = advancedPhase - wholePart;
+            sourceIndex_ += wholeFrames;
+        }
+
+        previousSample_ = in[inFrames - 1u];
+        hasPreviousSample_ = true;
+
+        // Rebase the local cursor around the newly retained history sample.
+        // A caller is expected to provide enough output capacity for the
+        // complete converted chunk (the production playback path does so).
+        const size_t historyShift =
+            hadPreviousSample ? inFrames : (inFrames - 1u);
+
+        if (sourceIndex_ >= historyShift) {
+            sourceIndex_ -= historyShift;
+        } else {
+            // Defensive recovery for a violated output-capacity contract.
+            // Avoid unsigned underflow or corrupted state; the next chunk
+            // starts cleanly at its history boundary.
+            sourceIndex_ = 0;
+            phase_ = 0.0;
+        }
+
+        return outCount;
+    }
+
+private:
+    int32_t inputRate_{0};
+    int32_t outputRate_{0};
+    size_t sourceIndex_{0};
+    double phase_{0.0};
+    int16_t previousSample_{0};
+    bool hasPreviousSample_{false};
 };
 
 } // namespace client::audio
