@@ -1,5 +1,6 @@
 package com.client.app.api
 
+import android.util.Log
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.serialization.json.JsonArray
@@ -29,6 +30,10 @@ sealed interface GeminiEvent {
     data object GenerationComplete : GeminiEvent
 
     data object TurnComplete : GeminiEvent
+
+    data class InteractionStatus(
+        val status: String
+    ) : GeminiEvent
 
     data class ModelText(
         val text: String
@@ -72,6 +77,7 @@ sealed interface GeminiEvent {
     data class Disconnected(
         val code: Int,
         val reason: String,
+        val sessionId: Long,
         val epoch: Long
     ) : GeminiEvent
 }
@@ -101,8 +107,8 @@ data class ToolResponse(
     val id: String?,
     val response: JsonObject,
     val parts: List<FunctionResponsePart> = emptyList(),
-    val scheduling: FunctionResponseScheduling =
-        FunctionResponseScheduling.WHEN_IDLE,
+    // Null means the field must be omitted from the wire message.
+    val scheduling: FunctionResponseScheduling? = null,
     val willContinue: Boolean = false
 )
 
@@ -114,12 +120,16 @@ data class ClientTurn(
 // AUD-005.2
 class AudioFrame(
     val pcm: ByteArray,
+    val sessionId: Long,
     val epoch: Long,
-    val generation: Long
+    val generation: Long,
+    val frameId: Long
 )
 
 data class GeminiEventEnvelope(
+    val sessionId: Long,
     val epoch: Long,
+    val frameId: Long,
     val event: GeminiEvent
 )
 
@@ -150,6 +160,82 @@ data class CompressionSettings(
     val targetTokens: Int = 0
 )
 
+/**
+ * Model-specific Live API contract. The model string alone is not enough to
+ * safely serialize setup/tool responses because Gemini Live models expose
+ * different thinking, tool-scheduling and interaction-lifecycle semantics.
+ */
+data class LiveModelCapabilities(
+    val supportsThinkingConfig: Boolean,
+    val supportsInteractionStatus: Boolean,
+    val supportsAsyncFunctionCalling: Boolean,
+    val supportsFunctionScheduling: Boolean,
+    val supportsContextCache: Boolean,
+    val requiresNonBlockingTools: Boolean
+)
+
+object LiveModelCapabilitiesRegistry {
+    fun forModel(model: String): LiveModelCapabilities {
+        val id = model
+            .trim()
+            .removePrefix("publishers/google/models/")
+            .removePrefix("models/")
+
+        return when (id) {
+            "gemini-3.8-live" -> LiveModelCapabilities(
+                supportsThinkingConfig = false,
+                supportsInteractionStatus = false,
+                supportsAsyncFunctionCalling = true,
+                supportsFunctionScheduling = true,
+                supportsContextCache = false,
+                requiresNonBlockingTools = false
+            )
+
+            "gemini-3.8-live-extended-thinking" -> LiveModelCapabilities(
+                supportsThinkingConfig = true,
+                supportsInteractionStatus = true,
+                supportsAsyncFunctionCalling = true,
+                supportsFunctionScheduling = false,
+                supportsContextCache = false,
+                requiresNonBlockingTools = true
+            )
+
+            "gemini-3.1-flash-live-preview" -> LiveModelCapabilities(
+                supportsThinkingConfig = true,
+                supportsInteractionStatus = false,
+                supportsAsyncFunctionCalling = false,
+                supportsFunctionScheduling = false,
+                supportsContextCache = false,
+                requiresNonBlockingTools = false
+            )
+
+            "gemini-2.5-flash-native-audio-preview-12-2025" -> LiveModelCapabilities(
+                supportsThinkingConfig = false,
+                supportsInteractionStatus = false,
+                supportsAsyncFunctionCalling = false,
+                supportsFunctionScheduling = false,
+                supportsContextCache = false,
+                requiresNonBlockingTools = false
+            )
+
+            else -> {
+                Log.w(
+                    "LiveModelCapabilities",
+                    "Unknown Gemini Live model '$id'; using conservative Gemini 3.8 Live baseline capabilities."
+                )
+                LiveModelCapabilities(
+                    supportsThinkingConfig = false,
+                    supportsInteractionStatus = false,
+                    supportsAsyncFunctionCalling = true,
+                    supportsFunctionScheduling = true,
+                    supportsContextCache = false,
+                    requiresNonBlockingTools = false
+                )
+            }
+        }
+    }
+}
+
 data class LiveConfig(
     val apiKey: String,
     val model: String = "gemini-3.8-live",
@@ -174,6 +260,7 @@ data class LiveConfig(
     val sessionResumptionEnabled: Boolean =
         true,
     val resumptionHandle: String? = null,
+    val thinkingLevel: String? = null,
     val toolsJson: JsonArray? = null,
     val enableGoogleSearch: Boolean = false,
     val initialHistory: List<ClientTurn> =
@@ -197,6 +284,9 @@ class GeminiLiveClient @Inject constructor(
 
     val epoch: Long
         get() = protobufClient.epoch
+
+    val sessionId: Long
+        get() = protobufClient.sessionId
 
     val audioGeneration: Long
         get() = protobufClient.audioGeneration
