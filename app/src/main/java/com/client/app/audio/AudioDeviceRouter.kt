@@ -1,9 +1,3 @@
-######################################################################
-### FILE 04: app/src/main/java/com/client/app/audio/AudioDeviceRouter.kt
-######################################################################
-
-### BEGIN FULL FILE
-// >>> FILE: app/src/main/java/com/client/app/audio/AudioDeviceRouter.kt
 package com.client.app.audio
 
 import android.Manifest
@@ -23,10 +17,8 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 enum class AudioRoutePath {
-    // Requests AAudio EXCLUSIVE for the built-in speaker; actual sharing mode
-    // and MMAP usage are verified by AAudioEngine after stream open.
-    SPEAKER_EXCLUSIVE,
-    CMF_BUDS_WIRELESS  // Nothing CMF Buds 2 (LE Audio LC3 / BT SCO)
+    SPEAKER_SHARED,
+    BLUETOOTH_COMMUNICATION
 }
 
 data class RouteProfile(
@@ -59,6 +51,17 @@ class AudioDeviceRouter @Inject constructor(
 
     private var onRouteChangedListener: ((RouteProfile) -> Unit)? = null
     private var isCallbackRegistered = false
+    private var isCommunicationListenerRegistered = false
+
+    private val communicationDeviceListener =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            AudioManager.OnCommunicationDeviceChangedListener { device ->
+                debounceTrigger.tryEmit(Unit)
+                logger.d("AudioDeviceRouter: communication device changed -> ${device?.id}")
+            }
+        } else {
+            null
+        }
 
     private data class RouteFingerprint(
         val path: AudioRoutePath,
@@ -78,55 +81,94 @@ class AudioDeviceRouter @Inject constructor(
         }
     }
 
-    fun start(onRouteChange: (RouteProfile) -> Unit) = synchronized(routeLock) {
-        // start()/stop()/route callbacks share one ownership lock so a new
-        // router session cannot race cleanup from the previous one.
-        onRouteChangedListener = onRouteChange
+    suspend fun start(onRouteChange: (RouteProfile) -> Unit) {
+        val initialProfile = synchronized(routeLock) {
+            // start()/stop()/route callbacks share one ownership lock so a new
+            // router session cannot race cleanup from the previous one.
+            onRouteChangedListener = onRouteChange
 
-        if (isCallbackRegistered) {
-            runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
-            isCallbackRegistered = false
-        }
-        routerScope?.cancel()
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        routerScope = scope
-
-        scope.launch {
-            debounceTrigger
-                .debounce(180L)
-                .collect {
-                    evaluateActiveRouteInternal()
+            if (isCallbackRegistered) {
+                runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
+                isCallbackRegistered = false
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && isCommunicationListenerRegistered) {
+                communicationDeviceListener?.let {
+                    runCatching { audioManager.removeOnCommunicationDeviceChangedListener(it) }
                 }
+                isCommunicationListenerRegistered = false
+            }
+            routerScope?.cancel()
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            routerScope = scope
+
+            scope.launch {
+                debounceTrigger
+                    .debounce(180L)
+                    .collect { evaluateActiveRouteInternal() }
+            }
+
+            try {
+                audioManager.registerAudioDeviceCallback(deviceCallback, null)
+                isCallbackRegistered = true
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    communicationDeviceListener?.let { listener ->
+                        audioManager.addOnCommunicationDeviceChangedListener(
+                            context.mainExecutor,
+                            listener
+                        )
+                        isCommunicationListenerRegistered = true
+                    }
+                }
+
+                reconcileRouteBindingLocked()
+                val profile = evaluateActiveProfileLocked()
+                activeFingerprint = RouteFingerprint(
+                    path = profile.path,
+                    inDevId = profile.inputDeviceId,
+                    outDevId = profile.outputDeviceId,
+                    sampleRate = profile.sampleRateOut
+                )
+                _currentProfile.value = profile
+                profile
+            } catch (t: Throwable) {
+                runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
+                isCallbackRegistered = false
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && isCommunicationListenerRegistered) {
+                    communicationDeviceListener?.let {
+                        runCatching { audioManager.removeOnCommunicationDeviceChangedListener(it) }
+                    }
+                    isCommunicationListenerRegistered = false
+                }
+                onRouteChangedListener = null
+                routerScope = null
+                scope.cancel()
+                logger.e("AudioDeviceRouter: initial route evaluation failed", t)
+                throw t
+            }
         }
 
-        try {
-            audioManager.registerAudioDeviceCallback(deviceCallback, null)
-            isCallbackRegistered = true
-        } catch (t: Throwable) {
-            routerScope = null
-            scope.cancel()
-            onRouteChangedListener = null
-            logger.e("AudioDeviceRouter: не удалось зарегистрировать AudioDeviceCallback", t)
-            throw t
-        }
-
-        try {
-            val initialProfile = evaluateActiveProfileLocked()
-            activeFingerprint = RouteFingerprint(
-                path = initialProfile.path,
-                inDevId = initialProfile.inputDeviceId,
-                outDevId = initialProfile.outputDeviceId,
-                sampleRate = initialProfile.sampleRateOut
+        // setCommunicationDevice() is asynchronous. Do not let the native
+        // audio route open until Android reports the requested communication
+        // output as the actual current device. This removes the request-vs-
+        // reality race during initial startup.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            initialProfile.outputDeviceId > 0) {
+            val confirmed = awaitCommunicationDevice(
+                initialProfile.outputDeviceId,
+                timeoutMs = 1200L
             )
-            _currentProfile.value = initialProfile
-        } catch (t: Throwable) {
-            runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
-            isCallbackRegistered = false
-            onRouteChangedListener = null
-            routerScope = null
-            scope.cancel()
-            logger.e("AudioDeviceRouter: initial route evaluation failed", t)
-            throw t
+            if (!confirmed && initialProfile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION) {
+                synchronized(routeLock) {
+                    runCatching { audioManager.clearCommunicationDevice() }
+                    activeFingerprint = null
+                    onRouteChangedListener = null
+                    routerScope?.cancel()
+                    routerScope = null
+                }
+                throw IllegalStateException(
+                    "Audio communication route did not reach requested device ${initialProfile.outputDeviceId}"
+                )
+            }
         }
     }
 
@@ -134,6 +176,10 @@ class AudioDeviceRouter @Inject constructor(
         if (isCallbackRegistered) {
             runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
             isCallbackRegistered = false
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && isCommunicationListenerRegistered) {
+            communicationDeviceListener?.let { runCatching { audioManager.removeOnCommunicationDeviceChangedListener(it) } }
+            isCommunicationListenerRegistered = false
         }
         onRouteChangedListener = null
         routerScope?.cancel()
@@ -154,21 +200,38 @@ class AudioDeviceRouter @Inject constructor(
 
     private fun selectOptimalBluetoothSampleRate(device: AudioDeviceInfo): Int {
         val supportedRates = device.sampleRates
-        if (supportedRates.isNotEmpty()) {
-            return when {
-                supportedRates.contains(24000) -> 24000
-                supportedRates.contains(16000) -> 16000
-                supportedRates.contains(48000) -> 48000
-                else -> supportedRates.firstOrNull { it >= 16000 } ?: 16000
-            }
+        if (supportedRates.isEmpty()) {
+            // Gemini Live output is fixed at 24 kHz. When the endpoint does not
+            // advertise a fixed list, use 24 kHz as the requested target and let
+            // the opened AAudio stream remain authoritative.
+            return 24000
         }
-        return if (device.type == AudioDeviceInfo.TYPE_BLE_HEADSET) 24000 else 16000
+
+        return supportedRates
+            .filter { it in 16000..48000 }
+            .minByOrNull { kotlin.math.abs(it - 24000) }
+            ?: supportedRates.minByOrNull { kotlin.math.abs(it - 24000) }
+            ?: 24000
+    }
+
+    private suspend fun awaitCommunicationDevice(
+        expectedDeviceId: Int,
+        timeoutMs: Long
+    ): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val current = runCatching { audioManager.communicationDevice?.id }.getOrNull()
+            if (current == expectedDeviceId) return true
+            delay(25L)
+        }
+        return runCatching { audioManager.communicationDevice?.id == expectedDeviceId }.getOrDefault(false)
     }
 
     private fun evaluateActiveRouteInternal() = synchronized(routeLock) {
         if (routerScope == null || onRouteChangedListener == null) return@synchronized
 
         runCatching {
+            reconcileRouteBindingLocked()
             val newProfile = evaluateActiveProfileLocked()
             val newFingerprint = RouteFingerprint(
                 path = newProfile.path,
@@ -208,51 +271,97 @@ class AudioDeviceRouter @Inject constructor(
         val allOutputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
         val allInputs = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
 
-        val btOutputDevice = if (hasBtPermission) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                commDevices.firstOrNull { dev ->
-                    dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                    dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-                }
-            } else {
-                allOutputs.firstOrNull { dev ->
-                    dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                    dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-                }
-            }
-        } else {
-            null
+        val btCandidates = if (hasBtPermission) {
+            (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) commDevices else allOutputs)
+                .filter { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
+        } else emptyList()
+
+        val currentCommunication = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) audioManager.communicationDevice else null
+        val btOutputDevice = currentCommunication?.takeIf { it in btCandidates }
+            ?: if (currentCommunication == null) btCandidates.singleOrNull() else null
+
+        if (currentCommunication != null && currentCommunication !in btCandidates &&
+            currentCommunication.type != AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
+            logger.w("AudioDeviceRouter: current communication device is no longer in the available communication set")
         }
 
-        // Явный поиск соответствующего микрофона гарнитуры (SCO / BLE Headset) в списке устройств ввода
+        // Явный поиск соответствующего микрофона гарнитуры (SCO / BLE Headset) в списке устройств ввода.
         val btInputDevice = if (hasBtPermission) {
             allInputs.firstOrNull { dev ->
                 dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                    dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
             }
         } else {
             null
         }
 
-        val bound = btOutputDevice != null && bindBluetoothCommunication(btOutputDevice)
-
-        return if (bound && btOutputDevice != null) {
+        return if (btOutputDevice != null) {
             val sampleRate = selectOptimalBluetoothSampleRate(btOutputDevice)
             RouteProfile(
-                path = AudioRoutePath.CMF_BUDS_WIRELESS,
+                path = AudioRoutePath.BLUETOOTH_COMMUNICATION,
                 sampleRateOut = sampleRate,
                 leadInBufferSizeFrames = 260 * 16,
                 vadThresholdStart = 0.40f,
                 vadThresholdEnd = 0.20f,
-                deviceName = btOutputDevice.productName.toString().ifBlank { "CMF Buds 2 (Wireless)" },
-                // API 31+ setCommunicationDevice() selects the matching communication
-                // source automatically. Avoid pinning a potentially stale input ID.
+                deviceName = btOutputDevice.productName.toString().ifBlank { "Bluetooth communication device" },
+                // API 31+ communicationDevice is the authoritative output; Android
+                // selects the matching communication input automatically.
                 inputDeviceId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) 0 else btInputDevice?.id ?: 0,
                 outputDeviceId = btOutputDevice.id
             )
         } else {
-            bindSpeakerCommunication()
             createSpeakerProfile()
+        }
+    }
+
+    /**
+     * Mutates Android routing only in an explicit reconciliation phase.
+     * evaluateActiveProfileLocked() below is read-only with respect to routing.
+     */
+    private fun reconcileRouteBindingLocked() {
+        val hasBtPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.BLUETOOTH_CONNECT
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && hasBtPermission) {
+            val candidates = runCatching {
+                audioManager.availableCommunicationDevices.filter {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                        it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                }
+            }.getOrDefault(emptyList())
+
+            val current = runCatching { audioManager.communicationDevice }.getOrNull()
+            val currentStillValid = current != null && current in candidates
+
+            if (current != null && (currentStillValid || current.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER)) {
+                return
+            }
+
+            when {
+                candidates.size == 1 -> {
+                    bindBluetoothCommunication(candidates.single())
+                }
+                candidates.size > 1 -> {
+                    logger.w("AudioDeviceRouter: multiple Bluetooth communication devices available; keeping Android's current route instead of selecting arbitrarily")
+                    bindSpeakerCommunication()
+                }
+                else -> {
+                    bindSpeakerCommunication()
+                }
+            }
+            return
+        }
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            // Pre-S routing is legacy SCO/speaker state and cannot expose the
+            // same authoritative communicationDevice property.
+            bindSpeakerCommunication()
         }
     }
 
@@ -282,7 +391,7 @@ class AudioDeviceRouter @Inject constructor(
         logger.w("AudioDeviceRouter: не удалось привязать Bluetooth communication device: ${it.message}")
     }.getOrDefault(false)
 
-    private fun bindSpeakerCommunication() {
+    private fun bindSpeakerCommunication(): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val speaker = runCatching {
                 audioManager.availableCommunicationDevices.firstOrNull {
@@ -308,7 +417,15 @@ class AudioDeviceRouter @Inject constructor(
         }
 
         if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            runCatching { audioManager.mode = AudioManager.MODE_IN_COMMUNICATION }
+                .onFailure { logger.w("AudioDeviceRouter: mode change failed: ${it.message}") }
+        }
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.communicationDevice?.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.isSpeakerphoneOn
         }
     }
 
@@ -320,15 +437,14 @@ class AudioDeviceRouter @Inject constructor(
         val builtInMic = allInputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
 
         return RouteProfile(
-            path = AudioRoutePath.SPEAKER_EXCLUSIVE,
+            path = AudioRoutePath.SPEAKER_SHARED,
             sampleRateOut = 48000,
             leadInBufferSizeFrames = 160 * 16,
             vadThresholdStart = 0.50f,
             vadThresholdEnd = 0.25f,
-            deviceName = "Samsung S23 Ultra Native MMAP (48kHz)",
+            deviceName = builtInSpeaker?.productName?.toString()?.ifBlank { "Built-in speaker" } ?: "Built-in speaker",
             inputDeviceId = builtInMic?.id ?: 0,
             outputDeviceId = builtInSpeaker?.id ?: 0
         )
     }
 }
-### END FULL FILE
