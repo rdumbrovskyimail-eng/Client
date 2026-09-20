@@ -3,6 +3,7 @@ name: Android CI
 on:
   push:
     branches: [ "main", "master" ]
+  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -10,76 +11,32 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-and-release:
+  build-and-test:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
           lfs: true
 
-      # AUD-070:
-      # Гарантируем, что реальный бинарник Silero V5 ONNX точно на месте
-      # и весит больше 500 КБ перед сборкой APK.
       - name: Fetch and Validate Silero V5 Model
         shell: bash
         run: |
           set -euo pipefail
-
           MODEL_PATH="app/src/main/assets/models/silero_vad_v5_quant.onnx"
-          mkdir -p "$(dirname "$MODEL_PATH")"
-
-          # 1. Попытка вытянуть через Git LFS, если доступен
-          if [ -f "$MODEL_PATH" ]; then
-            git lfs pull --include="$MODEL_PATH" || true
-          fi
-
-          # 2. Проверяем: если файла нет, он пустой (<500 КБ)
-          # или это текстовый LFS-указатель.
-          NEED_DOWNLOAD=0
-
-          if [ ! -f "$MODEL_PATH" ]; then
-            NEED_DOWNLOAD=1
-          else
-            FILE_SIZE="$(stat -c%s "$MODEL_PATH" 2>/dev/null || echo 0)"
-
-            if [ "$FILE_SIZE" -lt 500000 ]; then
-              NEED_DOWNLOAD=1
-            elif head -c 64 "$MODEL_PATH" 2>/dev/null | grep -q "git-lfs.github.com/spec"; then
-              NEED_DOWNLOAD=1
-            fi
-          fi
-
-          # 3. Скачиваем официальную модель Silero V5 ONNX,
-          # если нормальный бинарник отсутствует.
-          if [ "$NEED_DOWNLOAD" -eq 1 ]; then
-            echo "▶ Загружаем официальную модель Silero V5 ONNX..."
-
-            curl -fL --retry 3 --retry-delay 2 \
-              "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx" \
-              -o "$MODEL_PATH"
-          fi
-
-          # 4. Финальная проверка размера.
+          test -f "$MODEL_PATH" || { echo "Missing Silero V5 model in repository"; exit 1; }
+          git lfs pull --include="$MODEL_PATH"
+          git lfs checkout -- "$MODEL_PATH"
+          test -s "$MODEL_PATH"
           SIZE_BYTES="$(stat -c%s "$MODEL_PATH")"
-
-          echo "Размер модели Silero V5: $SIZE_BYTES байт"
-
-          if [ "$SIZE_BYTES" -lt 500000 ]; then
-            echo "ERROR AUD-070: файл модели слишком мал ($SIZE_BYTES байт)."
-            exit 1
+          test "$SIZE_BYTES" -ge 500000 || { echo "Silero V5 model is too small: $SIZE_BYTES"; exit 1; }
+          if head -c 128 "$MODEL_PATH" | grep -aq "git-lfs.github.com/spec"; then
+            echo "Silero V5 model is still an LFS pointer"; exit 1
           fi
-
-          if head -c 64 "$MODEL_PATH" | grep -q "git-lfs.github.com/spec"; then
-            echo "ERROR AUD-070: вместо бинарника упакован LFS-указатель."
-            exit 1
-          fi
-
-          echo "SHA-256 модели:"
+          echo "Silero V5 model SHA-256 (must be reviewed against the pinned repository artifact):"
           sha256sum "$MODEL_PATH"
 
       - name: Set up JDK 17
@@ -88,119 +45,48 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Ensure Android NDK 30.0.16248370
-        shell: bash
-        run: |
-          set -euo pipefail
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
+      - name: Accept licenses
+        run: yes | sdkmanager --licenses > /dev/null || true
 
-          SDKMANAGER="$(command -v sdkmanager || true)"
+      - name: Install Android NDK
+        run: sdkmanager "ndk;30.0.16248370"
 
-          if [[ -z "$SDKMANAGER" ]]; then
-            SDKMANAGER="${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
-          fi
-
-          test -x "$SDKMANAGER"
-
-          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
-
-          "$SDKMANAGER" "ndk;30.0.16248370"
-
-      - name: Setup Gradle
+      - name: Prepare Gradle Wrapper
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.14.3'
-          cache-read-only: false
 
       - name: Ensure Gradle Wrapper Exists
         run: |
-          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
-            echo "▶ gradle-wrapper.jar не найден в репозитории. Генерируем через Gradle CLI..."
-
-            gradle wrapper \
-              --gradle-version 8.14.3 \
-              --distribution-type bin
+          set -euo pipefail
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            gradle wrapper --gradle-version 8.14.3 --distribution-type bin
           fi
+          test -s gradle/wrapper/gradle-wrapper.jar
 
-          chmod +x gradlew
-
-      - name: Validate Gradle Wrapper Integrity
+      - name: Validate Gradle Wrapper
         uses: gradle/actions/wrapper-validation@v4
 
-      # Для обычной CI-проверки production keystore НЕ требуется.
-      #
-      # Debug APK автоматически подписывается Android Gradle Plugin
-      # стандартным debug-сертификатом.
-      #
-      # Production signing должен выполняться отдельным release pipeline,
-      # когда действительно требуется production APK.
-      - name: Build Debug APK
+      - name: Run unit tests, lint and build
         run: |
-          ./gradlew assembleDebug \
-            --build-cache \
-            --max-workers=4 \
-            --no-daemon \
-            -Dorg.gradle.jvmargs="-Xmx4g -XX:+UseParallelGC"
+          chmod +x gradlew
+          ./gradlew testDebugUnitTest lintDebug assembleDebug --stacktrace --no-daemon --max-workers=2
 
       - name: Verify 16 KB ELF and APK alignment
         shell: bash
         run: |
           chmod +x tools/verify-16k-elf-alignment.sh
-
-          tools/verify-16k-elf-alignment.sh \
-            app/build/outputs/apk/debug/app-debug.apk \
-            30.0.16248370
+          tools/verify-16k-elf-alignment.sh app/build/outputs/apk/debug/app-debug.apk 30.0.16248370
 
       - name: Verify Debug APK signature
-        shell: bash
         run: |
-          set -euo pipefail
-
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
-
-          APKSIGNER="$(
-            find "$SDK_ROOT/build-tools" \
-              -mindepth 2 \
-              -maxdepth 2 \
-              -type f \
-              -name apksigner \
-              | sort -V \
-              | tail -n 1
-          )"
-
+          APKSIGNER="$(find "$SDK_ROOT/build-tools" -mindepth 2 -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)"
           test -x "$APKSIGNER"
-
-          "$APKSIGNER" verify \
-            --verbose \
-            app/build/outputs/apk/debug/app-debug.apk
-
-      - name: Calculate APK Size
-        id: apk_info
-        run: |
-          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
-
-          if [ -f "$APK_PATH" ]; then
-
-            SIZE_BYTES="$(stat -c%s "$APK_PATH")"
-
-            SIZE_MB="$(
-              awk "BEGIN {
-                printf \"%.2f\", $SIZE_BYTES / 1048576
-              }"
-            )"
-
-            echo "apk_size=${SIZE_MB} MB" >> "$GITHUB_OUTPUT"
-
-            echo "▶ Размер APK: ${SIZE_MB} MB"
-
-          else
-
-            echo "❌ Ошибка: APK не найден!"
-
-            exit 1
-
-          fi
+          "$APKSIGNER" verify --verbose app/build/outputs/apk/debug/app-debug.apk
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
@@ -208,9 +94,3 @@ jobs:
           name: client-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
-
-      # GitHub Release здесь намеренно НЕ создаём.
-      #
-      # Этот CI предназначен для compile/build/ABI/alignment проверки.
-      # Production release с настоящим signing key должен быть отдельным
-      # workflow и не должен блокировать обычную разработку.
