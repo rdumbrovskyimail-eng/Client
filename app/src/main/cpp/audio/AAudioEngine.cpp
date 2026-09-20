@@ -83,28 +83,19 @@ void AnalogVoiceEnhancer::reset(int32_t sampleRate) {
     const float fs = static_cast<float>(currentRate_);
     lowShelf_.reset();
     highShelf_.reset();
-    lowShelf_.makeLowShelf(160.0f, 3.5f, fs);
-    highShelf_.makeHighShelf(std::min(5000.0f, fs * 0.44f), 3.2f, fs);
+    lowShelf_.makeLowShelf(160.0f, 0.0f, fs);
+    highShelf_.makeHighShelf(std::min(5000.0f, fs * 0.44f), 0.0f, fs);
 }
 
 void AnalogVoiceEnhancer::process(int16_t* samples, size_t numFrames, int32_t sampleRate) {
     if (samples == nullptr || numFrames == 0) return;
     if (sampleRate > 0 && sampleRate != currentRate_) reset(sampleRate);
-    constexpr float PRE_DRIVE = 1.48f;
-    constexpr float INV_32768 = 1.0f / 32768.0f;
-    for (size_t i = 0; i < numFrames; ++i) {
-        float x = static_cast<float>(samples[i]) * INV_32768 * PRE_DRIVE;
-        x = lowShelf_.process(x);
-        x = highShelf_.process(x);
-        x = x + 0.12f * (x * x);
-        const float absX = std::abs(x);
-        const float y = (absX < 1.0f)
-            ? (x - 0.22f * x * x * x)
-            : ((x > 0.0f ? 1.0f : -1.0f) *
-               (0.78f + 0.22f * (1.0f - std::exp(-2.0f * (absX - 1.0f)))));
-        const int32_t outSample = static_cast<int32_t>(y * 32767.0f);
-        samples[i] = static_cast<int16_t>(std::clamp(outSample, -32768, 32767));
-    }
+
+    // Keep the transport PCM bit-transparent. The previous EQ and
+    // waveshaping stage changed the spectrum and could introduce nonlinear
+    // distortion. Voice coloration, if ever needed, must be an explicit and
+    // separately tested playback effect rather than an implicit transport
+    // transform.
 }
 
 
@@ -219,8 +210,8 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
     if (AAudioStream_getDirection(captureStream_) != AAUDIO_DIRECTION_INPUT ||
         actualInFormat != AAUDIO_FORMAT_PCM_I16 ||
         (actualInChannels != 1 && actualInChannels != 2) ||
-        (actualInRate != 8000 && actualInRate != 16000 &&
-         actualInRate != 24000 && actualInRate != 48000)) {
+        (actualInRate != 8000 && actualInRate != 16000 && actualInRate != 24000 &&
+         actualInRate != 32000 && actualInRate != 48000)) {
         LOGE("AAudio capture unsupported actual config: rate=%d, channels=%d, format=%d, device=%d",
              actualInRate, actualInChannels, static_cast<int>(actualInFormat), actualInDeviceId);
         closeCaptureStreamLocked();
@@ -228,8 +219,10 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
     }
 
     if (inputDeviceId > 0 && actualInDeviceId != inputDeviceId) {
-        LOGW("AAudio capture device request was not honored exactly: requested=%d actual=%d",
+        LOGE("AAudio capture device request was not honored: requested=%d actual=%d",
              inputDeviceId, actualInDeviceId);
+        closeCaptureStreamLocked();
+        return false;
     }
 
     actualCaptureSampleRate_.store(actualInRate, std::memory_order_release);
@@ -499,9 +492,11 @@ bool AAudioEngine::validateAndPublishPlaybackConfigLocked(int32_t requestedOutpu
     }
 
     if (requestedOutputDeviceId > 0 && actualDeviceId != requestedOutputDeviceId) {
-        LOGW(
-            "AAudio playback device request was not honored exactly: requested=%d actual=%d",
+        LOGE(
+            "AAudio playback device request was not honored: requested=%d actual=%d",
             requestedOutputDeviceId, actualDeviceId);
+        closePlaybackStreamLocked();
+        return false;
     }
 
     actualPlaybackSampleRate_.store(actualRate, std::memory_order_release);
