@@ -1,13 +1,10 @@
-
 package com.client.app.service
 
 import android.Manifest
 import android.app.*
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -18,6 +15,7 @@ import androidx.core.content.ContextCompat
 import androidx.media.app.NotificationCompat.MediaStyle
 import com.client.app.MainActivity
 import com.client.app.session.SessionManager
+import com.client.app.util.AppLogger
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -29,20 +27,19 @@ import javax.inject.Inject
 class LiveSessionForegroundService : Service() {
 
     @Inject lateinit var sessionManager: SessionManager
+    @Inject lateinit var logger: AppLogger
 
     private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
     private var mediaSession: MediaSessionCompat? = null
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private var renewJob: Job? = null
+    private var mediaObserverJob: Job? = null
 
     companion object {
         const val ACTION_STOP = "com.client.app.action.STOP"
         private const val NOTIFICATION_ID = 101
         private const val CHANNEL_ID = "live_client_voice_channel"
-        private const val WAKELOCK_TIMEOUT_MS = 15 * 60 * 1000L // 15 минут
-
+        
         private val _isServiceActive = MutableStateFlow(false)
         val isServiceActive: StateFlow<Boolean> = _isServiceActive.asStateFlow()
     }
@@ -54,6 +51,21 @@ class LiveSessionForegroundService : Service() {
         promoteToForeground()
         if (_isServiceActive.value) {
             acquireHardwareLocks()
+        }
+        mediaObserverJob = serviceScope.launch {
+            sessionManager.state.collect { state ->
+                val mediaState = when {
+                    state.isAiSpeaking -> PlaybackStateCompat.STATE_PLAYING
+                    state.link != com.client.app.session.LinkState.IDLE -> PlaybackStateCompat.STATE_PAUSED
+                    else -> PlaybackStateCompat.STATE_STOPPED
+                }
+                mediaSession?.setPlaybackState(
+                    PlaybackStateCompat.Builder()
+                        .setActions(PlaybackStateCompat.ACTION_STOP)
+                        .setState(mediaState, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, 1.0f)
+                        .build()
+                )
+            }
         }
     }
 
@@ -80,17 +92,15 @@ class LiveSessionForegroundService : Service() {
     private fun initMediaSession() {
         runCatching {
             mediaSession = MediaSessionCompat(this, "GeminiLiveMediaSession").apply {
-                setFlags(
-                    MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS or
-                    MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS
-                )
+                setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS)
+                setCallback(object : MediaSessionCompat.Callback() {
+                    override fun onStop() {
+                        sessionManager.stopSession()
+                    }
+                })
                 val state = PlaybackStateCompat.Builder()
-                    .setActions(
-                        PlaybackStateCompat.ACTION_PLAY or
-                        PlaybackStateCompat.ACTION_PAUSE or
-                        PlaybackStateCompat.ACTION_STOP
-                    )
-                    .setState(PlaybackStateCompat.STATE_PLAYING, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, 1.0f)
+                    .setActions(PlaybackStateCompat.ACTION_STOP)
+                    .setState(PlaybackStateCompat.STATE_STOPPED, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, 0.0f)
                     .build()
                 setPlaybackState(state)
                 isActive = true
@@ -106,33 +116,11 @@ class LiveSessionForegroundService : Service() {
                 "client:live_session_cpu"
             ).apply {
                 setReferenceCounted(false)
-                acquire(WAKELOCK_TIMEOUT_MS)
-            }
-
-            if (renewJob?.isActive != true) {
-                renewJob = serviceScope.launch {
-                    while (isActive) {
-                        delay(8 * 60 * 1000L)
-                        runCatching {
-                            if (wakeLock?.isHeld != true) {
-                                wakeLock?.acquire(WAKELOCK_TIMEOUT_MS)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (wifiLock?.isHeld != true) {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            wifiLock = wm?.createWifiLock(
-                WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
-                "client:live_session_wifi"
-            )?.apply {
-                setReferenceCounted(false)
                 acquire()
             }
+
         }
+
     }
 
     private fun promoteToForeground() {
@@ -228,10 +216,15 @@ class LiveSessionForegroundService : Service() {
         return builder.build()
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        logger.w("LiveSessionForegroundService: task removed while service is active")
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         _isServiceActive.value = false
         super.onDestroy()
-        renewJob?.cancel()
+        mediaObserverJob?.cancel()
         serviceScope.cancel()
 
         runCatching {
@@ -239,10 +232,6 @@ class LiveSessionForegroundService : Service() {
         }
         wakeLock = null
 
-        runCatching {
-            if (wifiLock?.isHeld == true) wifiLock?.release()
-        }
-        wifiLock = null
 
         runCatching {
             mediaSession?.isActive = false
