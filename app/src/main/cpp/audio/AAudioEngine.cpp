@@ -1,9 +1,3 @@
-
-######################################################################
-### FILE 01: app/src/main/cpp/audio/AAudioEngine.cpp
-######################################################################
-
-### BEGIN FULL FILE
 #include "AAudioEngine.h"
 #include "NativeLogQueue.h"
 #include "dsp/NeonDspUtils.h"
@@ -286,6 +280,7 @@ bool AAudioEngine::initLocked(
         std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
         resampler24To16_.reset();
         resampler24To48_.reset();
+        genericResampler_.reset();
         captureDecimator48To16_.reset();
         captureResampler24To16_.reset();
         resetEarcon();
@@ -329,7 +324,13 @@ bool AAudioEngine::initLocked(
     }
 
     // Use the verified hardware rate for any stateful output DSP initialization.
-    voiceEnhancer_.reset(actualPlaybackSampleRate_.load(std::memory_order_acquire));
+    const int32_t verifiedPlaybackRate =
+        actualPlaybackSampleRate_.load(std::memory_order_acquire);
+    voiceEnhancer_.reset(verifiedPlaybackRate);
+    genericResampler_.configure(
+        SAMPLE_RATE_GEMINI_OUT,
+        verifiedPlaybackRate
+    );
 
     const int32_t playBurst = AAudioStream_getFramesPerBurst(playbackStream_);
     const int32_t playCapacity = AAudioStream_getBufferCapacityInFrames(playbackStream_);
@@ -570,7 +571,13 @@ bool AAudioEngine::startPlayback() {
             closePlaybackStreamLocked();
             return false;
         }
-        voiceEnhancer_.reset(actualPlaybackSampleRate_.load(std::memory_order_acquire));
+        const int32_t reopenedRate =
+            actualPlaybackSampleRate_.load(std::memory_order_acquire);
+        voiceEnhancer_.reset(reopenedRate);
+        genericResampler_.configure(
+            SAMPLE_RATE_GEMINI_OUT,
+            reopenedRate
+        );
     } else {
         const aaudio_stream_state_t state = AAudioStream_getState(playbackStream_);
         if (state == AAUDIO_STREAM_STATE_DISCONNECTED ||
@@ -588,7 +595,13 @@ bool AAudioEngine::startPlayback() {
                 closePlaybackStreamLocked();
                 return false;
             }
-            voiceEnhancer_.reset(actualPlaybackSampleRate_.load(std::memory_order_acquire));
+            const int32_t recoveredRate =
+                actualPlaybackSampleRate_.load(std::memory_order_acquire);
+            voiceEnhancer_.reset(recoveredRate);
+            genericResampler_.configure(
+                SAMPLE_RATE_GEMINI_OUT,
+                recoveredRate
+            );
         }
     }
 
@@ -812,6 +825,7 @@ void AAudioEngine::stopLocked() {
         std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
         resampler24To16_.reset();
         resampler24To48_.reset();
+        genericResampler_.reset();
         captureDecimator48To16_.reset();
         captureResampler24To16_.reset();
         resetEarcon();
@@ -1132,6 +1146,10 @@ void AAudioEngine::playbackDspThreadLoop() {
 
             resampler24To48_.reset();
             resampler24To16_.reset();
+            genericResampler_.configure(
+                SAMPLE_RATE_GEMINI_OUT,
+                currentRate
+            );
 
             fftPos_ = 0;
 
@@ -1387,63 +1405,23 @@ void AAudioEngine::playbackDspThreadLoop() {
 
         } else {
 
-            const double ratio =
-                static_cast<double>(
-                    actualRate) /
-                static_cast<double>(
-                    SAMPLE_RATE_GEMINI_OUT);
-
-            const size_t wanted =
-                std::min(
-                    playbackDspOutputScratch_.size(),
-                    static_cast<size_t>(
-                        inputFrames * ratio));
-
-            for (size_t i = 0;
-                 i < wanted;
-                 ++i) {
-
-                const double src =
-                    static_cast<double>(i) /
-                    ratio;
-
-                const size_t idx0 =
-                    std::min(
-                        static_cast<size_t>(
-                            src),
-                        inputFrames - 1);
-
-                const size_t idx1 =
-                    std::min(
-                        idx0 + 1,
-                        inputFrames - 1);
-
-                const double frac =
-                    src -
-                    static_cast<double>(
-                        idx0);
-
-                const double s =
-                    static_cast<double>(
-                        input[idx0]) +
-                    frac *
-                    (
-                        static_cast<double>(
-                            input[idx1]) -
-                        static_cast<double>(
-                            input[idx0])
-                    );
-
-                output[i] =
-                    static_cast<int16_t>(
-                        std::clamp(
-                            s,
-                            -32768.0,
-                            32767.0));
-            }
+            // Generic conversion keeps one continuous source phase across
+            // callback/chunk boundaries. SAMPLE_RATE_GEMINI_OUT is the 24 kHz
+            // Live API output rate, so inputRate -> actual hardwareRate is the
+            // correct direction of conversion; the important invariant is
+            // preserving the fractional phase between chunks.
+            genericResampler_.configure(
+                SAMPLE_RATE_GEMINI_OUT,
+                actualRate
+            );
 
             outputFrames =
-                wanted;
+                genericResampler_.process(
+                    input,
+                    inputFrames,
+                    output,
+                    playbackDspOutputScratch_.size()
+                );
         }
 
         if (outputFrames == 0) {
@@ -1846,6 +1824,12 @@ void AAudioEngine::unblockPlaybackCallback() {
         std::memory_order_release);
 }
 
+size_t AAudioEngine::getPendingPlaybackFrames() const {
+    return
+        playbackDspInputBuffer_.availableRead() +
+        playbackBuffer_.availableRead();
+}
+
 void AAudioEngine::getSpectrumData(
     dsp::SpectrumSnapshot& outSnapshot) {
 
@@ -2010,4 +1994,3 @@ void AAudioEngine::errorCallback(
 }
 
 } // namespace client::audio
-### END FULL FILE
