@@ -8,6 +8,8 @@ import com.client.app.util.AppLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -29,6 +31,7 @@ class ContextCacheService @Inject constructor(
         val KEY_CACHED_CONTENT_HASH = stringPreferencesKey("cached_content_hash")
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
         private const val MIN_TOKENS_FOR_CACHE = 32768
+        private const val CACHE_TTL_SECONDS = 3600
     }
 
     private val httpClient = OkHttpClient.Builder()
@@ -37,6 +40,7 @@ class ContextCacheService @Inject constructor(
         .build()
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
+    private val cacheMutex = Mutex()
 
     private fun generateCacheFingerprint(model: String, prompt: String): String {
         val input = "model:$model\u0000prompt:$prompt"
@@ -49,6 +53,7 @@ class ContextCacheService @Inject constructor(
         systemPrompt: String,
         modelName: String = "gemini-2.5-flash"
     ): String? = withContext(Dispatchers.IO) {
+        cacheMutex.withLock {
         val cleanApiKey = apiKey.trim()
         if (cleanApiKey.isBlank() || systemPrompt.isBlank()) return@withContext null
 
@@ -95,13 +100,14 @@ class ContextCacheService @Inject constructor(
                     add(buildJsonObject { put("text", systemPrompt) })
                 })
             })
-            put("ttl", "14400s")
+            put("ttl", "${CACHE_TTL_SECONDS}s")
         }.toString()
 
-        val url = "$BASE_URL/cachedContents?key=$cleanApiKey"
+        val url = "$BASE_URL/cachedContents"
         val request = Request.Builder()
             .url(url)
             .header("Content-Type", "application/json")
+            .header("x-goog-api-key", cleanApiKey)
             .post(payload.toRequestBody(JSON_MEDIA))
             .build()
 
@@ -120,7 +126,13 @@ class ContextCacheService @Inject constructor(
                         return@withContext cacheName
                     }
                 } else {
-                    logger.w("ContextCacheService: Сервер отклонил кэш (${response.code}): $body")
+                    if (response.code == 404 || response.code == 410) {
+                        dataStore.edit {
+                            it.remove(KEY_CACHED_CONTENT_ID)
+                            it.remove(KEY_CACHED_CONTENT_HASH)
+                        }
+                    }
+                    logger.w("ContextCacheService: Сервер отклонил кэш (${response.code})")
                 }
             }
         }.onFailure {
@@ -128,16 +140,23 @@ class ContextCacheService @Inject constructor(
         }
 
         null
+        }
     }
 
     suspend fun deleteCache(apiKey: String, cacheId: String) = withContext(Dispatchers.IO) {
         val cleanApiKey = apiKey.trim()
         if (cleanApiKey.isBlank() || cacheId.isBlank()) return@withContext
         val cleanId = cacheId.removePrefix("cachedContents/")
-        val url = "$BASE_URL/cachedContents/$cleanId?key=$cleanApiKey"
+        val url = "$BASE_URL/cachedContents/$cleanId"
 
         runCatching {
-            httpClient.newCall(Request.Builder().url(url).delete().build()).execute().use { response ->
+            httpClient.newCall(
+                Request.Builder()
+                    .url(url)
+                    .header("x-goog-api-key", cleanApiKey)
+                    .delete()
+                    .build()
+            ).execute().use { response ->
                 if (response.isSuccessful) {
                     dataStore.edit {
                         it.remove(KEY_CACHED_CONTENT_ID)
