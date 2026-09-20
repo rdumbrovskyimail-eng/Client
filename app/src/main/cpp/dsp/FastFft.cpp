@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/cpp/dsp/FastFft.cpp
 #include "FastFft.h"
 #include <cmath>
 #include <algorithm>
@@ -9,10 +8,12 @@ static constexpr float PI = 3.14159265358979323846f;
 static constexpr size_t N = audio::FFT_SIZE;
 
 FastFft::FastFft()
-    : readyIdx_(0),
-      hasNewData_(false),
-      writeIdx_(1),
-      readIdx_(2) {
+    : snapshotMicRms_(0.0f),
+      snapshotOutRms_(0.0f),
+      snapshotSeq_(0) {
+    for (auto& value : snapshotBands_) {
+        value.store(0.0f, std::memory_order_relaxed);
+    }
 }
 
 void FastFft::computeFft(float* real, float* imag, size_t n) {
@@ -130,23 +131,65 @@ void FastFft::process(const float* pcmInput, size_t count, float micRms, float o
         }
     }
 
-    for (size_t i = 0; i < audio::SPECTRUM_BANDS; ++i) {
-        pool_[writeIdx_].bands[i] = smoothedBands_[i];
-    }
-    pool_[writeIdx_].micRms = micRms;
-    pool_[writeIdx_].outRms = outRms;
+    // Publish with a seqlock. The odd value means the writer owns the
+    // snapshot; the even value means a stable payload is available.
+    snapshotSeq_.fetch_add(1, std::memory_order_acq_rel);
 
-    // Ошибка №29 [CONCURRENCY/DSP]: Публикация нового снимка с установкой флага hasNewData_
-    writeIdx_ = readyIdx_.exchange(writeIdx_, std::memory_order_acq_rel);
-    hasNewData_.store(true, std::memory_order_release);
+    for (size_t i = 0; i < audio::SPECTRUM_BANDS; ++i) {
+        snapshotBands_[i].store(
+            smoothedBands_[i],
+            std::memory_order_relaxed
+        );
+    }
+
+    snapshotMicRms_.store(
+        micRms,
+        std::memory_order_relaxed
+    );
+    snapshotOutRms_.store(
+        outRms,
+        std::memory_order_relaxed
+    );
+
+    snapshotSeq_.fetch_add(1, std::memory_order_release);
 }
 
-// Ошибка №29 [CONCURRENCY/DSP]: Чтение слота Андерсона строго при наличии новых данных
 void FastFft::getLatestSnapshot(SpectrumSnapshot& out) const {
-    if (hasNewData_.exchange(false, std::memory_order_acq_rel)) {
-        readIdx_ = readyIdx_.exchange(readIdx_, std::memory_order_acq_rel);
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const uint32_t seq1 =
+            snapshotSeq_.load(std::memory_order_acquire);
+
+        if ((seq1 & 1u) != 0u) {
+            continue;
+        }
+
+        SpectrumSnapshot candidate{};
+
+        for (size_t i = 0; i < audio::SPECTRUM_BANDS; ++i) {
+            candidate.bands[i] =
+                snapshotBands_[i].load(std::memory_order_relaxed);
+        }
+
+        candidate.micRms =
+            snapshotMicRms_.load(std::memory_order_relaxed);
+        candidate.outRms =
+            snapshotOutRms_.load(std::memory_order_relaxed);
+
+        const uint32_t seq2 =
+            snapshotSeq_.load(std::memory_order_acquire);
+
+        if (
+            seq1 == seq2 &&
+            (seq2 & 1u) == 0u
+        ) {
+            lastStableSnapshot_ = candidate;
+            out = candidate;
+            return;
+        }
     }
-    out = pool_[readIdx_];
+
+    // Bounded fallback: never assemble a potentially mixed-epoch snapshot.
+    out = lastStableSnapshot_;
 }
 
 } // namespace client::dsp
