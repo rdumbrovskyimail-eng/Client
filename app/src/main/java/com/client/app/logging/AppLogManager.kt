@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/java/com/client/app/logging/AppLogManager.kt
 package com.client.app.logging
 
 import android.content.Context
@@ -73,7 +72,7 @@ class AppLogManager @Inject constructor(
     init {
         scope.launch {
             while (isActive) {
-                delay(65) // Опрос аппаратной очереди C++ ядра 15 раз в секунду
+                delay(100) // Keep UI/log snapshot churn bounded at <=10 Hz
                 drainNativeLogsSafely()
                 if (updateDebounce.getAndSet(0) > 0) {
                     publishSnapshot()
@@ -122,7 +121,10 @@ class AppLogManager @Inject constructor(
     fun i(tag: String, msg: String, payload: String? = null) = log(LogLevel.INFO, tag, msg, payload)
     fun w(tag: String, msg: String, payload: String? = null) = log(LogLevel.WARN, tag, msg, payload)
     fun e(tag: String, msg: String, tr: Throwable? = null) {
-        val fullMsg = if (tr != null) "$msg\n${tr.stackTraceToString()}" else msg
+        val fullMsg = if (tr != null) {
+            val stack = tr.stackTraceToString().take(12_000)
+            "$msg\n$stack"
+        } else msg
         log(LogLevel.ERROR, tag, fullMsg)
         _errorCount.update { it + 1 }
     }
@@ -138,8 +140,8 @@ class AppLogManager @Inject constructor(
     private fun internalLog(level: LogLevel, tag: String, message: String, payload: String?) {
         val now = System.currentTimeMillis()
         val formattedTime = synchronized(timeFormat) { timeFormat.format(Date(now)) }
-        val sanitizedMsg = sanitize(message)
-        val sanitizedPayload = payload?.let { sanitize(it) }
+        val sanitizedMsg = sanitize(message).take(12_000)
+        val sanitizedPayload = payload?.let { sanitize(it).take(16_000) }
 
         val id = sequence.incrementAndGet()
         val entry = LogEntry(
@@ -202,7 +204,7 @@ class AppLogManager @Inject constructor(
         runCatching {
             FileOutputStream(file).bufferedWriter().use { writer ->
                 writer.write("=== GEMINI LIVE ULTRA SYSTEM LOG DUMP ===\n")
-                writer.write("Device: Samsung Galaxy S23 Ultra (SM8550-AC)\n")
+                writer.write("Device: Android runtime\n")
                 writer.write("Total Entries: ${logs.size}\n\n")
 
                 logs.forEach { entry ->
