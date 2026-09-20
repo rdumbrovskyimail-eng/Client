@@ -1,10 +1,3 @@
-######################################################################
-### FILE 03: app/src/main/cpp/jni/NativeBridge.cpp
-######################################################################
-
-### BEGIN FULL FILE
-
-
 #include <jni.h>
 #include <cstdio>
 #include <string>
@@ -124,6 +117,14 @@ Java_com_client_app_audio_NativeAudioBridge_getActiveInputDeviceId(JNIEnv * /* e
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_getActiveOutputDeviceId(JNIEnv * /* env */, jobject /* this */) {
     return AAudioEngine::getInstance().getActiveOutputDeviceId();
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getPendingPlaybackFrames(
+    JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jlong>(
+        AAudioEngine::getInstance().getPendingPlaybackFrames()
+    );
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -322,4 +323,3 @@ Java_com_client_app_audio_NativeAudioBridge_drainNativeLogs(JNIEnv *env, jobject
     env->DeleteLocalRef(stringClass);
     return resultArray;
 }
-### END FULL FILE
