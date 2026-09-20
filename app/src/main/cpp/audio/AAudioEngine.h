@@ -1,9 +1,3 @@
-######################################################################
-### FILE 02: app/src/main/cpp/audio/AAudioEngine.h
-######################################################################
-
-### BEGIN FULL FILE
-
 #pragma once
 
 #include <aaudio/AAudio.h>
@@ -123,6 +117,8 @@ public:
     int32_t getActiveOutputDeviceId() const {
         return actualOutputDeviceId_.load(std::memory_order_relaxed);
     }
+
+    size_t getPendingPlaybackFrames() const;
 
     // AUD-004: Метрика отброшенных входных аудио-фреймов
     uint64_t getCaptureDroppedFrames() const {
@@ -283,9 +279,9 @@ private:
 
     PolyphaseResampler24To16 resampler24To16_;
     HermiteResampler24To48 resampler24To48_;
+    StreamingLinearResampler genericResampler_;
     Decimator48To16 captureDecimator48To16_;
     PolyphaseResampler24To16 captureResampler24To16_;
 };
 
 } // namespace client::audio
-### END FULL FILE
