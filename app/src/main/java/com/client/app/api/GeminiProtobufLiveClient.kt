@@ -2,7 +2,6 @@ package com.client.app.api
 
 import android.util.Base64
 import kotlinx.coroutines.*
-import com.client.app.audio.NativeAudioBridge
 import com.client.app.audio.NativeAudioEngine
 import com.client.app.logging.AppLogManager
 import kotlinx.coroutines.channels.Channel
@@ -27,14 +26,13 @@ import java.net.InetSocketAddress
 import java.net.Proxy
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
-import javax.net.SocketFactory
 
 @Singleton
 class GeminiProtobufLiveClient @Inject constructor(
-    private val nativeBridge: NativeAudioBridge,
     private val audioEngine: NativeAudioEngine,
     private val logManager: AppLogManager
 ) {
@@ -66,7 +64,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         // Retained from prior P0 work:
         // protect against unbounded incoming model audio backlog.
         private const val MAX_AI_AUDIO_BACKLOG_BYTES =
-            4L * 1024L * 1024L
+            256L * 1024L
 
         private const val MAX_DATA_EVENTS_IN_FLIGHT = 256
 
@@ -104,6 +102,16 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         data object AudioStreamEnd :
             AudioOutboundCommand
+
+        /**
+         * Establishes a transport ordering barrier. The writer completes the
+         * deferred only after every earlier realtime command has been
+         * processed. Direct non-audio sends use this barrier so they cannot
+         * jump ahead of queued PCM/activity markers.
+         */
+        data class Barrier(
+            val completion: CompletableDeferred<Unit>
+        ) : AudioOutboundCommand
     }
 
     private val loggingEventListener =
@@ -193,13 +201,6 @@ class GeminiProtobufLiveClient @Inject constructor(
     private val httpClient =
         OkHttpClient.Builder()
             .eventListener(loggingEventListener)
-            .socketFactory(
-                TunedSocketFactory(
-                    SocketFactory.getDefault(),
-                    nativeBridge,
-                    logManager
-                )
-            )
             .connectTimeout(
                 10,
                 TimeUnit.SECONDS
@@ -216,7 +217,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                 12,
                 TimeUnit.SECONDS
             )
-            .retryOnConnectionFailure(true)
+            .retryOnConnectionFailure(false)
             .build()
 
     private val wsMutex =
@@ -244,8 +245,8 @@ class GeminiProtobufLiveClient @Inject constructor(
     val audioGeneration: Long
         get() = audioEngine.currentPlaybackGeneration
 
-    private val queuedAudioBytes =
-        AtomicLong(0L)
+    private val audioBudgetBySession =
+        ConcurrentHashMap<DataBudgetKey, AtomicLong>()
 
     // AUD-006:
     // One FIFO event ingress preserves the actual server delivery order.
@@ -254,12 +255,19 @@ class GeminiProtobufLiveClient @Inject constructor(
     // This is deliberately implemented above the Channel rather than with
     // an eviction policy so an evicted event can never leak ownership
     // or reorder lifecycle events.
+    private data class DataBudgetKey(
+        val sessionId: Long,
+        val epoch: Long
+    )
+
     private data class QueuedEvent(
         val sessionId: Long,
         val epoch: Long,
         val frameId: Long,
+        val generationId: Long,
         val event: GeminiEvent,
-        val isDataPlane: Boolean
+        val isDataPlane: Boolean,
+        val budgetKey: DataBudgetKey? = null
     )
 
     private enum class ProtocolPhase {
@@ -283,8 +291,12 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     private val cancelledToolCallIds = mutableSetOf<String>()
 
-    private val pendingDataEvents =
-        AtomicLong(0L)
+    private val pendingDataBySession =
+        ConcurrentHashMap<DataBudgetKey, AtomicLong>()
+
+    private val generationIdGen = AtomicLong(0L)
+    private var activeServerGenerationId = 0L
+    private var serverGenerationOpen = false
 
     private val _events =
         Channel<QueuedEvent>(
@@ -296,8 +308,12 @@ class GeminiProtobufLiveClient @Inject constructor(
             .receiveAsFlow()
             .onEach { queued ->
                 if (queued.isDataPlane) {
-                    pendingDataEvents.updateAndGet {
-                        (it - 1L).coerceAtLeast(0L)
+                    queued.budgetKey?.let { key ->
+                        pendingDataBySession[key]?.let { counter ->
+                            if (counter.decrementAndGet() <= 0L) {
+                                pendingDataBySession.remove(key, counter)
+                            }
+                        }
                     }
                 }
             }
@@ -315,6 +331,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                     sessionId = it.sessionId,
                     epoch = it.epoch,
                     frameId = it.frameId,
+                    generationId = it.generationId,
                     event = it.event
                 )
             }
@@ -357,7 +374,8 @@ class GeminiProtobufLiveClient @Inject constructor(
     private fun emitControlEvent(
         event: GeminiEvent,
         eventEpoch: Long,
-        frameId: Long = 0L
+        frameId: Long = 0L,
+        generationId: Long = activeServerGenerationId
     ) {
         synchronized(sessionStateLock) {
             if (eventEpoch != epoch) return
@@ -367,6 +385,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                     sessionId = sessionId,
                     epoch = eventEpoch,
                     frameId = frameId,
+                    generationId = generationId,
                     event = event,
                     isDataPlane = false
                 )
@@ -390,15 +409,21 @@ class GeminiProtobufLiveClient @Inject constructor(
     private fun emitDataEvent(
         event: GeminiEvent,
         eventEpoch: Long,
-        frameId: Long = 0L
+        frameId: Long = 0L,
+        generationId: Long = activeServerGenerationId
     ) {
         synchronized(sessionStateLock) {
             if (eventEpoch != epoch) return
 
+            val key = DataBudgetKey(sessionId, eventEpoch)
+            val perSession = pendingDataBySession.computeIfAbsent(key) { AtomicLong(0L) }
             while (true) {
-                val current = pendingDataEvents.get()
-                if (current >= MAX_DATA_EVENTS_IN_FLIGHT) return
-                if (pendingDataEvents.compareAndSet(current, current + 1L)) break
+                val current = perSession.get()
+                if (current >= MAX_DATA_EVENTS_IN_FLIGHT) {
+                    if (perSession.get() == 0L) pendingDataBySession.remove(key, perSession)
+                    return
+                }
+                if (perSession.compareAndSet(current, current + 1L)) break
             }
 
             val result = _events.trySend(
@@ -406,14 +431,16 @@ class GeminiProtobufLiveClient @Inject constructor(
                     sessionId = sessionId,
                     epoch = eventEpoch,
                     frameId = frameId,
+                    generationId = generationId,
                     event = event,
-                    isDataPlane = true
+                    isDataPlane = true,
+                    budgetKey = key
                 )
             )
 
             if (result.isFailure) {
-                pendingDataEvents.updateAndGet {
-                    (it - 1L).coerceAtLeast(0L)
+                if (perSession.decrementAndGet() <= 0L) {
+                    pendingDataBySession.remove(key, perSession)
                 }
             }
         }
@@ -422,29 +449,14 @@ class GeminiProtobufLiveClient @Inject constructor(
     fun invalidateAudio(): Long =
         audioEngine.invalidateAndFlushPlayback("transport invalidate")
 
-    fun releaseAudio(bytes: Int) {
-        if (bytes <= 0) {
-            return
-        }
-
-        while (true) {
-            val current =
-                queuedAudioBytes.get()
-
-            val next =
-                (
-                    current -
-                    bytes.toLong()
-                ).coerceAtLeast(0L)
-
-            if (
-                queuedAudioBytes.compareAndSet(
-                    current,
-                    next
-                )
-            ) {
-                return
-            }
+    fun releaseAudio(frame: AudioFrame) {
+        val bytes = frame.pcm.size
+        if (bytes <= 0) return
+        val key = DataBudgetKey(frame.sessionId, frame.epoch)
+        val counter = audioBudgetBySession[key] ?: return
+        if (counter.addAndGet(-bytes.toLong()) <= 0L) {
+            counter.set(0L)
+            audioBudgetBySession.remove(key, counter)
         }
     }
 
@@ -566,8 +578,7 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                         logManager.net(
                             "WebSocket:Tx",
-                            "Отправка 3.8 setup сообщения",
-                            setupMsg
+                            "Отправка setup сообщения (payload redacted)"
                         )
 
                         val setupAccepted =
@@ -602,14 +613,10 @@ class GeminiProtobufLiveClient @Inject constructor(
                             }) {
 
                             val logSummary =
-                                if (
-                                    text.contains(
-                                        "\"audio/pcm"
-                                    )
-                                ) {
-                                    "[Аудиочанк ~${text.length} байт]"
+                                if (text.contains("\"audio/pcm")) {
+                                    "[Аудиофрейм получен; размер=${text.length}]"
                                 } else {
-                                    text
+                                    "[WebSocket text frame; размер=${text.length}]"
                                 }
 
                             logManager.net(
@@ -812,6 +819,11 @@ class GeminiProtobufLiveClient @Inject constructor(
                     val command = channel.receiveCatching().getOrNull()
                         ?: break
 
+                    if (command is AudioOutboundCommand.Barrier) {
+                        command.completion.complete(Unit)
+                        continue
+                    }
+
                     if (!awaitWebSocketQueueCapacity(ws, writerEpoch)) {
                         break
                     }
@@ -919,14 +931,35 @@ class GeminiProtobufLiveClient @Inject constructor(
                         break
                     }
                 }
-            } catch (_: CancellationException) {
-                // Normal lifecycle shutdown.
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (t: Throwable) {
                 logManager.e(
                     "WebSocket:AudioWriter",
                     "Ошибка realtime audio writer",
                     t
                 )
+                val current = synchronized(sessionStateLock) {
+                    writerEpoch == epoch && webSocket === ws
+                }
+                if (current) {
+                    synchronized(sessionStateLock) {
+                        if (writerEpoch == epoch && webSocket === ws) {
+                            isReady = false
+                            protocolPhase = ProtocolPhase.CLOSING
+                        }
+                    }
+                    emitControlEvent(
+                        GeminiEvent.Disconnected(
+                            1011,
+                            "realtime audio writer failed",
+                            mySessionId,
+                            writerEpoch
+                        ),
+                        writerEpoch
+                    )
+                    runCatching { ws.close(1011, "realtime audio writer failed") }
+                }
             } finally {
                 channel.close()
 
@@ -984,6 +1017,12 @@ class GeminiProtobufLiveClient @Inject constructor(
     }
 
     private val outboundSendLock = Any()
+
+    // Serializes direct-send barriers + direct network sends against one
+    // another. Audio commands remain on the writer channel, but every direct
+    // sender first waits for a channel barrier, giving the whole transport a
+    // single logical outbound sequence.
+    private val outboundDirectMutex = Mutex()
 
     private fun stopAudioWriter(
         expectedWs: WebSocket? = null,
@@ -1047,12 +1086,11 @@ class GeminiProtobufLiveClient @Inject constructor(
             target.first.send(AudioOutboundCommand.Pcm(target.second))
         } catch (_: ClosedSendChannelException) {
             // Normal reconnect/close race.
-        } catch (_: CancellationException) {
-            // Caller is stopping the capture coroutine.
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         }
     }
 
-    // AUD-067:
     // AUD-067:
     // Tail PCM is queued before AudioStreamEnd in the same ordered channel.
     suspend fun sendAudioStreamEnd() {
@@ -1092,8 +1130,8 @@ class GeminiProtobufLiveClient @Inject constructor(
             pending.second.forEach { pending.first.send(it) }
         } catch (_: ClosedSendChannelException) {
             // Normal lifecycle race.
-        } catch (_: CancellationException) {
-            // Normal coroutine cancellation.
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         }
     }
 
@@ -1108,7 +1146,34 @@ class GeminiProtobufLiveClient @Inject constructor(
                 audioWriterChannel === channel
         }
 
-    fun sendRealtimeText(
+    private suspend fun awaitOutboundBarrier(
+        expectedEpoch: Long,
+        expectedWs: WebSocket
+    ): Boolean {
+        val channel = synchronized(sessionStateLock) {
+            if (expectedEpoch != epoch || webSocket !== expectedWs || !isReady) {
+                return false
+            }
+            audioWriterChannel
+        } ?: return false
+
+        val barrier = CompletableDeferred<Unit>()
+        return try {
+            channel.send(AudioOutboundCommand.Barrier(barrier))
+            withTimeoutOrNull(2500L) {
+                barrier.await()
+                true
+            } == true && synchronized(sessionStateLock) {
+                expectedEpoch == epoch && webSocket === expectedWs && isReady
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: ClosedSendChannelException) {
+            false
+        }
+    }
+
+    suspend fun sendRealtimeText(
         text: String
     ) {
 
@@ -1143,16 +1208,11 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         logManager.net(
             "WebSocket:TxText",
-            "Отправка realtimeInput.text: '$cleanText'",
-            jsonMessage
+            "Отправка realtimeInput.text (payload redacted; length=${cleanText.length})"
         )
 
-        synchronized(sessionStateLock) {
-            if (
-                sendEpoch == epoch &&
-                isReady &&
-                webSocket === ws
-            ) {
+        outboundDirectMutex.withLock {
+            if (awaitOutboundBarrier(sendEpoch, ws)) {
                 synchronized(outboundSendLock) {
                     ws.send(jsonMessage)
                 }
@@ -1160,7 +1220,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
     }
 
-    fun sendRealtimeImage(
+    suspend fun sendRealtimeImage(
         jpegBytes: ByteArray
     ) {
         val sendEpoch = epoch
@@ -1221,12 +1281,8 @@ class GeminiProtobufLiveClient @Inject constructor(
             "Отправка изображения (${jpegBytes.size} байт)"
         )
 
-        synchronized(sessionStateLock) {
-            if (
-                sendEpoch == epoch &&
-                isReady &&
-                webSocket === ws
-            ) {
+        outboundDirectMutex.withLock {
+            if (awaitOutboundBarrier(sendEpoch, ws)) {
                 synchronized(outboundSendLock) {
                     ws.send(jsonMessage)
                 }
@@ -1256,8 +1312,8 @@ class GeminiProtobufLiveClient @Inject constructor(
             channel.send(AudioOutboundCommand.ActivityStart)
         } catch (_: ClosedSendChannelException) {
             // Normal lifecycle race.
-        } catch (_: CancellationException) {
-            // Normal coroutine cancellation.
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         }
     }
 
@@ -1296,12 +1352,12 @@ class GeminiProtobufLiveClient @Inject constructor(
             pending.second.forEach { pending.first.send(it) }
         } catch (_: ClosedSendChannelException) {
             // Normal lifecycle race.
-        } catch (_: CancellationException) {
-            // Normal coroutine cancellation.
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         }
     }
 
-    fun sendClientContent(
+    suspend fun sendClientContent(
         turns: List<ClientTurn>,
         turnComplete: Boolean = true
     ) {
@@ -1380,24 +1436,25 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         logManager.net(
             "WebSocket:TxClientContent",
-            "Отправка clientContent (${turns.size} ходов, turnComplete=$turnComplete)",
-            jsonMessage
+            "Отправка clientContent (${turns.size} ходов, turnComplete=$turnComplete) [payload redacted]"
         )
 
         val accepted: Boolean =
-            synchronized(sessionStateLock) {
-                if (
+            outboundDirectMutex.withLock {
+                val allowed = synchronized(sessionStateLock) {
                     expectedEpoch == epoch &&
-                    webSocket === ws &&
-                    (targetWebSocket != null || isReady)
-                ) {
-                    val result =
-                        synchronized(outboundSendLock) {
-                            ws.send(jsonMessage)
-                        }
-                    result == true
-                } else {
+                        webSocket === ws &&
+                        (targetWebSocket != null || isReady)
+                }
+
+                if (!allowed) {
                     false
+                } else if (targetWebSocket == null && !awaitOutboundBarrier(expectedEpoch, ws)) {
+                    false
+                } else {
+                    synchronized(outboundSendLock) {
+                        ws.send(jsonMessage)
+                    }
                 }
             }
 
@@ -1424,7 +1481,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             val activeResponses =
                 responses.filter { response ->
                     val id = response.id
-                    id.isNullOrBlank() ||
+                    !id.isNullOrBlank() &&
                         !cancelledToolCallIds.contains(id)
                 }
 
@@ -1442,10 +1499,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                         putJsonArray("functionResponses") {
                             activeResponses.forEach { resp ->
                                 addJsonObject {
-                                    if (!resp.id.isNullOrBlank()) {
-                                        put("id", resp.id)
-                                    }
-
+                                    put("id", resp.id!!.trim())
                                     put("name", resp.name)
                                     put("response", resp.response)
 
@@ -1505,8 +1559,7 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         logManager.net(
             "WebSocket:ToolResp",
-            "Ответы функций accepted=$accepted: [$debugLog]",
-            jsonMessage
+            "Ответы функций accepted=$accepted: [$debugLog]"
         )
 
         if (!accepted) {
@@ -1960,632 +2013,236 @@ class GeminiProtobufLiveClient @Inject constructor(
     }
 
     private fun parseServerJsonMessage(
-        rawJson: String,
+        text: String,
         myEpoch: Long,
         sourceWebSocket: WebSocket
     ) {
-
-        try {
-
-            val root =
-                json.parseToJsonElement(
-                    rawJson
-                ).jsonObject
-
-            val frameId =
-                synchronized(sessionStateLock) {
-                    if (
-                        myEpoch != epoch ||
-                        webSocket !== sourceWebSocket
-                    ) {
-                        return
-                    }
-                    frameIdGen.incrementAndGet()
-                }
-
-            // Every event derived from one server WebSocket message shares
-            // one frame identity and is dispatched under one lifecycle lock.
-            // This prevents a reconnect/close from interleaving between
-            // semantically related fields of the same wire frame.
-            fun emitFrameControl(
-                event: GeminiEvent,
-                eventEpoch: Long
-            ) = emitControlEvent(event, eventEpoch, frameId)
-
-            fun emitFrameData(
-                event: GeminiEvent,
-                eventEpoch: Long
-            ) = emitDataEvent(event, eventEpoch, frameId)
-
-            // Decode frame-local PCM before entering sessionStateLock. The
-            // operation allocates and can be expensive for a large audio part;
-            // lifecycle synchronization must cover state publication, not CPU
-            // work such as Base64 decoding.
-            val decodedPcmParts = mutableListOf<ByteArray>()
-            root["serverContent"]
-                ?.jsonObject
-                ?.get("modelTurn")
-                ?.jsonObject
-                ?.get("parts")
-                ?.jsonArray
-                ?.forEach { partEl ->
-                    val inline =
-                        partEl.jsonObject["inlineData"]
-                            ?.jsonObject
-                            ?: return@forEach
-
-                    val mime =
-                        inline["mimeType"]
-                            ?.jsonPrimitive
-                            ?.contentOrNull
-                            .orEmpty()
-
-                    val dataB64 =
-                        inline["data"]
-                            ?.jsonPrimitive
-                            ?.contentOrNull
-                            .orEmpty()
-
-                    if (
-                        mime.startsWith("audio/pcm") &&
-                        dataB64.isNotEmpty()
-                    ) {
-                        decodedPcmParts += Base64.decode(
-                            dataB64,
-                            Base64.NO_WRAP
-                        )
-                    }
-                }
-
-            var decodedPcmIndex = 0
-
-            synchronized(sessionStateLock) {
-                if (
-                    myEpoch != epoch ||
-                    webSocket !== sourceWebSocket
-                ) {
-                    return
-                }
-
-            if (
-                root.containsKey(
-                    "setupComplete"
-                )
-            ) {
-
-                synchronized(sessionStateLock) {
-                    if (
-                        myEpoch != epoch ||
-                        webSocket !== sourceWebSocket ||
-                        isReady
-                    ) {
-                        return
-                    }
-
-                    logManager.i(
-                        "GeminiLive",
-                        "Сессия 3.8 готова: setupComplete получен"
-                    )
-
-                    val history =
-                        activeConfig?.initialHistory
-
-                    if (!history.isNullOrEmpty()) {
-                        val bounded =
-                            history.takeLast(
-                                MAX_INITIAL_HISTORY_TURNS
-                            )
-
-                        // This send is deliberately performed before isReady
-                        // becomes visible to the realtime writer. The server
-                        // explicitly waits for initial clientContent to finish
-                        // before realtimeInput is accepted as the live turn.
-                        val historyAccepted =
-                            sendClientContentInternal(
-                                turns = bounded,
-                                turnComplete = true,
-                                targetWebSocket = sourceWebSocket,
-                                expectedEpoch = myEpoch
-                            )
-
-                        if (!historyAccepted) {
-                            logManager.e(
-                                "GeminiLive",
-                                "Не удалось отправить initial history; сессия не переводится в READY"
-                            )
-                            sourceWebSocket.close(1011, "initial history send failed")
-                            return
-                        }
-
-                        logManager.net(
-                            "WebSocket:History",
-                            "Первоначальная история (${bounded.size} ходов) внедрена после setupComplete"
-                        )
-                    }
-
-                    isReady = true
-                    protocolPhase = ProtocolPhase.READY
-
-                    emitFrameControl(
-                        GeminiEvent.SetupComplete,
-                        myEpoch
-                    )
-                }
+        val root = runCatching { json.parseToJsonElement(text).jsonObject }
+            .getOrElse {
+                logManager.w("GeminiLive:Parse", "Некорректный JSON server frame отброшен")
+                return
             }
 
-            root["usageMetadata"]
-                ?.jsonObject
-                ?.get("totalTokenCount")
-                ?.jsonPrimitive
-                ?.intOrNull
-                ?.let {
+        val frameId = frameIdGen.incrementAndGet()
+        val mySessionId = synchronized(sessionStateLock) {
+            if (myEpoch != epoch || webSocket !== sourceWebSocket) return
+            sessionId
+        }
 
-                    emitFrameData(
-                        GeminiEvent.Usage(it),
-                        myEpoch
-                    )
-                }
+        val modelParts = root["serverContent"]
+            ?.jsonObject
+            ?.get("modelTurn")
+            ?.jsonObject
+            ?.get("parts")
+            ?.jsonArray
 
-            val interactionStatusElement =
-                root["interactionStatus"]
-                    ?: root["interaction_status"]
+        val decodedPcmParts = modelParts?.mapNotNull { partEl ->
+            val inline = partEl.jsonObject["inlineData"]?.jsonObject ?: return@mapNotNull null
+            val mime = inline["mimeType"]?.jsonPrimitive?.contentOrNull.orEmpty()
+            val data = inline["data"]?.jsonPrimitive?.contentOrNull.orEmpty()
+            if (!mime.startsWith("audio/pcm") || data.isEmpty()) return@mapNotNull null
+            runCatching { Base64.decode(data, Base64.NO_WRAP) }.getOrNull()
+        }.orEmpty()
 
-            interactionStatusElement
-                ?.jsonPrimitive
-                ?.contentOrNull
-                ?.takeIf {
-                    it.equals("IN_PROGRESS", true) ||
-                        it.equals("IDLE", true)
-                }
-                ?.let { status ->
-                    protocolPhase =
-                        if (status.equals("IN_PROGRESS", true)) {
-                            ProtocolPhase.AWAITING_INTERACTION_IDLE
+        var frameGenerationId = synchronized(sessionStateLock) {
+            if (!serverGenerationOpen && modelParts?.isNotEmpty() == true) {
+                activeServerGenerationId = generationIdGen.incrementAndGet()
+                serverGenerationOpen = true
+            }
+            activeServerGenerationId
+        }
+
+        fun emitControl(event: GeminiEvent) =
+            emitControlEvent(event, myEpoch, frameId, frameGenerationId)
+        fun emitData(event: GeminiEvent) =
+            emitDataEvent(event, myEpoch, frameId, frameGenerationId)
+
+        synchronized(sessionStateLock) {
+            if (myEpoch != epoch || webSocket !== sourceWebSocket) return
+
+            root["usageMetadata"]?.jsonObject?.get("totalTokenCount")
+                ?.jsonPrimitive?.intOrNull?.let { emitData(GeminiEvent.Usage(it)) }
+
+            val setupHistory =
+                if (root.containsKey("setupComplete")) {
+                    synchronized(sessionStateLock) {
+                        if (
+                            myEpoch == epoch &&
+                            webSocket === sourceWebSocket &&
+                            !isReady
+                        ) {
+                            activeConfig?.initialHistory
+                                .orEmpty()
+                                .takeLast(
+                                    MAX_INITIAL_HISTORY_TURNS
+                                )
                         } else {
-                            ProtocolPhase.READY
+                            null
                         }
-
-                    emitFrameControl(
-                        GeminiEvent.InteractionStatus(
-                            status.uppercase()
-                        ),
-                        myEpoch
-                    )
+                    }
+                } else {
+                    null
                 }
 
-            root["goAway"]
-                ?.jsonObject
-                ?.let { goAway ->
-
-                    val timeLeftMs =
-                        goAway["timeLeft"]
-                            ?.jsonPrimitive
-                            ?.contentOrNull
-                            ?.let { str ->
-
-                                if (
-                                    str.endsWith("s")
-                                ) {
-
-                                    str.removeSuffix(
-                                        "s"
-                                    )
-                                    .toDoubleOrNull()
-                                    ?.let {
-                                        (
-                                            it * 1000
-                                        ).toLong()
-                                    }
-
-                                } else {
-
-                                    str.toLongOrNull()
-                                }
-                            }
-                            ?: goAway["timeLeftMs"]
-                                ?.jsonPrimitive
-                                ?.longOrNull
-                            ?: 10000L
-
-                    logManager.w(
-                        "GeminiLive",
-                        "Получен сигнал GoAway: осталось $timeLeftMs мс"
+            if (setupHistory != null) {
+                if (setupHistory.isNotEmpty()) {
+                    val accepted = sendClientContentInternal(
+                        turns = setupHistory,
+                        turnComplete = true,
+                        targetWebSocket = sourceWebSocket,
+                        expectedEpoch = myEpoch
                     )
-
-                    emitFrameControl(
-                        GeminiEvent.GoAway(timeLeftMs),
-                        myEpoch
-                    )
-                }
-
-            root["sessionResumptionUpdate"]
-                ?.jsonObject
-                ?.let { sru ->
-
-                    val handle =
-                        sru["newHandle"]
-                            ?.jsonPrimitive
-                            ?.contentOrNull
-                            .orEmpty()
-
-                    val resumable =
-                        sru["resumable"]
-                            ?.jsonPrimitive
-                            ?.booleanOrNull
-                            ?: true
-
-                    emitFrameControl(
-                        GeminiEvent.ResumptionHandle(
-                            handle = handle.takeIf { it.isNotBlank() },
-                            resumable = resumable
-                        ),
-                        myEpoch
-                    )
-                }
-
-            root["toolCall"]
-                ?.jsonObject
-                ?.let { tc ->
-                    val calls =
-                        tc["functionCalls"]
-                            ?.jsonArray
-                            ?.mapNotNull { fcEl ->
-
-                                val fc =
-                                    fcEl.jsonObject
-
-                                val name =
-                                    fc["name"]
-                                        ?.jsonPrimitive
-                                        ?.contentOrNull
-                                        ?: return@mapNotNull null
-
-                                val id =
-                                    fc["id"]
-                                        ?.jsonPrimitive
-                                        ?.contentOrNull
-
-                                val argsObj =
-                                    fc["args"]
-                                        ?.jsonObject
-                                        ?: buildJsonObject {}
-
-                                FunctionCall(
-                                    name,
-                                    id,
-                                    argsObj
-                                )
-                            }
-                            ?: emptyList()
-
-                    if (
-                        calls.isNotEmpty()
-                    ) {
-                        protocolPhase = ProtocolPhase.ACTIVE
-
-                        emitFrameControl(
-                            GeminiEvent.ToolCall(
-                                calls
-                            ),
-                            myEpoch
+                    if (!accepted) {
+                        sourceWebSocket.close(
+                            1011,
+                            "initial history send failed"
                         )
+                        return
                     }
                 }
 
-            root["toolCallCancellation"]
-                ?.jsonObject
-                ?.get("ids")
-                ?.jsonArray
-                ?.let { idsArr ->
-
-                    val ids =
-                        idsArr.mapNotNull {
-                            it.jsonPrimitive
-                                .contentOrNull
-                        }
-
+                synchronized(sessionStateLock) {
                     if (
-                        ids.isNotEmpty()
+                        myEpoch == epoch &&
+                        webSocket === sourceWebSocket &&
+                        !isReady
                     ) {
-                        cancelledToolCallIds.addAll(ids)
-                        protocolPhase = ProtocolPhase.ACTIVE
-
-                        emitFrameControl(
-                            GeminiEvent.ToolCallCancelled(
-                                ids
-                            ),
-                            myEpoch
-                        )
-                    }
-                }
-
-            root["serverContent"]
-                ?.jsonObject
-                ?.let { sc ->
-
-                    val interrupted =
-                        sc["interrupted"]
-                            ?.jsonPrimitive
-                            ?.booleanOrNull == true
-
-                    if (interrupted) {
+                        isReady = true
                         protocolPhase = ProtocolPhase.READY
-
-                        emitFrameControl(
-                            GeminiEvent.Interrupted,
-                            myEpoch
+                        emitControl(
+                            GeminiEvent.SetupComplete
                         )
-                    }
-
-                    if (
-                        sc["generationComplete"]
-                            ?.jsonPrimitive
-                            ?.booleanOrNull == true
-                    ) {
-                        val supportsInteractionStatus =
-                            activeConfig?.let {
-                                LiveModelCapabilitiesRegistry
-                                    .forModel(it.model)
-                                    .supportsInteractionStatus
-                            } == true
-
-                        protocolPhase =
-                            if (supportsInteractionStatus) {
-                                ProtocolPhase.AWAITING_INTERACTION_IDLE
-                            } else {
-                                ProtocolPhase.READY
-                            }
-
-                        emitFrameControl(
-                            GeminiEvent.GenerationComplete,
-                            myEpoch
-                        )
-                    }
-
-                    if (
-                        sc["turnComplete"]
-                            ?.jsonPrimitive
-                            ?.booleanOrNull == true
-                    ) {
-                        val supportsInteractionStatus =
-                            activeConfig?.let {
-                                LiveModelCapabilitiesRegistry
-                                    .forModel(it.model)
-                                    .supportsInteractionStatus
-                            } == true
-
-                        protocolPhase =
-                            if (supportsInteractionStatus) {
-                                ProtocolPhase.AWAITING_INTERACTION_IDLE
-                            } else {
-                                ProtocolPhase.READY
-                            }
-
-                        emitFrameControl(
-                            GeminiEvent.TurnComplete,
-                            myEpoch
-                        )
-                    }
-
-                    extractTranscriptText(sc["interimInputTranscription"])
-                        ?.let {
-
-                            if (
-                                it.isNotBlank()
-                            ) {
-
-                                emitFrameData(
-                                    GeminiEvent.InputTranscript(
-                                        it,
-                                        interim = true
-                                    ),
-                                    myEpoch
-                                )
-                            }
-                        }
-
-                    extractTranscriptText(sc["inputTranscription"])
-                        ?.let {
-
-                            if (
-                                it.isNotBlank()
-                            ) {
-
-                                emitFrameControl(
-                                    GeminiEvent.InputTranscript(
-                                        it,
-                                        interim = false
-                                    ),
-                                    myEpoch
-                                )
-                            }
-                        }
-
-                    extractTranscriptText(sc["outputTranscription"])
-                        ?.let {
-
-                            if (
-                                it.isNotBlank()
-                            ) {
-
-                                emitFrameControl(
-                                    GeminiEvent.OutputTranscript(
-                                        it
-                                    ),
-                                    myEpoch
-                                )
-                            }
-                        }
-
-                    // Google documents `interrupted=true` as the signal to
-                    // stop and flush the current playback queue. The same
-                    // server event may still contain the tail of the cancelled
-                    // model turn; never enqueue that stale audio.
-                    if (!interrupted) {
-                        sc["modelTurn"]
-                            ?.jsonObject
-                            ?.get("parts")
-                            ?.jsonArray
-                            ?.forEach { partEl ->
-
-                            val part =
-                                partEl.jsonObject
-
-                            val isThought =
-                                part["thought"]
-                                    ?.jsonPrimitive
-                                    ?.booleanOrNull == true
-                            if (!isThought) {
-
-                                part["text"]
-                                    ?.jsonPrimitive
-                                    ?.contentOrNull
-                                    ?.let { text ->
-
-                                        if (
-                                            text.isNotBlank()
-                                        ) {
-
-                                            emitFrameData(
-                                                GeminiEvent.ModelText(
-                                                    text
-                                                ),
-                                                myEpoch
-                                            )
-                                        }
-                                    }
-                            }
-                            part["inlineData"]
-                                ?.jsonObject
-                                ?.let { inline ->
-
-                                    val mime =
-                                        inline["mimeType"]
-                                            ?.jsonPrimitive
-                                            ?.contentOrNull
-                                            .orEmpty()
-
-                                    val dataB64 =
-                                        inline["data"]
-                                            ?.jsonPrimitive
-                                            ?.contentOrNull
-                                            .orEmpty()
-
-                                    if (
-                                        mime.startsWith(
-                                            "audio/pcm"
-                                        ) &&
-                                        dataB64.isNotEmpty()
-                                    ) {
-
-                                        if (
-                                            decodedPcmIndex >=
-                                                decodedPcmParts.size
-                                        ) {
-                                            return@forEach
-                                        }
-
-                                        val pcmBytes =
-                                            decodedPcmParts[
-                                                decodedPcmIndex++
-                                            ]
-
-                                        // Playback generation is independent of
-                                        // transport epoch and can change during
-                                        // the lifetime of one WebSocket (for
-                                        // example after local barge-in). Sample
-                                        // it for each accepted server audio part.
-                                        val currentGen =
-                                            audioEngine.currentPlaybackGeneration
-
-                                        var backlogOverflow = false
-                                        var sendResult: ChannelResult<Unit>? = null
-
-                                        synchronized(sessionStateLock) {
-                                            if (
-                                                myEpoch == epoch &&
-                                                webSocket === sourceWebSocket
-                                            ) {
-                                                val newBacklog =
-                                                    queuedAudioBytes
-                                                        .addAndGet(
-                                                            pcmBytes.size
-                                                                .toLong()
-                                                        )
-
-                                                if (
-                                                    newBacklog >
-                                                    MAX_AI_AUDIO_BACKLOG_BYTES
-                                                ) {
-                                                    queuedAudioBytes
-                                                        .addAndGet(
-                                                            -pcmBytes.size
-                                                                .toLong()
-                                                        )
-                                                    backlogOverflow = true
-                                                } else {
-                                                    sendResult = _audio.trySend(
-                                                        AudioFrame(
-                                                            pcmBytes,
-                                                            mySessionId,
-                                                            myEpoch,
-                                                            currentGen,
-                                                            frameId
-                                                        )
-                                                    )
-                                                }
-                                            }
-                                        }
-
-                                        if (backlogOverflow) {
-                                            logManager.w(
-                                                "AudioStream",
-                                                "Превышен лимит бэклога. Controlled recovery."
-                                            )
-                                            if (
-                                                myEpoch == epoch &&
-                                                webSocket === sourceWebSocket
-                                            ) {
-                                                audioEngine.invalidateAndFlushPlayback(
-                                                    "server audio backlog overflow"
-                                                )
-                                            }
-                                            return@forEach
-                                        }
-
-                                        if (sendResult == null) {
-                                            releaseAudio(pcmBytes.size)
-                                            return@forEach
-                                        }
-
-                                        if (
-                                            sendResult.isFailure
-                                        ) {
-
-                                            releaseAudio(
-                                                pcmBytes.size
-                                            )
-
-                                            return@forEach
-                                        }
-                                    }
-                                }
-                        }
+                    } else {
+                        return
                     }
                 }
-
             }
 
-        } catch (e: Exception) {
+            (root["interactionStatus"] ?: root["interaction_status"])
+                ?.jsonPrimitive?.contentOrNull
+                ?.uppercase()
+                ?.takeIf { it == "IN_PROGRESS" || it == "IDLE" }
+                ?.let { status ->
+                    protocolPhase = if (status == "IN_PROGRESS") {
+                        ProtocolPhase.AWAITING_INTERACTION_IDLE
+                    } else {
+                        ProtocolPhase.READY
+                    }
+                    emitControl(GeminiEvent.InteractionStatus(status))
+                }
 
-            logManager.e(
-                "GeminiLive:Parse",
-                "Ошибка разбора входящего кадра: ${e.message}",
-                e
-            )
+            root["sessionResumptionUpdate"]?.jsonObject?.let { sru ->
+                val handle = sru["newHandle"]?.jsonPrimitive?.contentOrNull
+                    ?.takeIf { it.isNotBlank() }
+                val resumable = sru["resumable"]?.jsonPrimitive?.booleanOrNull ?: false
+                emitControl(GeminiEvent.ResumptionHandle(handle, resumable))
+            }
+
+            root["groundingMetadata"]?.jsonObject?.let {
+                emitData(GeminiEvent.GroundingMetadata(GroundingMetadata(it)))
+            }
+            root["urlContextMetadata"]?.jsonObject?.let {
+                emitData(GeminiEvent.UrlContextMetadata(UrlContextMetadata(it)))
+            }
+
+            root["goAway"]?.jsonObject?.let { goAway ->
+                val timeLeft = goAway["timeLeft"]?.jsonPrimitive?.contentOrNull?.let { raw ->
+                    if (raw.endsWith("s", true)) raw.dropLast(1).toDoubleOrNull()?.times(1000.0)?.toLong()
+                    else raw.toLongOrNull()
+                } ?: goAway["timeLeftMs"]?.jsonPrimitive?.longOrNull
+                emitControl(GeminiEvent.GoAway(timeLeft?.coerceAtLeast(0L)))
+            }
+
+            val sc = root["serverContent"]?.jsonObject
+            if (sc != null) {
+                val interrupted = sc["interrupted"]?.jsonPrimitive?.booleanOrNull == true
+                if (interrupted) {
+                    emitControl(GeminiEvent.Interrupted)
+                    serverGenerationOpen = false
+                }
+
+                extractTranscriptText(sc["interimInputTranscription"])
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { emitData(GeminiEvent.InputTranscript(it, interim = true)) }
+                extractTranscriptText(sc["inputTranscription"])
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { emitControl(GeminiEvent.InputTranscript(it, interim = false)) }
+                extractTranscriptText(sc["outputTranscription"])
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { emitControl(GeminiEvent.OutputTranscript(it)) }
+
+                if (!interrupted) {
+                    var audioIndex = 0
+                    sc["modelTurn"]?.jsonObject?.get("parts")?.jsonArray?.forEach { partEl ->
+                        val part = partEl.jsonObject
+                        val isThought = part["thought"]?.jsonPrimitive?.booleanOrNull == true
+                        if (!isThought) {
+                            part["text"]?.jsonPrimitive?.contentOrNull
+                                ?.takeIf { it.isNotBlank() }
+                                ?.let { emitData(GeminiEvent.ModelText(it)) }
+                        }
+                        val inline = part["inlineData"]?.jsonObject
+                        val mime = inline?.get("mimeType")?.jsonPrimitive?.contentOrNull.orEmpty()
+                        if (mime.startsWith("audio/pcm")) {
+                            val pcm = decodedPcmParts.getOrNull(audioIndex++) ?: return@forEach
+                            val generation = audioEngine.currentPlaybackGeneration
+                            val key = DataBudgetKey(mySessionId, myEpoch)
+                            var accepted = false
+                            val bytes = pcm.size.toLong()
+                            synchronized(sessionStateLock) {
+                                if (myEpoch == epoch && webSocket === sourceWebSocket) {
+                                    val perSession = audioBudgetBySession.computeIfAbsent(key) { AtomicLong(0L) }
+                                    val aggregate = perSession.get() + bytes
+                                    if (aggregate <= MAX_AI_AUDIO_BACKLOG_BYTES) {
+                                        perSession.addAndGet(bytes)
+                                        accepted = _audio.trySend(
+                                            AudioFrame(pcm, mySessionId, myEpoch, generation, frameId)
+                                        ).isSuccess
+                                        if (!accepted) {
+                                            audioBudgetBySession[key]?.let { c ->
+                                                if (c.addAndGet(-bytes) <= 0L) audioBudgetBySession.remove(key, c)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if (!accepted) {
+                                val backlog = audioBudgetBySession[key]?.get() ?: 0L
+                                if (backlog >= MAX_AI_AUDIO_BACKLOG_BYTES) {
+                                    audioEngine.invalidateAndFlushPlayback("server audio backlog overflow")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                root["toolCall"]?.jsonObject?.get("functionCalls")?.jsonArray
+                    ?.mapNotNull { fcEl ->
+                        val fc = fcEl.jsonObject
+                        val name = fc["name"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                        val id = fc["id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                        val args = fc["args"]?.jsonObject ?: buildJsonObject {}
+                        FunctionCall(name, id, args)
+                    }
+                    ?.takeIf { it.isNotEmpty() }
+                    ?.let { emitControl(GeminiEvent.ToolCall(it)) }
+
+                sc["generationComplete"]?.jsonPrimitive?.booleanOrNull?.takeIf { it }
+                    ?.let {
+                        emitControl(GeminiEvent.GenerationComplete)
+                        serverGenerationOpen = false
+                    }
+
+                sc["turnComplete"]?.jsonPrimitive?.booleanOrNull?.takeIf { it }
+                    ?.let { emitControl(GeminiEvent.TurnComplete) }
+
+                sc["toolCallCancellation"]?.jsonObject?.get("ids")?.jsonArray
+                    ?.mapNotNull { it.jsonPrimitive.contentOrNull }
+                    ?.takeIf { it.isNotEmpty() }
+                    ?.let { emitControl(GeminiEvent.ToolCallCancelled(it)) }
+            }
         }
     }
-
 
     private fun extractTranscriptText(element: JsonElement?): String? {
         return when (element) {
@@ -2618,14 +2275,18 @@ class GeminiProtobufLiveClient @Inject constructor(
 
             while (true) {
                 val frame = _audio.tryReceive().getOrNull() ?: break
-                releaseAudio(frame.pcm.size)
+                releaseAudio(frame)
             }
 
             while (true) {
                 val queued = _events.tryReceive().getOrNull() ?: break
                 if (queued.isDataPlane) {
-                    pendingDataEvents.updateAndGet {
-                        (it - 1L).coerceAtLeast(0L)
+                    queued.budgetKey?.let { key ->
+                        pendingDataBySession[key]?.let { counter ->
+                            if (counter.decrementAndGet() <= 0L) {
+                                pendingDataBySession.remove(key, counter)
+                            }
+                        }
                     }
                 }
             }
