@@ -7,6 +7,7 @@ import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Build
+import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import com.client.app.util.AppLogger
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -83,8 +84,6 @@ class AudioDeviceRouter @Inject constructor(
 
     suspend fun start(onRouteChange: (RouteProfile) -> Unit) {
         val initialProfile = synchronized(routeLock) {
-            // start()/stop()/route callbacks share one ownership lock so a new
-            // router session cannot race cleanup from the previous one.
             onRouteChangedListener = onRouteChange
 
             if (isCallbackRegistered) {
@@ -147,10 +146,6 @@ class AudioDeviceRouter @Inject constructor(
             }
         }
 
-        // setCommunicationDevice() is asynchronous. Do not let the native
-        // audio route open until Android reports the requested communication
-        // output as the actual current device. This removes the request-vs-
-        // reality race during initial startup.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
             initialProfile.outputDeviceId > 0) {
             val confirmed = awaitCommunicationDevice(
@@ -201,9 +196,6 @@ class AudioDeviceRouter @Inject constructor(
     private fun selectOptimalBluetoothSampleRate(device: AudioDeviceInfo): Int {
         val supportedRates = device.sampleRates
         if (supportedRates.isEmpty()) {
-            // Gemini Live output is fixed at 24 kHz. When the endpoint does not
-            // advertise a fixed list, use 24 kHz as the requested target and let
-            // the opened AAudio stream remain authoritative.
             return 24000
         }
 
@@ -214,10 +206,12 @@ class AudioDeviceRouter @Inject constructor(
             ?: 24000
     }
 
+    @RequiresApi(Build.VERSION_CODES.S)
     private suspend fun awaitCommunicationDevice(
         expectedDeviceId: Int,
         timeoutMs: Long
     ): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             val current = runCatching { audioManager.communicationDevice?.id }.getOrNull()
@@ -247,8 +241,6 @@ class AudioDeviceRouter @Inject constructor(
                 onRouteChangedListener?.invoke(newProfile)
             }
         }.onFailure {
-            // A transient permission/device query failure must not terminate
-            // the long-lived debounce collector. The next device event retries.
             logger.w("AudioDeviceRouter: ошибка проверки маршрута: ${it.message}")
         }
     }
@@ -285,7 +277,6 @@ class AudioDeviceRouter @Inject constructor(
             logger.w("AudioDeviceRouter: current communication device is no longer in the available communication set")
         }
 
-        // Явный поиск соответствующего микрофона гарнитуры (SCO / BLE Headset) в списке устройств ввода.
         val btInputDevice = if (hasBtPermission) {
             allInputs.firstOrNull { dev ->
                 dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
@@ -304,8 +295,6 @@ class AudioDeviceRouter @Inject constructor(
                 vadThresholdStart = 0.40f,
                 vadThresholdEnd = 0.20f,
                 deviceName = btOutputDevice.productName.toString().ifBlank { "Bluetooth communication device" },
-                // API 31+ communicationDevice is the authoritative output; Android
-                // selects the matching communication input automatically.
                 inputDeviceId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) 0 else btInputDevice?.id ?: 0,
                 outputDeviceId = btOutputDevice.id
             )
@@ -314,10 +303,6 @@ class AudioDeviceRouter @Inject constructor(
         }
     }
 
-    /**
-     * Mutates Android routing only in an explicit reconciliation phase.
-     * evaluateActiveProfileLocked() below is read-only with respect to routing.
-     */
     private fun reconcileRouteBindingLocked() {
         val hasBtPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             ContextCompat.checkSelfPermission(
@@ -359,8 +344,6 @@ class AudioDeviceRouter @Inject constructor(
         }
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-            // Pre-S routing is legacy SCO/speaker state and cannot expose the
-            // same authoritative communicationDevice property.
             bindSpeakerCommunication()
         }
     }
@@ -375,8 +358,6 @@ class AudioDeviceRouter @Inject constructor(
             if (currentComm?.id == device.id) {
                 true
             } else {
-                // On API 31+, Android selects the matching communication input
-                // automatically from the requested output communication device.
                 audioManager.setCommunicationDevice(device)
             }
         } else {
