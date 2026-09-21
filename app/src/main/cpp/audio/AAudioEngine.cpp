@@ -1,6 +1,7 @@
 #include "AAudioEngine.h"
 #include "NativeLogQueue.h"
 #include "dsp/NeonDspUtils.h"
+#include <dlfcn.h>
 
 #include <android/log.h>
 #include <pthread.h>
@@ -506,8 +507,14 @@ bool AAudioEngine::validateAndPublishPlaybackConfigLocked(int32_t requestedOutpu
     isExclusiveSharingActive_.store(
         AAudioStream_getSharingMode(playbackStream_) == AAUDIO_SHARING_MODE_EXCLUSIVE,
         std::memory_order_release);
+    bool mmapUsed = false;
+    typedef bool (*isMMapUsedFn_t)(AAudioStream*);
+    static auto fn_isMMapUsed = reinterpret_cast<isMMapUsedFn_t>(dlsym(RTLD_DEFAULT, "AAudioStream_isMMapUsed"));
+    if (fn_isMMapUsed != nullptr && playbackStream_ != nullptr) {
+        mmapUsed = fn_isMMapUsed(playbackStream_);
+    }
     isMmapActive_.store(
-        AAudioStream_isMMapUsed(playbackStream_),
+        mmapUsed,
         std::memory_order_release);
     return true;
 }

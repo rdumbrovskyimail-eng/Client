@@ -272,7 +272,7 @@ class AudioDeviceRouter @Inject constructor(
         val allInputs = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
 
         val btCandidates = if (hasBtPermission) {
-            (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) commDevices else allOutputs)
+            (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) commDevices else allOutputs.toList())
                 .filter { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
         } else emptyList()
 

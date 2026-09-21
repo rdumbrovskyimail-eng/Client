@@ -892,14 +892,16 @@ class GeminiProtobufLiveClient @Inject constructor(
                             AudioOutboundCommand.AudioStreamEnd ->
                                 buildJsonObject {
                                     putJsonObject(
-                                        "realtimeInput"
-                                    ) {
-                                        put(
-                                            "audioStreamEnd",
-                                            true
-                                        )
-                                    }
-                                }.toString()
+                                         "realtimeInput"
+                                     ) {
+                                         put(
+                                             "audioStreamEnd",
+                                             true
+                                         )
+                                     }
+                                 }.toString()
+
+                            is AudioOutboundCommand.Barrier -> ""
                         }
 
                     val sendAccepted =
@@ -1374,12 +1376,16 @@ class GeminiProtobufLiveClient @Inject constructor(
             return
         }
 
-        sendClientContentInternal(
-            turns = turns,
-            turnComplete = turnComplete,
-            targetWebSocket = ws,
-            expectedEpoch = sendEpoch
-        )
+        outboundDirectMutex.withLock {
+            if (awaitOutboundBarrier(sendEpoch, ws)) {
+                sendClientContentInternal(
+                    turns = turns,
+                    turnComplete = turnComplete,
+                    targetWebSocket = ws,
+                    expectedEpoch = sendEpoch
+                )
+            }
+        }
     }
 
     private fun sendClientContentInternal(
@@ -1441,16 +1447,12 @@ class GeminiProtobufLiveClient @Inject constructor(
         )
 
         val accepted: Boolean =
-            outboundDirectMutex.withLock {
-                val allowed = synchronized(sessionStateLock) {
-                    expectedEpoch == epoch &&
-                        webSocket === ws &&
-                        (targetWebSocket != null || isReady)
-                }
+            synchronized(sessionStateLock) {
+                val allowed = expectedEpoch == epoch &&
+                    webSocket === ws &&
+                    (targetWebSocket != null || isReady)
 
                 if (!allowed) {
-                    false
-                } else if (targetWebSocket == null && !awaitOutboundBarrier(expectedEpoch, ws)) {
                     false
                 } else {
                     synchronized(outboundSendLock) {
@@ -1613,7 +1615,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                 add(
                     buildJsonObject {
                         toolObj.forEach { (key, value) ->
-                            if (key != "functionDeclarations") add(key, value)
+                            if (key != "functionDeclarations") put(key, value)
                         }
 
                         putJsonArray("functionDeclarations") {
@@ -1631,7 +1633,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                                                 key == "behavior" &&
                                                 !capabilities.supportsAsyncFunctionCalling
                                             )) {
-                                                add(key, value)
+                                                put(key, value)
                                             }
                                         }
                                         if (capabilities.requiresNonBlockingTools) {

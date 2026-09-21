@@ -141,6 +141,7 @@ private:
     void stopPlaybackLocked();
     void closeCaptureStreamLocked();
     void closePlaybackStreamLocked();
+    bool openCaptureStreamLocked(int32_t inputDeviceId);
 
     bool waitForStreamState(AAudioStream* stream, aaudio_stream_state_t desired, int timeoutMs);
     bool validateAndPublishPlaybackConfigLocked(int32_t requestedOutputDeviceId);
