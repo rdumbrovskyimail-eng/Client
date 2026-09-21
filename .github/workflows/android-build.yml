@@ -46,7 +46,9 @@ jobs:
           distribution: 'temurin'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
       - name: Accept licenses
         run: yes | sdkmanager --licenses > /dev/null || true
@@ -54,25 +56,23 @@ jobs:
       - name: Install Android NDK
         run: sdkmanager "ndk;30.0.16248370"
 
-      - name: Prepare Gradle Wrapper
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.14.3'
 
-      - name: Ensure Gradle Wrapper Exists
+      - name: Generate Gradle Wrapper
         run: |
           set -euo pipefail
-          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
-            gradle wrapper --gradle-version 8.14.3 --distribution-type bin
-          fi
+          gradle wrapper --gradle-version 8.14.3 --distribution-type bin
           test -s gradle/wrapper/gradle-wrapper.jar
+          chmod +x gradlew
 
       - name: Validate Gradle Wrapper
         uses: gradle/actions/wrapper-validation@v4
 
       - name: Run unit tests, lint and build
         run: |
-          chmod +x gradlew
           ./gradlew testDebugUnitTest lintDebug assembleDebug --stacktrace --no-daemon --max-workers=2
 
       - name: Verify 16 KB ELF and APK alignment
