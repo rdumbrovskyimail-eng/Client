@@ -949,11 +949,12 @@ class GeminiProtobufLiveClient @Inject constructor(
                             protocolPhase = ProtocolPhase.CLOSING
                         }
                     }
+                    val failedSessionId = synchronized(sessionStateLock) { sessionId }
                     emitControlEvent(
                         GeminiEvent.Disconnected(
                             1011,
                             "realtime audio writer failed",
-                            mySessionId,
+                            failedSessionId,
                             writerEpoch
                         ),
                         writerEpoch

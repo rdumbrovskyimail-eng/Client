@@ -263,12 +263,9 @@ class NativeAudioEngine @Inject constructor(
         get() = playbackGeneration.get()
 
     fun setVadThresholds(start: Float, end: Float) {
-        desiredVadStart = start.coerceIn(0.05f, 0.95f)
-        desiredVadEnd = end.coerceIn(0.01f, desiredVadStart)
-        vadDetector.setThresholds(
-                            profile.vadThresholdStart,
-                            profile.vadThresholdEnd
-                        )
+        val s = start.coerceIn(0.05f, 0.95f)
+        val e = end.coerceIn(0.01f, s)
+        vadDetector.setThresholds(s, e)
     }
 
     @Volatile
@@ -1318,9 +1315,9 @@ class NativeAudioEngine @Inject constructor(
                                 recycleLeadInBuffersLocked()
                             }
                             vadDetector.setThresholds(
-                            profile.vadThresholdStart,
-                            profile.vadThresholdEnd
-                        )
+                                req.profile.vadThresholdStart,
+                                req.profile.vadThresholdEnd
+                            )
 
                             val playbackRecovered =
                                 !keepPlaying || bridge.startPlaybackAudio()

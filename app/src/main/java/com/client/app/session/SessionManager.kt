@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import com.client.app.api.*
 import com.client.app.attach.AnalysisResult
@@ -162,6 +163,7 @@ class SessionManager @Inject constructor(
     private val commandMutex = Mutex()
     private val transcriptLock = Any()
     private val userTurnMutex = Mutex()
+    private val toolResponseMutex = Mutex()
 
 
     private val _state = MutableStateFlow(SessionState(activePrompt = DEFAULT_SYSTEM_PROMPT))
@@ -312,8 +314,8 @@ class SessionManager @Inject constructor(
 
             resumptionHandle = null
             dataStore.edit {
-                remove(KEY_SESSION_RESUMPTION_HANDLE)
-                remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                it.remove(KEY_SESSION_RESUMPTION_HANDLE)
+                it.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
             }
             cancelReconnectWork()
             stopInternal(full = false)
@@ -677,8 +679,8 @@ class SessionManager @Inject constructor(
             !storedResumeFresh
         ) {
             dataStore.edit {
-                remove(KEY_SESSION_RESUMPTION_HANDLE)
-                remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                it.remove(KEY_SESSION_RESUMPTION_HANDLE)
+                it.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
             }
         }
         activeConnectUsedResumption = resume && (resumptionHandle?.isNotBlank() == true)
@@ -2371,8 +2373,8 @@ class SessionManager @Inject constructor(
 
                 if (hasStoredHandle || hasStoredTimestamp) {
                     dataStore.edit {
-                        remove(KEY_SESSION_RESUMPTION_HANDLE)
-                        remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                        it.remove(KEY_SESSION_RESUMPTION_HANDLE)
+                        it.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
                     }
                 }
                 resumptionHandle = null
