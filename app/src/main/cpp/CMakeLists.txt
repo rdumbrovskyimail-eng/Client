@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.22.1)
+
 project("client_core" LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
