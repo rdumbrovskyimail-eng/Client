@@ -7,6 +7,7 @@ import android.os.Build
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
@@ -15,6 +16,7 @@ import com.client.app.api.*
 import com.client.app.attach.AnalysisResult
 import com.client.app.attach.VocabItem
 import com.client.app.attach.VocabularyExtractor
+import com.client.app.audio.AudioFocusEvent
 import com.client.app.audio.AudioStreamEvent
 import com.client.app.audio.CaptureShutdownResult
 import com.client.app.audio.NativeAudioEngine
