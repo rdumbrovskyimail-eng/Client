@@ -51,8 +51,13 @@ class AttachmentProcessor @Inject constructor(
 
                 try {
                     when {
-                        // 1. Исходные файлы с кодом, разметкой и текстом:
-                        //    ограниченное потоковое чтение без полного readBytes().
+                        /*
+                         * Text/code attachments are read with a hard character
+                         * limit. They do not require image/vision processing at
+                         * this stage, but the resulting text is still model
+                         * input and therefore consumes ordinary input tokens
+                         * when included in an upstream model request.
+                         */
                         isTextFormat(mime, name) -> {
                             val txt =
                                 context.contentResolver
@@ -128,10 +133,12 @@ class AttachmentProcessor @Inject constructor(
                             }
                         }
 
-                        // 2. PDF-документы:
-                        //    цифровой text layer извлекается отдельно;
-                        //    страницы без достаточного text layer
-                        //    только рендерятся в изображения.
+                        /*
+                         * PDF:
+                         * - extract a digital text layer where available;
+                         * - otherwise render the page to a raster image;
+                         * - no OCR engine is executed here.
+                         */
                         mime == "application/pdf" ||
                             name.endsWith(".pdf", true) -> {
 
@@ -155,11 +162,6 @@ class AttachmentProcessor @Inject constructor(
                                 images.addAll(pdf.images)
                             }
 
-                            /*
-                             * Important: these pages are rendered raster
-                             * images, not OCR results. OCR is not performed
-                             * by AttachmentProcessor.
-                             */
                             val rasterCount =
                                 pdf.images.size
 
@@ -173,8 +175,7 @@ class AttachmentProcessor @Inject constructor(
                             )
                         }
 
-                        // 3. Растровые изображения с аппаратной
-                        //    коррекцией EXIF-ориентации.
+                        // Raster images with EXIF orientation correction.
                         mime.startsWith("image/") ||
                             isImageExtension(name) -> {
 
@@ -275,7 +276,6 @@ class AttachmentProcessor @Inject constructor(
     ): ByteArray? {
         val cr = context.contentResolver
 
-        // Определение ориентации сенсора камеры.
         val orientation =
             runCatching {
                 cr.openInputStream(uri)?.use { stream ->
@@ -319,8 +319,6 @@ class AttachmentProcessor @Inject constructor(
                 matrix.setRotate(270f)
         }
 
-        // Замер исходных габаритов без выделения памяти
-        // под пиксели.
         val bounds =
             BitmapFactory.Options().apply {
                 inJustDecodeBounds = true
@@ -502,15 +500,6 @@ class AttachmentProcessor @Inject constructor(
                                     }
                                 }
 
-                                /*
-                                 * A sufficiently populated digital text
-                                 * layer is kept as text and the page is not
-                                 * rasterized.
-                                 *
-                                 * Otherwise the page is only rendered as
-                                 * an image for subsequent vision/model
-                                 * processing. No OCR engine runs here.
-                                 */
                                 if (
                                     pageText.length >= 60
                                 ) {
