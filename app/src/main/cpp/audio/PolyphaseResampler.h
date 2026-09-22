@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cmath>
+#include <limits>
 
 namespace client::audio {
 
@@ -34,8 +35,15 @@ public:
         size_t totalOut = 0;
 
         while (processedIn < inFrames) {
-            size_t currentChunk = std::min(inFrames - processedIn, CHUNK_SIZE);
-            totalOut += processChunk(in + processedIn, currentChunk, out + totalOut);
+            size_t currentChunk =
+                std::min(inFrames - processedIn, CHUNK_SIZE);
+
+            totalOut += processChunk(
+                in + processedIn,
+                currentChunk,
+                out + totalOut
+            );
+
             processedIn += currentChunk;
         }
 
@@ -43,49 +51,114 @@ public:
     }
 
 private:
-    size_t processChunk(const int16_t* in, size_t inFrames, int16_t* out) {
-        static const int32_t H0[6] = { -151, -1039, 11689, 20454,  2522, -707 };
-        static const int32_t H1[6] = { -707,  2522, 20454, 11689, -1039, -151 };
+    size_t processChunk(
+        const int16_t* in,
+        size_t inFrames,
+        int16_t* out
+    ) {
+        static const int32_t H0[6] = {
+            -151, -1039, 11689, 20454, 2522, -707
+        };
+
+        static const int32_t H1[6] = {
+            -707, 2522, 20454, 11689, -1039, -151
+        };
 
         int16_t workBuf[CHUNK_SIZE + FILTER_ORDER];
-        std::memcpy(workBuf, historyBuf_, FILTER_ORDER * sizeof(int16_t));
-        std::memcpy(workBuf + FILTER_ORDER, in, inFrames * sizeof(int16_t));
-        const size_t totalFrames = FILTER_ORDER + inFrames;
+
+        std::memcpy(
+            workBuf,
+            historyBuf_,
+            FILTER_ORDER * sizeof(int16_t)
+        );
+
+        std::memcpy(
+            workBuf + FILTER_ORDER,
+            in,
+            inFrames * sizeof(int16_t)
+        );
+
+        const size_t totalFrames =
+            FILTER_ORDER + inFrames;
 
         size_t outFrames = 0;
-        size_t inputIndex = FILTER_ORDER + static_cast<size_t>(offset_);
+
+        size_t inputIndex =
+            FILTER_ORDER +
+            static_cast<size_t>(offset_);
 
         while (inputIndex < totalFrames) {
-            const int32_t* H = (phase_ == 0) ? H0 : H1;
+            const int32_t* H =
+                (phase_ == 0)
+                    ? H0
+                    : H1;
 
-            const int64_t acc = static_cast<int64_t>(H[0]) * workBuf[inputIndex]     +
-                                static_cast<int64_t>(H[1]) * workBuf[inputIndex - 1] +
-                                static_cast<int64_t>(H[2]) * workBuf[inputIndex - 2] +
-                                static_cast<int64_t>(H[3]) * workBuf[inputIndex - 3] +
-                                static_cast<int64_t>(H[4]) * workBuf[inputIndex - 4] +
-                                static_cast<int64_t>(H[5]) * workBuf[inputIndex - 5];
+            const int64_t acc =
+                static_cast<int64_t>(H[0]) *
+                    workBuf[inputIndex] +
+                static_cast<int64_t>(H[1]) *
+                    workBuf[inputIndex - 1] +
+                static_cast<int64_t>(H[2]) *
+                    workBuf[inputIndex - 2] +
+                static_cast<int64_t>(H[3]) *
+                    workBuf[inputIndex - 3] +
+                static_cast<int64_t>(H[4]) *
+                    workBuf[inputIndex - 4] +
+                static_cast<int64_t>(H[5]) *
+                    workBuf[inputIndex - 5];
 
-            out[outFrames++] = static_cast<int16_t>(std::clamp<int32_t>(static_cast<int32_t>(acc >> 15), -32768, 32767));
+            out[outFrames++] =
+                static_cast<int16_t>(
+                    std::clamp<int32_t>(
+                        static_cast<int32_t>(acc >> 15),
+                        -32768,
+                        32767
+                    )
+                );
 
-            const int32_t step = phase_ + 3;
-            inputIndex += static_cast<size_t>(step / 2);
-            phase_ = step % 2;
+            const int32_t step =
+                phase_ + 3;
+
+            inputIndex +=
+                static_cast<size_t>(
+                    step / 2
+                );
+
+            phase_ =
+                step % 2;
         }
 
-        offset_ = static_cast<int32_t>(inputIndex - totalFrames);
-        std::memcpy(historyBuf_, workBuf + totalFrames - FILTER_ORDER, FILTER_ORDER * sizeof(int16_t));
+        offset_ =
+            static_cast<int32_t>(
+                inputIndex - totalFrames
+            );
+
+        std::memcpy(
+            historyBuf_,
+            workBuf + totalFrames - FILTER_ORDER,
+            FILTER_ORDER * sizeof(int16_t)
+        );
+
         return outFrames;
     }
 
-    alignas(16) int16_t historyBuf_[FILTER_ORDER]{0};
+    alignas(16)
+    int16_t historyBuf_[FILTER_ORDER]{0};
+
     int32_t phase_{0};
     int32_t offset_{0};
 };
 
 /**
- * ИСПРАВЛЕННЫЙ Дециматор 3:1 (48 кГц -> 16 кГц) для микрофонного тракта.
- * Исключает замирание микрофона: кольцевой аккумулятор phase_ строго в пределах [0..2].
- * Устраняет поднормальное переполнение size_t и гарантирует непрерывную отдачу фреймов в VAD.
+ * Исправленный дециматор 3:1 (48 кГц -> 16 кГц)
+ * для микрофонного тракта.
+ *
+ * Инвариант:
+ * phase_ всегда находится в диапазоне [0..2].
+ *
+ * Перед обработкой выполняется точный расчёт количества
+ * выходных фреймов. Если maxOutFrames недостаточен,
+ * функция возвращает 0 и НЕ изменяет phase_ или history_.
  */
 class Decimator48To16 {
 public:
@@ -96,63 +169,180 @@ public:
     }
 
     void reset() {
-        std::memset(history_, 0, sizeof(history_));
+        std::memset(
+            history_,
+            0,
+            sizeof(history_)
+        );
+
         phase_ = 0;
     }
 
-    size_t process(const int16_t* in, size_t inFrames, int16_t* out, size_t maxOutFrames) {
-        if (in == nullptr || out == nullptr || inFrames == 0 || maxOutFrames == 0) return 0;
+    size_t process(
+        const int16_t* in,
+        size_t inFrames,
+        int16_t* out,
+        size_t maxOutFrames
+    ) {
+        if (
+            in == nullptr ||
+            out == nullptr ||
+            inFrames == 0 ||
+            maxOutFrames == 0
+        ) {
+            return 0;
+        }
 
         static const int32_t COEFFS[TAPS] = {
-            -180, -320, 450, 2400, 5800, 8234, 8234, 5800, 2400, 450, -320, -180
+            -180,
+            -320,
+            450,
+            2400,
+            5800,
+            8234,
+            8234,
+            5800,
+            2400,
+            450,
+            -320,
+            -180
         };
+
+        /*
+         * Точный preflight количества output samples.
+         *
+         * Для phase:
+         *   0 -> первый output на input[0]
+         *   1 -> первый output на input[2]
+         *   2 -> первый output на input[1]
+         *
+         * После первого output следующий появляется через каждые 3
+         * входных frame.
+         */
+        const size_t phase =
+            static_cast<size_t>(phase_);
+
+        const size_t firstOutputOffset =
+            (3u - phase) % 3u;
+
+        const size_t requiredOut =
+            firstOutputOffset < inFrames
+                ? 1u +
+                    (
+                        inFrames -
+                        1u -
+                        firstOutputOffset
+                    ) /
+                        3u
+                : 0u;
+
+        /*
+         * Главное условие транзакционности:
+         * при недостаточном output capacity нельзя частично
+         * продвинуть phase_ и затем продолжить со следующего chunk.
+         */
+        if (requiredOut > maxOutFrames) {
+            return 0;
+        }
 
         size_t outCount = 0;
 
         for (size_t i = 0; i < inFrames; ++i) {
             if (phase_ == 0) {
-                if (outCount >= maxOutFrames) break;
-
                 int64_t acc = 0;
+
                 for (size_t t = 0; t < TAPS; ++t) {
-                    const int32_t sample = (i >= t)
-                        ? static_cast<int32_t>(in[i - t])
-                        : static_cast<int32_t>(history_[TAPS + (static_cast<int32_t>(i) - static_cast<int32_t>(t))]);
-                    acc += static_cast<int64_t>(COEFFS[t]) * sample;
+                    const int32_t sample =
+                        (i >= t)
+                            ? static_cast<int32_t>(
+                                  in[i - t]
+                              )
+                            : static_cast<int32_t>(
+                                  history_[
+                                      static_cast<size_t>(
+                                          static_cast<int64_t>(TAPS) +
+                                          static_cast<int64_t>(i) -
+                                          static_cast<int64_t>(t)
+                                      )
+                                  ]
+                              );
+
+                    acc +=
+                        static_cast<int64_t>(
+                            COEFFS[t]
+                        ) *
+                        sample;
                 }
-                out[outCount++] = static_cast<int16_t>(std::clamp<int32_t>(static_cast<int32_t>(acc >> 15), -32768, 32767));
+
+                out[outCount++] =
+                    static_cast<int16_t>(
+                        std::clamp<int32_t>(
+                            static_cast<int32_t>(
+                                acc >> 15
+                            ),
+                            -32768,
+                            32767
+                        )
+                    );
             }
-            phase_ = (phase_ + 1) % 3;
+
+            phase_ =
+                (phase_ + 1) % 3;
         }
 
-        // Обновление циклической истории без повреждения границ буфера
+        /*
+         * History обновляется только после полностью завершённой
+         * обработки всего входного блока.
+         */
         if (inFrames >= TAPS) {
-            std::memcpy(history_, in + inFrames - TAPS, TAPS * sizeof(int16_t));
+            std::memcpy(
+                history_,
+                in + inFrames - TAPS,
+                TAPS * sizeof(int16_t)
+            );
         } else {
-            std::memmove(history_, history_ + inFrames, (TAPS - inFrames) * sizeof(int16_t));
-            std::memcpy(history_ + (TAPS - inFrames), in, inFrames * sizeof(int16_t));
+            std::memmove(
+                history_,
+                history_ + inFrames,
+                (TAPS - inFrames) * sizeof(int16_t)
+            );
+
+            std::memcpy(
+                history_ + (TAPS - inFrames),
+                in,
+                inFrames * sizeof(int16_t)
+            );
         }
 
         return outCount;
     }
 
 private:
-    alignas(16) int16_t history_[TAPS]{0};
+    alignas(16)
+    int16_t history_[TAPS]{0};
+
     int32_t phase_{0};
 };
 
 /**
- * Stateful 2:1 FIR decimator (32 kHz -> 16 kHz) for microphone capture.
+ * Stateful 2:1 FIR decimator (32 kHz -> 16 kHz)
+ * for microphone capture.
  *
- * The filter is a 95-tap linear-phase low-pass designed for a 7 kHz
- * passband and 8.5 kHz stopband at the 32 kHz input rate. Coefficients are
- * stored in Q30 with unity DC gain. The implementation uses the filter
- * symmetry and a contiguous history/work buffer, so the inner convolution
- * contains no per-tap boundary branch and performs 48 MACs per produced
- * sample. State survives process() chunk boundaries.
+ * The filter is a 95-tap linear-phase low-pass designed
+ * for a 7 kHz passband and 8.5 kHz stopband at the
+ * 32 kHz input rate.
  *
- * The first real input sample primes the history so a constant input starts
- * without an artificial zero-state transient.
+ * Coefficients are stored in Q30 with unity DC gain.
+ *
+ * The implementation uses filter symmetry and a contiguous
+ * history/work buffer, so the inner convolution contains
+ * no per-tap boundary branch.
+ *
+ * State survives process() chunk boundaries.
+ *
+ * The first real input sample primes the history so a
+ * constant input starts without an artificial zero-state
+ * transient.
  */
 class Decimator32To16 {
 public:
@@ -166,7 +356,12 @@ public:
     }
 
     void reset() {
-        std::memset(history_, 0, sizeof(history_));
+        std::memset(
+            history_,
+            0,
+            sizeof(history_)
+        );
+
         phase_ = 0;
         primed_ = false;
     }
@@ -175,20 +370,35 @@ public:
         const int16_t* in,
         size_t inFrames,
         int16_t* out,
-        size_t maxOutFrames) {
-
-        if (in == nullptr || out == nullptr || inFrames == 0 ||
-            maxOutFrames == 0) {
+        size_t maxOutFrames
+    ) {
+        if (
+            in == nullptr ||
+            out == nullptr ||
+            inFrames == 0 ||
+            maxOutFrames == 0
+        ) {
             return 0;
         }
 
         const size_t requiredOut =
             (inFrames / 2) +
-            ((phase_ == 0 && (inFrames & 1u) != 0u) ? 1u : 0u);
+            (
+                (
+                    phase_ == 0 &&
+                    (inFrames & 1u) != 0u
+                )
+                    ? 1u
+                    : 0u
+            );
 
-        // Never partially consume an input block when the caller did not
-        // provide enough output capacity; otherwise phase/history would no
-        // longer describe the samples actually consumed.
+        /*
+         * Никогда не частично потребляем входной chunk,
+         * если output capacity недостаточен.
+         *
+         * Иначе phase/history перестанут описывать реально
+         * потреблённые samples.
+         */
         if (requiredOut > maxOutFrames) {
             return 0;
         }
@@ -197,7 +407,9 @@ public:
             std::fill(
                 history_,
                 history_ + HISTORY,
-                in[0]);
+                in[0]
+            );
+
             primed_ = true;
         }
 
@@ -210,11 +422,11 @@ public:
             7652181,   1995049,  -9251823,  -3834797,  10938368,
            6342900, -12665461,  -9701107,  14380258,  14179417,
          -16026032, -20225409,  17544313,  28673636, -18878210,
-         -41317058,  19975994,  62851763, -20793951,-110595642,
-          21298709, 340809654, 515664194, 340809654,  21298709,
-        -110595642,-20793951,  62851763,  19975994,-41317058,
-         -18878210,  28673636,  17544313,-20225409,-16026032,
-          14179417,  14380258,  -9701107,-12665461,   6342900,
+         -41317058,  19975994,  62851763, -20793951, -110595642,
+          21298709,  340809654,  515664194,  340809654,  21298709,
+        -110595642, -20793951,  62851763,  19975994, -41317058,
+         -18878210,  28673636,  17544313, -20225409, -16026032,
+          14179417,  14380258,  -9701107, -12665461,   6342900,
           10938368,  -3834797,  -9251823,   1995049,   7652181,
            -688534,  -6176465,   -191699,   4853231,    736628,
           -3699732,  -1023827,   2724099,   1120958,  -1924923,
@@ -228,51 +440,92 @@ public:
 
         while (processed < inFrames) {
             const size_t chunk =
-                std::min(inFrames - processed, CHUNK_SIZE);
+                std::min(
+                    inFrames - processed,
+                    CHUNK_SIZE
+                );
 
-            const int16_t* chunkIn = in + processed;
+            const int16_t* chunkIn =
+                in + processed;
+
             std::memcpy(
                 workBuffer_,
                 history_,
-                HISTORY * sizeof(int16_t));
+                HISTORY * sizeof(int16_t)
+            );
+
             std::memcpy(
                 workBuffer_ + HISTORY,
                 chunkIn,
-                chunk * sizeof(int16_t));
+                chunk * sizeof(int16_t)
+            );
 
             const size_t base = HISTORY;
 
             for (size_t i = 0; i < chunk; ++i) {
-                const size_t idx = base + i;
+                const size_t idx =
+                    base + i;
 
                 if (phase_ == 0) {
                     int64_t acc = 0;
 
-                    // Symmetric 95-tap FIR: 47 mirrored pairs + center.
+                    /*
+                     * Symmetric 95-tap FIR:
+                     * 47 mirrored pairs + center.
+                     */
                     for (size_t k = 0; k < HALF_TAPS; ++k) {
                         const int32_t pair =
-                            static_cast<int32_t>(workBuffer_[idx - k]) +
-                            static_cast<int32_t>(workBuffer_[idx - (TAPS - 1 - k)]);
+                            static_cast<int32_t>(
+                                workBuffer_[idx - k]
+                            ) +
+                            static_cast<int32_t>(
+                                workBuffer_[
+                                    idx -
+                                    (
+                                        TAPS - 1 - k
+                                    )
+                                ]
+                            );
+
                         acc +=
-                            static_cast<int64_t>(COEFFS[k]) * pair;
+                            static_cast<int64_t>(
+                                COEFFS[k]
+                            ) *
+                            pair;
                     }
 
                     acc +=
-                        static_cast<int64_t>(COEFFS[HALF_TAPS]) *
-                        static_cast<int32_t>(workBuffer_[idx - HALF_TAPS]);
+                        static_cast<int64_t>(
+                            COEFFS[HALF_TAPS]
+                        ) *
+                        static_cast<int32_t>(
+                            workBuffer_[
+                                idx - HALF_TAPS
+                            ]
+                        );
 
-                    constexpr int64_t HALF = 1LL << 29;
+                    constexpr int64_t HALF =
+                        1LL << 29;
+
                     const int64_t rounded =
                         acc >= 0
-                            ? (acc + HALF) >> 30
-                            : -(((-acc) + HALF) >> 30);
+                            ? (
+                                acc + HALF
+                            ) >> 30
+                            : -(
+                                (
+                                    (-acc) + HALF
+                                ) >> 30
+                            );
 
                     out[totalOut++] =
                         static_cast<int16_t>(
                             std::clamp<int64_t>(
                                 rounded,
                                 -32768,
-                                32767));
+                                32767
+                            )
+                        );
                 }
 
                 phase_ ^= 1u;
@@ -281,17 +534,31 @@ public:
             if (chunk >= HISTORY) {
                 std::memcpy(
                     history_,
-                    workBuffer_ + HISTORY + chunk - HISTORY,
-                    HISTORY * sizeof(int16_t));
+                    workBuffer_ +
+                        HISTORY +
+                        chunk -
+                        HISTORY,
+                    HISTORY * sizeof(int16_t)
+                );
             } else {
                 std::memmove(
                     history_,
                     history_ + chunk,
-                    (HISTORY - chunk) * sizeof(int16_t));
+                    (
+                        HISTORY -
+                        chunk
+                    ) * sizeof(int16_t)
+                );
+
                 std::memcpy(
-                    history_ + (HISTORY - chunk),
+                    history_ +
+                        (
+                            HISTORY -
+                            chunk
+                        ),
                     chunkIn,
-                    chunk * sizeof(int16_t));
+                    chunk * sizeof(int16_t)
+                );
             }
 
             processed += chunk;
@@ -301,8 +568,12 @@ public:
     }
 
 private:
-    alignas(16) int16_t history_[HISTORY]{0};
-    alignas(16) int16_t workBuffer_[HISTORY + CHUNK_SIZE]{0};
+    alignas(16)
+    int16_t history_[HISTORY]{0};
+
+    alignas(16)
+    int16_t workBuffer_[HISTORY + CHUNK_SIZE]{0};
+
     uint32_t phase_{0};
     bool primed_{false};
 };
@@ -310,16 +581,17 @@ private:
 /**
  * 2x half-band FIR interpolator, 24 kHz -> 48 kHz.
  *
- * The public class name is retained for source/API compatibility with the
- * existing AAudioEngine. The implementation is deliberately no longer a
- * look-ahead cubic interpolator: a linear-phase half-band filter gives an
- * exactly 2:1 sample count, deterministic chunk boundaries, and no EOS
- * flush dependency. The 127-tap design has a 12 kHz half-band transition and
- * strong image rejection above the source Nyquist region.
+ * The public class name is retained for source/API compatibility
+ * with the existing AAudioEngine.
  *
- * Polyphase form uses 64 even-phase coefficients and one non-zero odd-phase
- * center coefficient. The history is primed with the first real sample, so
- * constant input has no artificial zero-state startup transient.
+ * The implementation is a linear-phase half-band filter with
+ * an exactly 2:1 sample count and deterministic chunk boundaries.
+ *
+ * The 127-tap design uses polyphase processing with 64 even-phase
+ * coefficients and one non-zero odd-phase center coefficient.
+ *
+ * The history is primed with the first real sample, so constant
+ * input has no artificial zero-state startup transient.
  */
 class HalfbandResampler24To48 {
 public:
@@ -334,16 +606,25 @@ public:
     }
 
     void reset() {
-        std::memset(history_, 0, sizeof(history_));
+        std::memset(
+            history_,
+            0,
+            sizeof(history_)
+        );
+
         primed_ = false;
     }
 
     size_t process(
         const int16_t* in,
         size_t inFrames,
-        int16_t* out) {
-
-        if (in == nullptr || out == nullptr || inFrames == 0) {
+        int16_t* out
+    ) {
+        if (
+            in == nullptr ||
+            out == nullptr ||
+            inFrames == 0
+        ) {
             return 0;
         }
 
@@ -354,7 +635,9 @@ public:
             std::fill(
                 history_,
                 history_ + HISTORY,
-                in[0]);
+                in[0]
+            );
+
             primed_ = true;
         }
 
@@ -377,67 +660,128 @@ public:
             135307, -76308, 37855, -12983
         };
 
-
         while (processed < inFrames) {
             const size_t chunk =
-                std::min(inFrames - processed, CHUNK_SIZE);
+                std::min(
+                    inFrames - processed,
+                    CHUNK_SIZE
+                );
 
-            const int16_t* chunkIn = in + processed;
+            const int16_t* chunkIn =
+                in + processed;
+
             std::memcpy(
                 workBuffer_,
                 history_,
-                HISTORY * sizeof(int16_t));
+                HISTORY * sizeof(int16_t)
+            );
+
             std::memcpy(
                 workBuffer_ + HISTORY,
                 chunkIn,
-                chunk * sizeof(int16_t));
+                chunk * sizeof(int16_t)
+            );
 
             const size_t base = HISTORY;
 
             for (size_t i = 0; i < chunk; ++i) {
-                const size_t idx = base + i;
+                const size_t idx =
+                    base + i;
 
                 int64_t evenAcc = 0;
+
                 for (size_t k = 0; k < EVEN_PAIRS; ++k) {
                     const int32_t pair =
-                        static_cast<int32_t>(workBuffer_[idx - k]) +
-                        static_cast<int32_t>(workBuffer_[idx - (HISTORY - k)]);
+                        static_cast<int32_t>(
+                            workBuffer_[idx - k]
+                        ) +
+                        static_cast<int32_t>(
+                            workBuffer_[
+                                idx -
+                                (
+                                    HISTORY -
+                                    k
+                                )
+                            ]
+                        );
+
                     evenAcc +=
-                        static_cast<int64_t>(EVEN_COEFFS[k]) * pair;
+                        static_cast<int64_t>(
+                            EVEN_COEFFS[k]
+                        ) *
+                        pair;
                 }
 
                 const int64_t evenRounded =
                     evenAcc >= 0
-                        ? (evenAcc + (1LL << 29)) >> 30
-                        : -(((-evenAcc) + (1LL << 29)) >> 30);
+                        ? (
+                            evenAcc +
+                            (
+                                1LL << 29
+                            )
+                        ) >> 30
+                        : -(
+                            (
+                                (-evenAcc) +
+                                (
+                                    1LL << 29
+                                )
+                            ) >> 30
+                        );
 
-                // h[63] = 1.0 Q30; all other odd taps are exactly zero.
+                /*
+                 * h[63] = 1.0 Q30;
+                 * all other odd taps are zero.
+                 */
                 const int16_t oddSample =
-                    workBuffer_[idx - (HISTORY / 2)];
+                    workBuffer_[
+                        idx -
+                        (
+                            HISTORY / 2
+                        )
+                    ];
 
                 out[totalOut++] =
                     static_cast<int16_t>(
                         std::clamp<int64_t>(
                             evenRounded,
                             -32768,
-                            32767));
-                out[totalOut++] = oddSample;
+                            32767
+                        )
+                    );
+
+                out[totalOut++] =
+                    oddSample;
             }
 
             if (chunk >= HISTORY) {
                 std::memcpy(
                     history_,
-                    workBuffer_ + HISTORY + chunk - HISTORY,
-                    HISTORY * sizeof(int16_t));
+                    workBuffer_ +
+                        HISTORY +
+                        chunk -
+                        HISTORY,
+                    HISTORY * sizeof(int16_t)
+                );
             } else {
                 std::memmove(
                     history_,
                     history_ + chunk,
-                    (HISTORY - chunk) * sizeof(int16_t));
+                    (
+                        HISTORY -
+                        chunk
+                    ) * sizeof(int16_t)
+                );
+
                 std::memcpy(
-                    history_ + (HISTORY - chunk),
+                    history_ +
+                        (
+                            HISTORY -
+                            chunk
+                        ),
                     chunkIn,
-                    chunk * sizeof(int16_t));
+                    chunk * sizeof(int16_t)
+                );
             }
 
             processed += chunk;
@@ -447,8 +791,12 @@ public:
     }
 
 private:
-    alignas(16) int16_t history_[HISTORY]{0};
-    alignas(16) int16_t workBuffer_[HISTORY + CHUNK_SIZE]{0};
+    alignas(16)
+    int16_t history_[HISTORY]{0};
+
+    alignas(16)
+    int16_t workBuffer_[HISTORY + CHUNK_SIZE]{0};
+
     bool primed_{false};
 };
 
@@ -457,24 +805,42 @@ private:
  *
  * The source clock is represented as one continuous fractional position,
  * so a non-integer conversion ratio does not restart at zero at every chunk.
+ *
  * This is intentionally simple and allocation-free; the fixed 24->16 and
  * 24->48 paths above remain the higher-quality production filters.
+ *
+ * Important invariant:
+ * state mutation is transactional with respect to maxOutFrames.
+ * If the supplied output buffer is too small, the function returns 0
+ * without changing phase/history.
  */
 class StreamingLinearResampler {
 public:
     StreamingLinearResampler() = default;
 
-    void configure(int32_t inputRate, int32_t outputRate) {
-        if (inputRate <= 0 || outputRate <= 0) {
+    void configure(
+        int32_t inputRate,
+        int32_t outputRate
+    ) {
+        if (
+            inputRate <= 0 ||
+            outputRate <= 0
+        ) {
             reset();
+
             inputRate_ = 0;
             outputRate_ = 0;
+
             return;
         }
 
-        if (inputRate_ != inputRate || outputRate_ != outputRate) {
+        if (
+            inputRate_ != inputRate ||
+            outputRate_ != outputRate
+        ) {
             inputRate_ = inputRate;
             outputRate_ = outputRate;
+
             reset();
         }
     }
@@ -490,11 +856,16 @@ public:
         const int16_t* in,
         size_t inFrames,
         int16_t* out,
-        size_t maxOutFrames) {
-
-        if (in == nullptr || out == nullptr ||
-            inFrames == 0 || maxOutFrames == 0 ||
-            inputRate_ <= 0 || outputRate_ <= 0) {
+        size_t maxOutFrames
+    ) {
+        if (
+            in == nullptr ||
+            out == nullptr ||
+            inFrames == 0 ||
+            maxOutFrames == 0 ||
+            inputRate_ <= 0 ||
+            outputRate_ <= 0
+        ) {
             return 0;
         }
 
@@ -502,81 +873,239 @@ public:
             static_cast<double>(inputRate_) /
             static_cast<double>(outputRate_);
 
-        // Local logical source sequence. When history exists, element 0 is
-        // the previous chunk's final sample and element 1 is in[0].
-        // phase_ is normalized to [0, 1); no absolute frame counter exists.
-        const bool hadPreviousSample = hasPreviousSample_;
-        const size_t logicalSize =
-            inFrames + (hadPreviousSample ? 1u : 0u);
+        /*
+         * The history representation adds one logical source sample:
+         *
+         *   logical[0] = previousSample_
+         *   logical[1] = in[0]
+         *   logical[2] = in[1]
+         *   ...
+         *
+         * Only when a previous sample exists.
+         */
+        const bool hadPreviousSample =
+            hasPreviousSample_;
 
+        /*
+         * Prevent logicalSize overflow in the only case where
+         * we add one element.
+         */
+        if (
+            hadPreviousSample &&
+            inFrames ==
+                std::numeric_limits<size_t>::max()
+        ) {
+            return 0;
+        }
+
+        const size_t logicalSize =
+            inFrames +
+            (
+                hadPreviousSample
+                    ? 1u
+                    : 0u
+            );
+
+        auto sampleAt =
+            [&](
+                size_t logicalIndex
+            ) -> int32_t {
+                if (
+                    hadPreviousSample &&
+                    logicalIndex == 0u
+                ) {
+                    return static_cast<int32_t>(
+                        previousSample_
+                    );
+                }
+
+                const size_t localIndex =
+                    hadPreviousSample
+                        ? logicalIndex - 1u
+                        : logicalIndex;
+
+                if (localIndex >= inFrames) {
+                    return static_cast<int32_t>(
+                        in[inFrames - 1u]
+                    );
+                }
+
+                return static_cast<int32_t>(
+                    in[localIndex]
+                );
+            };
+
+        /*
+         * --------------------------
+         * 1. Preflight / simulation
+         * --------------------------
+         *
+         * Do not mutate object state.
+         *
+         * This simulation follows exactly the same source-index/phase
+         * evolution as the actual conversion below.
+         */
+        size_t requiredOut = 0;
+
+        size_t simulatedSourceIndex =
+            sourceIndex_;
+
+        double simulatedPhase =
+            phase_;
+
+        while (
+            simulatedSourceIndex + 1u <
+            logicalSize
+        ) {
+            if (requiredOut == maxOutFrames) {
+                /*
+                 * The whole input chunk cannot be represented in the
+                 * caller-provided output buffer.
+                 *
+                 * Crucially: object state is untouched.
+                 */
+                return 0;
+            }
+
+            ++requiredOut;
+
+            const double advancedPhase =
+                simulatedPhase +
+                step;
+
+            const double wholePart =
+                std::floor(
+                    advancedPhase
+                );
+
+            simulatedPhase =
+                advancedPhase -
+                wholePart;
+
+            simulatedSourceIndex +=
+                static_cast<size_t>(
+                    wholePart
+                );
+        }
+
+        /*
+         * --------------------------
+         * 2. Actual conversion
+         * --------------------------
+         *
+         * State is still local.
+         */
         size_t outCount = 0;
 
-        auto sampleAt = [&](size_t logicalIndex) -> int32_t {
-            if (hadPreviousSample && logicalIndex == 0u) {
-                return static_cast<int32_t>(previousSample_);
-            }
+        size_t localSourceIndex =
+            sourceIndex_;
 
-            const size_t localIndex =
-                hadPreviousSample
-                    ? logicalIndex - 1u
-                    : logicalIndex;
+        double localPhase =
+            phase_;
 
-            if (localIndex >= inFrames) {
-                return static_cast<int32_t>(in[inFrames - 1u]);
-            }
+        while (
+            localSourceIndex + 1u <
+            logicalSize
+        ) {
+            const int32_t s0 =
+                sampleAt(
+                    localSourceIndex
+                );
 
-            return static_cast<int32_t>(in[localIndex]);
-        };
-
-        while (outCount < maxOutFrames) {
-            if (sourceIndex_ + 1u >= logicalSize) {
-                break;
-            }
-
-            const int32_t s0 = sampleAt(sourceIndex_);
-            const int32_t s1 = sampleAt(sourceIndex_ + 1u);
+            const int32_t s1 =
+                sampleAt(
+                    localSourceIndex + 1u
+                );
 
             const double interpolated =
                 static_cast<double>(s0) +
-                (static_cast<double>(s1) -
-                 static_cast<double>(s0)) *
-                    phase_;
+                (
+                    static_cast<double>(s1) -
+                    static_cast<double>(s0)
+                ) *
+                localPhase;
 
-            const long rounded = std::lround(interpolated);
+            const long rounded =
+                std::lround(
+                    interpolated
+                );
 
             out[outCount++] =
                 static_cast<int16_t>(
-                    std::clamp<long>(rounded, -32768L, 32767L));
+                    std::clamp<long>(
+                        rounded,
+                        -32768L,
+                        32767L
+                    )
+                );
 
-            // Split source advance into integer cursor motion plus a
-            // normalized fractional phase. For supported audio sample rates
-            // the integer component is safely representable by size_t.
-            const double advancedPhase = phase_ + step;
-            const double wholePart = std::floor(advancedPhase);
-            const size_t wholeFrames = static_cast<size_t>(wholePart);
+            const double advancedPhase =
+                localPhase +
+                step;
 
-            phase_ = advancedPhase - wholePart;
-            sourceIndex_ += wholeFrames;
+            const double wholePart =
+                std::floor(
+                    advancedPhase
+                );
+
+            localPhase =
+                advancedPhase -
+                wholePart;
+
+            localSourceIndex +=
+                static_cast<size_t>(
+                    wholePart
+                );
         }
 
-        previousSample_ = in[inFrames - 1u];
-        hasPreviousSample_ = true;
-
-        // Rebase the local cursor around the newly retained history sample.
-        // A caller is expected to provide enough output capacity for the
-        // complete converted chunk (the production playback path does so).
+        /*
+         * Rebase source cursor around the newly retained
+         * last sample.
+         *
+         * For the first chunk there is no previous history sample,
+         * so the retained history consumes n-1 logical positions.
+         *
+         * For subsequent chunks the previous-sample slot is part of
+         * the logical sequence, so the consumed history shift is n.
+         */
         const size_t historyShift =
-            hadPreviousSample ? inFrames : (inFrames - 1u);
+            hadPreviousSample
+                ? inFrames
+                : (inFrames - 1u);
 
-        if (sourceIndex_ >= historyShift) {
-            sourceIndex_ -= historyShift;
-        } else {
-            // Defensive recovery for a violated output-capacity contract.
-            // Avoid unsigned underflow or corrupted state; the next chunk
-            // starts cleanly at its history boundary.
-            sourceIndex_ = 0;
-            phase_ = 0.0;
+        if (
+            localSourceIndex <
+            historyShift
+        ) {
+            /*
+             * Should be unreachable after successful preflight.
+             *
+             * Most importantly, do NOT mutate object state here.
+             */
+            return 0;
         }
+
+        localSourceIndex -=
+            historyShift;
+
+        /*
+         * --------------------------
+         * 3. Commit
+         * --------------------------
+         *
+         * Only now is object state updated.
+         */
+        previousSample_ =
+            in[inFrames - 1u];
+
+        hasPreviousSample_ =
+            true;
+
+        sourceIndex_ =
+            localSourceIndex;
+
+        phase_ =
+            localPhase;
 
         return outCount;
     }
@@ -584,9 +1113,13 @@ public:
 private:
     int32_t inputRate_{0};
     int32_t outputRate_{0};
+
     size_t sourceIndex_{0};
+
     double phase_{0.0};
+
     int16_t previousSample_{0};
+
     bool hasPreviousSample_{false};
 };
 
