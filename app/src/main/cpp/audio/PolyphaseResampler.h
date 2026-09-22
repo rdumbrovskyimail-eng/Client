@@ -101,10 +101,40 @@ public:
         phase_ = 0;
     }
 
-    size_t process(const int16_t* in, size_t inFrames, int16_t* out, size_t maxOutFrames) {
-        if (in == nullptr || out == nullptr || inFrames == 0 || maxOutFrames == 0) return 0;
+    size_t process(
+        const int16_t* in,
+        size_t inFrames,
+        int16_t* out,
+        size_t maxOutFrames) {
 
-        static const int32_t COEFFS[TAPS] = {
+        if (in == nullptr || out == nullptr || inFrames == 0 || maxOutFrames == 0) {
+            return 0;
+        }
+
+        // The method returns only the number of output frames and therefore
+        // cannot report a partially consumed input block. Reject insufficient
+        // output capacity up front so phase/history always describe the whole
+        // input block that was consumed by this call.
+        size_t requiredOut = 0;
+        switch (phase_) {
+            case 0:
+                requiredOut = (inFrames / 3u) +
+                              ((inFrames % 3u) != 0u ? 1u : 0u);
+                break;
+            case 1:
+                requiredOut = inFrames / 3u;
+                break;
+            default: // phase_ == 2
+                requiredOut = (inFrames / 3u) +
+                              ((inFrames % 3u) >= 2u ? 1u : 0u);
+                break;
+        }
+
+        if (requiredOut > maxOutFrames) {
+            return 0;
+        }
+
+        static constexpr int32_t COEFFS[TAPS] = {
             -180, -320, 450, 2400, 5800, 8234, 8234, 5800, 2400, 450, -320, -180
         };
 
@@ -126,7 +156,9 @@ public:
             phase_ = (phase_ + 1) % 3;
         }
 
-        // Обновление циклической истории без повреждения границ буфера
+        // Full-input history update is safe because insufficient output
+        // capacity was rejected before any input was consumed.
+        // Обновление истории без выхода за границы буфера.
         if (inFrames >= TAPS) {
             std::memcpy(history_, in + inFrames - TAPS, TAPS * sizeof(int16_t));
         } else {
