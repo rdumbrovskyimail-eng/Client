@@ -21,7 +21,18 @@ inline void enableHardwareFtz() {
 #endif
 }
 
-inline void pcm16ToFloat(const int16_t* src, float* dst, size_t count, float gain = 1.0f) {
+inline void pcm16ToFloat(
+    const int16_t* src,
+    float* dst,
+    size_t count,
+    float gain = 1.0f) {
+
+    // A non-empty conversion requires both valid input and output buffers.
+    // Reject invalid pointers before either the NEON or scalar path accesses them.
+    if (src == nullptr || dst == nullptr || count == 0) {
+        return;
+    }
+
     size_t i = 0;
     const float scale_val = (1.0f / 32768.0f) * gain;
 
@@ -47,7 +58,11 @@ inline void pcm16ToFloat(const int16_t* src, float* dst, size_t count, float gai
 }
 
 inline float calculateRms(const int16_t* src, size_t count) {
-    if (count == 0) return 0.0f;
+    // count > 0 implies that src must designate a readable PCM buffer.
+    if (src == nullptr || count == 0) {
+        return 0.0f;
+    }
+
     double sum = 0.0;
     size_t i = 0;
 
