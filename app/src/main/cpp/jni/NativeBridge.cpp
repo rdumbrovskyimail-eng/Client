@@ -173,11 +173,21 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     JNIEnv *env, jobject /* this */, jbyteArray byteArray, jint offset, jint length, jlong generation) {
 
     if (!byteArray || offset < 0 || length <= 0) return 0;
+    if (generation <= 0) return 0;
     if ((length & 1) != 0) return 0; // Защита от нечётного количества байт PCM16
     const jsize arrayLen = env->GetArrayLength(byteArray);
-    if (offset + length > arrayLen) return 0;
+    if (arrayLen < 0) return 0;
 
-    const size_t frames = static_cast<size_t>(length) / sizeof(int16_t);
+    // Do the range check in jlong so offset + length cannot overflow jint.
+    const jlong endOffset =
+        static_cast<jlong>(offset) +
+        static_cast<jlong>(length);
+    if (endOffset > static_cast<jlong>(arrayLen)) {
+        return 0;
+    }
+
+    const size_t frames =
+        static_cast<size_t>(length) / sizeof(int16_t);
 
     thread_local std::vector<int16_t> playbackJniBuffer;
     if (playbackJniBuffer.size() < frames) {
@@ -200,12 +210,23 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackDirect(
     JNIEnv *env, jobject /* this */, jobject byteBuffer, jint offsetBytes, jint lengthBytes, jlong generation) {
 
     if (!byteBuffer || offsetBytes < 0 || lengthBytes <= 0) return 0;
+    if (generation <= 0) return 0;
     if ((lengthBytes & 1) != 0) return 0; // Защита от нечётного количества байт PCM16
     if ((offsetBytes & 1) != 0) return 0;
 
-    const jlong capacity = env->GetDirectBufferCapacity(byteBuffer);
-    if (capacity < 0 || (offsetBytes + lengthBytes) > capacity) {
-        LOGE("writePlaybackDirect OOB: Cap=%lld, Req=%d", static_cast<long long>(capacity), offsetBytes + lengthBytes);
+    const jlong capacity =
+        env->GetDirectBufferCapacity(byteBuffer);
+
+    const jlong endOffset =
+        static_cast<jlong>(offsetBytes) +
+        static_cast<jlong>(lengthBytes);
+
+    if (capacity < 0 || endOffset > capacity) {
+        LOGE(
+            "writePlaybackDirect OOB: Cap=%lld, Req=%lld",
+            static_cast<long long>(capacity),
+            static_cast<long long>(endOffset)
+        );
         return 0;
     }
 
@@ -244,7 +265,18 @@ Java_com_client_app_audio_NativeAudioBridge_readCaptureDirect(
 extern "C" JNIEXPORT void JNICALL
 Java_com_client_app_audio_NativeAudioBridge_flushPlayback(
     JNIEnv * /* env */, jobject /* this */, jlong generation) {
-    AAudioEngine::getInstance().flushPlayback(static_cast<uint64_t>(generation));
+
+    if (generation <= 0) {
+        LOGE(
+            "flushPlayback rejected invalid generation=%lld",
+            static_cast<long long>(generation)
+        );
+        return;
+    }
+
+    AAudioEngine::getInstance().flushPlayback(
+        static_cast<uint64_t>(generation)
+    );
 }
 
 extern "C" JNIEXPORT void JNICALL
