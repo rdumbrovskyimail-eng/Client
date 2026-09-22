@@ -4,6 +4,8 @@
 #include <atomic>
 #include <cstdint>
 #include <array>
+#include <mutex>
+
 #include "audio/AudioConstants.h"
 
 namespace client::dsp {
@@ -21,31 +23,79 @@ public:
     ~FastFft() = default;
 
     // ERR-09: Расчет спектра с учетом динамической частоты дискретизации sampleRate
-    void process(const float* pcmInput, size_t count, float micRms, float outRms, int32_t sampleRate = audio::SAMPLE_RATE_GEMINI_OUT);
+    void process(
+        const float* pcmInput,
+        size_t count,
+        float micRms,
+        float outRms,
+        int32_t sampleRate =
+            audio::SAMPLE_RATE_GEMINI_OUT
+    );
 
-    // E-03, ERR-05: Истинно Wait-Free считывание когерентного среза из UI JNI
-    void getLatestSnapshot(SpectrumSnapshot& out) const;
+    /*
+     * Возвращает когерентный snapshot.
+     *
+     * Основной путь чтения использует атомарный payload + seqlock.
+     * При редкой ситуации, когда snapshot не удалось получить за
+     * ограниченное число попыток, fallback читается под отдельным
+     * mutex, защищающим lastStableSnapshot_ от concurrent access.
+     */
+    void getLatestSnapshot(
+        SpectrumSnapshot& out
+    ) const;
 
 private:
-    void computeFft(float* real, float* imag, size_t n);
+    void computeFft(
+        float* real,
+        float* imag,
+        size_t n
+    );
 
-    float smoothedBands_[audio::SPECTRUM_BANDS]{0.0f};
+    /*
+     * Рабочее состояние FFT изменяется только потоком,
+     * выполняющим process().
+     */
+    float smoothedBands_[
+        audio::SPECTRUM_BANDS
+    ]{0.0f};
 
-    // ERR-05 / concurrency fix:
-    // A snapshot is published with a seqlock. The payload itself is stored as
-    // atomic scalar values, so a concurrent UI read can never race a writer.
+    /*
+     * Публикуемый payload snapshot.
+     *
+     * Каждый scalar является atomic, поэтому конкурентное чтение
+     * этих значений не создаёт data race.
+     */
     alignas(64)
-    std::array<std::atomic<float>, audio::SPECTRUM_BANDS> snapshotBands_{};
+    std::array<
+        std::atomic<float>,
+        audio::SPECTRUM_BANDS
+    > snapshotBands_{};
 
     std::atomic<float> snapshotMicRms_{0.0f};
+
     std::atomic<float> snapshotOutRms_{0.0f};
 
-    // Even = stable snapshot, odd = writer is publishing.
+    /*
+     * Even = stable snapshot.
+     * Odd  = writer находится в процессе публикации.
+     */
     mutable std::atomic<uint32_t> snapshotSeq_{0};
 
-    // Last snapshot that passed the stability check. Used only on bounded
-    // fallback so callers never receive a mixed-epoch snapshot.
+    /*
+     * Последний snapshot, успешно прошедший seqlock-проверку.
+     *
+     * Нужен только как bounded fallback.
+     */
     mutable SpectrumSnapshot lastStableSnapshot_{};
+
+    /*
+     * Защищает lastStableSnapshot_ от ситуации, когда несколько
+     * вызывающих потоков одновременно используют fallback либо
+     * один поток обновляет fallback, пока другой его читает.
+     *
+     * Основной успешный seqlock-path этот mutex не использует.
+     */
+    mutable std::mutex lastStableSnapshotMutex_;
 };
 
 } // namespace client::dsp
