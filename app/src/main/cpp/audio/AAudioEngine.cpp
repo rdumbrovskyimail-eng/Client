@@ -137,6 +137,18 @@ AAudioEngine::~AAudioEngine() {
     stop();
 }
 
+void AAudioEngine::joinPlaybackDspThreadLocked() {
+    if (playbackDspThread_.joinable()) {
+        playbackDspThread_.join();
+    }
+}
+
+void AAudioEngine::joinCaptureDspThreadLocked() {
+    if (captureDspThread_.joinable()) {
+        captureDspThread_.join();
+    }
+}
+
 bool AAudioEngine::init(
     bool isBluetoothMode,
     int32_t targetPlaybackSampleRate,
@@ -273,9 +285,10 @@ bool AAudioEngine::initLocked(
     {
         std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
         resampler24To16_.reset();
-        resampler24To48_.reset();
+        halfbandResampler24To48_.reset();
         genericResampler_.reset();
         captureDecimator48To16_.reset();
+        captureDecimator32To16_.reset();
         captureResampler24To16_.reset();
         resetEarcon();
         voiceEnhancer_.reset(targetPlaybackSampleRate);
@@ -608,6 +621,16 @@ bool AAudioEngine::startPlayback() {
     }
 
     blockPlaybackCallbackAndWait();
+
+    // Start each playback lifecycle with clean state so residual samples from
+    // a previous stream can never enter the new hardware stream.
+    {
+        std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
+        halfbandResampler24To48_.reset();
+        resampler24To16_.reset();
+        genericResampler_.reset();
+    }
+
     playbackDspInputBuffer_.resetQuiesced();
     playbackBuffer_.resetQuiesced();
 
@@ -626,6 +649,11 @@ bool AAudioEngine::startPlayback() {
         unblockPlaybackCallback();
         return false;
     }
+
+    // A std::thread remains joinable after its entry function returns. Never
+    // assign a new thread object over a joinable worker: the C++ standard
+    // requires std::terminate() in that case.
+    joinPlaybackDspThreadLocked();
 
     playbackDspRunning_.store(true, std::memory_order_release);
     try {
@@ -674,6 +702,9 @@ bool AAudioEngine::startCapture() {
     captureDroppedFrames_.store(0, std::memory_order_relaxed);
     captureRawBuffer_.resetQuiesced();
     captureBuffer_.resetQuiesced();
+    captureDecimator48To16_.reset();
+    captureDecimator32To16_.reset();
+    captureResampler24To16_.reset();
 
     const aaudio_result_t result = AAudioStream_requestStart(captureStream_);
     if (result != AAUDIO_OK) {
@@ -690,6 +721,10 @@ bool AAudioEngine::startCapture() {
         isDisconnected_.store(true, std::memory_order_release);
         return false;
     }
+
+    // A std::thread remains joinable after its entry function returns. Never
+    // assign a new thread object over a joinable worker.
+    joinCaptureDspThreadLocked();
 
     captureDspRunning_.store(true, std::memory_order_release);
     try {
@@ -769,7 +804,7 @@ bool AAudioEngine::flushOutputStreamLocked(bool resumeAfterFlush) {
 void AAudioEngine::stopCaptureLocked() {
     captureDspRunning_.store(false, std::memory_order_release);
     captureDspCv_.notify_all();
-    if (captureDspThread_.joinable()) captureDspThread_.join();
+    joinCaptureDspThreadLocked();
 
     if (captureStream_) {
         const aaudio_result_t res = AAudioStream_requestStop(captureStream_);
@@ -792,7 +827,7 @@ void AAudioEngine::stopPlaybackLocked() {
     playbackDspRunning_.store(false, std::memory_order_release);
     playbackDspCv_.notify_all();
     playbackIngressCv_.notify_all();
-    if (playbackDspThread_.joinable()) playbackDspThread_.join();
+    joinPlaybackDspThreadLocked();
 
     if (playbackStream_) {
         if (!flushOutputStreamLocked(false)) {
@@ -813,7 +848,9 @@ void AAudioEngine::stopLocked() {
         captureStream_ != nullptr ||
         playbackStream_ != nullptr ||
         captureDspRunning_.load(std::memory_order_acquire) ||
-        playbackDspRunning_.load(std::memory_order_acquire);
+        playbackDspRunning_.load(std::memory_order_acquire) ||
+        captureDspThread_.joinable() ||
+        playbackDspThread_.joinable();
 
     if (!hadState) {
         unblockPlaybackCallback();
@@ -826,9 +863,10 @@ void AAudioEngine::stopLocked() {
     {
         std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
         resampler24To16_.reset();
-        resampler24To48_.reset();
+        halfbandResampler24To48_.reset();
         genericResampler_.reset();
         captureDecimator48To16_.reset();
+        captureDecimator32To16_.reset();
         captureResampler24To16_.reset();
         resetEarcon();
         voiceEnhancer_.reset(48000);
@@ -1041,6 +1079,22 @@ void AAudioEngine::captureDspThreadLoop() {
 
             finalPcm = decBuf;
             finalFrames = processed;
+
+        } else if (capRate == 32000) {
+
+            int16_t* decBuf =
+                captureDecimateBuffer_.data();
+
+            size_t processed =
+                captureDecimator32To16_.process(
+                    monoBuf,
+                    chunkFrames,
+                    decBuf,
+                    decimateScratchCap);
+
+            finalPcm = decBuf;
+            finalFrames = processed;
+
         } else if (capRate == 8000) {
 
             int16_t* upBuf =
@@ -1146,7 +1200,7 @@ void AAudioEngine::playbackDspThreadLoop() {
             voiceEnhancer_.reset(
                 currentRate);
 
-            resampler24To48_.reset();
+            halfbandResampler24To48_.reset();
             resampler24To16_.reset();
             genericResampler_.configure(
                 SAMPLE_RATE_GEMINI_OUT,
@@ -1159,26 +1213,22 @@ void AAudioEngine::playbackDspThreadLoop() {
                 fftBuffer_.begin(),
                 fftBuffer_.end(),
                 0.0f);
-            // Quiesce the JNI producer side before resetting the SPSC queue.
-            // flushPlayback() sets inputIngressBlocked_ before publishing the
-            // new epoch and serializes with this mutex; taking it here makes
-            // the quiescence precondition explicit even if this worker reaches
-            // the epoch transition slightly later.
+            // This worker is the sole consumer/owner of playbackDspInputBuffer_.
+            // The logical flush keeps JNI ingress blocked until this consumer
+            // has discarded all pre-epoch samples and reset its state.
             {
                 std::lock_guard<std::mutex>
                     ingressLock(
                         playbackJniWriteMutex_);
 
                 playbackDspInputBuffer_.discardAllQuiesced();
-
                 workerDspEpoch = activeEpoch;
-
-                inputIngressBlocked_.store(
-                    false,
-                    std::memory_order_release);
             }
 
-            playbackIngressCv_.notify_all();
+            playbackDspResetAcknowledgedEpoch_.store(
+                activeEpoch,
+                std::memory_order_release);
+            playbackDspCv_.notify_all();
         }
 
         const int32_t actualRate =
@@ -1390,7 +1440,7 @@ void AAudioEngine::playbackDspThreadLoop() {
                 SAMPLE_RATE_BT_A2DP) {
 
             outputFrames =
-                resampler24To48_.process(
+                halfbandResampler24To48_.process(
                     input,
                     inputFrames,
                     output);
@@ -1662,18 +1712,21 @@ size_t AAudioEngine::readCapturePcm(
 }
 
 // AUD-063:
-// AUD-022:
+// AUD-022 / ER-035:
 //
-// Never wait for a callback-generated flush ACK.
+// Separate the logical generation barrier from the physical AAudio state
+// transition. The JNI producer must never hold playbackJniWriteMutex_ while
+// requestPause/requestFlush/requestStart wait for the HAL.
 //
-// Instead:
-//   1. block new playback callbacks;
-//   2. wait for already admitted callbacks to finish;
-//   3. reset playbackBuffer_ only while quiescent;
-//   4. publish new epoch;
-//   5. unblock callbacks.
-//
-// This preserves SPSC head ownership.
+// Sequence:
+//   1. serialize native playback lifecycle with lifecycleMutex_;
+//   2. block callback admission and JNI ingress;
+//   3. reset only the hardware-facing SPSC consumer buffer while quiescent;
+//   4. publish the new epoch;
+//   5. wait only for the DSP consumer to discard old input and acknowledge the
+//      new epoch, then reopen JNI ingress;
+//   6. perform the physical AAudio transition without playbackJniWriteMutex_;
+//   7. release callback admission.
 void AAudioEngine::flushPlayback(
     uint64_t generation) {
 
@@ -1682,31 +1735,139 @@ void AAudioEngine::flushPlayback(
         return;
     }
 
-    std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
-    const uint64_t currentEpoch = playbackEpoch_.load(std::memory_order_acquire);
-    if (generation <= currentEpoch) return;
+    // All other mutations of playbackStream_ (open/start/stop/close/recovery)
+    // are serialized by lifecycleMutex_. Keep the same ownership here so the
+    // physical HAL transition cannot race stream destruction/replacement.
+    std::unique_lock<std::mutex> lifecycleLock(lifecycleMutex_);
 
-    inputIngressBlocked_.store(true, std::memory_order_release);
-    blockPlaybackCallbackAndWait();
-
-    const bool wasPlaybackActive = playbackDspRunning_.load(std::memory_order_acquire);
-    bool physicalOk = true;
-    if (playbackStream_) {
-        physicalOk = flushOutputStreamLocked(wasPlaybackActive);
+    const uint64_t currentEpoch =
+        playbackEpoch_.load(std::memory_order_acquire);
+    if (generation <= currentEpoch) {
+        return;
     }
 
-    playbackBuffer_.discardAllQuiesced();
-    playbackEpoch_.store(generation, std::memory_order_release);
-    earconRequested_.store(false, std::memory_order_release);
-    outRms_.store(0.0f, std::memory_order_relaxed);
+    blockPlaybackCallbackAndWait();
+
+    const bool wasPlaybackActive =
+        playbackDspRunning_.load(std::memory_order_acquire);
+
+    {
+        // This is the short logical-reset critical section. It does not include
+        // any AAudio request or state wait.
+        std::scoped_lock lock(
+            playbackControlMutex_,
+            playbackJniWriteMutex_);
+
+        inputIngressBlocked_.store(
+            true,
+            std::memory_order_release);
+
+        // Callback admission is already quiesced, and playbackControlMutex_
+        // serializes against the DSP commit into the callback-facing SPSC ring.
+        playbackBuffer_.discardAllQuiesced();
+        playbackEpoch_.store(
+            generation,
+            std::memory_order_release);
+        earconRequested_.store(
+            false,
+            std::memory_order_release);
+        outRms_.store(
+            0.0f,
+            std::memory_order_relaxed);
+    }
+
+    // Wake the DSP so it observes the new epoch before any new-generation audio
+    // is allowed into playbackDspInputBuffer_.
+    playbackDspCv_.notify_all();
+
+    bool resetReady = true;
+    if (wasPlaybackActive) {
+        constexpr auto kDspResetTimeout =
+            std::chrono::milliseconds(100);
+
+        std::unique_lock<std::mutex> waitLock(
+            playbackDspWaitMutex_);
+
+        resetReady = playbackDspCv_.wait_for(
+            waitLock,
+            kDspResetTimeout,
+            [this, generation]() {
+                return
+                    playbackDspResetAcknowledgedEpoch_.load(
+                        std::memory_order_acquire) >= generation
+                    ||
+                    !playbackDspRunning_.load(
+                        std::memory_order_acquire);
+            });
+
+        // A stopped worker is not an acknowledgement: without a successful
+        // consumer-side discard, releasing ingress could mix generations.
+        resetReady =
+            resetReady
+            &&
+            playbackDspResetAcknowledgedEpoch_.load(
+                std::memory_order_acquire) >= generation;
+    }
+
+    if (!resetReady) {
+        // We cannot safely release ingress while the DSP consumer still owns
+        // pre-epoch queue contents. Fail closed instead of mixing generations.
+        playbackDspRunning_.store(
+            false,
+            std::memory_order_release);
+        playbackDspCv_.notify_all();
+        playbackIngressCv_.notify_all();
+
+        if (playbackDspThread_.joinable()) {
+            playbackDspThread_.join();
+        }
+
+        playbackDspInputBuffer_.resetQuiesced();
+        playbackBuffer_.discardAllQuiesced();
+        if (playbackStream_) {
+            closePlaybackStreamLocked();
+        }
+
+        isMmapActive_.store(false, std::memory_order_release);
+        isExclusiveSharingActive_.store(false, std::memory_order_release);
+        isDisconnected_.store(true, std::memory_order_release);
+        inputIngressBlocked_.store(false, std::memory_order_release);
+        unblockPlaybackCallback();
+        LOGW(
+            "AAudioEngine: playback DSP reset acknowledgement timed out; stream closed for fail-closed recovery");
+        return;
+    }
+
+    // Only now may new-generation JNI producers enter the DSP input ring. They
+    // can continue feeding the pipeline while the HAL transition below waits.
+    inputIngressBlocked_.store(
+        false,
+        std::memory_order_release);
+    playbackIngressCv_.notify_all();
+
+    bool physicalOk = true;
+    if (playbackStream_) {
+        // lifecycleMutex_ remains held, but playbackJniWriteMutex_ is free.
+        physicalOk =
+            flushOutputStreamLocked(wasPlaybackActive);
+    }
 
     if (!physicalOk) {
-        // Fail closed. requestStop() drains buffered audio and is therefore
-        // unsafe for a stale-audio barrier. Closing the stream prevents any
-        // residual application or hardware-buffered samples from reaching
-        // the DAC while the recovery path recreates the route.
-        playbackDspRunning_.store(false, std::memory_order_release);
+        // Fail closed. requestStop() can drain buffered audio and would violate
+        // the stale-audio barrier. Join the DSP worker before resetting its SPSC
+        // input queue, then close the stream without allowing the callback to run.
+        playbackDspRunning_.store(
+            false,
+            std::memory_order_release);
         playbackDspCv_.notify_all();
+        playbackIngressCv_.notify_all();
+
+        if (playbackDspThread_.joinable()) {
+            playbackDspThread_.join();
+        }
+
+        playbackDspInputBuffer_.resetQuiesced();
+        playbackBuffer_.discardAllQuiesced();
 
         if (playbackStream_) {
             closePlaybackStreamLocked();

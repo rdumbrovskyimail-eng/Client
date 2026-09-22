@@ -9,8 +9,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -56,8 +56,12 @@ class SileroVadDetector @Inject constructor(
     private var ortSession:
         OrtSession? = null
 
-    private val initMutex =
-        Mutex()
+    // One synchronization domain protects the entire mutable ONNX lifecycle:
+    // session/tensors, streaming state and recovery/reset paths. ReentrantLock
+    // is deliberate because evaluateNeural() can fail inside processSamples()
+    // and call closeResourcesLocked() recursively on the same thread.
+    private val vadLock =
+        ReentrantLock()
 
     private val _speechProbability =
         MutableStateFlow(0f)
@@ -156,7 +160,7 @@ class SileroVadDetector @Inject constructor(
         Boolean =
         withContext(Dispatchers.IO) {
 
-            initMutex.withLock {
+            vadLock.withLock {
 
                 if (isNeuralModelLoaded) {
                     return@withContext true
@@ -409,7 +413,7 @@ class SileroVadDetector @Inject constructor(
                         e
                     )
 
-                    closeResources()
+                    closeResourcesLocked()
 
                     isNeuralModelLoaded =
                         false
@@ -457,11 +461,10 @@ class SileroVadDetector @Inject constructor(
         }
     }
 
-    @Synchronized
     fun setThresholds(
         start: Float,
         end: Float
-    ) {
+    ) = vadLock.withLock {
 
         thresholdSpeechStart =
             start
@@ -470,12 +473,11 @@ class SileroVadDetector @Inject constructor(
             end
     }
 
-    @Synchronized
     fun processSamples(
         pcm16: ByteArray,
         onSpeechStart: () -> Unit,
         onSpeechEnd: () -> Unit
-    ) {
+    ) = vadLock.withLock {
 
         val sampleCount =
             pcm16.size / 2
@@ -563,7 +565,7 @@ class SileroVadDetector @Inject constructor(
         } catch (t: Throwable) {
             logger.e("SileroVadDetector: V5 inference failed; switching to RMS fallback", t)
             isNeuralModelLoaded = false
-            closeResources()
+            closeResourcesLocked()
             evaluateFallbackRms(window)
         }
 
@@ -785,7 +787,7 @@ class SileroVadDetector @Inject constructor(
             isNeuralModelLoaded =
                 false
 
-            closeResources()
+            closeResourcesLocked()
 
             throw IllegalStateException(
                 "Silero V5 inference failed",
@@ -794,7 +796,8 @@ class SileroVadDetector @Inject constructor(
         }
     }
 
-    private fun closeResources() {
+    // PRECONDITION: vadLock is held by the caller.
+    private fun closeResourcesLocked() {
 
         runCatching {
             persistentInputTensor?.close()
@@ -865,8 +868,7 @@ class SileroVadDetector @Inject constructor(
         )
     }
 
-    @Synchronized
-    fun resetState() {
+    fun resetState() = vadLock.withLock {
 
         stateBuffer.fill(
             0f

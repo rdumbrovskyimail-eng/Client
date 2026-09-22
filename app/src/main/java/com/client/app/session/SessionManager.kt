@@ -137,8 +137,10 @@ class SessionManager @Inject constructor(
         val KEY_SESSION_RESUMPTION_HANDLE = stringPreferencesKey("gemini_session_resumption_handle")
         val KEY_SESSION_RESUMPTION_TIMESTAMP =
             longPreferencesKey("gemini_resumption_timestamp")
-        private const val MAX_RESUMPTION_AGE_MS =
-            2L * 60 * 60 * 1000L
+        // The server is the authority on resumption-token validity. The Live
+        // API documents the two-hour validity window from the last session
+        // termination, not from the moment a token is received, so a local
+        // receipt timestamp must not be used as a hard expiry.
 
         val KEY_INITIAL_HISTORY_TURNS = intPreferencesKey("gemini_initial_history_turns")
 
@@ -183,6 +185,7 @@ class SessionManager @Inject constructor(
     private val reconnectToken = AtomicLong(0L)
     private val goAwayToken = AtomicLong(0L)
     @Volatile private var resumptionHandle: String? = null
+    private val resumptionPersistenceMutex = Mutex()
     @Volatile private var reconnectAttempts = 0
     @Volatile private var pendingGoAway = false
     @Volatile private var activeConnectUsedResumption = false
@@ -309,9 +312,11 @@ class SessionManager @Inject constructor(
                 if (!shouldRestart || !connectionDesired) return@withLock
 
                 resumptionHandle = null
-                dataStore.edit {
-                    it.remove(KEY_SESSION_RESUMPTION_HANDLE)
-                    it.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                resumptionPersistenceMutex.withLock {
+                    dataStore.edit {
+                        it.remove(KEY_SESSION_RESUMPTION_HANDLE)
+                        it.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                    }
                 }
                 cancelReconnectWork()
                 stopInternal(full = false)
@@ -652,31 +657,14 @@ class SessionManager @Inject constructor(
         val storedResumeHandle = cryptoManager.decrypt(
             prefs[KEY_SESSION_RESUMPTION_HANDLE]?.trim().orEmpty()
         )
-        val storedResumeTimestamp =
-            prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] ?: 0L
-        val storedResumeFresh =
-            storedResumeTimestamp > 0L &&
-                (System.currentTimeMillis() -
-                    storedResumeTimestamp)
-                    .coerceAtLeast(0L) <=
-                    MAX_RESUMPTION_AGE_MS
-
         if (
             resumptionHandle.isNullOrBlank() &&
             storedResumeHandle.isNotBlank() &&
-            prefs[KEY_SESSION_RESUMPTION_ENABLED] != false &&
-            storedResumeFresh
+            prefs[KEY_SESSION_RESUMPTION_ENABLED] != false
         ) {
+            // Do not locally evict based on token receipt time. The server
+            // determines whether the handle is still resumable.
             resumptionHandle = storedResumeHandle
-        } else if (
-            prefs[KEY_SESSION_RESUMPTION_ENABLED] != false &&
-            storedResumeHandle.isNotBlank() &&
-            !storedResumeFresh
-        ) {
-            dataStore.edit {
-                it.remove(KEY_SESSION_RESUMPTION_HANDLE)
-                it.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
-            }
         }
         activeConnectUsedResumption = resume && (resumptionHandle?.isNotBlank() == true)
 
@@ -1027,9 +1015,11 @@ class SessionManager @Inject constructor(
                 reconnectAttempts = 0
                 resumptionHandle = null
                 activeConnectUsedResumption = false
-                dataStore.edit {
-                    it.remove(KEY_SESSION_RESUMPTION_HANDLE)
-                    it.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                resumptionPersistenceMutex.withLock {
+                    dataStore.edit {
+                        it.remove(KEY_SESSION_RESUMPTION_HANDLE)
+                        it.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                    }
                 }
 
                 try {
@@ -1581,24 +1571,21 @@ class SessionManager @Inject constructor(
                                                 it.isNotBlank()
                                         }
 
-                                resumptionHandle = usableHandle
-
-                                scope.launch {
-                                    dataStore.edit { prefs ->
-                                        if (usableHandle != null) {
+                                if (usableHandle != null) {
+                                    // resumable=false means that a new token is
+                                    // not currently available; it does not revoke
+                                    // the last valid handle. Persist only actual
+                                    // resumable handles and serialize writes so an
+                                    // older async write cannot overwrite a newer one.
+                                    resumptionHandle = usableHandle
+                                    resumptionPersistenceMutex.withLock {
+                                        dataStore.edit { prefs ->
                                             prefs[KEY_SESSION_RESUMPTION_HANDLE] =
                                                 cryptoManager.encrypt(
                                                     usableHandle
                                                 )
                                             prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] =
                                                 System.currentTimeMillis()
-                                        } else {
-                                            prefs.remove(
-                                                KEY_SESSION_RESUMPTION_HANDLE
-                                            )
-                                            prefs.remove(
-                                                KEY_SESSION_RESUMPTION_TIMESTAMP
-                                            )
                                         }
                                     }
                                 }
@@ -1830,6 +1817,12 @@ class SessionManager @Inject constructor(
                                 if (resumeRejected) {
                                     resumptionHandle = null
                                     activeConnectUsedResumption = false
+                                    resumptionPersistenceMutex.withLock {
+                                        dataStore.edit { prefs ->
+                                            prefs.remove(KEY_SESSION_RESUMPTION_HANDLE)
+                                            prefs.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                                        }
+                                    }
                                 }
 
                                 val authOrClientFatal =
@@ -2193,7 +2186,10 @@ class SessionManager @Inject constructor(
                 )
 
             if (existing == null) {
-                if (currentEpoch == client.epoch) {
+                if (
+                    currentEpoch == client.epoch &&
+                    !cancelledToolCallKeys.contains(key)
+                ) {
                     job.start()
                 } else {
                     job.cancel()
@@ -2304,9 +2300,11 @@ class SessionManager @Inject constructor(
                     prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] != null
 
                 if (hasStoredHandle || hasStoredTimestamp) {
-                    dataStore.edit {
-                        it.remove(KEY_SESSION_RESUMPTION_HANDLE)
-                        it.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                    resumptionPersistenceMutex.withLock {
+                        dataStore.edit {
+                            it.remove(KEY_SESSION_RESUMPTION_HANDLE)
+                            it.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                        }
                     }
                 }
                 resumptionHandle = null

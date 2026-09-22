@@ -139,6 +139,8 @@ private:
     void stopLocked();
     void stopCaptureLocked();
     void stopPlaybackLocked();
+    void joinPlaybackDspThreadLocked();
+    void joinCaptureDspThreadLocked();
     void closeCaptureStreamLocked();
     void closePlaybackStreamLocked();
     bool openCaptureStreamLocked(int32_t inputDeviceId);
@@ -247,6 +249,10 @@ private:
 
     alignas(64) std::atomic<uint64_t> playbackEpoch_{0};
 
+    // Generation reset acknowledgement from the sole playback DSP consumer.
+    // The input SPSC ring may only be discarded by its consumer thread.
+    alignas(64) std::atomic<uint64_t> playbackDspResetAcknowledgedEpoch_{0};
+
     // AUD-063: realtime callback admission/quiescence state.
     alignas(64)
     std::atomic<uint32_t> playbackCallbackState_{PLAYBACK_CALLBACK_BLOCKED};
@@ -279,9 +285,10 @@ private:
     AnalogVoiceEnhancer voiceEnhancer_;
 
     PolyphaseResampler24To16 resampler24To16_;
-    HermiteResampler24To48 resampler24To48_;
+    HalfbandResampler24To48 halfbandResampler24To48_;
     StreamingLinearResampler genericResampler_;
     Decimator48To16 captureDecimator48To16_;
+    Decimator32To16 captureDecimator32To16_;
     PolyphaseResampler24To16 captureResampler24To16_;
 };
 

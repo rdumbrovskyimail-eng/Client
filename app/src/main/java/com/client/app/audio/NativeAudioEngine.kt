@@ -174,12 +174,15 @@ class NativeAudioEngine @Inject constructor(
         StateFlow<AudioFocusEvent> =
         _focusEvents.asStateFlow()
 
-    // AUD-013:
-    // Never suspend the capture producer on a bounded channel. Backlog is
-    // explicitly accounted in bytes and has a hard memory ceiling.
+    // AUD-013 / ER-002:
+    // PCM backlog is bounded explicitly in bytes. The channel itself is
+    // unbounded so lifecycle control events never compete with a fixed
+    // element capacity. The byte budget below remains the memory ceiling for
+    // queued PCM buffers; only a bounded number of zero-byte control events
+    // can be outstanding.
     private val _micOutput =
         Channel<AudioStreamEvent>(
-            128
+            Channel.UNLIMITED
         )
 
     private val queuedMicOutputBytes =
@@ -222,6 +225,11 @@ class NativeAudioEngine @Inject constructor(
 
     private val audioLifecycleMutex =
         Mutex()
+
+    // Serializes capture-event publication with capture-generation invalidation
+    // and draining. This prevents stale workers from winning a check/send race.
+    private val captureEventLock =
+        Any()
 
     private val captureDirectMutex =
         Mutex()
@@ -525,7 +533,9 @@ class NativeAudioEngine @Inject constructor(
                     return@withContext false
                 }
 
-                streamStopGeneration = -1L
+                synchronized(captureEventLock) {
+                    streamStopGeneration = -1L
+                }
 
                 try {
                     router.start { profile ->
@@ -642,11 +652,23 @@ class NativeAudioEngine @Inject constructor(
                 }
 
                 val existingCaptureJob = captureJob
-                if (existingCaptureJob?.isActive == true) {
-                    logger.e(
-                        "NativeAudioEngine: capture worker from previous lifecycle is still active; refusing a second producer"
-                    )
-                    return@withContext false
+                if (existingCaptureJob != null && !existingCaptureJob.isCompleted) {
+                    val joined =
+                        withTimeoutOrNull(500L) {
+                            existingCaptureJob.join()
+                            true
+                        } ?: false
+
+                    if (!joined) {
+                        logger.e(
+                            "NativeAudioEngine: previous capture worker is still terminating; refusing a second producer"
+                        )
+                        return@withContext false
+                    }
+                }
+
+                if (captureJob != null) {
+                    captureJob = null
                 }
 
                 if (!_isPlaying.value) {
@@ -673,7 +695,9 @@ class NativeAudioEngine @Inject constructor(
                             profile.vadThresholdEnd
                         )
 
-                streamStopGeneration = -1L
+                synchronized(captureEventLock) {
+                    streamStopGeneration = -1L
+                }
 
                 val started =
                     captureDirectMutex.withLock {
@@ -690,7 +714,9 @@ class NativeAudioEngine @Inject constructor(
 
                 _isCapturing.value = true
                 captureDesired.set(true)
-                captureInstanceId.incrementAndGet()
+                synchronized(captureEventLock) {
+                    captureInstanceId.incrementAndGet()
+                }
                 startLoops()
                 true
             }
@@ -700,7 +726,7 @@ class NativeAudioEngine @Inject constructor(
 
         if (
             _isCapturing.value &&
-            captureJob?.isActive != true
+            captureJob?.isCompleted != false
         ) {
             val instanceId = captureInstanceId.get()
 
@@ -904,7 +930,8 @@ class NativeAudioEngine @Inject constructor(
 
                                             sendMicEvent(
                                                 AudioStreamEvent
-                                                    .Audio(pf)
+                                                    .Audio(pf),
+                                                instanceId
                                             )
                                         }
                                     }
@@ -948,7 +975,8 @@ class NativeAudioEngine @Inject constructor(
                                     AudioStreamEvent
                                         .Audio(
                                             currentAudioBytes
-                                        )
+                                        ),
+                                    instanceId
                                 )
 
                             } else {
@@ -989,7 +1017,8 @@ class NativeAudioEngine @Inject constructor(
                             ) {
                                 sendMicEvent(
                                     AudioStreamEvent
-                                        .SpeechEnd
+                                        .SpeechEnd,
+                                    instanceId
                                 )
                             }
 
@@ -1022,7 +1051,8 @@ class NativeAudioEngine @Inject constructor(
 
                                 sendMicEvent(
                                     AudioStreamEvent
-                                        .SpeechStart
+                                        .SpeechStart,
+                                    instanceId
                                 )
 
                                 for (
@@ -1040,7 +1070,8 @@ class NativeAudioEngine @Inject constructor(
                                     AudioStreamEvent
                                         .Audio(
                                             currentAudioBytes
-                                        )
+                                        ),
+                                    instanceId
                                 )
 
                                 isSpeechActiveManual =
@@ -1054,7 +1085,8 @@ class NativeAudioEngine @Inject constructor(
                                     AudioStreamEvent
                                         .Audio(
                                             currentAudioBytes
-                                        )
+                                        ),
+                                    instanceId
                                 )
 
                             } else {
@@ -1088,7 +1120,8 @@ class NativeAudioEngine @Inject constructor(
                             ) {
                                 sendMicEvent(
                                     AudioStreamEvent
-                                        .SpeechEnd
+                                        .SpeechEnd,
+                                    instanceId
                                 )
                                 isSpeechActiveManual = false
                             }
@@ -1114,7 +1147,10 @@ class NativeAudioEngine @Inject constructor(
             } finally {
                 if (captureInstanceId.get() == instanceId) {
                     _isCapturing.value = false
-                    enqueueStreamStopOnce(engineGeneration.get())
+                    enqueueStreamStopOnce(
+                        engineGeneration.get(),
+                        instanceId
+                    )
                     runCatching {
                         captureDirectMutex.withLock {
                             bridge.stopCaptureAudio()
@@ -1242,37 +1278,43 @@ class NativeAudioEngine @Inject constructor(
                 // the native side is about to close.
                 if (keepCapturing) {
                     _isCapturing.value = false
-                    captureInstanceId.incrementAndGet()
+                    synchronized(captureEventLock) {
+                        captureInstanceId.incrementAndGet()
+                    }
 
                     val oldCaptureJob = captureJob
                     if (oldCaptureJob != null && oldCaptureJob.isActive) {
+                        oldCaptureJob.cancel()
+                    }
+
+                    // Stop the physical capture before waiting on the Kotlin
+                    // worker. captureDirectMutex excludes an in-flight JNI
+                    // read; generation invalidation prevents a new read from
+                    // the old lifecycle.
+                    captureDirectMutex.withLock {
+                        bridge.stopCaptureAudio()
+                    }
+
+                    if (oldCaptureJob != null) {
                         val stopped =
-                            cancelAndJoinBounded(
-                                oldCaptureJob,
-                                1000L
-                            )
+                            withTimeoutOrNull(1000L) {
+                                oldCaptureJob.join()
+                                true
+                            } ?: false
 
                         if (!stopped) {
-                            // Keep the old reader/native stream paired until it
-                            // really terminates, but do not silently strand the
-                            // route transition after one join timeout. Retry the
-                            // same transition after a bounded quiet interval.
                             logger.e(
-                                "NativeAudioEngine: route recovery deferred because the previous capture worker did not terminate; scheduling bounded retry"
+                                "NativeAudioEngine: previous capture worker did not terminate during route recovery; keeping it as the lifecycle ownership barrier"
                             )
-
                             engineScope.launch {
                                 delay(100L)
-
                                 if (
-                                    req.generation ==
-                                        engineGeneration.get() &&
+                                    req.generation == engineGeneration.get() &&
                                     captureDesired.get()
                                 ) {
                                     routeTransitionChannel.trySend(req)
                                 }
                             }
-
                             return@withContext
                         }
                     }
@@ -1346,7 +1388,9 @@ class NativeAudioEngine @Inject constructor(
                             }
 
                             if (captureRecovered && keepCapturing) {
-                                captureInstanceId.incrementAndGet()
+                                synchronized(captureEventLock) {
+                                    captureInstanceId.incrementAndGet()
+                                }
                                 startLoops()
                             }
                         }
@@ -1361,7 +1405,7 @@ class NativeAudioEngine @Inject constructor(
         job: Job,
         timeoutMs: Long
     ): Boolean {
-        if (!job.isActive) {
+        if (job.isCompleted) {
             return true
         }
 
@@ -1379,110 +1423,90 @@ class NativeAudioEngine @Inject constructor(
     }
 
     private suspend fun enqueueStreamStopOnce(
-        generation: Long
-    ): Boolean {
-        if (
-            streamStopGeneration ==
-                generation
-        ) {
-            return true
+        generation: Long,
+        expectedCaptureInstanceId: Long? = null
+    ): Boolean =
+        synchronized(captureEventLock) {
+            if (streamStopGeneration == generation) {
+                return@synchronized true
+            }
+
+            val enqueued =
+                sendMicEventLocked(
+                    AudioStreamEvent.StreamStop,
+                    expectedCaptureInstanceId
+                )
+
+            if (enqueued) {
+                streamStopGeneration = generation
+            }
+
+            enqueued
         }
-
-        val enqueued =
-            sendMicEvent(
-                AudioStreamEvent
-                    .StreamStop
-            )
-
-        if (enqueued) {
-            streamStopGeneration = generation
-        }
-
-        return enqueued
-    }
 
     suspend fun stopCaptureGraceful(
         gracefulTimeoutMs: Long = 1500L
-    ):
-        CaptureShutdownResult =
-        audioLifecycleMutex.withLock {
+    ): CaptureShutdownResult =
+        withContext(NonCancellable) {
+            audioLifecycleMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    captureDesired.set(false)
+                    _isCapturing.value = false
 
-            withContext(Dispatchers.IO) {
+                    synchronized(captureEventLock) {
+                        captureInstanceId.incrementAndGet()
+                    }
 
-                captureDesired.set(false)
+                    var shutdownStatus =
+                        CaptureShutdownResult.GRACEFUL_LOSSLESS
+                    val job = captureJob
 
-                var shutdownStatus =
-                    CaptureShutdownResult
-                        .GRACEFUL_LOSSLESS
+                    if (job?.isActive == true) {
+                        job.cancel()
+                    }
 
-                _isCapturing.value =
-                    false
-                captureInstanceId.incrementAndGet()
+                    // The native AAudio stream is a separate resource owned by
+                    // AAudioEngine. captureDirectMutex excludes an in-flight
+                    // JNI ring-buffer read; it is not necessary to wait for the
+                    // Kotlin coroutine before requesting native stop.
+                    captureDirectMutex.withLock {
+                        bridge.stopCaptureAudio()
+                    }
 
-                val job =
-                    captureJob
+                    if (job != null) {
+                        val completed =
+                            withTimeoutOrNull(
+                                gracefulTimeoutMs.coerceAtLeast(0L)
+                            ) {
+                                job.join()
+                                true
+                            } ?: false
 
-                if (
-                    job != null &&
-                    job.isActive
-                ) {
-                    val gracefulCompleted =
-                        withTimeoutOrNull(
-                            gracefulTimeoutMs
-                        ) {
-                            job.join()
-                            true
-                        } ?: false
-
-                    if (!gracefulCompleted) {
-                        shutdownStatus =
-                            CaptureShutdownResult
-                                .FORCED_TIMEOUT
-
-                        val forcedCompleted =
-                            cancelAndJoinBounded(
-                                job,
-                                500L
-                            )
-
-                        if (!forcedCompleted) {
+                        if (!completed) {
+                            shutdownStatus =
+                                CaptureShutdownResult.FORCED_TIMEOUT
                             logger.e(
-                                "NativeAudioEngine: capture worker did not terminate during graceful shutdown; native capture remains untouched to preserve ownership safety"
+                                "NativeAudioEngine: capture worker did not terminate after native capture stop"
                             )
-                            return@withContext shutdownStatus
                         }
                     }
+
+                    if (job?.isCompleted == true) {
+                        captureJob = null
+                    }
+
+                    synchronized(poolLock) {
+                        recycleLeadInBuffersLocked()
+                    }
+                    vadDetector.resetState()
+
+                    if (!enqueueStreamStopOnce(engineGeneration.get())) {
+                        shutdownStatus =
+                            CaptureShutdownResult.FORCED_TIMEOUT
+                    }
+
+                    return@withContext shutdownStatus
                 }
-
-                captureJob = null
-
-                // AAudio requestStop is asynchronous; do it only after the
-                // Kotlin capture consumer/producer has fully terminated.
-                captureDirectMutex.withLock {
-                    bridge.stopCaptureAudio()
-                }
-
-                synchronized(
-                    poolLock
-                ) {
-                    recycleLeadInBuffersLocked()
-                }
-                vadDetector.resetState()
-
-                val currentGeneration =
-                    engineGeneration.get()
-
-                if (
-                    !enqueueStreamStopOnce(
-                        currentGeneration
-                    )
-                ) {
-                    shutdownStatus =
-                        CaptureShutdownResult
-                            .FORCED_TIMEOUT
-                }
-
-                return@withContext shutdownStatus
             }
         }
 
@@ -1503,75 +1527,64 @@ class NativeAudioEngine @Inject constructor(
                 engineGeneration
                     .incrementAndGet()
 
-                streamStopGeneration =
-                    -1L
+                synchronized(captureEventLock) {
+                    streamStopGeneration = -1L
+                    captureInstanceId.incrementAndGet()
+                }
 
                 val captureToStop = captureJob
-                var captureStopped = true
-
                 if (captureToStop?.isActive == true) {
                     captureToStop.cancel()
-                    captureStopped =
-                        withTimeoutOrNull(
-                            1500L
-                        ) {
-                            captureToStop.join()
-                            true
-                        } ?: false
+                }
 
-                    if (!captureStopped) {
-                        logger.e(
-                            "NativeAudioEngine: terminal stop could not join capture worker; native capture will not be force-closed from under a live reader"
-                        )
+                spectrumJob?.let { job ->
+                    if (job.isActive) {
+                        job.cancel()
+                        withTimeoutOrNull(500L) { job.join() }
                     }
                 }
-
-                if (captureStopped) {
-                    captureJob = null
-                }
-                spectrumJob?.let {
-
-                    if (it.isActive) {
-
-                        it.cancel()
-
-                        withTimeoutOrNull(
-                            500L
-                        ) {
-                            it.join()
-                        }
-                    }
-                }
-
                 spectrumJob = null
 
-                healthJob?.let {
-                    if (it.isActive) {
-                        it.cancel()
-                        withTimeoutOrNull(500L) {
-                            it.join()
-                        }
+                healthJob?.let { job ->
+                    if (job.isActive) {
+                        job.cancel()
+                        withTimeoutOrNull(500L) { job.join() }
                     }
                 }
                 healthJob = null
 
+                // Physical native teardown is mandatory even if the Kotlin
+                // capture worker misses its join deadline. The direct-read
+                // mutex excludes the JNI read; the capture generation has
+                // already been invalidated, so the old worker cannot publish
+                // or start another read for this lifecycle.
                 captureDirectMutex.withLock {
                     playbackOperationLock.lock()
                     try {
-                        if (captureStopped) {
-                            bridge.stopAudio()
-                        } else {
-                            // Preserve ownership safety: the native stream must
-                            // not be destroyed while the capture reader may
-                            // still be executing against it.
-                            logger.e(
-                                "NativeAudioEngine: skipping bridge.stopAudio() while capture worker is still alive"
-                            )
-                        }
+                        bridge.stopAudio()
                     } finally {
                         playbackOperationLock.unlock()
                     }
                 }
+
+                if (captureToStop != null) {
+                    val completed =
+                        withTimeoutOrNull(500L) {
+                            captureToStop.join()
+                            true
+                        } ?: false
+
+                    if (completed) {
+                        captureJob = null
+                    } else {
+                        logger.e(
+                            "NativeAudioEngine: terminal capture worker still terminating after native stop; retaining lifecycle ownership barrier"
+                        )
+                    }
+                } else {
+                    captureJob = null
+                }
+
                 abandonAudioFocus()
 
                 router.stop()
@@ -1856,14 +1869,20 @@ class NativeAudioEngine @Inject constructor(
     }
 
     private fun drainMicOutput() {
-        while (true) {
-            val result = _micOutput.tryReceive()
-            val event = result.getOrNull() ?: break
-            if (event is AudioStreamEvent.Audio) {
-                releaseCapturedBuffer(event.pcm)
+        synchronized(captureEventLock) {
+            while (true) {
+                val result = _micOutput.tryReceive()
+                val event = result.getOrNull() ?: break
+                if (event is AudioStreamEvent.Audio) {
+                    releaseCapturedBuffer(event.pcm)
+                }
             }
+            // Do not blindly reset queuedMicOutputBytes here. A consumer may
+            // already own a dequeued Audio event and will decrement the same
+            // counter when it releases that buffer. Keeping the atomic count
+            // exact prevents a late release from cancelling against a newer
+            // buffer and under-reporting the real backlog.
         }
-        queuedMicOutputBytes.set(0L)
     }
 
     /** Drops any capture events left after a consumer-side shutdown. */
@@ -1871,17 +1890,32 @@ class NativeAudioEngine @Inject constructor(
         drainMicOutput()
     }
 
-    // AUD-013:
-    // Capture-side events are enqueued without suspension. Audio buffers are
-    // owned by the channel until SessionManager calls releaseCapturedBuffer().
     private fun sendMicEvent(
-        event: AudioStreamEvent
+        event: AudioStreamEvent,
+        expectedCaptureInstanceId: Long? = null
+    ): Boolean =
+        synchronized(captureEventLock) {
+            sendMicEventLocked(
+                event,
+                expectedCaptureInstanceId
+            )
+        }
+
+    private fun sendMicEventLocked(
+        event: AudioStreamEvent,
+        expectedCaptureInstanceId: Long?
     ): Boolean {
+        if (
+            expectedCaptureInstanceId != null &&
+            captureInstanceId.get() != expectedCaptureInstanceId
+        ) {
+            if (event is AudioStreamEvent.Audio) {
+                recycleBuffer(event.pcm)
+            }
+            return false
+        }
+
         if (event is AudioStreamEvent.Audio) {
-            // Once PCM has been physically captured, lifecycle shutdown must
-            // not retroactively invalidate that frame solely because the
-            // logical capture flag has already flipped to false. Ownership is
-            // transferred to the bounded channel or explicitly recycled.
             val bytes = event.pcm.size.toLong()
             val next = queuedMicOutputBytes.addAndGet(bytes)
 
@@ -1898,9 +1932,7 @@ class NativeAudioEngine @Inject constructor(
                 if (streamStopGeneration != engineGeneration.get()) {
                     if (
                         _micOutput
-                            .trySend(
-                                AudioStreamEvent.StreamStop
-                            )
+                            .trySend(AudioStreamEvent.StreamStop)
                             .isSuccess
                     ) {
                         streamStopGeneration =
@@ -1917,6 +1949,7 @@ class NativeAudioEngine @Inject constructor(
         if (result.isFailure && event is AudioStreamEvent.Audio) {
             releaseCapturedBuffer(event.pcm)
         }
+
         return result.isSuccess
     }
 

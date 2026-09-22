@@ -31,6 +31,8 @@ import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
 
+private const val GEMINI_INPUT_AUDIO_MIME_TYPE = "audio/pcm;rate=16000"
+
 @Singleton
 class GeminiProtobufLiveClient @Inject constructor(
     private val audioEngine: NativeAudioEngine,
@@ -68,7 +70,6 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         private const val MAX_DATA_EVENTS_IN_FLIGHT = 256
 
-        private const val MAX_EVENT_QUEUE_CAPACITY = 512
         private const val MAX_AUDIO_FRAME_QUEUE_CAPACITY = 128
     }
 
@@ -298,9 +299,14 @@ class GeminiProtobufLiveClient @Inject constructor(
     private var activeServerGenerationId = 0L
     private var serverGenerationOpen = false
 
+    // One FIFO preserves control/data ordering. The physical event queue is
+    // unlimited; Data Plane admission remains bounded separately by
+    // MAX_DATA_EVENTS_IN_FLIGHT so high-rate model data cannot consume
+    // unbounded application memory. Control events must never be dropped just
+    // because a fixed queue capacity was reached.
     private val _events =
         Channel<QueuedEvent>(
-            MAX_EVENT_QUEUE_CAPACITY
+            Channel.UNLIMITED
         )
 
     val events: Flow<GeminiEventEnvelope> =
@@ -392,16 +398,13 @@ class GeminiProtobufLiveClient @Inject constructor(
             ).isSuccess
 
             if (!accepted) {
-                protocolPhase = ProtocolPhase.CLOSING
-                isReady = false
-                val ws = webSocket
-                logManager.e(
+                // With Channel.UNLIMITED this can only be a closed-channel
+                // lifecycle race, not a capacity condition. Do not tear down a
+                // healthy WebSocket because an in-memory event queue filled up.
+                logManager.w(
                     "GeminiLive:EventQueue",
-                    "Control event queue exhausted; closing current session"
+                    "Control event rejected because the event channel is closed"
                 )
-                runCatching {
-                    ws?.close(1013, "control event queue exhausted")
-                }
             }
         }
     }
@@ -856,7 +859,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                                         ) {
                                             put(
                                                 "mimeType",
-                                                "audio/pcm;rate=16000"
+                                                GEMINI_INPUT_AUDIO_MIME_TYPE
                                             )
                                             put(
                                                 "data",
@@ -2156,6 +2159,18 @@ class GeminiProtobufLiveClient @Inject constructor(
                 emitControl(GeminiEvent.GoAway(timeLeft?.coerceAtLeast(0L)))
             }
 
+            // Gemini Live places toolCallCancellation at the top level of the
+            // server message, alongside toolCall/serverContent. Record the
+            // cancellation before the SessionManager can observe the event so
+            // sendToolResponses() has an immediate protocol-side send barrier.
+            root["toolCallCancellation"]?.jsonObject?.get("ids")?.jsonArray
+                ?.mapNotNull { it.jsonPrimitive.contentOrNull }
+                ?.takeIf { it.isNotEmpty() }
+                ?.let { ids ->
+                    cancelledToolCallIds.addAll(ids)
+                    emitControl(GeminiEvent.ToolCallCancelled(ids))
+                }
+
             val sc = root["serverContent"]?.jsonObject
             if (sc != null) {
                 val interrupted = sc["interrupted"]?.jsonPrimitive?.booleanOrNull == true
@@ -2239,10 +2254,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                 sc["turnComplete"]?.jsonPrimitive?.booleanOrNull?.takeIf { it }
                     ?.let { emitControl(GeminiEvent.TurnComplete) }
 
-                sc["toolCallCancellation"]?.jsonObject?.get("ids")?.jsonArray
-                    ?.mapNotNull { it.jsonPrimitive.contentOrNull }
-                    ?.takeIf { it.isNotEmpty() }
-                    ?.let { emitControl(GeminiEvent.ToolCallCancelled(it)) }
             }
         }
     }
