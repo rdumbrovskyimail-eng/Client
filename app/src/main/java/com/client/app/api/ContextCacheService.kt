@@ -85,7 +85,47 @@ class ContextCacheService @Inject constructor(
         val existingHash = prefs[KEY_CACHED_CONTENT_HASH]
 
         if (!existingId.isNullOrBlank() && existingHash == promptHash) {
-            return@withContext existingId
+            // A cached content entry is automatically removed when its TTL
+            // expires. The persisted ID therefore cannot be trusted solely
+            // because the local prompt hash still matches.
+            //
+            // Verify the resource server-side before returning it. A 404/410
+            // means the local pointer is stale; clear it and recreate below.
+            // Other failures are treated as transient and do not silently
+            // hand an unverified cache ID to the caller.
+            val existingStillValid = runCatching {
+                val verifyUrl =
+                    "$BASE_URL/${existingId.removePrefix("cachedContents/")}"
+
+                httpClient.newCall(
+                    Request.Builder()
+                        .url(verifyUrl)
+                        .header("x-goog-api-key", cleanApiKey)
+                        .get()
+                        .build()
+                ).execute().use { response ->
+                    when {
+                        response.isSuccessful -> true
+                        response.code == 404 || response.code == 410 -> {
+                            dataStore.edit {
+                                it.remove(KEY_CACHED_CONTENT_ID)
+                                it.remove(KEY_CACHED_CONTENT_HASH)
+                            }
+                            false
+                        }
+                        else -> false
+                    }
+                }
+            }.getOrElse {
+                logger.w(
+                    "ContextCacheService: Не удалось проверить существующий кэш: ${it.message}"
+                )
+                false
+            }
+
+            if (existingStillValid) {
+                return@withContext existingId
+            }
         }
 
         if (!existingId.isNullOrBlank()) {
