@@ -2,7 +2,7 @@ name: Android CI
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
   pull_request:
   workflow_dispatch:
 
@@ -16,6 +16,7 @@ permissions:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -26,67 +27,125 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           MODEL_PATH="app/src/main/assets/models/silero_vad_v5_quant.onnx"
-          test -f "$MODEL_PATH" || { echo "Missing Silero V5 model in repository"; exit 1; }
+
+          test -f "$MODEL_PATH" || {
+            echo "Missing Silero V5 model in repository"
+            exit 1
+          }
+
           git lfs pull --include="$MODEL_PATH"
           git lfs checkout -- "$MODEL_PATH"
+
           test -s "$MODEL_PATH"
+
           SIZE_BYTES="$(stat -c%s "$MODEL_PATH")"
-          test "$SIZE_BYTES" -ge 500000 || { echo "Silero V5 model is too small: $SIZE_BYTES"; exit 1; }
+
+          test "$SIZE_BYTES" -ge 500000 || {
+            echo "Silero V5 model is too small: $SIZE_BYTES"
+            exit 1
+          }
+
           if head -c 128 "$MODEL_PATH" | grep -aq "git-lfs.github.com/spec"; then
-            echo "Silero V5 model is still an LFS pointer"; exit 1
+            echo "Silero V5 model is still an LFS pointer"
+            exit 1
           fi
-          echo "Silero V5 model SHA-256 (must be reviewed against the pinned repository artifact):"
+
+          echo "Silero V5 model SHA-256:"
           sha256sum "$MODEL_PATH"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          java-version: "17"
+          distribution: "temurin"
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
-          packages: 'platform-tools'
-
-      - name: Accept licenses
-        run: yes | sdkmanager --licenses > /dev/null || true
-
-      - name: Install Android NDK
-        run: sdkmanager "ndk;30.0.16248370"
+          packages: >-
+            platform-tools
+            platforms;android-36
+            build-tools;36.0.0
+            cmake;3.22.1
+            ndk;30.0.16248370
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.14.3'
+        uses: gradle/actions/setup-gradle@v6
 
-      - name: Generate Gradle Wrapper
+      - name: Prepare Gradle Wrapper
+        shell: bash
         run: |
           set -euo pipefail
-          gradle wrapper --gradle-version 8.14.3 --distribution-type bin
-          test -s gradle/wrapper/gradle-wrapper.jar
-          chmod +x gradlew
 
-      - name: Validate Gradle Wrapper
-        uses: gradle/actions/wrapper-validation@v4
+          test -f ./gradlew || {
+            echo "gradlew is missing"
+            exit 1
+          }
+
+          test -s ./gradle/wrapper/gradle-wrapper.jar || {
+            echo "gradle-wrapper.jar is missing or empty"
+            exit 1
+          }
+
+          test -s ./gradle/wrapper/gradle-wrapper.properties || {
+            echo "gradle-wrapper.properties is missing or empty"
+            exit 1
+          }
+
+          chmod +x ./gradlew
 
       - name: Run unit tests, lint and build
+        shell: bash
         run: |
-          ./gradlew testDebugUnitTest lintDebug assembleDebug --stacktrace --no-daemon --max-workers=2
+          set -euo pipefail
+
+          ./gradlew \
+            testDebugUnitTest \
+            lintDebug \
+            assembleDebug \
+            --stacktrace \
+            --no-daemon \
+            --max-workers=2
 
       - name: Verify 16 KB ELF and APK alignment
         shell: bash
         run: |
+          set -euo pipefail
+
           chmod +x tools/verify-16k-elf-alignment.sh
-          tools/verify-16k-elf-alignment.sh app/build/outputs/apk/debug/app-debug.apk 30.0.16248370
+
+          tools/verify-16k-elf-alignment.sh \
+            app/build/outputs/apk/debug/app-debug.apk \
+            30.0.16248370
 
       - name: Verify Debug APK signature
+        shell: bash
         run: |
+          set -euo pipefail
+
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}"
-          APKSIGNER="$(find "$SDK_ROOT/build-tools" -mindepth 2 -maxdepth 2 -type f -name apksigner | sort -V | tail -n 1)"
-          test -x "$APKSIGNER"
-          "$APKSIGNER" verify --verbose app/build/outputs/apk/debug/app-debug.apk
+
+          APKSIGNER="$(
+            find "$SDK_ROOT/build-tools" \
+              -mindepth 2 \
+              -maxdepth 2 \
+              -type f \
+              -name apksigner \
+              -perm -111 \
+              | sort -V \
+              | tail -n 1
+          )"
+
+          test -n "$APKSIGNER" || {
+            echo "apksigner was not found"
+            exit 1
+          }
+
+          "$APKSIGNER" verify \
+            --verbose \
+            app/build/outputs/apk/debug/app-debug.apk
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
