@@ -1,16 +1,15 @@
+// >>> FILE: app/src/main/cpp/dsp/FastFft.h
 #pragma once
 
-#include <array>
-#include <atomic>
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
-#include <mutex>
-
+#include <array>
 #include "audio/AudioConstants.h"
 
 namespace client::dsp {
 
-// E-03: coherent FFT/RMS snapshot aligned to a 16-byte boundary.
+// E-03: Согласованный снимок полос БПФ и RMS с выравниванием по границе 16 байт
 struct alignas(16) SpectrumSnapshot {
     float bands[audio::SPECTRUM_BANDS]{0.0f};
     float micRms{0.0f};
@@ -22,57 +21,32 @@ public:
     FastFft();
     ~FastFft() = default;
 
-    // Calculate spectrum using the actual input sample rate.
-    void process(
-        const float* pcmInput,
-        size_t count,
-        float micRms,
-        float outRms,
-        int32_t sampleRate = audio::SAMPLE_RATE_GEMINI_OUT
-    );
+    // ERR-09: Расчет спектра с учетом динамической частоты дискретизации sampleRate
+    void process(const float* pcmInput, size_t count, float micRms, float outRms, int32_t sampleRate = audio::SAMPLE_RATE_GEMINI_OUT);
 
-    // Read one coherent snapshot without exposing a mixed publication epoch.
-    void getLatestSnapshot(
-        SpectrumSnapshot& out
-    ) const;
+    // E-03, ERR-05: Истинно Wait-Free считывание когерентного среза из UI JNI
+    void getLatestSnapshot(SpectrumSnapshot& out) const;
 
 private:
-    void computeFft(
-        float* real,
-        float* imag,
-        size_t n
-    );
+    void computeFft(float* real, float* imag, size_t n);
 
-    float smoothedBands_[
-        audio::SPECTRUM_BANDS
-    ]{0.0f};
+    float smoothedBands_[audio::SPECTRUM_BANDS]{0.0f};
 
-    /*
-     * Main publication path:
-     *   - scalar payloads are atomic;
-     *   - snapshotSeq_ forms the seqlock.
-     *
-     * The fallback snapshot is a normal object, therefore its accesses are
-     * protected separately. This prevents concurrent readers from racing with
-     * each other when updating/reading lastStableSnapshot_.
-     */
+    // ERR-05 / concurrency fix:
+    // A snapshot is published with a seqlock. The payload itself is stored as
+    // atomic scalar values, so a concurrent UI read can never race a writer.
     alignas(64)
-    std::array<
-        std::atomic<float>,
-        audio::SPECTRUM_BANDS
-    > snapshotBands_{};
+    std::array<std::atomic<float>, audio::SPECTRUM_BANDS> snapshotBands_{};
 
     std::atomic<float> snapshotMicRms_{0.0f};
     std::atomic<float> snapshotOutRms_{0.0f};
 
-    // Even = stable publication, odd = writer is publishing.
+    // Even = stable snapshot, odd = writer is publishing.
     mutable std::atomic<uint32_t> snapshotSeq_{0};
 
-    // Last snapshot that passed the seqlock stability check.
+    // Last snapshot that passed the stability check. Used only on bounded
+    // fallback so callers never receive a mixed-epoch snapshot.
     mutable SpectrumSnapshot lastStableSnapshot_{};
-
-    // Protects the non-atomic fallback snapshot.
-    mutable std::mutex lastStableSnapshotMutex_;
 };
 
 } // namespace client::dsp
