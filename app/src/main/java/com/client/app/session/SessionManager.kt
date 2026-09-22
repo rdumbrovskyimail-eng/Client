@@ -1109,13 +1109,26 @@ class SessionManager @Inject constructor(
             }
 
             if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-                scope.launch {
-                    mutex.withLock {
-                        if (
-                            connectionDesired &&
-                            client.epoch == sourceEpoch &&
-                            _state.value.link != LinkState.IDLE
-                        ) {
+                // This is a terminal decision for the reconnect controller.
+                // Do not require client.epoch == sourceEpoch here: a failed
+                // handshake/close can advance the transport epoch before this
+                // coroutine gets the mutex. The reconnect token is the
+                // authoritative guard against a newer user action or reconnect
+                // controller superseding this terminal decision.
+                val terminalToken = reconnectToken.incrementAndGet()
+
+                reconnectJob?.cancel()
+                reconnectJob = scope.launch {
+                    try {
+                        mutex.withLock {
+                            if (
+                                terminalToken != reconnectToken.get() ||
+                                !connectionDesired ||
+                                _state.value.link == LinkState.IDLE
+                            ) {
+                                return@withLock
+                            }
+
                             connectionDesired = false
                             userMicDesired = false
                             stopInternal(full = true)
@@ -1124,6 +1137,19 @@ class SessionManager @Inject constructor(
                                 it.copy(
                                     error = "Соединение потеряно: $reason"
                                 )
+                            }
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (t: Throwable) {
+                        logger.e(
+                            "SessionManager: terminal reconnect shutdown failed",
+                            t
+                        )
+                    } finally {
+                        synchronized(reconnectGuard) {
+                            if (reconnectJob == coroutineContext[Job]) {
+                                reconnectJob = null
                             }
                         }
                     }
@@ -1647,8 +1673,13 @@ class SessionManager @Inject constructor(
                                     }
                                 } else if (
                                     interactionStatus == "IDLE" &&
-                                    turnCompleteSeen
+                                    clientCapabilitiesForCurrentSession()
+                                        .supportsInteractionStatus
                                 ) {
+                                    // For extended-thinking sessions, IDLE is the
+                                    // authoritative interaction lifecycle signal.
+                                    // turnComplete may be emitted earlier while
+                                    // background reasoning or async tools continue.
                                     finishInteractionAfterPlayback(
                                         sourceSessionId = eventSessionId,
                                         sourceEpoch = eventEpoch,
@@ -1773,14 +1804,18 @@ class SessionManager @Inject constructor(
                             }
 
                             is GeminiEvent.ModelText -> {
-                                if (!currentOutputTranscriptionEnabled) {
-                                    appendTranscript(
-                                        ClientRole.MODEL,
-                                        event.text,
-                                        false,
-                                        envelope.generationId
-                                    )
-                                }
+                                // ModelText is a real model-turn content stream, not
+                                // merely a fallback for output transcription. It can
+                                // be the only textual representation of a response
+                                // when audio transcription is absent (for example
+                                // around tool use or text-only model content). Keep
+                                // it visible even when output transcription is enabled.
+                                appendTranscript(
+                                    ClientRole.MODEL,
+                                    event.text,
+                                    false,
+                                    envelope.generationId
+                                )
                             }
 
                             is GeminiEvent.Usage -> {
@@ -1972,17 +2007,20 @@ class SessionManager @Inject constructor(
 
             val shouldReconnect =
                 mutex.withLock {
+                    val lifecycleComplete =
+                        if (capabilities.supportsInteractionStatus) {
+                            interactionStatus == "IDLE"
+                        } else {
+                            turnCompleteSeen
+                        }
+
                     if (
                         !connectionDesired ||
                         activeSessionId != sourceSessionId ||
                         client.sessionId != sourceSessionId ||
                         client.epoch != sourceEpoch ||
                         _state.value.link == LinkState.IDLE ||
-                        !turnCompleteSeen ||
-                        (
-                            capabilities.supportsInteractionStatus &&
-                            interactionStatus != "IDLE"
-                        )
+                        !lifecycleComplete
                     ) {
                         return@withLock false
                     }
@@ -2227,7 +2265,13 @@ class SessionManager @Inject constructor(
                         }
                     } finally {
                         activeToolJobs.remove(key)
-                        cancelledToolCallKeys.remove(key)
+                        // A server cancellation is a protocol-level barrier for
+                        // this call. Do not erase it from finally: the coroutine
+                        // may observe cancellation only after this block has
+                        // started, while the response path still needs the key
+                        // to suppress a late FunctionResponse. Cancelled-call
+                        // markers are cleared centrally on session shutdown /
+                        // transport teardown.
                     }
                 }
 
@@ -2296,7 +2340,23 @@ class SessionManager @Inject constructor(
                         !last.interim &&
                         transcriptStreamGenerationId == generationId
                     ) {
-                        list[list.lastIndex] = last.copy(text = last.text + text)
+                        val previous = last.text
+                        val incoming = text
+                        val previousComparable =
+                            normalizeTranscriptForComparison(previous)
+                        val incomingComparable =
+                            normalizeTranscriptForComparison(incoming)
+
+                        val mergedText = when {
+                            incomingComparable.isBlank() -> previous
+                            previousComparable.isBlank() -> incoming
+                            previousComparable == incomingComparable -> previous
+                            incomingComparable.startsWith(previousComparable) -> incoming
+                            previousComparable.startsWith(incomingComparable) -> previous
+                            else -> joinTranscriptChunks(previous, incoming)
+                        }
+
+                        list[list.lastIndex] = last.copy(text = mergedText)
                     } else {
                         list.add(
                             ChatMessage(
@@ -2311,6 +2371,35 @@ class SessionManager @Inject constructor(
             }
 
             transcriptStreamGenerationId = generationId
+        }
+    }
+
+    private fun normalizeTranscriptForComparison(text: String): String =
+        text
+            .trim()
+            .replace(Regex("\\s+"), " ")
+            .trimEnd('.', ',', '!', '?', ';', ':', '…')
+            .lowercase()
+
+    private fun joinTranscriptChunks(
+        previous: String,
+        incoming: String
+    ): String {
+        if (previous.isEmpty()) return incoming
+        if (incoming.isEmpty()) return previous
+        if (previous.last().isWhitespace() || incoming.first().isWhitespace()) {
+            return previous + incoming
+        }
+
+        val noLeadingSpace = incoming.first() in
+            ".,!?;:%)]}\"»”’…-–—"
+        val noTrailingSpace = previous.last() in
+            "([{\"«“‘"
+
+        return if (noLeadingSpace || noTrailingSpace) {
+            previous + incoming
+        } else {
+            "$previous $incoming"
         }
     }
 
@@ -2429,3 +2518,4 @@ class SessionManager @Inject constructor(
         }
     }
 }
+
