@@ -2,6 +2,7 @@ package com.client.app.api
 
 import android.util.Base64
 import kotlinx.coroutines.*
+import com.client.app.audio.NativeAudioBridge
 import com.client.app.audio.NativeAudioEngine
 import com.client.app.logging.AppLogManager
 import kotlinx.coroutines.channels.Channel
@@ -28,6 +29,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
+import javax.net.SocketFactory
 import javax.inject.Singleton
 
 private const val GEMINI_INPUT_AUDIO_MIME_TYPE = "audio/pcm;rate=16000"
@@ -35,6 +37,7 @@ private const val GEMINI_INPUT_AUDIO_MIME_TYPE = "audio/pcm;rate=16000"
 @Singleton
 class GeminiProtobufLiveClient @Inject constructor(
     private val audioEngine: NativeAudioEngine,
+    private val nativeBridge: NativeAudioBridge,
     private val logManager: AppLogManager
 ) {
     companion object {
@@ -198,6 +201,13 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     private val httpClient =
         OkHttpClient.Builder()
+            .socketFactory(
+                TunedSocketFactory(
+                    delegate = SocketFactory.getDefault(),
+                    nativeBridge = nativeBridge,
+                    logManager = logManager
+                )
+            )
             .eventListener(loggingEventListener)
             .connectTimeout(
                 10,
@@ -1466,16 +1476,21 @@ class GeminiProtobufLiveClient @Inject constructor(
                                 addJsonObject {
                                     put("id", resp.id!!.trim())
                                     put("name", resp.name)
-                                    put("response", resp.response)
 
-                                    if (
-                                        caps.supportsFunctionScheduling &&
-                                        resp.scheduling != null
-                                    ) {
-                                        put(
-                                            "scheduling",
-                                            resp.scheduling.name
-                                        )
+                                    putJsonObject("response") {
+                                        resp.response.forEach { (key, value) ->
+                                            put(key, value)
+                                        }
+
+                                        if (
+                                            caps.supportsFunctionScheduling &&
+                                            resp.scheduling != null
+                                        ) {
+                                            put(
+                                                "scheduling",
+                                                resp.scheduling.name
+                                            )
+                                        }
                                     }
 
                                     if (resp.willContinue) {
@@ -2130,6 +2145,34 @@ class GeminiProtobufLiveClient @Inject constructor(
                     emitControl(GeminiEvent.ToolCallCancelled(ids))
                 }
 
+            // toolCall is a top-level BidiGenerateContentServerMessage variant;
+            // it is independent of serverContent and must be parsed even when
+            // the same frame does not contain serverContent.
+            root["toolCall"]?.jsonObject?.get("functionCalls")?.jsonArray
+                ?.mapNotNull { fcEl ->
+                    val fc = fcEl.jsonObject
+                    val name =
+                        fc["name"]?.jsonPrimitive?.contentOrNull
+                            ?.takeIf { it.isNotBlank() }
+                            ?: return@mapNotNull null
+                    val id =
+                        fc["id"]?.jsonPrimitive?.contentOrNull
+                            ?.takeIf { it.isNotBlank() }
+                            ?: return@mapNotNull null
+                    val args =
+                        fc["args"]?.jsonObject
+                            ?: buildJsonObject {}
+                    FunctionCall(
+                        name = name,
+                        id = id,
+                        args = args
+                    )
+                }
+                ?.takeIf { it.isNotEmpty() }
+                ?.let { calls ->
+                    emitControl(GeminiEvent.ToolCall(calls))
+                }
+
             val sc = root["serverContent"]?.jsonObject
             if (sc != null) {
                 val interrupted = sc["interrupted"]?.jsonPrimitive?.booleanOrNull == true
@@ -2192,17 +2235,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                         }
                     }
                 }
-
-                root["toolCall"]?.jsonObject?.get("functionCalls")?.jsonArray
-                    ?.mapNotNull { fcEl ->
-                        val fc = fcEl.jsonObject
-                        val name = fc["name"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                        val id = fc["id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                        val args = fc["args"]?.jsonObject ?: buildJsonObject {}
-                        FunctionCall(name, id, args)
-                    }
-                    ?.takeIf { it.isNotEmpty() }
-                    ?.let { emitControl(GeminiEvent.ToolCall(it)) }
 
                 sc["generationComplete"]?.jsonPrimitive?.booleanOrNull?.takeIf { it }
                     ?.let {
