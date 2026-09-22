@@ -1,10 +1,10 @@
-// >>> FILE: app/src/main/java/com/client/app/util/CryptoManager.kt
 package com.client.app.util
 
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import java.security.KeyStore
+import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -53,6 +53,7 @@ class CryptoManager @Inject constructor() {
         val store = KeyStore.getInstance(ANDROID_KEYSTORE).apply {
             load(null)
         }
+
         keyStore = store
         return store
     }
@@ -63,103 +64,192 @@ class CryptoManager @Inject constructor() {
 
         if (store.containsAlias(KEY_ALIAS)) {
             val entry = store.getEntry(KEY_ALIAS, null)
+
             return (entry as? KeyStore.SecretKeyEntry)?.secretKey
-                ?: throw IllegalStateException("Android Keystore alias has unexpected entry type")
+                ?: throw IllegalStateException(
+                    "Android Keystore alias has unexpected entry type"
+                )
         }
 
         val keyGenerator = KeyGenerator.getInstance(
             KeyProperties.KEY_ALGORITHM_AES,
             ANDROID_KEYSTORE
         )
+
         val spec = KeyGenParameterSpec.Builder(
             KEY_ALIAS,
-            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            KeyProperties.PURPOSE_ENCRYPT or
+                KeyProperties.PURPOSE_DECRYPT
         )
-            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setBlockModes(
+                KeyProperties.BLOCK_MODE_GCM
+            )
+            .setEncryptionPaddings(
+                KeyProperties.ENCRYPTION_PADDING_NONE
+            )
             .setKeySize(256)
             .build()
 
         keyGenerator.init(spec)
+
         return keyGenerator.generateKey()
     }
 
-    fun encrypt(plainText: String): CryptoResult {
+    fun encrypt(
+        plainText: String
+    ): CryptoResult {
+
         if (plainText.isBlank()) {
             return CryptoResult.Success("")
         }
 
         return try {
             val key = getOrCreateKey()
-            val cipher = Cipher.getInstance(TRANSFORMATION)
-            cipher.init(Cipher.ENCRYPT_MODE, key)
+
+            val cipher = Cipher.getInstance(
+                TRANSFORMATION
+            )
+
+            cipher.init(
+                Cipher.ENCRYPT_MODE,
+                key
+            )
 
             val iv = cipher.iv
+
             if (iv.size != GCM_IV_LENGTH_BYTES) {
                 return CryptoResult.Failure(
                     CryptoFailureReason.ENCRYPTION_FAILED,
-                    IllegalStateException("Unexpected GCM IV length: ${iv.size}")
+                    IllegalStateException(
+                        "Unexpected GCM IV length: ${iv.size}"
+                    )
                 )
             }
 
-            val cipherText = cipher.doFinal(plainText.toByteArray(Charsets.UTF_8))
-            val combined = ByteArray(iv.size + cipherText.size)
+            val cipherText =
+                cipher.doFinal(
+                    plainText.toByteArray(
+                        Charsets.UTF_8
+                    )
+                )
 
-            System.arraycopy(iv, 0, combined, 0, iv.size)
-            System.arraycopy(cipherText, 0, combined, iv.size, cipherText.size)
+            val combined =
+                ByteArray(
+                    iv.size + cipherText.size
+                )
+
+            System.arraycopy(
+                iv,
+                0,
+                combined,
+                0,
+                iv.size
+            )
+
+            System.arraycopy(
+                cipherText,
+                0,
+                combined,
+                iv.size,
+                cipherText.size
+            )
 
             CryptoResult.Success(
-                Base64.encodeToString(combined, Base64.NO_WRAP)
+                Base64.encodeToString(
+                    combined,
+                    Base64.NO_WRAP
+                )
             )
+
         } catch (e: java.security.KeyStoreException) {
             keyStore = null
-            CryptoResult.Failure(CryptoFailureReason.KEYSTORE_UNAVAILABLE, e)
+
+            CryptoResult.Failure(
+                CryptoFailureReason.KEYSTORE_UNAVAILABLE,
+                e
+            )
+
         } catch (e: java.io.IOException) {
             keyStore = null
-            CryptoResult.Failure(CryptoFailureReason.KEYSTORE_UNAVAILABLE, e)
+
+            CryptoResult.Failure(
+                CryptoFailureReason.KEYSTORE_UNAVAILABLE,
+                e
+            )
+
         } catch (e: java.security.GeneralSecurityException) {
-            CryptoResult.Failure(CryptoFailureReason.ENCRYPTION_FAILED, e)
+            CryptoResult.Failure(
+                CryptoFailureReason.ENCRYPTION_FAILED,
+                e
+            )
+
         } catch (e: RuntimeException) {
-            CryptoResult.Failure(CryptoFailureReason.KEY_ACCESS_FAILED, e)
+            CryptoResult.Failure(
+                CryptoFailureReason.KEY_ACCESS_FAILED,
+                e
+            )
         }
     }
 
-    fun decrypt(encryptedText: String): CryptoResult {
+    fun decrypt(
+        encryptedText: String
+    ): CryptoResult {
+
         if (encryptedText.isBlank()) {
             return CryptoResult.Missing
         }
 
         return try {
-            val combined = try {
-                Base64.decode(encryptedText, Base64.NO_WRAP)
-            } catch (e: IllegalArgumentException) {
-                return CryptoResult.Failure(
-                    CryptoFailureReason.INVALID_CIPHERTEXT,
-                    e
-                )
-            }
 
-            if (combined.size < MIN_CIPHERTEXT_LENGTH_BYTES) {
+            val combined =
+                try {
+                    Base64.decode(
+                        encryptedText,
+                        Base64.NO_WRAP
+                    )
+                } catch (e: IllegalArgumentException) {
+                    return CryptoResult.Failure(
+                        CryptoFailureReason.INVALID_CIPHERTEXT,
+                        e
+                    )
+                }
+
+            if (
+                combined.size <
+                MIN_CIPHERTEXT_LENGTH_BYTES
+            ) {
                 return CryptoResult.Failure(
                     CryptoFailureReason.INVALID_CIPHERTEXT
                 )
             }
 
-            val iv = combined.copyOfRange(
-                0,
-                GCM_IV_LENGTH_BYTES
-            )
-            val cipherText = combined.copyOfRange(
-                GCM_IV_LENGTH_BYTES,
-                combined.size
-            )
+            val iv =
+                combined.copyOfRange(
+                    0,
+                    GCM_IV_LENGTH_BYTES
+                )
 
-            val key = getOrCreateKey()
-            val cipher = Cipher.getInstance(TRANSFORMATION)
+            val cipherText =
+                combined.copyOfRange(
+                    GCM_IV_LENGTH_BYTES,
+                    combined.size
+                )
+
+            val key =
+                getOrCreateKey()
+
+            val cipher =
+                Cipher.getInstance(
+                    TRANSFORMATION
+                )
+
             cipher.init(
                 Cipher.DECRYPT_MODE,
                 key,
-                GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv)
+                GCMParameterSpec(
+                    GCM_TAG_LENGTH_BITS,
+                    iv
+                )
             )
 
             CryptoResult.Success(
@@ -168,21 +258,45 @@ class CryptoManager @Inject constructor() {
                     Charsets.UTF_8
                 )
             )
+
         } catch (e: AEADBadTagException) {
+
             CryptoResult.Failure(
                 CryptoFailureReason.AUTHENTICATION_FAILED,
                 e
             )
+
         } catch (e: java.security.KeyStoreException) {
+
             keyStore = null
-            CryptoResult.Failure(CryptoFailureReason.KEYSTORE_UNAVAILABLE, e)
+
+            CryptoResult.Failure(
+                CryptoFailureReason.KEYSTORE_UNAVAILABLE,
+                e
+            )
+
         } catch (e: java.io.IOException) {
+
             keyStore = null
-            CryptoResult.Failure(CryptoFailureReason.KEYSTORE_UNAVAILABLE, e)
+
+            CryptoResult.Failure(
+                CryptoFailureReason.KEYSTORE_UNAVAILABLE,
+                e
+            )
+
         } catch (e: java.security.GeneralSecurityException) {
-            CryptoResult.Failure(CryptoFailureReason.DECRYPTION_FAILED, e)
+
+            CryptoResult.Failure(
+                CryptoFailureReason.DECRYPTION_FAILED,
+                e
+            )
+
         } catch (e: RuntimeException) {
-            CryptoResult.Failure(CryptoFailureReason.KEY_ACCESS_FAILED, e)
+
+            CryptoResult.Failure(
+                CryptoFailureReason.KEY_ACCESS_FAILED,
+                e
+            )
         }
     }
 }
