@@ -5,7 +5,6 @@ import kotlinx.coroutines.*
 import com.client.app.audio.NativeAudioEngine
 import com.client.app.logging.AppLogManager
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.ChannelResult
 import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.channels.SendChannel
@@ -70,7 +69,6 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         private const val MAX_DATA_EVENTS_IN_FLIGHT = 256
 
-        private const val MAX_AUDIO_FRAME_QUEUE_CAPACITY = 128
     }
 
     private val json =
@@ -105,13 +103,12 @@ class GeminiProtobufLiveClient @Inject constructor(
             AudioOutboundCommand
 
         /**
-         * Establishes a transport ordering barrier. The writer completes the
-         * deferred only after every earlier realtime command has been
-         * processed. Direct non-audio sends use this barrier so they cannot
-         * jump ahead of queued PCM/activity markers.
+         * Arbitrary realtime JSON that must preserve FIFO ordering with audio
+         * and activity markers. All realtime producers therefore share one
+         * ordered command stream rather than using a mutex around a network wait.
          */
-        data class Barrier(
-            val completion: CompletableDeferred<Unit>
+        data class DirectJson(
+            val jsonMessage: String
         ) : AudioOutboundCommand
     }
 
@@ -342,9 +339,12 @@ class GeminiProtobufLiveClient @Inject constructor(
                 )
             }
 
-    // AI output audio is independently bounded by byte accounting.
+    // AI output audio is independently bounded by byte accounting. The channel
+    // itself is unlimited so capacity cannot cause an otherwise budget-admitted
+    // PCM frame to be silently discarded. MAX_AI_AUDIO_BACKLOG_BYTES remains the
+    // hard memory ceiling enforced at ingress.
     private val _audio =
-        Channel<AudioFrame>(MAX_AUDIO_FRAME_QUEUE_CAPACITY)
+        Channel<AudioFrame>(Channel.UNLIMITED)
 
     val audio: ReceiveChannel<AudioFrame> =
         _audio
@@ -822,11 +822,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                     val command = channel.receiveCatching().getOrNull()
                         ?: break
 
-                    if (command is AudioOutboundCommand.Barrier) {
-                        command.completion.complete(Unit)
-                        continue
-                    }
-
                     if (!awaitWebSocketQueueCapacity(ws, writerEpoch)) {
                         break
                     }
@@ -895,16 +890,17 @@ class GeminiProtobufLiveClient @Inject constructor(
                             AudioOutboundCommand.AudioStreamEnd ->
                                 buildJsonObject {
                                     putJsonObject(
-                                         "realtimeInput"
-                                     ) {
-                                         put(
-                                             "audioStreamEnd",
-                                             true
-                                         )
-                                     }
-                                 }.toString()
+                                        "realtimeInput"
+                                    ) {
+                                        put(
+                                            "audioStreamEnd",
+                                            true
+                                        )
+                                    }
+                                }.toString()
 
-                            is AudioOutboundCommand.Barrier -> ""
+                            is AudioOutboundCommand.DirectJson ->
+                                command.jsonMessage
                         }
 
                     val sendAccepted =
@@ -1024,11 +1020,10 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     private val outboundSendLock = Any()
 
-    // Serializes direct-send barriers + direct network sends against one
-    // another. Audio commands remain on the writer channel, but every direct
-    // sender first waits for a channel barrier, giving the whole transport a
-    // single logical outbound sequence.
-    private val outboundDirectMutex = Mutex()
+    // Serializes only command enqueue operations. It is never held while the
+    // writer waits for OkHttp capacity or performs a network call, so direct
+    // text/image sends cannot create mutex-based HOL blocking.
+    private val outboundCommandMutex = Mutex()
 
     private fun stopAudioWriter(
         expectedWs: WebSocket? = null,
@@ -1054,90 +1049,83 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
     }
 
-    // AUD-067:
-    // Suspend while the application-level realtime command queue is full.
-    // A lifecycle race is treated as a normal drop of a stale command, not as
-    // an application exception. The capture producer is never handed a
-    // synthetic "writer not active" failure during reconnect/close.
+    // AUD-067 / ER-046 / ER-048:
+    // All realtime producers enqueue into one FIFO. The enqueue mutex orders
+    // the logical operations, but no network wait is performed while it is held.
     suspend fun sendAudioPcm(
         pcm: ByteArray
     ) {
         if (pcm.isEmpty()) return
 
-        val target = synchronized(batchLock) {
-            val writerEpoch = synchronized(sessionStateLock) { epoch }
-            val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
-            val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
+        outboundCommandMutex.withLock {
+            val target = synchronized(batchLock) {
+                val writerEpoch = synchronized(sessionStateLock) { epoch }
+                val ws = synchronized(sessionStateLock) { webSocket }
+                    ?: return@synchronized null
+                val channel = synchronized(sessionStateLock) { audioWriterChannel }
+                    ?: return@synchronized null
 
-            isAudioStreamEnded = false
-            audioBatchBuffer.write(pcm)
+                isAudioStreamEnded = false
+                audioBatchBuffer.write(pcm)
 
-            val payload =
-                if (audioBatchBuffer.size() >= AUDIO_BATCH_THRESHOLD_BYTES) {
-                    audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
-                } else {
+                val payload =
+                    if (audioBatchBuffer.size() >= AUDIO_BATCH_THRESHOLD_BYTES) {
+                        audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
+                    } else {
+                        null
+                    }
+
+                if (payload == null || !isWriterCurrent(writerEpoch, ws, channel)) {
                     null
+                } else {
+                    channel to payload
                 }
+            } ?: return@withLock
 
-            if (payload == null ||
-                !isWriterCurrent(writerEpoch, ws, channel)
-            ) {
-                null
-            } else {
-                channel to payload
+            try {
+                target.first.send(AudioOutboundCommand.Pcm(target.second))
+            } catch (_: ClosedSendChannelException) {
+                // Normal reconnect/close race.
             }
-        } ?: return
-
-        try {
-            target.first.send(AudioOutboundCommand.Pcm(target.second))
-        } catch (_: ClosedSendChannelException) {
-            // Normal reconnect/close race.
-        } catch (cancelled: CancellationException) {
-            throw cancelled
         }
     }
 
-    // AUD-067:
     // Tail PCM is queued before AudioStreamEnd in the same ordered channel.
     suspend fun sendAudioStreamEnd() {
-        val pending = synchronized(batchLock) {
-            if (isAudioStreamEnded) return@synchronized null
+        outboundCommandMutex.withLock {
+            val pending = synchronized(batchLock) {
+                if (isAudioStreamEnded) return@synchronized null
 
-            val writerEpoch = synchronized(sessionStateLock) { epoch }
-            val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
-            val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
+                val writerEpoch = synchronized(sessionStateLock) { epoch }
+                val ws = synchronized(sessionStateLock) { webSocket }
+                    ?: return@synchronized null
+                val channel = synchronized(sessionStateLock) { audioWriterChannel }
+                    ?: return@synchronized null
 
-            val tailPayload =
-                if (audioBatchBuffer.size() == 0) {
+                val tailPayload =
+                    if (audioBatchBuffer.size() == 0) {
+                        null
+                    } else {
+                        audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
+                    }
+
+                isAudioStreamEnded = true
+
+                if (!isWriterCurrent(writerEpoch, ws, channel)) {
                     null
                 } else {
-                    audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
+                    Triple(channel, tailPayload, Unit)
                 }
+            } ?: return@withLock
 
-            isAudioStreamEnded = true
-
-            if (!isWriterCurrent(writerEpoch, ws, channel)) {
-                null
-            } else {
-                val commands =
-                    if (tailPayload != null) {
-                        listOf(
-                            AudioOutboundCommand.Pcm(tailPayload),
-                            AudioOutboundCommand.AudioStreamEnd
-                        )
-                    } else {
-                        listOf(AudioOutboundCommand.AudioStreamEnd)
-                    }
-                channel to commands
+            try {
+                pending.second?.let {
+                    pending.first.send(AudioOutboundCommand.Pcm(it))
+                }
+                pending.first.send(AudioOutboundCommand.AudioStreamEnd)
+            } catch (_: ClosedSendChannelException) {
+                // Normal reconnect/close race.
             }
-        } ?: return
-
-        try {
-            pending.second.forEach { pending.first.send(it) }
-        } catch (_: ClosedSendChannelException) {
-            // Normal lifecycle race.
-        } catch (cancelled: CancellationException) {
-            throw cancelled
         }
     }
 
@@ -1152,98 +1140,69 @@ class GeminiProtobufLiveClient @Inject constructor(
                 audioWriterChannel === channel
         }
 
-    private suspend fun awaitOutboundBarrier(
-        expectedEpoch: Long,
-        expectedWs: WebSocket
-    ): Boolean {
-        val channel = synchronized(sessionStateLock) {
-            if (expectedEpoch != epoch || webSocket !== expectedWs || !isReady) {
-                return false
+    private suspend fun sendOrderedJson(
+        jsonMessage: String,
+        writerEpoch: Long,
+        ws: WebSocket,
+        channel: Channel<AudioOutboundCommand>
+    ) {
+        outboundCommandMutex.withLock {
+            if (!isWriterCurrent(writerEpoch, ws, channel)) return@withLock
+            try {
+                channel.send(AudioOutboundCommand.DirectJson(jsonMessage))
+            } catch (_: ClosedSendChannelException) {
+                // Normal reconnect/close race.
             }
-            audioWriterChannel
-        } ?: return false
-
-        val barrier = CompletableDeferred<Unit>()
-        return try {
-            channel.send(AudioOutboundCommand.Barrier(barrier))
-            withTimeoutOrNull(2500L) {
-                barrier.await()
-                true
-            } == true && synchronized(sessionStateLock) {
-                expectedEpoch == epoch && webSocket === expectedWs && isReady
-            }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: ClosedSendChannelException) {
-            false
         }
     }
 
     suspend fun sendRealtimeText(
         text: String
     ) {
+        if (text.isBlank()) return
 
-        val sendEpoch = epoch
-        val ws =
-            webSocket ?: return
+        val target = synchronized(sessionStateLock) {
+            if (!isReady) return@synchronized null
+            val currentWs = webSocket ?: return@synchronized null
+            val currentChannel = audioWriterChannel ?: return@synchronized null
+            Triple(epoch, currentWs, currentChannel)
+        } ?: return
 
-        if (
-            !isReady ||
-            text.isBlank()
-        ) {
-            return
-        }
-
-        val cleanText =
-            text.trim()
-
-        val jsonMessage =
-            buildJsonObject {
-
-                putJsonObject(
-                    "realtimeInput"
-                ) {
-
-                    put(
-                        "text",
-                        cleanText
-                    )
-                }
-
-            }.toString()
+        val cleanText = text.trim()
+        val jsonMessage = buildJsonObject {
+            putJsonObject("realtimeInput") {
+                put("text", cleanText)
+            }
+        }.toString()
 
         logManager.net(
             "WebSocket:TxText",
             "Отправка realtimeInput.text (payload redacted; length=${cleanText.length})"
         )
 
-        outboundDirectMutex.withLock {
-            if (awaitOutboundBarrier(sendEpoch, ws)) {
-                synchronized(outboundSendLock) {
-                    ws.send(jsonMessage)
-                }
-            }
-        }
+        sendOrderedJson(
+            jsonMessage,
+            target.first,
+            target.second,
+            target.third
+        )
     }
 
     suspend fun sendRealtimeImage(
         jpegBytes: ByteArray
     ) {
-        val sendEpoch = epoch
-        val ws =
-            webSocket ?: return
+        if (jpegBytes.isEmpty()) return
 
-        if (
-            !isReady ||
-            jpegBytes.isEmpty()
-        ) {
-            return
-        }
+        val target = synchronized(sessionStateLock) {
+            if (!isReady) return@synchronized null
+            val currentWs = webSocket ?: return@synchronized null
+            val currentChannel = audioWriterChannel ?: return@synchronized null
+            Triple(epoch, currentWs, currentChannel)
+        } ?: return
 
-        // Video is an optional realtime producer. Unlike PCM/control, it may
-        // be safely shed when the OkHttp outbound queue is congested. This keeps
-        // transient image bursts from competing with the voice transport.
-        if (ws.queueSize() > MAX_QUEUE_BYTES) {
+        // Video is optional and may be shed when the OkHttp outbound queue is
+        // congested. Voice/control commands remain in the ordered channel.
+        if (target.second.queueSize() > MAX_QUEUE_BYTES) {
             logManager.w(
                 "WebSocket:TxImage",
                 "Очередь WebSocket перегружена; realtime image пропущен"
@@ -1251,115 +1210,101 @@ class GeminiProtobufLiveClient @Inject constructor(
             return
         }
 
-        val base64Data =
-            Base64.encodeToString(
-                jpegBytes,
-                Base64.NO_WRAP
-            )
-
-        val jsonMessage =
-            buildJsonObject {
-
-                putJsonObject(
-                    "realtimeInput"
-                ) {
-
-                    putJsonObject(
-                        "video"
-                    ) {
-
-                        put(
-                            "mimeType",
-                            "image/jpeg"
-                        )
-
-                        put(
-                            "data",
-                            base64Data
-                        )
-                    }
+        val base64Data = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
+        val jsonMessage = buildJsonObject {
+            putJsonObject("realtimeInput") {
+                putJsonObject("video") {
+                    put("mimeType", "image/jpeg")
+                    put("data", base64Data)
                 }
-
-            }.toString()
+            }
+        }.toString()
 
         logManager.net(
             "WebSocket:TxImage",
             "Отправка изображения (${jpegBytes.size} байт)"
         )
 
-        outboundDirectMutex.withLock {
-            if (awaitOutboundBarrier(sendEpoch, ws)) {
-                synchronized(outboundSendLock) {
-                    ws.send(jsonMessage)
-                }
-            }
-        }
+        sendOrderedJson(
+            jsonMessage,
+            target.first,
+            target.second,
+            target.third
+        )
     }
 
-    // Manual VAD activity markers are serialized through the same
-    // realtime audio command stream.
+    // Manual VAD activity markers are serialized with buffered PCM. Most
+    // importantly, ActivityStart no longer destroys the pre-roll already staged
+    // in audioBatchBuffer; it is emitted immediately after the marker.
     suspend fun sendActivityStart() {
-        val channel = synchronized(batchLock) {
-            val writerEpoch = synchronized(sessionStateLock) { epoch }
-            val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
-            val target = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
+        outboundCommandMutex.withLock {
+            val pending = synchronized(batchLock) {
+                val writerEpoch = synchronized(sessionStateLock) { epoch }
+                val ws = synchronized(sessionStateLock) { webSocket }
+                    ?: return@synchronized null
+                val channel = synchronized(sessionStateLock) { audioWriterChannel }
+                    ?: return@synchronized null
 
-            isAudioStreamEnded = false
-            audioBatchBuffer.reset()
+                val preRoll =
+                    if (audioBatchBuffer.size() == 0) {
+                        null
+                    } else {
+                        audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
+                    }
 
-            if (isWriterCurrent(writerEpoch, ws, target)) {
-                target
-            } else {
-                null
+                isAudioStreamEnded = false
+
+                if (isWriterCurrent(writerEpoch, ws, channel)) {
+                    Triple(channel, preRoll, Unit)
+                } else {
+                    null
+                }
+            } ?: return@withLock
+
+            try {
+                pending.first.send(AudioOutboundCommand.ActivityStart)
+                pending.second?.let {
+                    pending.first.send(AudioOutboundCommand.Pcm(it))
+                }
+            } catch (_: ClosedSendChannelException) {
+                // Normal reconnect/close race.
             }
-        } ?: return
-
-        try {
-            channel.send(AudioOutboundCommand.ActivityStart)
-        } catch (_: ClosedSendChannelException) {
-            // Normal lifecycle race.
-        } catch (cancelled: CancellationException) {
-            throw cancelled
         }
     }
 
     suspend fun sendActivityEnd() {
-        val pending = synchronized(batchLock) {
-            val writerEpoch = synchronized(sessionStateLock) { epoch }
-            val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
-            val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
+        outboundCommandMutex.withLock {
+            val pending = synchronized(batchLock) {
+                val writerEpoch = synchronized(sessionStateLock) { epoch }
+                val ws = synchronized(sessionStateLock) { webSocket }
+                    ?: return@synchronized null
+                val channel = synchronized(sessionStateLock) { audioWriterChannel }
+                    ?: return@synchronized null
 
-            val tailPayload =
-                if (audioBatchBuffer.size() == 0) {
+                val tailPayload =
+                    if (audioBatchBuffer.size() == 0) {
+                        null
+                    } else {
+                        audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
+                    }
+
+                isAudioStreamEnded = true
+
+                if (!isWriterCurrent(writerEpoch, ws, channel)) {
                     null
                 } else {
-                    audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
+                    Triple(channel, tailPayload, Unit)
                 }
+            } ?: return@withLock
 
-            isAudioStreamEnded = true
-
-            if (!isWriterCurrent(writerEpoch, ws, channel)) {
-                null
-            } else {
-                val commands =
-                    if (tailPayload != null) {
-                        listOf(
-                            AudioOutboundCommand.Pcm(tailPayload),
-                            AudioOutboundCommand.ActivityEnd
-                        )
-                    } else {
-                        listOf(AudioOutboundCommand.ActivityEnd)
-                    }
-                channel to commands
+            try {
+                pending.second?.let {
+                    pending.first.send(AudioOutboundCommand.Pcm(it))
+                }
+                pending.first.send(AudioOutboundCommand.ActivityEnd)
+            } catch (_: ClosedSendChannelException) {
+                // Normal reconnect/close race.
             }
-        } ?: return
-
-        try {
-            pending.second.forEach { pending.first.send(it) }
-        } catch (_: ClosedSendChannelException) {
-            // Normal lifecycle race.
-        } catch (cancelled: CancellationException) {
-            throw cancelled
         }
     }
 
@@ -1367,28 +1312,42 @@ class GeminiProtobufLiveClient @Inject constructor(
         turns: List<ClientTurn>,
         turnComplete: Boolean = true
     ) {
+        if (turns.isEmpty()) return
 
-        val sendEpoch = epoch
-        val ws =
-            webSocket ?: return
+        val target = synchronized(sessionStateLock) {
+            if (!isReady) return@synchronized null
+            val currentWs = webSocket ?: return@synchronized null
+            val currentChannel = audioWriterChannel ?: return@synchronized null
+            Triple(epoch, currentWs, currentChannel)
+        } ?: return
 
-        if (
-            !isReady ||
-            turns.isEmpty()
-        ) {
-            return
-        }
-
-        outboundDirectMutex.withLock {
-            if (awaitOutboundBarrier(sendEpoch, ws)) {
-                sendClientContentInternal(
-                    turns = turns,
-                    turnComplete = turnComplete,
-                    targetWebSocket = ws,
-                    expectedEpoch = sendEpoch
-                )
+        val jsonMessage = buildJsonObject {
+            putJsonObject("clientContent") {
+                putJsonArray("turns") {
+                    turns.forEach { turn ->
+                        addJsonObject {
+                            put("role", turn.role.value)
+                            putJsonArray("parts") {
+                                addJsonObject { put("text", turn.text) }
+                            }
+                        }
+                    }
+                }
+                put("turnComplete", turnComplete)
             }
-        }
+        }.toString()
+
+        logManager.net(
+            "WebSocket:TxClientContent",
+            "Отправка clientContent (${turns.size} ходов, turnComplete=$turnComplete) [payload redacted]"
+        )
+
+        sendOrderedJson(
+            jsonMessage,
+            target.first,
+            target.second,
+            target.third
+        )
     }
 
     private fun sendClientContentInternal(

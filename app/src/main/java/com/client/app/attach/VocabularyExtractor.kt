@@ -49,7 +49,7 @@ class VocabularyExtractor @Inject constructor(
         private const val ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
         
         const val DEFAULT_MODEL = "gemini-3.8-flash"
-        private const val FALLBACK_MODEL = "gemini-3.8-flash"
+        private const val FALLBACK_MODEL = "gemini-3.7-flash"
         
         private const val MAX_IMAGES_PER_CALL = 4
         private const val MAX_VOCAB = 250

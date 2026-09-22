@@ -9,7 +9,9 @@ import com.client.app.util.AppLogger
 import com.client.app.util.CryptoManager
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.json.*
 import okhttp3.OkHttpClient
@@ -84,6 +86,7 @@ class ForvoRepository @Inject constructor(
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
     private val gate = Semaphore(3)
+    private val quotaMutex = Mutex()
     private val hits = ConcurrentHashMap<String, Pronunciation>()
     private val misses = ConcurrentHashMap<String, Long>()
 
@@ -140,9 +143,14 @@ class ForvoRepository @Inject constructor(
         hits[cacheKey]?.let { if (!it.isStale()) return ForvoResult.Found(it) else hits.remove(cacheKey) }
         misses[cacheKey]?.let { if (System.currentTimeMillis() - it < MISS_TTL_MS) return ForvoResult.NotFound }
 
-        if (_quota.value.isExhausted) return ForvoResult.QuotaExceeded
-
         return gate.withPermit {
+            // ER-023 / ER-053: reserve the API-request slot immediately before
+            // the external call. The reservation is atomic with the quota check,
+            // so concurrent batches cannot cross the daily limit.
+            if (!reserveQuotaSlot()) {
+                return@withPermit ForvoResult.QuotaExceeded
+            }
+
             val encoded = URLEncoder.encode(query, "UTF-8").replace("+", "%20")
             val host = readHost()
             val url = "$host/key/$apiKey/format/json/action/standard-pronunciation/word/$encoded/language/$targetLang"
@@ -185,25 +193,52 @@ class ForvoRepository @Inject constructor(
         }
     }
 
-    // Ошибка №13 [PERF]: Запуск в рамках контролируемого repositoryScope
-    fun registerSuccessfulPlayback() {
-        repositoryScope.launch {
+    /**
+     * Atomically reserves one daily Forvo API request slot. Quota semantics are
+     * deliberately request-based: a failed remote request still consumed the
+     * provider-side request opportunity and therefore keeps the reserved slot.
+     */
+    private suspend fun reserveQuotaSlot(): Boolean = quotaMutex.withLock {
+        var reserved = false
+        var usedAfter = 0
+        var limitAfter = DEFAULT_QUOTA_LIMIT
+
+        dataStore.edit { prefs ->
             val currentDay = calculateForvoDayId(Instant.now())
-            dataStore.edit { prefs ->
-                val savedDay = prefs[KEY_QUOTA_DAY] ?: ""
-                val currentUsed = if (savedDay == currentDay) prefs[KEY_QUOTA_USED] ?: 0 else 0
-                val newUsed = currentUsed + 1
+            val savedDay = prefs[KEY_QUOTA_DAY] ?: ""
+            val limit = prefs[KEY_QUOTA_LIMIT] ?: DEFAULT_QUOTA_LIMIT
+            val used = if (savedDay == currentDay) {
+                prefs[KEY_QUOTA_USED] ?: 0
+            } else {
+                0
+            }
+
+            limitAfter = limit
+            if (used < limit) {
+                usedAfter = used + 1
                 prefs[KEY_QUOTA_DAY] = currentDay
-                prefs[KEY_QUOTA_USED] = newUsed
-                _quota.value = ForvoQuota(newUsed, prefs[KEY_QUOTA_LIMIT] ?: DEFAULT_QUOTA_LIMIT)
+                prefs[KEY_QUOTA_USED] = usedAfter
+                reserved = true
+            } else {
+                usedAfter = used
             }
         }
+
+        _quota.value = ForvoQuota(usedAfter, limitAfter)
+        reserved
     }
 
     fun clearMisses() = misses.clear()
 
     private suspend fun readApiKey(): String =
-        cryptoManager.decrypt(dataStore.data.first()[KEY_FORVO_API]?.trim().orEmpty())
+        when (val result = cryptoManager.decrypt(dataStore.data.first()[KEY_FORVO_API]?.trim().orEmpty())) {
+            is com.client.app.util.CryptoResult.Success -> result.value
+            com.client.app.util.CryptoResult.Missing -> ""
+            is com.client.app.util.CryptoResult.Failure -> {
+                logger.w("ForvoRepository: saved API key could not be decrypted: ${result.reason}")
+                ""
+            }
+        }
 
     private suspend fun readHost(): String {
         val configured = dataStore.data.first()[KEY_FORVO_HOST]?.trim().orEmpty()

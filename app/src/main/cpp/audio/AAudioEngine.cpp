@@ -290,6 +290,8 @@ bool AAudioEngine::initLocked(
         captureDecimator48To16_.reset();
         captureDecimator32To16_.reset();
         captureResampler24To16_.reset();
+        lastCaptureSample8k_ = 0;
+        hasLastCaptureSample8k_ = false;
         resetEarcon();
         voiceEnhancer_.reset(targetPlaybackSampleRate);
         fftPos_ = 0;
@@ -682,61 +684,123 @@ bool AAudioEngine::startCapture() {
 
     if (captureDspRunning_.load(std::memory_order_acquire)) return true;
 
-    if (!captureStream_) {
-        if (!openCaptureStreamLocked(requestedInputDeviceId_.load(std::memory_order_relaxed))) {
-            LOGE("startCapture: failed to reopen capture stream");
-            return false;
-        }
-    } else {
-        const aaudio_stream_state_t state = AAudioStream_getState(captureStream_);
-        if (state != AAUDIO_STREAM_STATE_OPEN && state != AAUDIO_STREAM_STATE_STOPPED) {
-            if (!waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 500)) {
+    // A std::thread remains joinable after its entry function returns. Join the
+    // previous capture worker before reusing the thread object and before any
+    // queue reset. This also removes the std::terminate() restart hazard.
+    joinCaptureDspThreadLocked();
+
+    // captureRawBuffer_ is fed by the AAudio callback. The callback must be
+    // quiescent before resetQuiesced() is called.
+    if (captureStream_) {
+        const aaudio_stream_state_t state =
+            AAudioStream_getState(captureStream_);
+
+        if (state != AAUDIO_STREAM_STATE_OPEN &&
+            state != AAUDIO_STREAM_STATE_STOPPED) {
+            const aaudio_result_t stopResult =
+                AAudioStream_requestStop(captureStream_);
+
+            if (stopResult != AAUDIO_OK ||
+                !waitForStreamState(
+                    captureStream_,
+                    AAUDIO_STREAM_STATE_STOPPED,
+                    500)) {
                 closeCaptureStreamLocked();
-                if (!openCaptureStreamLocked(requestedInputDeviceId_.load(std::memory_order_relaxed))) {
-                    return false;
-                }
             }
         }
     }
 
+    if (!captureStream_) {
+        if (!openCaptureStreamLocked(
+                requestedInputDeviceId_.load(std::memory_order_relaxed))) {
+            LOGE("startCapture: failed to open capture stream");
+            return false;
+        }
+    }
+
+    // Both the worker and the AAudio callback are quiescent here, so the SPSC
+    // queues can be reset under their lifecycle-only contract.
     captureDroppedFrames_.store(0, std::memory_order_relaxed);
     captureRawBuffer_.resetQuiesced();
     captureBuffer_.resetQuiesced();
     captureDecimator48To16_.reset();
     captureDecimator32To16_.reset();
     captureResampler24To16_.reset();
+    lastCaptureSample8k_ = 0;
+    hasLastCaptureSample8k_ = false;
 
-    const aaudio_result_t result = AAudioStream_requestStart(captureStream_);
+    const aaudio_result_t result =
+        AAudioStream_requestStart(captureStream_);
     if (result != AAUDIO_OK) {
-        LOGE("AAudioStream_requestStart(capture) failed: %d (%s)", result, AAudio_convertResultToText(result));
+        LOGE(
+            "AAudioStream_requestStart(capture) failed: %d (%s)",
+            result,
+            AAudio_convertResultToText(result));
+
         closeCaptureStreamLocked();
+        captureDroppedFrames_.store(0, std::memory_order_relaxed);
+        captureRawBuffer_.resetQuiesced();
+        captureBuffer_.resetQuiesced();
+        captureDecimator48To16_.reset();
+        captureDecimator32To16_.reset();
+        captureResampler24To16_.reset();
+        lastCaptureSample8k_ = 0;
+        hasLastCaptureSample8k_ = false;
         isDisconnected_.store(true, std::memory_order_release);
         return false;
     }
-    if (!waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STARTED, 500)) {
+
+    if (!waitForStreamState(
+            captureStream_,
+            AAUDIO_STREAM_STATE_STARTED,
+            500)) {
         LOGE("Capture stream did not reach STARTED within 500 ms");
         AAudioStream_requestStop(captureStream_);
-        waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 200);
+        waitForStreamState(
+            captureStream_,
+            AAUDIO_STREAM_STATE_STOPPED,
+            200);
         closeCaptureStreamLocked();
+
+        captureDroppedFrames_.store(0, std::memory_order_relaxed);
+        captureRawBuffer_.resetQuiesced();
+        captureBuffer_.resetQuiesced();
+        captureDecimator48To16_.reset();
+        captureDecimator32To16_.reset();
+        captureResampler24To16_.reset();
+        lastCaptureSample8k_ = 0;
+        hasLastCaptureSample8k_ = false;
         isDisconnected_.store(true, std::memory_order_release);
         return false;
     }
-
-    // A std::thread remains joinable after its entry function returns. Never
-    // assign a new thread object over a joinable worker.
-    joinCaptureDspThreadLocked();
 
     captureDspRunning_.store(true, std::memory_order_release);
     try {
-        captureDspThread_ = std::thread(&AAudioEngine::captureDspThreadLoop, this);
+        captureDspThread_ =
+            std::thread(
+                &AAudioEngine::captureDspThreadLoop,
+                this);
     } catch (...) {
         captureDspRunning_.store(false, std::memory_order_release);
         captureDspCv_.notify_all();
+
         if (captureStream_) {
             AAudioStream_requestStop(captureStream_);
-            waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 500);
+            waitForStreamState(
+                captureStream_,
+                AAUDIO_STREAM_STATE_STOPPED,
+                500);
             closeCaptureStreamLocked();
         }
+
+        captureDroppedFrames_.store(0, std::memory_order_relaxed);
+        captureRawBuffer_.resetQuiesced();
+        captureBuffer_.resetQuiesced();
+        captureDecimator48To16_.reset();
+        captureDecimator32To16_.reset();
+        captureResampler24To16_.reset();
+        lastCaptureSample8k_ = 0;
+        hasLastCaptureSample8k_ = false;
         isDisconnected_.store(true, std::memory_order_release);
         return false;
     }
@@ -819,6 +883,8 @@ void AAudioEngine::stopCaptureLocked() {
 
     captureRawBuffer_.resetQuiesced();
     captureBuffer_.resetQuiesced();
+    lastCaptureSample8k_ = 0;
+    hasLastCaptureSample8k_ = false;
     micRms_.store(0.0f, std::memory_order_relaxed);
 }
 
@@ -868,6 +934,8 @@ void AAudioEngine::stopLocked() {
         captureDecimator48To16_.reset();
         captureDecimator32To16_.reset();
         captureResampler24To16_.reset();
+        lastCaptureSample8k_ = 0;
+        hasLastCaptureSample8k_ = false;
         resetEarcon();
         voiceEnhancer_.reset(48000);
         fftPos_ = 0;
@@ -1100,36 +1168,56 @@ void AAudioEngine::captureDspThreadLoop() {
             int16_t* upBuf =
                 captureDecimateBuffer_.data();
 
-            size_t outIdx = 0;
+            // Causal stateful 8 kHz -> 16 kHz interpolation. Each input sample
+            // produces exactly two output samples, and the previous chunk's
+            // final sample supplies the midpoint at the next chunk boundary.
+            const size_t requiredOut =
+                chunkFrames * 2u;
 
-            for (
-                size_t i = 0;
-                i < chunkFrames &&
-                (outIdx + 1) < decimateScratchCap;
-                ++i) {
+            if (requiredOut <= decimateScratchCap) {
+                size_t outIdx = 0;
 
-                int16_t current =
-                    monoBuf[i];
+                auto interpolatePair =
+                    [](int16_t a, int16_t b) -> int16_t {
+                        return static_cast<int16_t>(
+                            (
+                                static_cast<int32_t>(a) +
+                                static_cast<int32_t>(b)
+                            ) / 2
+                        );
+                    };
 
-                int16_t next =
-                    (i + 1 < chunkFrames)
-                        ? monoBuf[i + 1]
-                        : current;
-                upBuf[outIdx++] =
-                    current;
+                if (chunkFrames > 0) {
+                    int16_t previous =
+                        hasLastCaptureSample8k_
+                            ? lastCaptureSample8k_
+                            : monoBuf[0];
 
-                upBuf[outIdx++] =
-                    static_cast<int16_t>(
-                        (
-                            static_cast<int32_t>(
-                                current) +
-                            static_cast<int32_t>(
-                                next)
-                        ) / 2);
+                    for (size_t i = 0; i < chunkFrames; ++i) {
+                        const int16_t current = monoBuf[i];
+
+                        upBuf[outIdx++] =
+                            interpolatePair(previous, current);
+                        upBuf[outIdx++] = current;
+
+                        previous = current;
+                    }
+
+                    lastCaptureSample8k_ =
+                        monoBuf[chunkFrames - 1];
+                    hasLastCaptureSample8k_ = true;
+                }
+
+                finalPcm = upBuf;
+                finalFrames = outIdx;
+            } else {
+                LOGE(
+                    "AAudioEngine: 8k upsampler output capacity too small: need=%zu cap=%zu",
+                    requiredOut,
+                    decimateScratchCap);
+                finalPcm = upBuf;
+                finalFrames = 0;
             }
-
-            finalPcm = upBuf;
-            finalFrames = outIdx;
         }
 
         if (finalFrames > 0) {

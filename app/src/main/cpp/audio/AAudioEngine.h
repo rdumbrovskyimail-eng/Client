@@ -290,6 +290,10 @@ private:
     Decimator48To16 captureDecimator48To16_;
     Decimator32To16 captureDecimator32To16_;
     PolyphaseResampler24To16 captureResampler24To16_;
+
+    // Stateful causal 8 kHz -> 16 kHz interpolation across capture chunks.
+    int16_t lastCaptureSample8k_{0};
+    bool hasLastCaptureSample8k_{false};
 };
 
 } // namespace client::audio

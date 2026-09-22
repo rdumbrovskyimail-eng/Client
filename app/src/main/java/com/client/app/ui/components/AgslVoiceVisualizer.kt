@@ -24,6 +24,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.client.app.audio.NativeAudioEngine
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import com.client.app.session.LinkState
 import com.client.app.session.SessionState
 
@@ -150,11 +152,81 @@ fun AgslVoiceVisualizer(
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         AgslOrbInternal(nativeEngine, state, onClick, modifier, size)
     } else {
-        Box(
-            modifier = modifier
-                .size(size)
-                .clickable(onClick = onClick)
+        LegacyVoiceVisualizer(
+            nativeEngine = nativeEngine,
+            state = state,
+            onClick = onClick,
+            modifier = modifier,
+            size = size
         )
+    }
+}
+
+@Composable
+private fun LegacyVoiceVisualizer(
+    nativeEngine: NativeAudioEngine,
+    state: SessionState,
+    onClick: () -> Unit,
+    modifier: Modifier,
+    size: Dp
+) {
+    val mic by nativeEngine.micLevel.collectAsState()
+    val output by nativeEngine.outLevel.collectAsState()
+    val targetAmplitude =
+        maxOf(0.08f, mic, output)
+            .coerceIn(0.08f, 1.0f)
+
+    val animatedAmplitude by animateFloatAsState(
+        targetValue = targetAmplitude,
+        animationSpec = tween(
+            durationMillis = 90,
+            easing = LinearOutSlowInEasing
+        ),
+        label = "legacy_amplitude"
+    )
+
+    Box(
+        modifier = modifier
+            .size(size)
+            .semantics {
+                role = Role.Button
+                contentDescription = when {
+                    state.error != null -> "Ошибка голосового режима"
+                    state.isAiSpeaking -> "Ассистент говорит"
+                    state.isMicActive -> "Микрофон слушает"
+                    state.link == LinkState.CONNECTING -> "Сессия подключается"
+                    else -> "Голосовой режим ожидания"
+                }
+            }
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onClick
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Canvas(Modifier.size(size)) {
+            val centerX = size.width / 2f
+            val centerY = size.height / 2f
+            val baseRadius = minOf(size.width, size.height) * 0.31f
+            val pulseRadius = baseRadius * (1f + animatedAmplitude * 0.28f)
+
+            drawCircle(
+                color = Color(0xFF202024),
+                radius = baseRadius
+                    .coerceAtLeast(1f),
+                center = androidx.compose.ui.geometry.Offset(centerX, centerY)
+            )
+            drawCircle(
+                color = Color(0xFF4F46E5),
+                radius = pulseRadius
+                    .coerceAtLeast(baseRadius),
+                center = androidx.compose.ui.geometry.Offset(centerX, centerY),
+                style = androidx.compose.ui.graphics.drawscope.Stroke(
+                    width = minOf(size.width, size.height) * 0.035f
+                )
+            )
+        }
     }
 }
 
@@ -183,26 +255,36 @@ private fun AgslOrbInternal(
         label = "state_anim"
     )
 
-    val infiniteTransition = rememberInfiniteTransition(label = "time_loop")
-    val timeParam by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 6.2831853f * 50f, // ровно 50 периодов 2*PI
-        animationSpec = infiniteRepeatable(
-            animation = tween(100000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "time"
-    )
+    // The orb only needs motion while the session/audio state is active. Drive
+    // shader time at ~30 FPS instead of Compose's display refresh rate; this
+    // prevents a 120 Hz device from running the ray-march shader four times as
+    // often with no user-visible benefit. The 40π loop period is a common period for the 0.75, 1.1 and 2.2 shader time coefficients.
+    val shouldAnimate =
+        state.link != LinkState.IDLE ||
+            state.isMicActive ||
+            state.isAiSpeaking ||
+            state.error != null
+
+    var timeParam by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(shouldAnimate) {
+        if (!shouldAnimate) return@LaunchedEffect
+        while (isActive) {
+            timeParam = (timeParam + 0.10471976f) % 125.663704f
+            delay(33L)
+        }
+    }
 
     Box(
         modifier = modifier
             .size(size)
             .semantics {
                 role = Role.Button
-                contentDescription = when (targetStateId.toInt()) {
-                    3 -> "Ассистент говорит"
-                    1 -> "Микрофон слушает"
-                    2 -> "Сессия подключается"
+                contentDescription = when {
+                    state.error != null -> "Ошибка голосового режима"
+                    state.isAiSpeaking -> "Ассистент говорит"
+                    state.isMicActive -> "Микрофон слушает"
+                    state.link == LinkState.CONNECTING ||
+                        state.link == LinkState.RECONNECTING -> "Сессия подключается"
                     else -> "Голосовой режим ожидания"
                 }
             }

@@ -14,6 +14,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
+import java.io.InputStreamReader
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -32,6 +33,7 @@ class AttachmentProcessor @Inject constructor(
         private const val MAX_SIDE = 1568
         private const val JPEG_QUALITY = 88
         private const val MAX_PDF_PAGES = 16
+        private const val MAX_TEXT_CHARS_PER_FILE = 60_000
     }
 
     suspend fun process(uris: List<Uri>): Result = withContext(Dispatchers.IO) {
@@ -48,11 +50,22 @@ class AttachmentProcessor @Inject constructor(
                     // 1. Исходные файлы с кодом, разметкой и текстом: мгновенное чтение без расхода Vision-токенов
                     isTextFormat(mime, name) -> {
                         val txt = context.contentResolver.openInputStream(uri)?.use { stream ->
-                            stream.readBytes().decodeToString()
+                            InputStreamReader(stream, Charsets.UTF_8).use { reader ->
+                                val buffer = CharArray(8192)
+                                val out = StringBuilder(MAX_TEXT_CHARS_PER_FILE)
+                                while (out.length < MAX_TEXT_CHARS_PER_FILE) {
+                                    val toRead =
+                                        minOf(buffer.size, MAX_TEXT_CHARS_PER_FILE - out.length)
+                                    val count = reader.read(buffer, 0, toRead)
+                                    if (count <= 0) break
+                                    out.append(buffer, 0, count)
+                                }
+                                out.toString()
+                            }
                         }
                         if (!txt.isNullOrBlank()) {
-                            textBuilder.append("\n\n--- Документ/Код: $name ---\n").append(txt.take(60_000))
-                            accepted.add("$name (текстовый слой, ${txt.length} симв.)")
+                            textBuilder.append("\n\n--- Документ/Код: $name ---\n").append(txt)
+                            accepted.add("$name (текстовый слой, ${txt.length} симв.${if (txt.length == MAX_TEXT_CHARS_PER_FILE) ", обрезан" else ""})")
                         }
                     }
 
@@ -114,11 +127,26 @@ class AttachmentProcessor @Inject constructor(
             }
         }.getOrNull() ?: ExifInterface.ORIENTATION_NORMAL
 
-        val rotationDegrees = when (orientation) {
-            ExifInterface.ORIENTATION_ROTATE_90 -> 90f
-            ExifInterface.ORIENTATION_ROTATE_180 -> 180f
-            ExifInterface.ORIENTATION_ROTATE_270 -> 270f
-            else -> 0f
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL ->
+                matrix.setScale(-1f, 1f)
+            ExifInterface.ORIENTATION_ROTATE_180 ->
+                matrix.setRotate(180f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL ->
+                matrix.setScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE -> {
+                matrix.setScale(-1f, 1f)
+                matrix.postRotate(270f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_90 ->
+                matrix.setRotate(90f)
+            ExifInterface.ORIENTATION_TRANSVERSE -> {
+                matrix.setScale(-1f, 1f)
+                matrix.postRotate(90f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_270 ->
+                matrix.setRotate(270f)
         }
 
         // Замер исходных габаритов без выделения памяти под пиксели
@@ -136,11 +164,6 @@ class AttachmentProcessor @Inject constructor(
         val rawBmp = cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, decodeOpts) }
             ?: return null
 
-        val matrix = Matrix()
-        if (rotationDegrees != 0f) {
-            matrix.postRotate(rotationDegrees)
-        }
-
         val longestDecoded = maxOf(rawBmp.width, rawBmp.height)
         if (longestDecoded > MAX_SIDE) {
             val scale = MAX_SIDE.toFloat() / longestDecoded
@@ -156,8 +179,15 @@ class AttachmentProcessor @Inject constructor(
         }
 
         val out = ByteArrayOutputStream()
-        finalBmp.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
+        val compressed = runCatching {
+            finalBmp.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
+        }.getOrDefault(false)
         finalBmp.recycle()
+
+        if (!compressed) {
+            logger.w("AttachmentProcessor: JPEG compression failed for $uri")
+            return null
+        }
         return out.toByteArray()
     }
 
@@ -208,8 +238,20 @@ class AttachmentProcessor @Inject constructor(
                                 page.render(reusableBmp!!, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
 
                                 ByteArrayOutputStream().use { out ->
-                                    reusableBmp!!.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
-                                    images.add(out.toByteArray())
+                                    val compressed = runCatching {
+                                        reusableBmp!!.compress(
+                                            Bitmap.CompressFormat.JPEG,
+                                            JPEG_QUALITY,
+                                            out
+                                        )
+                                    }.getOrDefault(false)
+                                    if (compressed) {
+                                        images.add(out.toByteArray())
+                                    } else {
+                                        logger.w(
+                                            "AttachmentProcessor: JPEG compression failed for PDF page ${i + 1}"
+                                        )
+                                    }
                                 }
                             }
                         }

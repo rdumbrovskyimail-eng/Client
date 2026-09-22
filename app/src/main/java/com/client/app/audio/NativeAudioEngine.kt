@@ -12,6 +12,7 @@ import com.client.app.util.AppLogger
 import com.client.app.vad.SileroVadDetector
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.*
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
@@ -22,6 +23,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
@@ -209,6 +211,31 @@ class NativeAudioEngine @Inject constructor(
                 coroutineExceptionHandler
         )
 
+    // Capture work is realtime-sensitive and must not run on the shared
+    // Dispatchers.IO pool. The OS priority therefore belongs to this dedicated
+    // physical thread, not to a coroutine that may migrate between pool threads.
+    private val captureExecutor =
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(
+                {
+                    runCatching {
+                        Process.setThreadPriority(
+                            Process.THREAD_PRIORITY_URGENT_AUDIO
+                        )
+                    }.onFailure {
+                        logger.w(
+                            "NativeAudioEngine: failed to set capture thread priority: ${it.message}"
+                        )
+                    }
+                    runnable.run()
+                },
+                "NativeAudioCapture"
+            )
+        }
+
+    private val captureDispatcher =
+        captureExecutor.asCoroutineDispatcher()
+
     private var captureJob:
         Job? = null
 
@@ -240,9 +267,13 @@ class NativeAudioEngine @Inject constructor(
     private val playbackOperationLock =
         ReentrantLock()
 
+    // Route transitions are latest-state semantics. Intermediate hardware
+    // events do not carry independent work that must all execute; only the
+    // newest requested route matters. This also makes trySend() non-dropping
+    // while the channel is open.
     private val routeTransitionChannel =
         Channel<RouteTransitionRequest>(
-            Channel.BUFFERED
+            Channel.CONFLATED
         )
 
     // Internal route lifecycle generation. This is deliberately separate from
@@ -731,11 +762,7 @@ class NativeAudioEngine @Inject constructor(
             val instanceId = captureInstanceId.get()
 
             captureJob =
-                engineScope.launch {
-
-                Process.setThreadPriority(
-                    Process.THREAD_PRIORITY_URGENT_AUDIO
-                )
+                engineScope.launch(captureDispatcher) {
 
                 var isSpeechActiveManual =
                     false

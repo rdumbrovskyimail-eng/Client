@@ -21,6 +21,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.lang.ref.WeakReference
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -39,13 +40,36 @@ class LiveSessionForegroundService : Service() {
         const val ACTION_STOP = "com.client.app.action.STOP"
         private const val NOTIFICATION_ID = 101
         private const val CHANNEL_ID = "live_client_voice_channel"
-        
+
         private val _isServiceActive = MutableStateFlow(false)
         val isServiceActive: StateFlow<Boolean> = _isServiceActive.asStateFlow()
+
+        private val _serviceError = MutableStateFlow<String?>(null)
+        val serviceError: StateFlow<String?> = _serviceError.asStateFlow()
+
+        @Volatile
+        private var instanceRef: WeakReference<LiveSessionForegroundService>? = null
+
+        fun prepareForStart() {
+            _serviceError.value = null
+        }
+
+        fun ensureMicrophoneForegroundType(): Boolean {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return true
+            val service = instanceRef?.get() ?: return false
+            val permissionGranted = ContextCompat.checkSelfPermission(
+                service,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!permissionGranted) return false
+            return service.promoteToForeground()
+        }
     }
 
     override fun onCreate() {
         super.onCreate()
+        instanceRef = WeakReference(this)
+        prepareForStart()
         createNotificationChannel()
         initMediaSession()
         promoteToForeground()
@@ -123,14 +147,14 @@ class LiveSessionForegroundService : Service() {
 
     }
 
-    private fun promoteToForeground() {
+    private fun promoteToForeground(): Boolean {
         val notification = buildNotification()
         val hasMic = ContextCompat.checkSelfPermission(
             this,
             Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
 
-        runCatching {
+        return runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
                 if (hasMic) {
@@ -148,13 +172,23 @@ class LiveSessionForegroundService : Service() {
                     notification
                 )
             }
+            _serviceError.value = null
             _isServiceActive.value = true
-        }.onFailure {
+            true
+        }.getOrElse { throwable ->
+            _serviceError.value =
+                throwable.localizedMessage ?: throwable.javaClass.simpleName
             _isServiceActive.value = false
+            logger.e(
+                "LiveSessionForegroundService: startForeground failed",
+                throwable
+            )
             runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
             stopSelf()
+            false
         }
     }
+
 
     private fun createNotificationChannel() {
         val nm = getSystemService(NotificationManager::class.java)
@@ -223,7 +257,6 @@ class LiveSessionForegroundService : Service() {
 
     override fun onDestroy() {
         _isServiceActive.value = false
-        super.onDestroy()
         mediaObserverJob?.cancel()
         serviceScope.cancel()
 
@@ -232,12 +265,16 @@ class LiveSessionForegroundService : Service() {
         }
         wakeLock = null
 
-
         runCatching {
             mediaSession?.isActive = false
             mediaSession?.release()
         }
         mediaSession = null
+
+        if (instanceRef?.get() === this) {
+            instanceRef = null
+        }
+        super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

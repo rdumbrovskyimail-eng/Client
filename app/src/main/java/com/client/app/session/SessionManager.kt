@@ -451,7 +451,10 @@ class SessionManager @Inject constructor(
         try {
             val processed = attachmentProcessor.process(uris)
             val prefs = dataStore.data.first()
-            val apiKey = cryptoManager.decrypt(prefs[KEY_API]?.trim().orEmpty())
+            val apiKey = decryptStoredValue(
+                prefs[KEY_API]?.trim().orEmpty(),
+                "Gemini API key"
+            ).orEmpty()
             val forvoOn = prefs[KEY_ENABLE_FORVO] ?: false
 
             val displayText = text.ifEmpty { "Изучи приложенный документ." }
@@ -654,9 +657,10 @@ class SessionManager @Inject constructor(
         isManualActivityActive.set(false)
 
         val prefs = dataStore.data.first()
-        val storedResumeHandle = cryptoManager.decrypt(
-            prefs[KEY_SESSION_RESUMPTION_HANDLE]?.trim().orEmpty()
-        )
+        val storedResumeHandle = decryptStoredValue(
+            prefs[KEY_SESSION_RESUMPTION_HANDLE]?.trim().orEmpty(),
+            "Live session resumption handle"
+        ).orEmpty()
         if (
             resumptionHandle.isNullOrBlank() &&
             storedResumeHandle.isNotBlank() &&
@@ -668,9 +672,28 @@ class SessionManager @Inject constructor(
         }
         activeConnectUsedResumption = resume && (resumptionHandle?.isNotBlank() == true)
 
-        val apiKey = cryptoManager.decrypt(
-            prefs[KEY_API]?.trim().orEmpty()
+        val encryptedApiKey = prefs[KEY_API]?.trim().orEmpty()
+        val apiKeyResult = decryptStoredValue(
+            encryptedApiKey,
+            "Gemini API key"
         )
+
+        if (apiKeyResult == null && encryptedApiKey.isNotBlank()) {
+            connectionDesired = false
+            userMicDesired = false
+            cancelReconnectWork()
+            _state.update {
+                it.copy(
+                    error = "Сохранённый Gemini API Key повреждён или недоступен. Введите ключ заново.",
+                    link = LinkState.IDLE,
+                    isMicActive = false,
+                    isAiSpeaking = false
+                )
+            }
+            return
+        }
+
+        val apiKey = apiKeyResult.orEmpty()
 
         if (apiKey.isEmpty()) {
             connectionDesired = false
@@ -815,7 +838,8 @@ class SessionManager @Inject constructor(
                 _state.value.link == LinkState.IDLE
 
         if (startingFreshSession) {
-            if (!ensureForegroundServiceActive()) {
+            val foregroundServiceError = ensureForegroundServiceActive()
+            if (foregroundServiceError != null) {
                 audioEngine.stop()
                 connectionDesired = false
                 cancelReconnectWork()
@@ -825,7 +849,7 @@ class SessionManager @Inject constructor(
                         link = LinkState.IDLE,
                         isMicActive = false,
                         isAiSpeaking = false,
-                        error = "Foreground service не перешёл в активное состояние"
+                        error = foregroundServiceError
                     )
                 }
                 return
@@ -1281,6 +1305,13 @@ class SessionManager @Inject constructor(
 
         isManualActivityActive.set(false)
 
+        if (!LiveSessionForegroundService.ensureMicrophoneForegroundType()) {
+            _state.update {
+                it.copy(error = "Не удалось активировать microphone foreground-service type")
+            }
+            return
+        }
+
         if (!audioEngine.startCapture()) {
             _state.update {
                 it.copy(error = "Микрофон недоступен")
@@ -1579,13 +1610,24 @@ class SessionManager @Inject constructor(
                                     // older async write cannot overwrite a newer one.
                                     resumptionHandle = usableHandle
                                     resumptionPersistenceMutex.withLock {
-                                        dataStore.edit { prefs ->
-                                            prefs[KEY_SESSION_RESUMPTION_HANDLE] =
-                                                cryptoManager.encrypt(
-                                                    usableHandle
+                                        when (val encrypted = cryptoManager.encrypt(usableHandle)) {
+                                            is com.client.app.util.CryptoResult.Success -> {
+                                                dataStore.edit { prefs ->
+                                                    prefs[KEY_SESSION_RESUMPTION_HANDLE] =
+                                                        encrypted.value
+                                                    prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] =
+                                                        System.currentTimeMillis()
+                                                }
+                                            }
+                                            com.client.app.util.CryptoResult.Missing -> {
+                                                logger.w("SessionManager: resumption handle unexpectedly encrypted as missing")
+                                            }
+                                            is com.client.app.util.CryptoResult.Failure -> {
+                                                logger.e(
+                                                    "SessionManager: could not persist Live session resumption handle: ${encrypted.reason}",
+                                                    encrypted.cause
                                                 )
-                                            prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] =
-                                                System.currentTimeMillis()
+                                            }
                                         }
                                     }
                                 }
@@ -1629,7 +1671,9 @@ class SessionManager @Inject constructor(
 
                                     goAwayJob = scope.launch {
                                         try {
-                                            val millisLeft = event.millisLeft ?: return@launch
+                                            // A missing deadline must not strand the session in
+                                            // pendingGoAway. Treat it as an immediate reconnect deadline.
+                                            val millisLeft = event.millisLeft ?: 0L
                                             delay(millisLeft.coerceAtLeast(0L))
 
                                             if (
@@ -1913,10 +1957,18 @@ class SessionManager @Inject constructor(
             val generation =
                 audioEngine.currentPlaybackGeneration
 
-            audioEngine.awaitPlaybackDrained(
+            val drained = audioEngine.awaitPlaybackDrained(
                 generation = generation,
                 timeoutMs = 2500L
             )
+            if (!drained &&
+                audioEngine.currentPlaybackGeneration == generation
+            ) {
+                logger.w(
+                    "SessionManager: playback drain timed out; invalidating stale playback generation"
+                )
+                invalidateAndFlushAudio("playback drain timeout")
+            }
 
             val shouldReconnect =
                 mutex.withLock {
@@ -2288,6 +2340,21 @@ class SessionManager @Inject constructor(
         }
     }
 
+    private fun decryptStoredValue(
+        encryptedValue: String,
+        label: String
+    ): String? = when (val result = cryptoManager.decrypt(encryptedValue)) {
+        is com.client.app.util.CryptoResult.Success -> result.value
+        com.client.app.util.CryptoResult.Missing -> ""
+        is com.client.app.util.CryptoResult.Failure -> {
+            logger.e(
+                "SessionManager: failed to decrypt $label: ${result.reason}",
+                result.cause
+            )
+            null
+        }
+    }
+
     private fun observeSettings() = scope.launch {
         dataStore.data.collect { prefs ->
             audioEngine.setVolume(prefs[KEY_VOLUME] ?: 1.0f)
@@ -2312,7 +2379,8 @@ class SessionManager @Inject constructor(
         }
     }
 
-    private fun startForegroundService(): Boolean {
+    private fun startForegroundService(): String? {
+        LiveSessionForegroundService.prepareForStart()
         val intent = Intent(context, LiveSessionForegroundService::class.java)
         return runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -2320,23 +2388,34 @@ class SessionManager @Inject constructor(
             } else {
                 context.startService(intent)
             }
-            true
+            null
         }.getOrElse { throwable ->
             logger.e("SessionManager: Failed to request foreground service", throwable)
-            false
+            throwable.localizedMessage ?: throwable.javaClass.simpleName
         }
     }
 
-    private suspend fun ensureForegroundServiceActive(): Boolean {
-        if (!LiveSessionForegroundService.isServiceActive.value) {
-            if (!startForegroundService()) return false
+    private suspend fun ensureForegroundServiceActive(): String? {
+        if (LiveSessionForegroundService.isServiceActive.value) {
+            return null
         }
-        return withTimeoutOrNull(3000L) {
+
+        startForegroundService()?.let { return it }
+
+        val activated = withTimeoutOrNull(3000L) {
             while (!LiveSessionForegroundService.isServiceActive.value) {
+                LiveSessionForegroundService.serviceError.value?.let {
+                    return@withTimeoutOrNull false
+                }
                 delay(25L)
             }
             true
         } == true
+
+        if (activated) return null
+
+        return LiveSessionForegroundService.serviceError.value
+            ?: "Foreground service не перешёл в активное состояние за 3000 мс"
     }
 
     private fun stopForegroundService() {

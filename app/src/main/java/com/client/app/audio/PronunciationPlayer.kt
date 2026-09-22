@@ -5,7 +5,7 @@ import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.media.audiofx.DynamicsProcessing
 import android.os.Build
-import com.client.app.forvo.ForvoRepository
+import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -19,46 +19,63 @@ import kotlin.coroutines.resume
 private enum class PlayerState { IDLE, PREPARING, PLAYING, RELEASED }
 
 @Singleton
-class PronunciationPlayer @Inject constructor(
-    private val forvoRepo: ForvoRepository
-) {
+class PronunciationPlayer @Inject constructor() {
     private val lock = Any()
     private var mediaPlayer: MediaPlayer? = null
     private var dynamicsProcessing: DynamicsProcessing? = null
     private var currentState = PlayerState.IDLE
+    private var activeContinuation: CancellableContinuation<Boolean>? = null
 
     private val _isPlaying = MutableStateFlow(false)
     val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
 
     suspend fun play(url: String): Boolean = withContext(Dispatchers.Main.immediate) {
         suspendCancellableCoroutine { cont ->
-            synchronized(lock) {
-                releasePlayerInternal()
+            val previousContinuation = synchronized(lock) {
+                val previous = activeContinuation
+                activeContinuation = null
+                releasePlayerInternalLocked()
                 _isPlaying.value = true
                 currentState = PlayerState.PREPARING
+                activeContinuation = cont
+                previous
+            }
+            previousContinuation?.let { previous ->
+                if (previous.isActive) previous.resume(false)
             }
 
             val mp = MediaPlayer()
-            synchronized(lock) { mediaPlayer = mp }
-
-            var isResumed = false
-            fun finish(success: Boolean) {
-                synchronized(lock) {
-                    if (mediaPlayer == mp) releasePlayerInternal()
+            synchronized(lock) {
+                if (activeContinuation !== cont) {
+                    runCatching { mp.release() }
+                    return@suspendCancellableCoroutine
                 }
-                if (!isResumed && cont.isActive) {
-                    isResumed = true
-                    cont.resume(success)
+                mediaPlayer = mp
+            }
+
+            fun finish(success: Boolean) {
+                val continuationToResume = synchronized(lock) {
+                    if (activeContinuation !== cont) {
+                        return@synchronized null
+                    }
+                    activeContinuation = null
+                    releasePlayerInternalLocked()
+                    cont
+                }
+                continuationToResume?.let { continuation ->
+                    if (continuation.isActive) {
+                        continuation.resume(success)
+                    }
                 }
             }
 
             cont.invokeOnCancellation {
                 synchronized(lock) {
-                    if (mediaPlayer == mp) {
-                        mp.setOnPreparedListener(null)
-                        mp.setOnCompletionListener(null)
-                        mp.setOnErrorListener(null)
-                        releasePlayerInternal()
+                    if (activeContinuation === cont) {
+                        activeContinuation = null
+                        if (mediaPlayer === mp) {
+                            releasePlayerInternalLocked()
+                        }
                     }
                 }
             }
@@ -72,37 +89,49 @@ class PronunciationPlayer @Inject constructor(
                 )
 
                 mp.setOnPreparedListener { player ->
-                    synchronized(lock) {
-                        if (mediaPlayer != player || currentState == PlayerState.RELEASED) {
-                            runCatching { player.release() }
-                            return@setOnPreparedListener
-                        }
-                        currentState = PlayerState.PLAYING
+                    val valid = synchronized(lock) {
+                        if (mediaPlayer !== player || activeContinuation !== cont || currentState == PlayerState.RELEASED) {
+                            false
+                        } else {
+                            currentState = PlayerState.PLAYING
 
-                        // Регистрация воспроизведения
-                        forvoRepo.registerSuccessfulPlayback()
-
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                            runCatching {
-                                val config = DynamicsProcessing.Config.Builder(
-                                    DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
-                                    1, false, 0, false, 0, false, 0, true
-                                ).build()
-                                dynamicsProcessing = DynamicsProcessing(0, player.audioSessionId, config).apply {
-                                    val limiter = DynamicsProcessing.Limiter(
-                                        true, true, 0, 1.0f, 50.0f, 10.0f, -0.5f, 0.0f
-                                    )
-                                    setLimiterAllChannelsTo(limiter)
-                                    enabled = true
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                                runCatching {
+                                    val config = DynamicsProcessing.Config.Builder(
+                                        DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
+                                        1, false, 0, false, 0, false, 0, true
+                                    ).build()
+                                    dynamicsProcessing = DynamicsProcessing(0, player.audioSessionId, config).apply {
+                                        val limiter = DynamicsProcessing.Limiter(
+                                            true, true, 0, 1.0f, 50.0f, 10.0f, -0.5f, 0.0f
+                                        )
+                                        setLimiterAllChannelsTo(limiter)
+                                        enabled = true
+                                    }
                                 }
                             }
+                            true
                         }
+                    }
+
+                    if (!valid) {
+                        runCatching { player.release() }
+                        return@setOnPreparedListener
+                    }
+
+                    try {
                         player.start()
+                    } catch (_: Exception) {
+                        // Do not leave the continuation suspended when start() fails.
+                        finish(false)
                     }
                 }
 
                 mp.setOnCompletionListener { finish(true) }
-                mp.setOnErrorListener { _, _, _ -> finish(false); true }
+                mp.setOnErrorListener { _, _, _ ->
+                    finish(false)
+                    true
+                }
 
                 mp.setDataSource(url)
                 mp.prepareAsync()
@@ -113,21 +142,34 @@ class PronunciationPlayer @Inject constructor(
     }
 
     fun stop() {
-        synchronized(lock) { releasePlayerInternal() }
+        val continuationToResume = synchronized(lock) {
+            val previous = activeContinuation
+            activeContinuation = null
+            releasePlayerInternalLocked()
+            previous
+        }
+        continuationToResume?.let { continuation ->
+            if (continuation.isActive) continuation.resume(false)
+        }
     }
 
-    private fun releasePlayerInternal() {
+    private fun releasePlayerInternalLocked() {
         _isPlaying.value = false
         currentState = PlayerState.RELEASED
+
         runCatching { dynamicsProcessing?.release() }
         dynamicsProcessing = null
+
         mediaPlayer?.let { mp ->
+            runCatching { mp.setOnPreparedListener(null) }
+            runCatching { mp.setOnCompletionListener(null) }
+            runCatching { mp.setOnErrorListener(null) }
             runCatching {
                 if (mp.isPlaying) mp.stop()
-                mp.reset()
-                mp.release()
             }
+            runCatching { mp.reset() }
+            runCatching { mp.release() }
         }
         mediaPlayer = null
     }
-} 
+}

@@ -9,6 +9,7 @@ import com.client.app.api.LiveModelCapabilitiesRegistry
 import com.client.app.attach.VocabularyExtractor
 import com.client.app.forvo.ForvoRepository
 import com.client.app.session.SessionManager
+import com.client.app.util.AppLogger
 import com.client.app.util.CryptoManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.FlowPreview
@@ -62,7 +63,8 @@ data class AppSettingsState(
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
     private val dataStore: DataStore<Preferences>,
-    private val cryptoManager: CryptoManager
+    private val cryptoManager: CryptoManager,
+    private val logger: AppLogger
 ) : ViewModel() {
 
     companion object {
@@ -94,6 +96,20 @@ class SettingsViewModel @Inject constructor(
     private val inputVocabDebounce = MutableSharedFlow<String>(extraBufferCapacity = 1)
     private val outputVocabDebounce = MutableSharedFlow<String>(extraBufferCapacity = 1)
 
+    private fun decryptSetting(
+        encrypted: String,
+        label: String
+    ): String = when (val result = cryptoManager.decrypt(encrypted)) {
+        is com.client.app.util.CryptoResult.Success -> result.value
+        com.client.app.util.CryptoResult.Missing -> ""
+        is com.client.app.util.CryptoResult.Failure -> {
+            logger.w(
+                "SettingsViewModel: failed to decrypt $label: ${result.reason}"
+            )
+            ""
+        }
+    }
+
     init {
         viewModelScope.launch {
             dataStore.data.collect { p ->
@@ -110,7 +126,10 @@ class SettingsViewModel @Inject constructor(
 
                 _settings.update {
                     it.copy(
-                        apiKey = cryptoManager.decrypt(p[SessionManager.KEY_API].orEmpty()),
+                        apiKey = decryptSetting(
+                            p[SessionManager.KEY_API].orEmpty(),
+                            "Gemini API key"
+                        ),
                         liveModel = modelId,
                         thinkingLevel = if (capabilities.supportsThinkingConfig) normalizedThinking else "low",
                         analyzerModel = p[SessionManager.KEY_ANALYZER_MODEL] ?: VocabularyExtractor.DEFAULT_MODEL,
@@ -148,7 +167,10 @@ class SettingsViewModel @Inject constructor(
                         initialHistoryTurns = p[SessionManager.KEY_INITIAL_HISTORY_TURNS] ?: 20,
 
                         enableForvo = p[SessionManager.KEY_ENABLE_FORVO] ?: false,
-                        forvoApiKey = cryptoManager.decrypt(p[ForvoRepository.KEY_FORVO_API].orEmpty()),
+                        forvoApiKey = decryptSetting(
+                            p[ForvoRepository.KEY_FORVO_API].orEmpty(),
+                            "Forvo API key"
+                        ),
                         enableGoogleSearch = (p[SessionManager.KEY_ENABLE_SEARCH] ?: false) && true
                     )
                 }
@@ -157,8 +179,20 @@ class SettingsViewModel @Inject constructor(
 
         viewModelScope.launch {
             apiKeyDebounce.debounce(350).collect { k ->
-                val encrypted = cryptoManager.encrypt(k.trim())
-                dataStore.edit { it[SessionManager.KEY_API] = encrypted }
+                when (val encrypted = cryptoManager.encrypt(k.trim())) {
+                    is com.client.app.util.CryptoResult.Success -> {
+                        dataStore.edit { it[SessionManager.KEY_API] = encrypted.value }
+                    }
+                    com.client.app.util.CryptoResult.Missing -> {
+                        dataStore.edit { it.remove(SessionManager.KEY_API) }
+                    }
+                    is com.client.app.util.CryptoResult.Failure -> {
+                        logger.e(
+                            "SettingsViewModel: could not save Gemini API key: ${encrypted.reason}",
+                            encrypted.cause
+                        )
+                    }
+                }
             }
         }
         viewModelScope.launch {
@@ -168,8 +202,20 @@ class SettingsViewModel @Inject constructor(
         }
         viewModelScope.launch {
             forvoKeyDebounce.debounce(350).collect { k ->
-                val encrypted = cryptoManager.encrypt(k.trim())
-                dataStore.edit { it[ForvoRepository.KEY_FORVO_API] = encrypted }
+                when (val encrypted = cryptoManager.encrypt(k.trim())) {
+                    is com.client.app.util.CryptoResult.Success -> {
+                        dataStore.edit { it[ForvoRepository.KEY_FORVO_API] = encrypted.value }
+                    }
+                    com.client.app.util.CryptoResult.Missing -> {
+                        dataStore.edit { it.remove(ForvoRepository.KEY_FORVO_API) }
+                    }
+                    is com.client.app.util.CryptoResult.Failure -> {
+                        logger.e(
+                            "SettingsViewModel: could not save Forvo API key: ${encrypted.reason}",
+                            encrypted.cause
+                        )
+                    }
+                }
             }
         }
         viewModelScope.launch {
