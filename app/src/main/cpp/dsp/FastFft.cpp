@@ -59,9 +59,23 @@ void FastFft::computeFft(float* real, float* imag, size_t n) {
     }
 }
 
-void FastFft::process(const float* pcmInput, size_t count, float micRms, float outRms, int32_t sampleRate) {
-    if (count < N) return;
-    if (sampleRate <= 0) sampleRate = audio::SAMPLE_RATE_GEMINI_OUT;
+void FastFft::process(
+    const float* pcmInput,
+    size_t count,
+    float micRms,
+    float outRms,
+    int32_t sampleRate) {
+
+    // A valid FFT block requires both a complete input buffer and enough
+    // samples for one N-point transform. Without the null check, a caller
+    // passing nullptr with count >= N would be dereferenced below.
+    if (pcmInput == nullptr || count < N) {
+        return;
+    }
+
+    if (sampleRate <= 0) {
+        sampleRate = audio::SAMPLE_RATE_GEMINI_OUT;
+    }
 
     alignas(16) float real[N] = {0.0f};
     alignas(16) float imag[N] = {0.0f};
