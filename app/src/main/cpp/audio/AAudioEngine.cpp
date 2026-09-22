@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/cpp/audio/AAudioEngine.cpp
 #include "AAudioEngine.h"
 #include "NativeLogQueue.h"
 #include "dsp/NeonDspUtils.h"
@@ -13,6 +12,7 @@
 #include <cstring>
 #include <chrono>
 #include <thread>
+#include <exception>
 
 #define LOG_TAG "NativeAudioEngine"
 
@@ -1229,9 +1229,19 @@ void AAudioEngine::captureDspThreadLoop() {
                     finalFrames),
                 std::memory_order_relaxed);
 
-            captureBuffer_.write(
-                finalPcm,
-                finalFrames);
+            const size_t writtenFrames =
+                captureBuffer_.write(
+                    finalPcm,
+                    finalFrames);
+
+            if (writtenFrames < finalFrames) {
+                // The capture output queue is deliberately non-blocking. Never
+                // stall this worker waiting for a slow Kotlin/VAD consumer;
+                // instead expose the loss through the existing drop metric.
+                captureDroppedFrames_.fetch_add(
+                    finalFrames - writtenFrames,
+                    std::memory_order_relaxed);
+            }
         }
     }
     } catch (const std::exception& e) {
@@ -1291,6 +1301,11 @@ void AAudioEngine::playbackDspThreadLoop() {
 
             halfbandResampler24To48_.reset();
             resampler24To16_.reset();
+            // configure() intentionally does not reset when the ratio is
+            // unchanged. A new playback epoch still requires a clean DSP
+            // history, otherwise previous-generation samples can leak through
+            // previousSample_/phase_ in the streaming resampler.
+            genericResampler_.reset();
             genericResampler_.configure(
                 SAMPLE_RATE_GEMINI_OUT,
                 currentRate
@@ -1528,11 +1543,24 @@ void AAudioEngine::playbackDspThreadLoop() {
             actualRate ==
                 SAMPLE_RATE_BT_A2DP) {
 
+            // Keep 24 kHz -> 48 kHz state in the same streaming resampler
+            // used by the generic path. The HalfbandResampler24To48 class in
+            // PolyphaseResampler.h is not used here because its current
+            // polyphase indexing does not match the declared 127-tap layout.
+            // The streaming linear path is stateful, allocation-free, and
+            // preserves generation boundaries through the explicit reset above.
+            genericResampler_.configure(
+                SAMPLE_RATE_GEMINI_OUT,
+                actualRate
+            );
+
             outputFrames =
-                halfbandResampler24To48_.process(
+                genericResampler_.process(
                     input,
                     inputFrames,
-                    output);
+                    output,
+                    playbackDspOutputScratch_.size()
+                );
 
         } else if (
             actualRate ==
@@ -2246,3 +2274,5 @@ void AAudioEngine::errorCallback(
 }
 
 } // namespace client::audio
+
+────────────────────────────────────────────────────────────
