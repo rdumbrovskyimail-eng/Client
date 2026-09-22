@@ -1,43 +1,36 @@
-// >>> FILE: app/src/main/java/com/client/app/ui/display/DisplayRateManager.kt
 package com.client.app.ui.display
 
-import android.os.Build
 import android.view.Window
 
 object DisplayRateManager {
 
     /**
-     * Аппаратная фиксация 120 Гц на дисплейной панели Samsung LTPO 2.0 (Dynamic AMOLED 2X).
-     * Исключает сброс частоты до 24 Гц контроллером One UI при отсутствии касаний пальцем.
+     * Запрашивает предпочтительную частоту обновления окна.
+     *
+     * Это именно preference/hint для WindowManager, а не гарантия
+     * постоянной аппаратной работы дисплея на 120 Гц.
+     *
+     * При отключении предпочтение сбрасывается, позволяя системе
+     * самостоятельно выбирать подходящую частоту.
      */
     fun setHighRefreshRate(window: Window, enable: Boolean) {
         runCatching {
             val layoutParams = window.attributes
 
-            if (enable) {
-                // Поиск и фиксация 120-Гц режима в DisplayModeDirector
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    val display = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        window.context.display
-                    } else {
-                        @Suppress("DEPRECATION")
-                        window.windowManager.defaultDisplay
-                    }
-
-                    val mode120 = display?.supportedModes?.firstOrNull { mode ->
-                        mode.refreshRate >= 119.0f
-                    }
-                    if (mode120 != null) {
-                        layoutParams.preferredDisplayModeId = mode120.modeId
-                    }
-                }
-                layoutParams.preferredRefreshRate = 120.0f
+            layoutParams.preferredRefreshRate = if (enable) {
+                120.0f
             } else {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    layoutParams.preferredDisplayModeId = 0
-                }
-                layoutParams.preferredRefreshRate = 0.0f
+                0.0f
             }
+
+            /*
+             * Не фиксируем preferredDisplayModeId вручную.
+             *
+             * preferredRefreshRate достаточно как предпочтения частоты,
+             * а выбор конкретного Display.Mode должен оставаться за системой.
+             * Поэтому при каждом вызове явно снимаем ранее заданный mode-id.
+             */
+            layoutParams.preferredDisplayModeId = 0
 
             window.attributes = layoutParams
         }
