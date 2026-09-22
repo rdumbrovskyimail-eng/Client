@@ -1,86 +1,70 @@
 # >>> FILE: app/proguard-rules.pro
-
-# Keep metadata required by Kotlin/JVM reflection, serialization and generated
-# code where applicable.
 -keepattributes *Annotation*, InnerClasses, Signature, Exceptions, EnclosingMethod
+-dontobfuscate
 
-# ---------------------------------------------------------------------------
-# 1. JNI
-# ---------------------------------------------------------------------------
-# JNI methods are resolved by their Java/Kotlin class and native method names.
-# Keep the bridge class and all of its members stable.
+# 1. Защита нативных точек входа C++ JNI (libclient_core.so)
 -keepclasseswithmembernames class * {
     native <methods>;
 }
+-keep class com.client.app.audio.NativeAudioBridge { *; }
 
--keep class com.client.app.audio.NativeAudioBridge {
-    *;
-}
+# 2. Microsoft ONNX Runtime (Snapdragon NPU / Hexagon HTP v73)
+-keep class ai.onnxruntime.** { *; }
+-dontwarn ai.onnxruntime.**
 
-# ---------------------------------------------------------------------------
-# 2. Kotlinx Serialization
-# ---------------------------------------------------------------------------
-# Preserve annotation/serializer metadata used by kotlinx.serialization.
+# 3. Системные медиа-сессии (защита от засыпания One UI App Freezer)
+-keep class android.support.v4.media.** { *; }
+-keep class androidx.media.** { *; }
+-keep class androidx.media.app.** { *; }
+
+# 4. Сериализация Kotlinx
 -dontnote kotlinx.serialization.AnnotationsKt
-
--keep @kotlinx.serialization.Serializable class * {
-    *;
+-keepclassmembers class kotlinx.serialization.json.** { *** Companion; }
+-keepclasseswithmembers class kotlinx.serialization.json.** {
+    kotlinx.serialization.KSerializer serializer(...);
 }
-
+-keep @kotlinx.serialization.Serializable class *
 -keepclassmembers class * {
-    @kotlinx.serialization.SerialName <fields>;
+    @kotlinx.serialization.SerialName *;
 }
 
-# ---------------------------------------------------------------------------
-# 3. Hilt / javax.inject
-# ---------------------------------------------------------------------------
-# Hilt normally supplies the necessary consumer rules. These application-side
-# rules retain only injection entry points that are selected by annotations.
--keep @dagger.hilt.android.lifecycle.HiltViewModel class * {
-    <init>(...);
+# 5. Корутины и каналы
+-keepnames class kotlinx.coroutines.internal.MainDispatcherFactory {}
+-keepnames class kotlinx.coroutines.CoroutineExceptionHandler {}
+-keepclassmembernames class kotlinx.** {
+    volatile <fields>;
 }
 
+# 6. OkHttp & Okio
+-dontwarn okhttp3.**
+-dontwarn okio.**
+-keep class okhttp3.** { *; }
+-keep interface okhttp3.** { *; }
+
+# 7. Dagger Hilt
+-keep class dagger.hilt.** { *; }
+-keep class javax.inject.** { *; }
+-keep @dagger.hilt.android.lifecycle.HiltViewModel class * { <init>(...); }
 -keepclassmembers class * {
     @javax.inject.Inject <init>(...);
 }
 
-# ---------------------------------------------------------------------------
-# 4. Kotlin coroutines
-# ---------------------------------------------------------------------------
-# Keep dispatcher factory / handler names required by ServiceLoader-style
-# discovery.
--keepnames class kotlinx.coroutines.internal.MainDispatcherFactory
--keepnames class kotlinx.coroutines.CoroutineExceptionHandler
+# 8. Jetpack Compose Runtime
+-keep class androidx.compose.runtime.** { *; }
+-keep class androidx.compose.ui.** { *; }
+-keepclassmembers class androidx.compose.** {
+    <init>(...);
+}
 
-# ---------------------------------------------------------------------------
-# 5. Logging diagnostics
-# ---------------------------------------------------------------------------
-# Preserve source locations in diagnostic builds/reports.
+# 9. Доменные сущности приложения
+-keep class com.client.app.session.** { *; }
+-keep class com.client.app.api.** { *; }
+-keep class com.client.app.audio.** { *; }
+-keep class com.client.app.vad.** { *; }
+-keep class com.client.app.haptics.** { *; }
+-keep class com.client.app.ui.display.** { *; }
+
+# 10. Подсистема сквозного логирования (AppLogManager)
+-keep class com.client.app.logging.** { *; }
+-keepenum class com.client.app.logging.LogLevel { *; }
 -keepattributes SourceFile,LineNumberTable
-
-# ---------------------------------------------------------------------------
-# 6. Do NOT add package-wide keep rules here.
-#
-# The following broad rules were intentionally removed:
-#
-# -dontobfuscate
-# -keep class ai.onnxruntime.** { *; }
-# -keep class okhttp3.** { *; }
-# -keep interface okhttp3.** { *; }
-# -keep class dagger.hilt.** { *; }
-# -keep class javax.inject.** { *; }
-# -keep class androidx.media.** { *; }
-# -keep class androidx.media.app.** { *; }
-# -keep class androidx.compose.runtime.** { *; }
-# -keep class androidx.compose.ui.** { *; }
-# -keep class com.client.app.session.** { *; }
-# -keep class com.client.app.api.** { *; }
-# -keep class com.client.app.audio.** { *; }
-# -keep class com.client.app.vad.** { *; }
-# -keep class com.client.app.haptics.** { *; }
-# -keep class com.client.app.ui.display.** { *; }
-# -keep class com.client.app.logging.** { *; }
-#
-# Libraries above provide their own consumer/R8 rules where required.
-# Application classes should remain shrinkable/obfuscatable unless a concrete
-# runtime contract requires retention.
