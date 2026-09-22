@@ -19,6 +19,10 @@ class LockFreeRingBuffer {
         "LockFreeRingBuffer requires trivially copyable elements"
     );
     static_assert(
+        Capacity > 0,
+        "Capacity must be greater than zero"
+    );
+    static_assert(
         (Capacity & (Capacity - 1)) == 0,
         "Capacity must be a power of two"
     );
@@ -41,6 +45,9 @@ public:
     //
     //   producer owns tail_
     //   consumer owns head_
+    //
+    //   availableRead()/availableWrite() may be called concurrently because
+    //   they only perform atomic observations.
     //
     // Lifecycle-only discard/clear operations require full quiescence
     // of both producer and consumer.
@@ -144,7 +151,7 @@ public:
                 (toRead - firstChunk) * sizeof(T)
             );
         }
-        // IMPORTANT:
+
         // Only the consumer writes head_.
         head_.store(
             currentHead + toRead,
