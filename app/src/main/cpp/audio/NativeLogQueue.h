@@ -17,20 +17,26 @@ struct NativeLogItem {
 };
 
 /**
- * Высокопроизводительная безблокировочная MPSC-очередь (Multi-Producer Single-Consumer)
- * фиксированной емкости на строгом алгоритме Дмитрия Вьюкова.
- * 
+ * Высокопроизводительная MPSC-очередь (Multi-Producer Single-Consumer)
+ * фиксированной емкости на базе алгоритма последовательностей Дмитрия Вьюкова.
+ *
  * Особенности:
- * - Zero-Allocation: память под 1024 слота предвыделена статически.
- * - Lock-Free & Non-Blocking: в методе push() нет мьютексов и системных вызовов ядра.
- * - Строгий инвариант sequence: при переполнении очереди (diff < 0) запись отбрасывается
- *   без изменения enqueuePos_ и без порчи ячеек буфера, что предотвращает зацикливание pop().
- * - Выравнивание по 64 байтам (alignas(64)) исключает деградацию кэш-линий CPU (False Sharing).
+ * - Zero-Allocation: память под все 1024 слота предвыделена статически.
+ * - Без mutex и без выделения памяти в push()/pop().
+ * - Операции используют sequence-поля ячеек для корректной публикации
+ *   payload между несколькими producer-потоками и одним consumer-потоком.
+ * - Это не является формально lock-free алгоритмом: producer может удерживать
+ *   уже захваченную ячейку, пока другой producer/consumer ожидает ее публикации.
+ * - Каждая Cell выровнена по 64 байтам, чтобы sequence разных ячеек не
+ *   делили одну cache line из-за шага массива.
  */
 class NativeLogQueue {
 public:
     static constexpr size_t CAPACITY = 1024;
-    static_assert((CAPACITY & (CAPACITY - 1)) == 0, "CAPACITY must be a power of two");
+    static_assert(
+        CAPACITY >= 2 && (CAPACITY & (CAPACITY - 1)) == 0,
+        "CAPACITY must be a power of two and at least 2"
+    );
 
     static NativeLogQueue& getInstance() {
         static NativeLogQueue instance;
@@ -76,9 +82,17 @@ public:
             cell->item.message[0] = '\0';
         }
 
-        timespec ts;
-        clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-        cell->item.timestampNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+        // CLOCK_MONOTONIC_RAW is supported by Android bionic on the target
+        // platform. Still, clock_gettime() can report failure; never consume
+        // an uninitialized timespec in that case.
+        timespec ts{};
+        if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) == 0) {
+            cell->item.timestampNs =
+                static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL +
+                static_cast<uint64_t>(ts.tv_nsec);
+        } else {
+            cell->item.timestampNs = 0;
+        }
 
         cell->sequence.store(pos + 1, std::memory_order_release);
         return true;
@@ -114,7 +128,7 @@ public:
     }
 
 private:
-    struct Cell {
+    struct alignas(64) Cell {
         std::atomic<uint64_t> sequence;
         NativeLogItem item;
     };
