@@ -105,13 +105,22 @@ data class FunctionCall(
         key: String
     ): List<String> {
         val value = args[key] ?: return emptyList()
+
         return when (value) {
-            is JsonArray -> value.mapNotNull { it.jsonPrimitive.contentOrNull?.takeIf(String::isNotBlank) }
-            else -> value.jsonPrimitive.contentOrNull
-                ?.split(',', ';')
-                ?.map { it.trim() }
-                ?.filter(String::isNotBlank)
-                ?: emptyList()
+            is JsonArray ->
+                value.mapNotNull {
+                    it.jsonPrimitive
+                        .contentOrNull
+                        ?.takeIf(String::isNotBlank)
+                }
+
+            else ->
+                value.jsonPrimitive
+                    .contentOrNull
+                    ?.split(',', ';')
+                    ?.map { it.trim() }
+                    ?.filter(String::isNotBlank)
+                    ?: emptyList()
         }
     }
 }
@@ -126,8 +135,10 @@ data class ToolResponse(
     val id: String?,
     val response: JsonObject,
     val parts: List<FunctionResponsePart> = emptyList(),
+
     // Null means the field must be omitted from the wire message.
     val scheduling: FunctionResponseScheduling? = null,
+
     val willContinue: Boolean = false
 )
 
@@ -164,12 +175,16 @@ data class RealtimeInputSettings(
     val aadEnabled: Boolean = true,
     val startSensitivity: String =
         "START_SENSITIVITY_HIGH",
+
     val endSensitivity: String =
         "END_SENSITIVITY_LOW",
+
     val prefixPaddingMs: Int = 60,
     val silenceDurationMs: Int = 600,
+
     val activityHandling: String =
         "START_OF_ACTIVITY_INTERRUPTS",
+
     val turnCoverage: String =
         "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
 )
@@ -206,6 +221,7 @@ data class LiveModelCapabilities(
 )
 
 object LiveModelCapabilitiesRegistry {
+
     private fun normalize(model: String): String =
         model.trim()
             .removePrefix("publishers/google/models/")
@@ -213,109 +229,175 @@ object LiveModelCapabilitiesRegistry {
 
     fun normalizeResourceName(model: String): String {
         val id = normalize(model)
-        require(id.matches(Regex("[a-zA-Z0-9._-]+"))) {
+
+        require(
+            id.matches(
+                Regex("[a-zA-Z0-9._-]+")
+            )
+        ) {
             "Invalid Gemini model resource name: '$model'"
         }
+
         return "models/$id"
     }
 
-    fun requireBcp47Language(language: String): String {
+    fun requireBcp47Language(
+        language: String
+    ): String {
         val clean = language.trim()
-        require(clean.matches(Regex("^[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?(?:-[A-Za-z0-9]{2,8})*$"))) {
+
+        require(
+            clean.matches(
+                Regex(
+                    "^[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?(?:-[A-Za-z0-9]{2,8})*$"
+                )
+            )
+        ) {
             "Invalid BCP-47 speech language: '$language'"
         }
+
         return clean
     }
 
-    fun requireVoiceName(voice: String): String {
+    fun requireVoiceName(
+        voice: String
+    ): String {
         val clean = voice.trim()
-        require(clean.matches(Regex("^[A-Za-z][A-Za-z0-9_-]{1,63}$"))) {
+
+        require(
+            clean.matches(
+                Regex(
+                    "^[A-Za-z][A-Za-z0-9_-]{1,63}$"
+                )
+            )
+        ) {
             "Invalid Gemini voice name: '$voice'"
         }
+
         return clean
     }
 
-    fun forModel(model: String): LiveModelCapabilities {
+    fun forModel(
+        model: String
+    ): LiveModelCapabilities {
+
         return when (normalize(model)) {
-            "gemini-3.8-live" -> LiveModelCapabilities(
-                supportsThinkingConfig = false,
-                supportsInteractionStatus = false,
-                supportsAsyncFunctionCalling = true,
-                supportsFunctionScheduling = true,
-                supportsContextCache = false,
-                requiresNonBlockingTools = false,
-                supportsSearchGrounding = true,
-                supportsUrlContext = false,
-                maxInputTokens = 131_072
-            )
-            "gemini-3.8-live-extended-thinking" -> LiveModelCapabilities(
-                supportsThinkingConfig = true,
-                supportsInteractionStatus = true,
-                supportsAsyncFunctionCalling = true,
-                supportsFunctionScheduling = false,
-                supportsContextCache = false,
-                requiresNonBlockingTools = true,
-                supportsSearchGrounding = true,
-                supportsUrlContext = false,
-                maxInputTokens = 131_072
-            )
-            "gemini-3.1-flash-live-preview" -> LiveModelCapabilities(
-                supportsThinkingConfig = true,
-                supportsInteractionStatus = false,
-                supportsAsyncFunctionCalling = false,
-                supportsFunctionScheduling = false,
-                supportsContextCache = false,
-                requiresNonBlockingTools = false,
-                supportsSearchGrounding = false,
-                supportsUrlContext = false,
-                maxInputTokens = 131_072
-            )
-            "gemini-2.5-flash-native-audio-preview-12-2025" -> LiveModelCapabilities(
-                supportsThinkingConfig = false,
-                supportsInteractionStatus = false,
-                supportsAsyncFunctionCalling = false,
-                supportsFunctionScheduling = false,
-                supportsContextCache = false,
-                requiresNonBlockingTools = false,
-                supportsSearchGrounding = false,
-                supportsUrlContext = false,
-                maxInputTokens = 131_072
-            )
-            else -> throw IllegalArgumentException(
-                "Unsupported Gemini Live model '${normalize(model)}'. Add it to LiveModelCapabilitiesRegistry only after verifying its official protocol contract."
-            )
+
+            "gemini-3.8-live" ->
+                LiveModelCapabilities(
+                    supportsThinkingConfig = false,
+                    supportsInteractionStatus = false,
+                    supportsAsyncFunctionCalling = true,
+                    supportsFunctionScheduling = true,
+                    supportsContextCache = false,
+                    requiresNonBlockingTools = false,
+                    supportsSearchGrounding = true,
+                    supportsUrlContext = false,
+                    maxInputTokens = 131_072
+                )
+
+            "gemini-3.8-live-extended-thinking" ->
+                LiveModelCapabilities(
+                    supportsThinkingConfig = true,
+                    supportsInteractionStatus = true,
+                    supportsAsyncFunctionCalling = true,
+                    supportsFunctionScheduling = false,
+                    supportsContextCache = false,
+                    requiresNonBlockingTools = true,
+                    supportsSearchGrounding = true,
+                    supportsUrlContext = false,
+                    maxInputTokens = 131_072
+                )
+
+            "gemini-3.1-flash-live-preview" ->
+                LiveModelCapabilities(
+                    supportsThinkingConfig = true,
+                    supportsInteractionStatus = false,
+                    supportsAsyncFunctionCalling = false,
+                    supportsFunctionScheduling = false,
+                    supportsContextCache = false,
+                    requiresNonBlockingTools = false,
+
+                    // Google documents Search grounding as supported
+                    // for Gemini 3.1 Flash Live Preview.
+                    supportsSearchGrounding = true,
+
+                    supportsUrlContext = false,
+                    maxInputTokens = 131_072
+                )
+
+            "gemini-2.5-flash-native-audio-preview-12-2025" ->
+                LiveModelCapabilities(
+                    supportsThinkingConfig = false,
+                    supportsInteractionStatus = false,
+                    supportsAsyncFunctionCalling = false,
+                    supportsFunctionScheduling = false,
+                    supportsContextCache = false,
+                    requiresNonBlockingTools = false,
+                    supportsSearchGrounding = false,
+                    supportsUrlContext = false,
+                    maxInputTokens = 131_072
+                )
+
+            else ->
+                throw IllegalArgumentException(
+                    "Unsupported Gemini Live model '${normalize(model)}'. " +
+                        "Add it to LiveModelCapabilitiesRegistry only after " +
+                        "verifying its official protocol contract."
+                )
         }
     }
 }
 
-
 data class LiveConfig(
     val apiKey: String,
-    val model: String = "gemini-3.8-live",
+    val model: String =
+        "gemini-3.8-live",
+
     val systemInstruction: String,
-    val voiceName: String = "Charon",
+
+    val voiceName: String =
+        "Charon",
+
     val speechLanguage: String? = null,
-    val temperature: Float = 0.5f,
+
+    val temperature: Float =
+        0.5f,
+
     val mediaResolution: String =
         "MEDIA_RESOLUTION_HIGH",
+
     val inputTranscription:
         TranscriptionSettings =
         TranscriptionSettings(),
+
     val outputTranscription:
         TranscriptionSettings =
         TranscriptionSettings(),
+
     val realtimeInput:
         RealtimeInputSettings =
         RealtimeInputSettings(),
+
     val compression:
         CompressionSettings =
         CompressionSettings(),
+
     val sessionResumptionEnabled: Boolean =
         true,
-    val resumptionHandle: String? = null,
-    val thinkingLevel: String? = null,
-    val toolsJson: JsonArray? = null,
-    val enableGoogleSearch: Boolean = false,
+
+    val resumptionHandle: String? =
+        null,
+
+    val thinkingLevel: String? =
+        null,
+
+    val toolsJson: JsonArray? =
+        null,
+
+    val enableGoogleSearch: Boolean =
+        false,
+
     val initialHistory: List<ClientTurn> =
         emptyList()
 )
@@ -346,7 +428,8 @@ class GeminiLiveClient @Inject constructor(
 
     suspend fun connect(
         cfg: LiveConfig,
-        beforeOpen: (suspend () -> Unit)? = null
+        beforeOpen:
+            (suspend () -> Unit)? = null
     ) =
         protobufClient.connect(
             cfg,
@@ -357,17 +440,23 @@ class GeminiLiveClient @Inject constructor(
     suspend fun sendAudio(
         pcm: ByteArray
     ) =
-        protobufClient.sendAudioPcm(pcm)
+        protobufClient.sendAudioPcm(
+            pcm
+        )
 
     suspend fun sendRealtimeText(
         text: String
     ) =
-        protobufClient.sendRealtimeText(text)
+        protobufClient.sendRealtimeText(
+            text
+        )
 
     suspend fun sendRealtimeImage(
         jpegBytes: ByteArray
     ) =
-        protobufClient.sendRealtimeImage(jpegBytes)
+        protobufClient.sendRealtimeImage(
+            jpegBytes
+        )
 
     // AUD-067
     suspend fun sendActivityStart() =
@@ -401,8 +490,12 @@ class GeminiLiveClient @Inject constructor(
     fun invalidateAudio(): Long =
         protobufClient.invalidateAudio()
 
-    fun releaseAudio(frame: AudioFrame) =
-        protobufClient.releaseAudio(frame)
+    fun releaseAudio(
+        frame: AudioFrame
+    ) =
+        protobufClient.releaseAudio(
+            frame
+        )
 
     suspend fun disconnect() =
         protobufClient.disconnect()
