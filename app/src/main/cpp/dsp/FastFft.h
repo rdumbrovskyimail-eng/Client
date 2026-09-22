@@ -24,7 +24,8 @@ public:
     // ERR-09: Расчет спектра с учетом динамической частоты дискретизации sampleRate
     void process(const float* pcmInput, size_t count, float micRms, float outRms, int32_t sampleRate = audio::SAMPLE_RATE_GEMINI_OUT);
 
-    // E-03, ERR-05: Истинно Wait-Free считывание когерентного среза из UI JNI
+    // E-03, ERR-05: Ограниченное по числу попыток считывание когерентного среза из UI JNI.
+    // Стандарт C++ не гарантирует wait-free свойства для std::atomic<float>.
     void getLatestSnapshot(SpectrumSnapshot& out) const;
 
 private:
@@ -33,8 +34,9 @@ private:
     float smoothedBands_[audio::SPECTRUM_BANDS]{0.0f};
 
     // ERR-05 / concurrency fix:
-    // A snapshot is published with a seqlock. The payload itself is stored as
-    // atomic scalar values, so a concurrent UI read can never race a writer.
+    // A snapshot is published with a sequence counter. The payload itself is
+    // stored as atomic scalar values, so concurrent readers do not form a C++
+    // data race with the writer while observing the snapshot.
     alignas(64)
     std::array<std::atomic<float>, audio::SPECTRUM_BANDS> snapshotBands_{};
 
