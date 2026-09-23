@@ -65,10 +65,10 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         private const val MAX_INITIAL_HISTORY_TURNS = 20
 
-        // Retained from prior P0 work:
-        // protect against unbounded incoming model audio backlog.
+        // Физически обоснованный лимит бэклога входящего аудио (~174 секунды 24 кГц PCM16).
+        // Устраняет ложное переполнение памяти при быстрых сетевых всплесках генератора Gemini.
         private const val MAX_AI_AUDIO_BACKLOG_BYTES =
-            256L * 1024L
+            8L * 1024L * 1024L
 
         private const val MAX_DATA_EVENTS_IN_FLIGHT = 256
     }
@@ -2153,10 +2153,13 @@ class GeminiProtobufLiveClient @Inject constructor(
                                 }
                             }
                             if (!accepted) {
+                                // Плавный Non-Destructive сброс: исключён панический вызов invalidateAndFlushPlayback().
+                                // Играющий звук модели больше не прерывается.
                                 val backlog = audioBudgetBySession[key]?.get() ?: 0L
-                                if (backlog >= MAX_AI_AUDIO_BACKLOG_BYTES) {
-                                    audioEngine.invalidateAndFlushPlayback("server audio backlog overflow")
-                                }
+                                logManager.w(
+                                    "GeminiLive:AudioBacklog",
+                                    "Входящий аудиочанк отклонён защитным лимитом (backlog=${backlog / 1024} КБ, лимит=${MAX_AI_AUDIO_BACKLOG_BYTES / 1024} КБ)"
+                                )
                             }
                         }
                     }
