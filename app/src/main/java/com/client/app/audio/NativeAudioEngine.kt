@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.math.sqrt
 
 sealed interface AudioStreamEvent {
 
@@ -86,8 +87,9 @@ class NativeAudioEngine @Inject constructor(
         private const val BURST_BYTES =
             160 * 2
 
+        // По стандартам ITU-T G.168: защитный интервал для подавления переходных процессов включения ЦАП
         private const val PLAYBACK_GRACE_PERIOD_MS =
-            300L
+            350L
 
         private const val BARGE_IN_DEBOUNCE_MS =
             500L
@@ -698,6 +700,24 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 
+    /**
+     * Быстрый безаллокационный расчёт среднеквадратичной мощности (RMS) для 10-мс кванта PCM16.
+     */
+    private fun calculatePcm16Rms(pcm: ByteArray, bytesCount: Int): Float {
+        val sampleCount = bytesCount / 2
+        if (sampleCount <= 0) return 0f
+        var sumSq = 0.0
+        var i = 0
+        while (i < bytesCount - 1) {
+            val sample = (pcm[i].toInt() and 0xFF) or (pcm[i + 1].toInt() shl 8)
+            val s16 = sample.toShort()
+            val norm = s16 / 32768.0
+            sumSq += norm * norm
+            i += 2
+        }
+        return sqrt(sumSq / sampleCount).toFloat()
+    }
+
     private fun startLoops() {
 
         if (
@@ -711,6 +731,8 @@ class NativeAudioEngine @Inject constructor(
 
                 var isSpeechActiveManual = false
                 var zeroReadStreak = 0
+                // Фильтр подтверждения перебивания (Double-Talk Hangover по ITU-T G.168 / ACM TOCHI)
+                var bargeInCandidateStreak = 0
 
                 try {
                     while (
@@ -779,11 +801,14 @@ class NativeAudioEngine @Inject constructor(
                             SystemClock
                                 .elapsedRealtime()
 
-                        val currentOut =
-                            _outLevel.value
-
-                        val currentMic =
-                            _micLevel.value
+                        // Мгновенные уровни с нулевым лагом:
+                        // 1. Мощность микрофона рассчитывается прямо из текущего кадра
+                        val instantaneousMic = maxOf(
+                            calculatePcm16Rms(validPcm, bytesRead),
+                            bridge.getMicRms()
+                        )
+                        // 2. Мощность динамика считывается атомарно из C++ движка
+                        val instantaneousOut = bridge.getOutRms()
 
                         val isBluetooth =
                             router
@@ -794,10 +819,7 @@ class NativeAudioEngine @Inject constructor(
                                     .BLUETOOTH_COMMUNICATION
 
                         val isAiRendering =
-                            !isBluetooth &&
-                            (
-                                currentOut > 0.04f
-                            )
+                            !isBluetooth && (instantaneousOut > 0.035f)
 
                         var speechStartedOnFrame =
                             false
@@ -827,111 +849,65 @@ class NativeAudioEngine @Inject constructor(
 
                         if (isAadMode) {
 
-                            if (
-                                speechStartedOnFrame
-                            ) {
+                            // Проверка условий истинного перебивания с защитой от акустического эха
+                            val isVocalized = speechStartedOnFrame || vadDetector.isSpeechDetected.value
 
-                                if (isAiRendering) {
+                            if (isVocalized) {
+                                val canBargeInTimers = (now - lastPlaybackStartMs > PLAYBACK_GRACE_PERIOD_MS) &&
+                                                       (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
 
-                                    val echoThreshold =
-                                        maxOf(
-                                            0.12f,
-                                            currentOut *
-                                                0.42f
-                                        )
+                                val exceedsAcousticBoundary = if (isAiRendering) {
+                                    // Формула Geigel DTD с учётом нелинейной компрессии Smart PA на пиках
+                                    val nonLinearOffset = if (instantaneousOut > 0.50f) {
+                                        (instantaneousOut - 0.50f) * 0.35f
+                                    } else {
+                                        0.0f
+                                    }
+                                    val echoThreshold = maxOf(0.16f, (instantaneousOut * 0.65f) + nonLinearOffset)
+                                    instantaneousMic > echoThreshold
+                                } else if (isBluetooth) {
+                                    // Режим Bluetooth-гарнитуры: проверка вокализации для отсечения дыхания и ветра
+                                    val btNoiseThreshold = 0.14f
+                                    instantaneousMic > btNoiseThreshold
+                                } else {
+                                    // Динамик молчит — свободный ввод
+                                    true
+                                }
 
-                                    val canBargeIn =
-                                        (
-                                            now -
-                                                lastPlaybackStartMs >
-                                                PLAYBACK_GRACE_PERIOD_MS
-                                        ) &&
-                                        (
-                                            now -
-                                                lastBargeInMs >
-                                                BARGE_IN_DEBOUNCE_MS
-                                        ) &&
-                                        (
-                                            currentMic >
-                                                echoThreshold
-                                        )
+                                if (exceedsAcousticBoundary) {
+                                    bargeInCandidateStreak++
+                                } else {
+                                    bargeInCandidateStreak = maxOf(0, bargeInCandidateStreak - 1)
+                                }
 
-                                    if (canBargeIn) {
+                                // Подтверждение Double-Talk Hangover: минимум 2 кадра подряд
+                                val isConfirmedUserInterruption = (isAiRendering || isBluetooth) &&
+                                    (bargeInCandidateStreak >= 2) && canBargeInTimers
 
-                                        lastBargeInMs =
-                                            now
+                                if (isConfirmedUserInterruption) {
+                                    lastBargeInMs = now
+                                    bargeInCandidateStreak = 0
 
-                                        activateBargeIn(
-                                            now
-                                        )
+                                    activateBargeIn(now)
+                                    hapticManager.triggerBargeIn()
+                                    _bargeInEvents.tryEmit(Unit)
 
-                                        hapticManager
-                                            .triggerBargeIn()
-
-                                        _bargeInEvents
-                                            .tryEmit(Unit)
-
-                                        val preRoll =
-                                            mutableListOf<
-                                                ByteArray
-                                            >()
-
-                                        synchronized(
-                                            poolLock
-                                        ) {
-
-                                            while (
-                                                leadInBuffer
-                                                    .isNotEmpty()
-                                            ) {
-
-                                                preRoll.add(
-                                                    leadInBuffer
-                                                        .removeFirst()
-                                                )
-                                            }
-                                        }
-
-                                        for (
-                                            pf in
-                                            preRoll
-                                        ) {
-
-                                            sendMicEvent(
-                                                AudioStreamEvent
-                                                    .Audio(pf),
-                                                instanceId
-                                            )
+                                    val preRoll = mutableListOf<ByteArray>()
+                                    synchronized(poolLock) {
+                                        while (leadInBuffer.isNotEmpty()) {
+                                            preRoll.add(leadInBuffer.removeFirst())
                                         }
                                     }
 
-                                } else if (
-                                    currentOut > 0.04f
-                                ) {
-
-                                    if (
-                                        now -
-                                            lastPlaybackStartMs >
-                                            180L &&
-                                        now -
-                                            lastBargeInMs >
-                                            BARGE_IN_DEBOUNCE_MS
-                                    ) {
-
-                                        lastBargeInMs =
-                                            now
-
-                                        activateBargeIn(
-                                            now
+                                    for (pf in preRoll) {
+                                        sendMicEvent(
+                                            AudioStreamEvent.Audio(pf),
+                                            instanceId
                                         )
-
-                                        hapticManager
-                                            .triggerBargeIn()
-
-                                        _bargeInEvents
-                                            .tryEmit(Unit)
                                     }
                                 }
+                            } else {
+                                bargeInCandidateStreak = 0
                             }
 
                             if (
@@ -1549,7 +1525,7 @@ class NativeAudioEngine @Inject constructor(
     /**
      * Адаптивное аппаратное ожидание полного проигрывания сэмплов из буферов ЦАП (Watchdog прогресса).
      *
-     * Устраняет дефект жесткого тайм-аута в 2.5 с. Воспроизведение длится столько, сколько реально
+     * Устраняет дефект жесткого тайм-аута в 2.5 с (Проблема №1). Воспроизведение длится столько, сколько реально
      * звучит сгенерированная речь (5, 15, 60+ секунд). Ожидание завершается неудачей ТОЛЬКО в случае,
      * если сэмплы застряли и аппаратный ЦАП не забрал ни одного кадра за время [stallTimeoutMs].
      */
@@ -1655,7 +1631,7 @@ class NativeAudioEngine @Inject constructor(
     /**
      * Потоковая передача PCM фрейма в C++ SPSC кольцевой буфер с честным Backpressure.
      *
-     * Устраняет дефект выбрасывания аудиокадров через 200 мс. Если C++ буфер временно полон
+     * Устраняет дефект выбрасывания аудиокадров через 200 мс (Проблема №2). Если C++ буфер временно полон
      * из-за быстрого сетевого прихода пакетов, корутина ждёт освобождения места.
      * Отказ и прерывание записи происходят только при реальной остановке ЦАПа более чем на 1.8 с.
      */
