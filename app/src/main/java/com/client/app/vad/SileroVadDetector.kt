@@ -33,7 +33,7 @@ class SileroVadDetector @Inject constructor(
         const val WINDOW_SIZE_SAMPLES =
             512
 
-        // Official Silero V5 @ 16 kHz streaming context.
+        // Официальный стриминговый контекст Silero V5 при 16 кГц
         private const val CONTEXT_SIZE_SAMPLES =
             64
 
@@ -44,8 +44,6 @@ class SileroVadDetector @Inject constructor(
         private const val MODEL_PATH =
             "models/silero_vad_v5_quant.onnx"
 
-        // This is a sanity lower bound only.
-        // CI also validates Git LFS materialization.
         private const val MIN_VALID_MODEL_BYTES =
             500_000L
     }
@@ -56,10 +54,6 @@ class SileroVadDetector @Inject constructor(
     private var ortSession:
         OrtSession? = null
 
-    // One synchronization domain protects the entire mutable ONNX lifecycle:
-    // session/tensors, streaming state and recovery/reset paths. ReentrantLock
-    // is deliberate because evaluateNeural() can fail inside processSamples()
-    // and call closeResourcesLocked() recursively on the same thread.
     private val vadLock =
         ReentrantLock()
 
@@ -83,19 +77,17 @@ class SileroVadDetector @Inject constructor(
     private var thresholdSpeechEnd =
         0.35f
 
-    // Official V5 state: [2, 1, 128].
+    // Состояние модели Silero V5: тензор [2, 1, 128]
     private val stateBuffer =
         FloatArray(
             2 * 1 * 128
         )
 
-    // Official V5 16 kHz context.
     private val contextBuffer =
         FloatArray(
             CONTEXT_SIZE_SAMPLES
         )
 
-    // 64 context + 512 current samples.
     private val inputFloatBuffer:
         FloatBuffer =
         ByteBuffer
@@ -140,7 +132,6 @@ class SileroVadDetector @Inject constructor(
         Boolean
         get() = isNeuralModelLoaded
 
-    // Persistent ONNX tensors.
     private var persistentInputTensor:
         OnnxTensor? = null
 
@@ -150,12 +141,6 @@ class SileroVadDetector @Inject constructor(
     private var persistentSrTensor:
         OnnxTensor? = null
 
-    // AUD-070:
-    //
-    // Strict startup validation.
-    //
-    // A broken/missing model is NOT silently hidden behind RMS fallback.
-    // The caller receives false and the audio engine refuses to start.
     suspend fun prepare():
         Boolean =
         withContext(Dispatchers.IO) {
@@ -167,10 +152,6 @@ class SileroVadDetector @Inject constructor(
                 }
 
                 try {
-
-                    // openFd() requires an uncompressed asset.
-                    // app/build.gradle.kts explicitly declares .onnx
-                    // as noCompress.
                     val afd =
                         context.assets.openFd(
                             MODEL_PATH
@@ -182,11 +163,9 @@ class SileroVadDetector @Inject constructor(
                             asset.length <
                                 MIN_VALID_MODEL_BYTES
                         ) {
-
                             logger.e(
                                 "SileroVadDetector: $MODEL_PATH is too small (${asset.length} bytes); expected a real Silero V5 ONNX asset"
                             )
-
                             return@withContext false
                         }
 
@@ -198,15 +177,8 @@ class SileroVadDetector @Inject constructor(
                             OrtSession
                                 .SessionOptions()
                                 .apply {
-
-                                    setIntraOpNumThreads(
-                                        1
-                                    )
-
-                                    setInterOpNumThreads(
-                                        1
-                                    )
-
+                                    setIntraOpNumThreads(1)
+                                    setInterOpNumThreads(1)
                                     setOptimizationLevel(
                                         OrtSession
                                             .SessionOptions
@@ -215,9 +187,6 @@ class SileroVadDetector @Inject constructor(
                                     )
                                 }
 
-                        // Duplicate the FD so the AutoCloseInputStream
-                        // owns its descriptor without closing AssetManager's
-                        // underlying descriptor.
                         ParcelFileDescriptor
                             .AutoCloseInputStream(
                                 ParcelFileDescriptor.dup(
@@ -261,13 +230,11 @@ class SileroVadDetector @Inject constructor(
                         )
 
                         inputFloatBuffer.clear()
-
                         stateFloatBuffer.clear()
 
                         stateFloatBuffer.put(
                             stateBuffer
                         )
-
                         stateFloatBuffer.flip()
 
                         persistentInputTensor =
@@ -300,32 +267,20 @@ class SileroVadDetector @Inject constructor(
                                 )
                             )
 
-                        // Warm-up inference verifies that:
-                        //   - the ONNX graph is parseable;
-                        //   - the required inputs work;
-                        //   - the expected outputs exist.
                         inputFloatBuffer.clear()
-
                         repeat(
                             MODEL_INPUT_SAMPLES
                         ) {
-                            inputFloatBuffer.put(
-                                0f
-                            )
+                            inputFloatBuffer.put(0f)
                         }
-
                         inputFloatBuffer.flip()
 
                         stateFloatBuffer.clear()
-
                         repeat(
                             stateBuffer.size
                         ) {
-                            stateFloatBuffer.put(
-                                0f
-                            )
+                            stateFloatBuffer.put(0f)
                         }
-
                         stateFloatBuffer.flip()
 
                         val inputTensor =
@@ -354,10 +309,7 @@ class SileroVadDetector @Inject constructor(
                             )
                         ).use { result ->
 
-                            if (
-                                result.size() < 2
-                            ) {
-
+                            if (result.size() < 2) {
                                 throw IllegalStateException(
                                     "Silero V5 warm-up returned ${result.size()} outputs"
                                 )
@@ -366,10 +318,7 @@ class SileroVadDetector @Inject constructor(
                             val probability =
                                 result.get(0).value
 
-                            if (
-                                probability !is Array<*>
-                            ) {
-
+                            if (probability !is Array<*>) {
                                 throw IllegalStateException(
                                     "Silero V5 probability output has unexpected type: ${probability?.javaClass}"
                                 )
@@ -378,23 +327,15 @@ class SileroVadDetector @Inject constructor(
                             val returnedState =
                                 result.get(1).value
 
-                            if (
-                                returnedState !is Array<*>
-                            ) {
-
+                            if (returnedState !is Array<*>) {
                                 throw IllegalStateException(
                                     "Silero V5 state output has unexpected type: ${returnedState?.javaClass}"
                                 )
                             }
                         }
 
-                        stateBuffer.fill(
-                            0f
-                        )
-
-                        contextBuffer.fill(
-                            0f
-                        )
+                        stateBuffer.fill(0f)
+                        contextBuffer.fill(0f)
 
                         isNeuralModelLoaded =
                             true
@@ -407,17 +348,13 @@ class SileroVadDetector @Inject constructor(
                     }
 
                 } catch (e: Exception) {
-
                     logger.e(
                         "SileroVadDetector: strict ONNX initialization failed",
                         e
                     )
 
                     closeResourcesLocked()
-
-                    isNeuralModelLoaded =
-                        false
-
+                    isNeuralModelLoaded = false
                     return@withContext false
                 }
             }
@@ -426,7 +363,6 @@ class SileroVadDetector @Inject constructor(
     private fun validateModelContract(
         session: OrtSession
     ) {
-
         val inputNames =
             session.inputNames
 
@@ -440,21 +376,13 @@ class SileroVadDetector @Inject constructor(
                 "sr"
             )
 
-        if (
-            !inputNames.containsAll(
-                requiredInputs
-            )
-        ) {
-
+        if (!inputNames.containsAll(requiredInputs)) {
             throw IllegalStateException(
                 "Unexpected Silero V5 inputs: $inputNames, required=$requiredInputs"
             )
         }
 
-        if (
-            outputNames.size < 2
-        ) {
-
+        if (outputNames.size < 2) {
             throw IllegalStateException(
                 "Unexpected Silero V5 outputs: $outputNames"
             )
@@ -465,12 +393,8 @@ class SileroVadDetector @Inject constructor(
         start: Float,
         end: Float
     ) = vadLock.withLock {
-
-        thresholdSpeechStart =
-            start
-
-        thresholdSpeechEnd =
-            end
+        thresholdSpeechStart = start
+        thresholdSpeechEnd = end
     }
 
     fun processSamples(
@@ -484,21 +408,15 @@ class SileroVadDetector @Inject constructor(
 
         var offset = 0
 
-        while (
-            offset < sampleCount
-        ) {
+        while (offset < sampleCount) {
 
             val toCopy =
                 minOf(
                     sampleCount - offset,
-                    WINDOW_SIZE_SAMPLES -
-                        accumulatorCount
+                    WINDOW_SIZE_SAMPLES - accumulatorCount
                 )
 
-            for (
-                i in
-                0 until toCopy
-            ) {
+            for (i in 0 until toCopy) {
 
                 val byteIdx =
                     (offset + i) * 2
@@ -507,41 +425,27 @@ class SileroVadDetector @Inject constructor(
                     (
                         (
                             pcm16[byteIdx]
-                                .toInt() and
-                                0xFF
+                                .toInt() and 0xFF
                         ) or
                         (
-                            pcm16[
-                                byteIdx + 1
-                            ]
+                            pcm16[byteIdx + 1]
                                 .toInt() shl 8
                         )
                     ).toShort()
 
-                accumulator[
-                    accumulatorCount + i
-                ] = s
+                accumulator[accumulatorCount + i] = s
             }
 
-            accumulatorCount +=
-                toCopy
+            accumulatorCount += toCopy
+            offset += toCopy
 
-            offset +=
-                toCopy
-
-            if (
-                accumulatorCount >=
-                    WINDOW_SIZE_SAMPLES
-            ) {
-
+            if (accumulatorCount >= WINDOW_SIZE_SAMPLES) {
                 evaluateWindow(
                     accumulator,
                     onSpeechStart,
                     onSpeechEnd
                 )
-
-                accumulatorCount =
-                    0
+                accumulatorCount = 0
             }
         }
     }
@@ -551,7 +455,6 @@ class SileroVadDetector @Inject constructor(
         onSpeechStart: () -> Unit,
         onSpeechEnd: () -> Unit
     ) {
-
         val prob = try {
             if (
                 isNeuralModelLoaded &&
@@ -569,71 +472,39 @@ class SileroVadDetector @Inject constructor(
             evaluateFallbackRms(window)
         }
 
-        _speechProbability.value =
-            prob
+        _speechProbability.value = prob
 
-        if (
-            !_isSpeechDetected.value
-        ) {
+        if (!_isSpeechDetected.value) {
 
-            if (
-                prob >=
-                    thresholdSpeechStart
-            ) {
-
+            if (prob >= thresholdSpeechStart) {
                 speechStartStreak++
 
-                if (
-                    speechStartStreak >= 2
-                ) {
-
-                    _isSpeechDetected.value =
-                        true
-
-                    speechStartStreak =
-                        0
-
-                    speechEndStreak =
-                        0
-
+                if (speechStartStreak >= 2) {
+                    _isSpeechDetected.value = true
+                    speechStartStreak = 0
+                    speechEndStreak = 0
                     onSpeechStart()
                 }
-
             } else {
-
-                speechStartStreak =
-                    0
+                speechStartStreak = 0
             }
 
         } else {
 
-            if (
-                prob <
-                    thresholdSpeechEnd
-            ) {
-
+            if (prob < thresholdSpeechEnd) {
                 speechEndStreak++
 
-                if (
-                    speechEndStreak >= 10
-                ) {
-
-                    _isSpeechDetected.value =
-                        false
-
-                    speechEndStreak =
-                        0
-
-                    speechStartStreak =
-                        0
-
+                if (speechEndStreak >= 10) {
+                    _isSpeechDetected.value = false
+                    speechEndStreak = 0
+                    speechStartStreak = 0
                     onSpeechEnd()
                 }
-
             } else {
-
-                speechEndStreak =
-                    0
+                // Адаптивное подавление шума (Hangover) по стандарту ITU-T G.729B:
+                // Вместо мгновенного сброса счётчика тишины при единичном щелчке или вздохе,
+                // плавно снижаем счётчик, исключая зависание VAD в шумной среде.
+                speechEndStreak = maxOf(0, speechEndStreak - 2)
             }
         }
     }
@@ -672,39 +543,16 @@ class SileroVadDetector @Inject constructor(
                     "Silero V5 sample-rate tensor is unavailable"
                 )
 
-        // Official V5 @ 16 kHz:
-        //
-        //   64 samples previous context
-        //   +
-        //   512 current samples
-        //   =
-        //   576 samples
-        //
         inputFloatBuffer.clear()
+        inputFloatBuffer.put(contextBuffer)
 
-        inputFloatBuffer.put(
-            contextBuffer
-        )
-
-        for (
-            i in
-            0 until WINDOW_SIZE_SAMPLES
-        ) {
-
-            inputFloatBuffer.put(
-                window[i] /
-                    32768.0f
-            )
+        for (i in 0 until WINDOW_SIZE_SAMPLES) {
+            inputFloatBuffer.put(window[i] / 32768.0f)
         }
-
         inputFloatBuffer.flip()
 
         stateFloatBuffer.clear()
-
-        stateFloatBuffer.put(
-            stateBuffer
-        )
-
+        stateFloatBuffer.put(stateBuffer)
         stateFloatBuffer.flip()
 
         return try {
@@ -716,77 +564,42 @@ class SileroVadDetector @Inject constructor(
                     "sr" to srTensor
                 )
 
-            session.run(
-                inputs
-            ).use { result ->
+            session.run(inputs).use { result ->
 
                 val outputProb =
                     (
-                        result
-                            .get(0)
-                            .value
-                            as Array<FloatArray>
+                        result.get(0).value as Array<FloatArray>
                     )[0][0]
 
-                @Suppress(
-                    "UNCHECKED_CAST"
-                )
+                @Suppress("UNCHECKED_CAST")
                 val nextState =
-                    result
-                        .get(1)
-                        .value
-                        as Array<
-                            Array<FloatArray>
-                        >
+                    result.get(1).value as Array<Array<FloatArray>>
 
                 var idx = 0
-
-                for (
-                    i in
-                    0 until 2
-                ) {
-
-                    for (
-                        j in
-                        0 until 128
-                    ) {
-
-                        stateBuffer[idx++] =
-                            nextState[i][0][j]
+                for (i in 0 until 2) {
+                    for (j in 0 until 128) {
+                        stateBuffer[idx++] = nextState[i][0][j]
                     }
                 }
 
-                // Carry the last 64 samples of the current 512-sample
-                // window into the next inference call.
                 val contextStart =
-                    WINDOW_SIZE_SAMPLES -
-                        CONTEXT_SIZE_SAMPLES
+                    WINDOW_SIZE_SAMPLES - CONTEXT_SIZE_SAMPLES
 
-                for (
-                    i in
-                    0 until CONTEXT_SIZE_SAMPLES
-                ) {
-
+                for (i in 0 until CONTEXT_SIZE_SAMPLES) {
                     contextBuffer[i] =
-                        window[
-                            contextStart + i
-                        ] /
-                        32768.0f
+                        window[contextStart + i] / 32768.0f
                 }
 
                 outputProb
             }
 
         } catch (e: Exception) {
-
             logger.e(
                 "SileroVadDetector: V5 inference failure",
                 e
             )
 
-            isNeuralModelLoaded =
-                false
-
+            isNeuralModelLoaded = false
             closeResourcesLocked()
 
             throw IllegalStateException(
@@ -796,105 +609,51 @@ class SileroVadDetector @Inject constructor(
         }
     }
 
-    // PRECONDITION: vadLock is held by the caller.
     private fun closeResourcesLocked() {
+        runCatching { persistentInputTensor?.close() }
+        runCatching { persistentStateTensor?.close() }
+        runCatching { persistentSrTensor?.close() }
+        runCatching { ortSession?.close() }
 
-        runCatching {
-            persistentInputTensor?.close()
-        }
-
-        runCatching {
-            persistentStateTensor?.close()
-        }
-
-        runCatching {
-            persistentSrTensor?.close()
-        }
-
-        runCatching {
-            ortSession?.close()
-        }
-
-        // OrtEnvironment is process-scoped in common ONNX Runtime usage.
-        // Do not close the global environment here.
-        persistentInputTensor =
-            null
-
-        persistentStateTensor =
-            null
-
-        persistentSrTensor =
-            null
-
-        ortSession =
-            null
-
-        ortEnvironment =
-            null
+        persistentInputTensor = null
+        persistentStateTensor = null
+        persistentSrTensor = null
+        ortSession = null
+        ortEnvironment = null
     }
 
     private fun evaluateFallbackRms(
         window: ShortArray
     ): Float {
-
         var sumSq = 0.0
 
         for (s in window) {
-
-            val f =
-                s / 32768.0
-
-            sumSq +=
-                f * f
+            val f = s / 32768.0
+            sumSq += f * f
         }
 
         val rms =
             sqrt(
-                (
-                    sumSq + 1e-9
-                ) /
-                    window.size
+                (sumSq + 1e-9) / window.size
             ).toFloat()
 
         return (
-            (
-                rms -
-                0.012f
-            ) /
-            0.045f
-        ).coerceIn(
-            0.0f,
-            1.0f
-        )
+            (rms - 0.012f) / 0.045f
+        ).coerceIn(0.0f, 1.0f)
     }
 
     fun resetState() = vadLock.withLock {
-
-        stateBuffer.fill(
-            0f
-        )
-
-        contextBuffer.fill(
-            0f
-        )
+        stateBuffer.fill(0f)
+        contextBuffer.fill(0f)
 
         inputFloatBuffer.clear()
-
         stateFloatBuffer.clear()
 
-        accumulatorCount =
-            0
+        accumulatorCount = 0
+        speechStartStreak = 0
+        speechEndStreak = 0
 
-        speechStartStreak =
-            0
-
-        speechEndStreak =
-            0
-
-        _isSpeechDetected.value =
-            false
-
-        _speechProbability.value =
-            0f
+        _isSpeechDetected.value = false
+        _speechProbability.value = 0f
     }
 }
