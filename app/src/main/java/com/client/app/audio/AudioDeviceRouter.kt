@@ -48,13 +48,11 @@ class AudioDeviceRouter @Inject constructor(
 
     private var routerScope: CoroutineScope? = null
 
-    // Preserve the application's pre-session audio state and restore it on stop.
+    // Сохранение аудиосостояния устройства до сессии для корректного восстановления при остановке
     private var previousAudioMode: Int? = null
     private var previousSpeakerphoneOn: Boolean? = null
 
-    // Legacy SCO is asynchronous on API 28-30. These are distinct states:
-    // requested means startBluetoothSco() was issued; connected means the
-    // system reported SCO_AUDIO_STATE_CONNECTED.
+    // Асинхронное состояние Bluetooth SCO для Android 9–11 (API 28–30)
     private var legacyScoRequested = false
     private var legacyScoConnected = false
     private var legacyScoReceiverRegistered = false
@@ -130,8 +128,6 @@ class AudioDeviceRouter @Inject constructor(
             }
 
             AudioManager.SCO_AUDIO_STATE_CONNECTED -> {
-                // CONNECTED is the authoritative point at which legacy SCO may
-                // be reported as active to the rest of the routing state machine.
                 audioManager.isBluetoothScoOn = true
                 legacyScoRequested = false
                 legacyScoConnected = true
@@ -158,9 +154,6 @@ class AudioDeviceRouter @Inject constructor(
         )
         legacyScoReceiverRegistered = true
 
-        // ACTION_SCO_AUDIO_STATE_UPDATED is sticky. Consume the current state at
-        // registration time so an already-connected SCO session is not mistaken
-        // for DISCONNECTED merely because no new transition broadcast follows.
         val stickyState = sticky?.getIntExtra(
             AudioManager.EXTRA_SCO_AUDIO_STATE,
             AudioManager.SCO_AUDIO_STATE_DISCONNECTED
@@ -404,8 +397,6 @@ class AudioDeviceRouter @Inject constructor(
                         it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
                 }
             } else {
-                // Legacy routing is based specifically on Bluetooth SCO/HFP.
-                // Do not classify a non-SCO Bluetooth output as a communication route.
                 allOutputs.filter { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
             }
         } else {
@@ -416,7 +407,7 @@ class AudioDeviceRouter @Inject constructor(
         val btOutputDevice = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             currentCommunication?.takeIf { it in btCandidates }
         } else {
-            btCandidates.singleOrNull().takeIf { legacyScoConnected && audioManager.isBluetoothScoOn }
+            btCandidates.firstOrNull().takeIf { legacyScoConnected && audioManager.isBluetoothScoOn }
         }
 
         if (currentCommunication != null && currentCommunication !in btCandidates &&
@@ -473,26 +464,21 @@ class AudioDeviceRouter @Inject constructor(
             val currentStillValid = current != null && current in candidates
 
             when {
+                // Если текущее устройство уже является валидным Bluetooth-эндпоинтом, не меняем маршрут
                 currentStillValid -> return
-                candidates.size == 1 -> {
-                    if (!bindBluetoothCommunication(candidates.single())) {
+                candidates.isNotEmpty() -> {
+                    // Выбираем лучший доступный Bluetooth-кандидат (BLE гарнитура в приоритете, затем SCO)
+                    val targetDevice = candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
+                        ?: candidates.first()
+                    if (!bindBluetoothCommunication(targetDevice)) {
                         val fallbackConfirmed = bindSpeakerCommunication()
                         if (!fallbackConfirmed) {
                             logger.w("AudioDeviceRouter: Bluetooth bind and speaker fallback both failed")
                         }
                     }
                 }
-                candidates.isEmpty() -> {
-                    bindSpeakerCommunication()
-                }
                 else -> {
-                    // Multiple communication-capable BT devices cannot be selected
-                    // deterministically here. Preserve the existing system route;
-                    // if it is not usable, speaker is the explicit safe fallback.
-                    logger.w("AudioDeviceRouter: multiple Bluetooth communication devices available; keeping Android's current route")
-                    if (current?.type != AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
-                        bindSpeakerCommunication()
-                    }
+                    bindSpeakerCommunication()
                 }
             }
             return
@@ -508,8 +494,8 @@ class AudioDeviceRouter @Inject constructor(
             when {
                 legacyScoConnected && audioManager.isBluetoothScoOn -> return
                 legacyScoRequested -> return
-                candidates.size == 1 -> {
-                    if (!bindBluetoothCommunication(candidates.single())) {
+                candidates.isNotEmpty() -> {
+                    if (!bindBluetoothCommunication(candidates.first())) {
                         bindSpeakerCommunication()
                     }
                 }
@@ -547,8 +533,6 @@ class AudioDeviceRouter @Inject constructor(
                 }
             }
 
-            // The request is asynchronous. Do not claim a Bluetooth route until
-            // the CONNECTED broadcast has made the state authoritative.
             true
         }
     }.onFailure {
@@ -572,9 +556,6 @@ class AudioDeviceRouter @Inject constructor(
                     }
                 }
             } else {
-                // Clearing the communication device does not prove that the
-                // built-in speaker is active; the final route check below is
-                // authoritative.
                 runCatching { audioManager.clearCommunicationDevice() }
                     .onFailure {
                         logger.w(
