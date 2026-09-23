@@ -69,14 +69,13 @@ class ForvoRepository @Inject constructor(
         const val URL_TTL_MS = 90L * 60 * 1000
         private const val MISS_TTL_MS = 30L * 60 * 1000
 
-        // E-17: Математически выверенная функция границы 22:00 UTC
+        // Граница суток Forvo API: 22:00 UTC
         fun calculateForvoDayId(instant: Instant): String {
             val shifted = instant.minus(Duration.ofHours(22))
             return DateTimeFormatter.ISO_LOCAL_DATE.withZone(ZoneOffset.UTC).format(shifted)
         }
     }
 
-    // Ошибка №13 [PERF]: Единый контролируемый скоуп репозитория с SupervisorJob для исключения утечек корутин
     private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val client = OkHttpClient.Builder()
@@ -93,14 +92,28 @@ class ForvoRepository @Inject constructor(
     private val _quota = MutableStateFlow(ForvoQuota(0, DEFAULT_QUOTA_LIMIT))
     val quota: StateFlow<ForvoQuota> = _quota.asStateFlow()
 
+    private var currentDayId: String = calculateForvoDayId(Instant.now())
+    private var currentUsed: Int = 0
+    private var currentLimit: Int = DEFAULT_QUOTA_LIMIT
+    private var isInitialized = false
+    private var pendingPersistJob: Job? = null
+
     init {
         repositoryScope.launch {
             dataStore.data.collect { prefs ->
-                val currentDay = calculateForvoDayId(Instant.now())
-                val savedDay = prefs[KEY_QUOTA_DAY] ?: ""
-                val limit = prefs[KEY_QUOTA_LIMIT] ?: DEFAULT_QUOTA_LIMIT
-                val used = if (savedDay == currentDay) prefs[KEY_QUOTA_USED] ?: 0 else 0
-                _quota.value = ForvoQuota(used, limit)
+                quotaMutex.withLock {
+                    val today = calculateForvoDayId(Instant.now())
+                    val savedDay = prefs[KEY_QUOTA_DAY] ?: ""
+                    currentLimit = prefs[KEY_QUOTA_LIMIT] ?: DEFAULT_QUOTA_LIMIT
+                    if (!isInitialized) {
+                        currentDayId = today
+                        currentUsed = if (savedDay == today) prefs[KEY_QUOTA_USED] ?: 0 else 0
+                        isInitialized = true
+                    } else if (savedDay == today && currentUsed < (prefs[KEY_QUOTA_USED] ?: 0)) {
+                        currentUsed = prefs[KEY_QUOTA_USED] ?: 0
+                    }
+                    _quota.value = ForvoQuota(currentUsed, currentLimit)
+                }
             }
         }
     }
@@ -144,9 +157,6 @@ class ForvoRepository @Inject constructor(
         misses[cacheKey]?.let { if (System.currentTimeMillis() - it < MISS_TTL_MS) return ForvoResult.NotFound }
 
         return gate.withPermit {
-            // ER-023 / ER-053: reserve the API-request slot immediately before
-            // the external call. The reservation is atomic with the quota check,
-            // so concurrent batches cannot cross the daily limit.
             if (!reserveQuotaSlot()) {
                 return@withPermit ForvoResult.QuotaExceeded
             }
@@ -162,7 +172,6 @@ class ForvoRepository @Inject constructor(
 
                     val root = json.parseToJsonElement(body).jsonObject
 
-                    // Ошибка №5 [DEFECT]: Валидация ошибок Forvo для исключения отравления Negative Cache (misses)
                     if (root.containsKey("errors")) {
                         val msg = root["errors"].toString()
                         return@use ForvoResult.Failed("Forvo API: $msg")
@@ -194,38 +203,46 @@ class ForvoRepository @Inject constructor(
     }
 
     /**
-     * Atomically reserves one daily Forvo API request slot. Quota semantics are
-     * deliberately request-based: a failed remote request still consumed the
-     * provider-side request opportunity and therefore keeps the reserved slot.
+     * Атомарно резервирует слот суточной квоты в оперативной памяти.
+     * Сброс изменений в DataStore агрегируется и выполняется пакетом с дебаунсом 300 мс,
+     * устраняя множественные последовательные fsync-транзакции при пакетном запросе (batch lookup).
      */
     private suspend fun reserveQuotaSlot(): Boolean = quotaMutex.withLock {
-        var reserved = false
-        var usedAfter = 0
-        var limitAfter = DEFAULT_QUOTA_LIMIT
-
-        dataStore.edit { prefs ->
-            val currentDay = calculateForvoDayId(Instant.now())
-            val savedDay = prefs[KEY_QUOTA_DAY] ?: ""
-            val limit = prefs[KEY_QUOTA_LIMIT] ?: DEFAULT_QUOTA_LIMIT
-            val used = if (savedDay == currentDay) {
-                prefs[KEY_QUOTA_USED] ?: 0
-            } else {
-                0
-            }
-
-            limitAfter = limit
-            if (used < limit) {
-                usedAfter = used + 1
-                prefs[KEY_QUOTA_DAY] = currentDay
-                prefs[KEY_QUOTA_USED] = usedAfter
-                reserved = true
-            } else {
-                usedAfter = used
-            }
+        val today = calculateForvoDayId(Instant.now())
+        if (currentDayId != today) {
+            currentDayId = today
+            currentUsed = 0
         }
 
-        _quota.value = ForvoQuota(usedAfter, limitAfter)
-        reserved
+        if (currentUsed >= currentLimit) {
+            _quota.value = ForvoQuota(currentUsed, currentLimit)
+            return@withLock false
+        }
+
+        currentUsed++
+        _quota.value = ForvoQuota(currentUsed, currentLimit)
+
+        scheduleQuotaPersistLocked()
+        true
+    }
+
+    private fun scheduleQuotaPersistLocked() {
+        pendingPersistJob?.cancel()
+        pendingPersistJob = repositoryScope.launch {
+            delay(300L) // Коалесценция быстрых последовательных вызовов в одну транзакцию
+            quotaMutex.withLock {
+                val dayToSave = currentDayId
+                val usedToSave = currentUsed
+                runCatching {
+                    dataStore.edit { prefs ->
+                        prefs[KEY_QUOTA_DAY] = dayToSave
+                        prefs[KEY_QUOTA_USED] = usedToSave
+                    }
+                }.onFailure {
+                    logger.w("ForvoRepository: не удалось сохранить обновлённую квоту: ${it.message}")
+                }
+            }
+        }
     }
 
     fun clearMisses() = misses.clear()
