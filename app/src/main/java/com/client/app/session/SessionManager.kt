@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
@@ -137,10 +138,6 @@ class SessionManager @Inject constructor(
         val KEY_SESSION_RESUMPTION_HANDLE = stringPreferencesKey("gemini_session_resumption_handle")
         val KEY_SESSION_RESUMPTION_TIMESTAMP =
             longPreferencesKey("gemini_resumption_timestamp")
-        // The server is the authority on resumption-token validity. The Live
-        // API documents the two-hour validity window from the last session
-        // termination, not from the moment a token is received, so a local
-        // receipt timestamp must not be used as a hard expiry.
 
         val KEY_INITIAL_HISTORY_TURNS = intPreferencesKey("gemini_initial_history_turns")
 
@@ -666,8 +663,6 @@ class SessionManager @Inject constructor(
             storedResumeHandle.isNotBlank() &&
             prefs[KEY_SESSION_RESUMPTION_ENABLED] != false
         ) {
-            // Do not locally evict based on token receipt time. The server
-            // determines whether the handle is still resumable.
             resumptionHandle = storedResumeHandle
         }
         activeConnectUsedResumption = resume && (resumptionHandle?.isNotBlank() == true)
@@ -1109,12 +1104,6 @@ class SessionManager @Inject constructor(
             }
 
             if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-                // This is a terminal decision for the reconnect controller.
-                // Do not require client.epoch == sourceEpoch here: a failed
-                // handshake/close can advance the transport epoch before this
-                // coroutine gets the mutex. The reconnect token is the
-                // authoritative guard against a newer user action or reconnect
-                // controller superseding this terminal decision.
                 val terminalToken = reconnectToken.incrementAndGet()
 
                 reconnectJob?.cancel()
@@ -1629,11 +1618,6 @@ class SessionManager @Inject constructor(
                                         }
 
                                 if (usableHandle != null) {
-                                    // resumable=false means that a new token is
-                                    // not currently available; it does not revoke
-                                    // the last valid handle. Persist only actual
-                                    // resumable handles and serialize writes so an
-                                    // older async write cannot overwrite a newer one.
                                     resumptionHandle = usableHandle
                                     resumptionPersistenceMutex.withLock {
                                         when (val encrypted = cryptoManager.encrypt(usableHandle)) {
@@ -1676,10 +1660,6 @@ class SessionManager @Inject constructor(
                                     clientCapabilitiesForCurrentSession()
                                         .supportsInteractionStatus
                                 ) {
-                                    // For extended-thinking sessions, IDLE is the
-                                    // authoritative interaction lifecycle signal.
-                                    // turnComplete may be emitted earlier while
-                                    // background reasoning or async tools continue.
                                     finishInteractionAfterPlayback(
                                         sourceSessionId = eventSessionId,
                                         sourceEpoch = eventEpoch,
@@ -1702,8 +1682,6 @@ class SessionManager @Inject constructor(
 
                                     goAwayJob = scope.launch {
                                         try {
-                                            // A missing deadline must not strand the session in
-                                            // pendingGoAway. Treat it as an immediate reconnect deadline.
                                             val millisLeft = event.millisLeft ?: 0L
                                             delay(millisLeft.coerceAtLeast(0L))
 
@@ -1804,12 +1782,6 @@ class SessionManager @Inject constructor(
                             }
 
                             is GeminiEvent.ModelText -> {
-                                // ModelText is a real model-turn content stream, not
-                                // merely a fallback for output transcription. It can
-                                // be the only textual representation of a response
-                                // when audio transcription is absent (for example
-                                // around tool use or text-only model content). Keep
-                                // it visible even when output transcription is enabled.
                                 appendTranscript(
                                     ClientRole.MODEL,
                                     event.text,
@@ -1982,6 +1954,13 @@ class SessionManager @Inject constructor(
     private fun clientCapabilitiesForCurrentSession(): LiveModelCapabilities =
         activeLiveCapabilities
 
+    /**
+     * Завершение речевого взаимодействия модели строго после того, как все сэмплы покинули ЦАП.
+     *
+     * 1. Гарантирует вычитку сетевого канала (client.hasPendingAudioFrames).
+     * 2. Ожидает физического дренажа через адаптивный прогресс-вотчдог.
+     * 3. Переводит состояние isAiSpeaking в false строго после завершения звука.
+     */
     private fun finishInteractionAfterPlayback(
         sourceSessionId: Long,
         sourceEpoch: Long,
@@ -1989,22 +1968,25 @@ class SessionManager @Inject constructor(
         capabilities: LiveModelCapabilities
     ) {
         scope.launch {
-            val generation =
-                audioEngine.currentPlaybackGeneration
+            val generation = audioEngine.currentPlaybackGeneration
 
-            val drained = audioEngine.awaitPlaybackDrained(
-                generation = generation,
-                timeoutMs = 2500L
-            )
-            if (!drained &&
-                audioEngine.currentPlaybackGeneration == generation
-            ) {
-                logger.w(
-                    "SessionManager: playback drain timed out; invalidating stale playback generation"
-                )
-                invalidateAndFlushAudio("playback drain timeout")
+            // 1. Ожидаем, пока корутина observeAudio() перельёт остатки аудиопакетов сокета в C++ буфер
+            val ingressDeadline = SystemClock.elapsedRealtime() + 1500L
+            while (client.hasPendingAudioFrames && SystemClock.elapsedRealtime() < ingressDeadline) {
+                if (client.sessionId != sourceSessionId || client.epoch != sourceEpoch || !connectionDesired) {
+                    return@launch
+                }
+                delay(15L)
             }
 
+            // 2. Адаптивное аппаратное ожидание опустошения очереди ЦАП
+            val drained = audioEngine.awaitPlaybackDrained(generation = generation)
+            if (!drained && audioEngine.currentPlaybackGeneration == generation) {
+                logger.w("SessionManager: playback drain watchdog detected hardware stall; clearing stalled queue")
+                invalidateAndFlushAudio("playback stall recovery")
+            }
+
+            // 3. Атомарный перевод состояния интерфейса в режим ожидания
             val shouldReconnect =
                 mutex.withLock {
                     val lifecycleComplete =
@@ -2265,13 +2247,6 @@ class SessionManager @Inject constructor(
                         }
                     } finally {
                         activeToolJobs.remove(key)
-                        // A server cancellation is a protocol-level barrier for
-                        // this call. Do not erase it from finally: the coroutine
-                        // may observe cancellation only after this block has
-                        // started, while the response path still needs the key
-                        // to suppress a late FunctionResponse. Cancelled-call
-                        // markers are cleared centrally on session shutdown /
-                        // transport teardown.
                     }
                 }
 
@@ -2518,4 +2493,3 @@ class SessionManager @Inject constructor(
         }
     }
 }
-
