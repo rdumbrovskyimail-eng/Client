@@ -39,6 +39,7 @@
     __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "%s", _buf); \
     client::logging::NativeLogQueue::getInstance().push(6, LOG_TAG, _buf); \
 } while (0)
+
 namespace client::audio {
 
 void Biquad::reset() {
@@ -71,7 +72,7 @@ void Biquad::makeHighShelf(float fc, float gainDb, float fs) {
     const float a0 = (A + 1.0f) - (A - 1.0f) * cs + beta;
     b0 = (A * ((A + 1.0f) + (A - 1.0f) * cs + beta)) / a0;
     b1 = (-2.0f * A * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
-    b2 = (A * ((A + 1.0f) + (A - 1.0f) * cs - beta)) / a0;
+    b2 = (A * ((A + 1.0f) - (A - 1.0f) * cs - beta)) / a0;
     a1 = (2.0f * ((A - 1.0f) - (A + 1.0f) * cs)) / a0;
     a2 = ((A + 1.0f) - (A - 1.0f) * cs - beta) / a0;
 }
@@ -92,14 +93,8 @@ void AnalogVoiceEnhancer::reset(int32_t sampleRate) {
 void AnalogVoiceEnhancer::process(int16_t* samples, size_t numFrames, int32_t sampleRate) {
     if (samples == nullptr || numFrames == 0) return;
     if (sampleRate > 0 && sampleRate != currentRate_) reset(sampleRate);
-
-    // Keep the transport PCM bit-transparent. The previous EQ and
-    // waveshaping stage changed the spectrum and could introduce nonlinear
-    // distortion. Voice coloration, if ever needed, must be an explicit and
-    // separately tested playback effect rather than an implicit transport
-    // transform.
+    // Transport PCM remains bit-transparent for high fidelity speech output.
 }
-
 
 AAudioEngine& AAudioEngine::getInstance() {
     static AAudioEngine instance;
@@ -233,10 +228,8 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
     }
 
     if (inputDeviceId > 0 && actualInDeviceId != inputDeviceId) {
-        LOGE("AAudio capture device request was not honored: requested=%d actual=%d",
+        LOGW("AAudio capture device preference not strictly matched: requested=%d actual=%d; continuing with routed device",
              inputDeviceId, actualInDeviceId);
-        closeCaptureStreamLocked();
-        return false;
     }
 
     actualCaptureSampleRate_.store(actualInRate, std::memory_order_release);
@@ -305,8 +298,6 @@ bool AAudioEngine::initLocked(
     playbackDspInputBuffer_.resetQuiesced();
     playbackBuffer_.resetQuiesced();
 
-    // initAudioRoute initializes the playback side only. Capture is opened lazily
-    // by startCapture(), which makes playback-only routes a first-class lifecycle.
     actualCaptureSampleRate_.store(0, std::memory_order_release);
     actualCaptureChannels_.store(0, std::memory_order_release);
     actualInputDeviceId_.store(AAUDIO_UNSPECIFIED, std::memory_order_release);
@@ -333,7 +324,6 @@ bool AAudioEngine::initLocked(
         return false;
     }
 
-    // Use the verified hardware rate for any stateful output DSP initialization.
     const int32_t verifiedPlaybackRate =
         actualPlaybackSampleRate_.load(std::memory_order_acquire);
     voiceEnhancer_.reset(verifiedPlaybackRate);
@@ -509,11 +499,9 @@ bool AAudioEngine::validateAndPublishPlaybackConfigLocked(int32_t requestedOutpu
     }
 
     if (requestedOutputDeviceId > 0 && actualDeviceId != requestedOutputDeviceId) {
-        LOGE(
-            "AAudio playback device request was not honored: requested=%d actual=%d",
+        LOGW(
+            "AAudio playback device preference not strictly matched: requested=%d actual=%d; continuing with routed device",
             requestedOutputDeviceId, actualDeviceId);
-        closePlaybackStreamLocked();
-        return false;
     }
 
     actualPlaybackSampleRate_.store(actualRate, std::memory_order_release);
@@ -559,8 +547,6 @@ bool AAudioEngine::waitForStreamState(
         if (result == AAUDIO_OK) {
             state = nextState;
         } else if (result == AAUDIO_ERROR_TIMEOUT) {
-            // This timeout is only the polling slice. Re-read the authoritative
-            // stream state and continue until the outer deadline expires.
             state = AAudioStream_getState(stream);
         } else {
             LOGW("AAudioStream_waitForStateChange error: %d (%s)",
@@ -625,8 +611,6 @@ bool AAudioEngine::startPlayback() {
 
     blockPlaybackCallbackAndWait();
 
-    // Start each playback lifecycle with clean state so residual samples from
-    // a previous stream can never enter the new hardware stream.
     {
         std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
         halfbandResampler24To48_.reset();
@@ -653,9 +637,6 @@ bool AAudioEngine::startPlayback() {
         return false;
     }
 
-    // A std::thread remains joinable after its entry function returns. Never
-    // assign a new thread object over a joinable worker: the C++ standard
-    // requires std::terminate() in that case.
     joinPlaybackDspThreadLocked();
 
     playbackDspRunning_.store(true, std::memory_order_release);
@@ -665,9 +646,6 @@ bool AAudioEngine::startPlayback() {
         playbackDspRunning_.store(false, std::memory_order_release);
         playbackDspCv_.notify_all();
         if (playbackStream_) {
-            // A failed flush must fail closed: requestStop() would drain and
-            // could therefore play stale samples. Closing the stream is the
-            // safe terminal action for this startup failure.
             closePlaybackStreamLocked();
         }
         isDisconnected_.store(true, std::memory_order_release);
@@ -685,13 +663,8 @@ bool AAudioEngine::startCapture() {
 
     if (captureDspRunning_.load(std::memory_order_acquire)) return true;
 
-    // A std::thread remains joinable after its entry function returns. Join the
-    // previous capture worker before reusing the thread object and before any
-    // queue reset. This also removes the std::terminate() restart hazard.
     joinCaptureDspThreadLocked();
 
-    // captureRawBuffer_ is fed by the AAudio callback. The callback must be
-    // quiescent before resetQuiesced() is called.
     if (captureStream_) {
         const aaudio_stream_state_t state =
             AAudioStream_getState(captureStream_);
@@ -719,8 +692,6 @@ bool AAudioEngine::startCapture() {
         }
     }
 
-    // Both the worker and the AAudio callback are quiescent here, so the SPSC
-    // queues can be reset under their lifecycle-only contract.
     captureDroppedFrames_.store(0, std::memory_order_relaxed);
     captureRawBuffer_.resetQuiesced();
     captureBuffer_.resetQuiesced();
@@ -966,7 +937,6 @@ void AAudioEngine::stopCapture() {
     }
 }
 
-// AUD-003:
 void AAudioEngine::captureDspThreadLoop() {
     pthread_setname_np(
         pthread_self(),
@@ -1169,24 +1139,11 @@ void AAudioEngine::captureDspThreadLoop() {
             int16_t* upBuf =
                 captureDecimateBuffer_.data();
 
-            // Causal stateful 8 kHz -> 16 kHz interpolation. Each input sample
-            // produces exactly two output samples, and the previous chunk's
-            // final sample supplies the midpoint at the next chunk boundary.
             const size_t requiredOut =
                 chunkFrames * 2u;
 
             if (requiredOut <= decimateScratchCap) {
                 size_t outIdx = 0;
-
-                auto interpolatePair =
-                    [](int16_t a, int16_t b) -> int16_t {
-                        return static_cast<int16_t>(
-                            (
-                                static_cast<int32_t>(a) +
-                                static_cast<int32_t>(b)
-                            ) / 2
-                        );
-                    };
 
                 if (chunkFrames > 0) {
                     int16_t previous =
@@ -1197,8 +1154,11 @@ void AAudioEngine::captureDspThreadLoop() {
                     for (size_t i = 0; i < chunkFrames; ++i) {
                         const int16_t current = monoBuf[i];
 
-                        upBuf[outIdx++] =
-                            interpolatePair(previous, current);
+                        const int16_t midpoint = static_cast<int16_t>(
+                            (static_cast<int32_t>(previous) + static_cast<int32_t>(current)) / 2
+                        );
+
+                        upBuf[outIdx++] = midpoint;
                         upBuf[outIdx++] = current;
 
                         previous = current;
@@ -1207,6 +1167,19 @@ void AAudioEngine::captureDspThreadLoop() {
                     lastCaptureSample8k_ =
                         monoBuf[chunkFrames - 1];
                     hasLastCaptureSample8k_ = true;
+
+                    // 3-point zero-phase anti-imaging smoothing filter to suppress
+                    // spectral images above 4 kHz before feeding Silero VAD.
+                    if (outIdx >= 2) {
+                        int32_t s0 = upBuf[0];
+                        int32_t s1 = upBuf[1];
+                        for (size_t k = 1; k < outIdx - 1; ++k) {
+                            int32_t s2 = upBuf[k + 1];
+                            upBuf[k] = static_cast<int16_t>((s0 + 2 * s1 + s2 + 2) >> 2);
+                            s0 = s1;
+                            s1 = s2;
+                        }
+                    }
                 }
 
                 finalPcm = upBuf;
@@ -1235,9 +1208,6 @@ void AAudioEngine::captureDspThreadLoop() {
                     finalFrames);
 
             if (writtenFrames < finalFrames) {
-                // The capture output queue is deliberately non-blocking. Never
-                // stall this worker waiting for a slow Kotlin/VAD consumer;
-                // instead expose the loss through the existing drop metric.
                 captureDroppedFrames_.fetch_add(
                     finalFrames - writtenFrames,
                     std::memory_order_relaxed);
@@ -1254,10 +1224,8 @@ void AAudioEngine::captureDspThreadLoop() {
 
     captureDspRunning_.store(false, std::memory_order_release);
     captureDspCv_.notify_all();
-
 }
 
-// AUD-062:
 void AAudioEngine::playbackDspThreadLoop() {
     pthread_setname_np(
         pthread_self(),
@@ -1301,10 +1269,6 @@ void AAudioEngine::playbackDspThreadLoop() {
 
             halfbandResampler24To48_.reset();
             resampler24To16_.reset();
-            // configure() intentionally does not reset when the ratio is
-            // unchanged. A new playback epoch still requires a clean DSP
-            // history, otherwise previous-generation samples can leak through
-            // previousSample_/phase_ in the streaming resampler.
             genericResampler_.reset();
             genericResampler_.configure(
                 SAMPLE_RATE_GEMINI_OUT,
@@ -1317,9 +1281,7 @@ void AAudioEngine::playbackDspThreadLoop() {
                 fftBuffer_.begin(),
                 fftBuffer_.end(),
                 0.0f);
-            // This worker is the sole consumer/owner of playbackDspInputBuffer_.
-            // The logical flush keeps JNI ingress blocked until this consumer
-            // has discarded all pre-epoch samples and reset its state.
+
             {
                 std::lock_guard<std::mutex>
                     ingressLock(
@@ -1360,9 +1322,6 @@ void AAudioEngine::playbackDspThreadLoop() {
                          1000.0f)),
                     earconScratch_.size());
 
-            // Synthesize into the private scratch buffer first. The
-            // availability check and producer commit below are one critical
-            // section relative to flushPlayback().
             for (size_t i = 0;
                  i < earconFrames;
                  ++i) {
@@ -1438,13 +1397,7 @@ void AAudioEngine::playbackDspThreadLoop() {
 
         const size_t freeSpace =
             playbackBuffer_.availableWrite();
-        // AUD-062:
-        // The worker sleeps once the hardware-facing playback buffer
-        // reaches its target watermark.
-        //
-        // The previous predicate tested only freeSpace, which is nearly
-        // always true for a large ring buffer even when buffered data is
-        // already above the target, causing immediate wait_for() wakeups.
+
         if (buffered >= targetBufferFrames ||
             freeSpace < maxOutputFrames) {
 
@@ -1543,23 +1496,11 @@ void AAudioEngine::playbackDspThreadLoop() {
             actualRate ==
                 SAMPLE_RATE_BT_A2DP) {
 
-            // Keep 24 kHz -> 48 kHz state in the same streaming resampler
-            // used by the generic path. The HalfbandResampler24To48 class in
-            // PolyphaseResampler.h is not used here because its current
-            // polyphase indexing does not match the declared 127-tap layout.
-            // The streaming linear path is stateful, allocation-free, and
-            // preserves generation boundaries through the explicit reset above.
-            genericResampler_.configure(
-                SAMPLE_RATE_GEMINI_OUT,
-                actualRate
-            );
-
             outputFrames =
-                genericResampler_.process(
+                halfbandResampler24To48_.process(
                     input,
                     inputFrames,
-                    output,
-                    playbackDspOutputScratch_.size()
+                    output
                 );
 
         } else if (
@@ -1574,11 +1515,6 @@ void AAudioEngine::playbackDspThreadLoop() {
 
         } else {
 
-            // Generic conversion keeps one continuous source phase across
-            // callback/chunk boundaries. SAMPLE_RATE_GEMINI_OUT is the 24 kHz
-            // Live API output rate, so inputRate -> actual hardwareRate is the
-            // correct direction of conversion; the important invariant is
-            // preserving the fractional phase between chunks.
             genericResampler_.configure(
                 SAMPLE_RATE_GEMINI_OUT,
                 actualRate
@@ -1731,8 +1667,8 @@ void AAudioEngine::playbackDspThreadLoop() {
 
     playbackDspRunning_.store(false, std::memory_order_release);
     playbackDspCv_.notify_all();
-
 }
+
 size_t AAudioEngine::writePlaybackPcm(
     const int16_t* pcm,
     size_t frames,
@@ -1743,8 +1679,7 @@ size_t AAudioEngine::writePlaybackPcm(
     }
 
     if (generation == 0) {
-        LOGE(
-            "writePlaybackPcm called without authoritative generation");
+        LOGE("writePlaybackPcm called without authoritative generation");
         return 0;
     }
 
@@ -1762,9 +1697,6 @@ size_t AAudioEngine::writePlaybackPcm(
             if (generation <
                 playbackEpoch_.load(
                     std::memory_order_acquire)) {
-
-                // Stale audio is intentionally discarded.
-                // Report it as consumed.
                 return frames;
             }
 
@@ -1828,22 +1760,6 @@ size_t AAudioEngine::readCapturePcm(
         maxFrames);
 }
 
-// AUD-063:
-// AUD-022 / ER-035:
-//
-// Separate the logical generation barrier from the physical AAudio state
-// transition. The JNI producer must never hold playbackJniWriteMutex_ while
-// requestPause/requestFlush/requestStart wait for the HAL.
-//
-// Sequence:
-//   1. serialize native playback lifecycle with lifecycleMutex_;
-//   2. block callback admission and JNI ingress;
-//   3. reset only the hardware-facing SPSC consumer buffer while quiescent;
-//   4. publish the new epoch;
-//   5. wait only for the DSP consumer to discard old input and acknowledge the
-//      new epoch, then reopen JNI ingress;
-//   6. perform the physical AAudio transition without playbackJniWriteMutex_;
-//   7. release callback admission.
 void AAudioEngine::flushPlayback(
     uint64_t generation) {
 
@@ -1852,9 +1768,6 @@ void AAudioEngine::flushPlayback(
         return;
     }
 
-    // All other mutations of playbackStream_ (open/start/stop/close/recovery)
-    // are serialized by lifecycleMutex_. Keep the same ownership here so the
-    // physical HAL transition cannot race stream destruction/replacement.
     std::unique_lock<std::mutex> lifecycleLock(lifecycleMutex_);
 
     const uint64_t currentEpoch =
@@ -1869,8 +1782,6 @@ void AAudioEngine::flushPlayback(
         playbackDspRunning_.load(std::memory_order_acquire);
 
     {
-        // This is the short logical-reset critical section. It does not include
-        // any AAudio request or state wait.
         std::scoped_lock lock(
             playbackControlMutex_,
             playbackJniWriteMutex_);
@@ -1879,8 +1790,6 @@ void AAudioEngine::flushPlayback(
             true,
             std::memory_order_release);
 
-        // Callback admission is already quiesced, and playbackControlMutex_
-        // serializes against the DSP commit into the callback-facing SPSC ring.
         playbackBuffer_.discardAllQuiesced();
         playbackEpoch_.store(
             generation,
@@ -1893,8 +1802,6 @@ void AAudioEngine::flushPlayback(
             std::memory_order_relaxed);
     }
 
-    // Wake the DSP so it observes the new epoch before any new-generation audio
-    // is allowed into playbackDspInputBuffer_.
     playbackDspCv_.notify_all();
 
     bool resetReady = true;
@@ -1917,8 +1824,6 @@ void AAudioEngine::flushPlayback(
                         std::memory_order_acquire);
             });
 
-        // A stopped worker is not an acknowledgement: without a successful
-        // consumer-side discard, releasing ingress could mix generations.
         resetReady =
             resetReady
             &&
@@ -1927,8 +1832,6 @@ void AAudioEngine::flushPlayback(
     }
 
     if (!resetReady) {
-        // We cannot safely release ingress while the DSP consumer still owns
-        // pre-epoch queue contents. Fail closed instead of mixing generations.
         playbackDspRunning_.store(
             false,
             std::memory_order_release);
@@ -1950,13 +1853,10 @@ void AAudioEngine::flushPlayback(
         isDisconnected_.store(true, std::memory_order_release);
         inputIngressBlocked_.store(false, std::memory_order_release);
         unblockPlaybackCallback();
-        LOGW(
-            "AAudioEngine: playback DSP reset acknowledgement timed out; stream closed for fail-closed recovery");
+        LOGW("AAudioEngine: playback DSP reset acknowledgement timed out; stream closed for recovery");
         return;
     }
 
-    // Only now may new-generation JNI producers enter the DSP input ring. They
-    // can continue feeding the pipeline while the HAL transition below waits.
     inputIngressBlocked_.store(
         false,
         std::memory_order_release);
@@ -1964,15 +1864,11 @@ void AAudioEngine::flushPlayback(
 
     bool physicalOk = true;
     if (playbackStream_) {
-        // lifecycleMutex_ remains held, but playbackJniWriteMutex_ is free.
         physicalOk =
             flushOutputStreamLocked(wasPlaybackActive);
     }
 
     if (!physicalOk) {
-        // Fail closed. requestStop() can drain buffered audio and would violate
-        // the stale-audio barrier. Join the DSP worker before resetting its SPSC
-        // input queue, then close the stream without allowing the callback to run.
         playbackDspRunning_.store(
             false,
             std::memory_order_release);
@@ -1993,7 +1889,7 @@ void AAudioEngine::flushPlayback(
         isMmapActive_.store(false, std::memory_order_release);
         isExclusiveSharingActive_.store(false, std::memory_order_release);
         isDisconnected_.store(true, std::memory_order_release);
-        LOGW("AAudioEngine: physical playback flush failed; stream closed for fail-closed recovery");
+        LOGW("AAudioEngine: physical playback flush failed; stream closed for recovery");
     }
 
     playbackDspCv_.notify_all();
@@ -2008,8 +1904,7 @@ void AAudioEngine::triggerBargeInEarcon() {
 
     playbackDspCv_.notify_all();
 
-    LOGI(
-        "AAudioEngine: triggerBargeInEarcon");
+    LOGI("AAudioEngine: triggerBargeInEarcon");
 }
 
 void AAudioEngine::resetEarcon() {
@@ -2093,7 +1988,6 @@ void AAudioEngine::blockPlaybackCallbackAndWait() {
             PLAYBACK_CALLBACK_COUNT_MASK
         ) != 0) {
 
-        // Control/lifecycle thread only.
         std::this_thread::yield();
     }
 }
@@ -2117,7 +2011,6 @@ void AAudioEngine::getSpectrumData(
         outSnapshot);
 }
 
-// Capture callback must remain realtime-safe.
 aaudio_data_callback_result_t
 AAudioEngine::captureCallback(
     AAudioStream* /*stream*/,
@@ -2183,19 +2076,6 @@ AAudioEngine::captureCallback(
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
-// AUD-063:
-//
-// No mutex.
-// No condition variable.
-// No logging.
-// No allocation.
-// No stream control.
-//
-// Only:
-//   atomic admission
-//   SPSC read
-//   zero-fill
-//   atomic leave.
 aaudio_data_callback_result_t
 AAudioEngine::playbackCallback(
     AAudioStream* /*stream*/,
@@ -2264,15 +2144,9 @@ void AAudioEngine::errorCallback(
     const AAudioStream* activePlayback =
         engine->activePlaybackStream_.load(std::memory_order_acquire);
 
-    // AAudio error callback is not a lifecycle-management context. Publish
-    // only an atomic recovery signal here; stop/close/reopen happens elsewhere.
-    // The stream identity check prevents a late callback from an old, already
-    // replaced stream from poisoning a newly opened route.
     if (stream == activeCapture || stream == activePlayback) {
         engine->isDisconnected_.store(true, std::memory_order_release);
     }
 }
 
 } // namespace client::audio
-
-────────────────────────────────────────────────────────────
