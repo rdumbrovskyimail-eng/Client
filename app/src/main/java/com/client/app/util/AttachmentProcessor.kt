@@ -34,12 +34,16 @@ class AttachmentProcessor @Inject constructor(
         private const val JPEG_QUALITY = 88
         private const val MAX_PDF_PAGES = 16
         private const val MAX_TEXT_CHARS_PER_FILE = 60_000
+
+        // Защитный агрегированный лимит памяти на все декодированные вложения (35 МБ) для предотвращения OOM
+        private const val MAX_TOTAL_IMAGE_BYTES = 35 * 1024 * 1024L
     }
 
     suspend fun process(uris: List<Uri>): Result = withContext(Dispatchers.IO) {
         val images = mutableListOf<ByteArray>()
         val accepted = mutableListOf<String>()
         val textBuilder = StringBuilder()
+        var totalImageBytes = 0L
 
         for (uri in uris) {
             val name = getFileName(uri)
@@ -47,7 +51,7 @@ class AttachmentProcessor @Inject constructor(
 
             try {
                 when {
-                    // 1. Исходные файлы с кодом, разметкой и текстом: мгновенное чтение без расхода Vision-токенов
+                    // 1. Исходные файлы с кодом, разметкой и текстом: чтение без расхода Vision-токенов
                     isTextFormat(mime, name) -> {
                         val txt = context.contentResolver.openInputStream(uri)?.use { stream ->
                             InputStreamReader(stream, Charsets.UTF_8).use { reader ->
@@ -69,24 +73,45 @@ class AttachmentProcessor @Inject constructor(
                         }
                     }
 
-                    // 2. PDF-документы: гибридный цифровой/растровый разбор с переиспользованием битмапа
+                    // 2. PDF-документы: гибридный разбор с контролем валидности содержимого
                     mime == "application/pdf" || name.endsWith(".pdf", true) -> {
                         val pdf = processPdfStream(uri, MAX_PDF_PAGES)
+                        var addedPages = 0
+
                         if (pdf.text.isNotBlank()) {
                             textBuilder.append("\n\n--- Документ: $name ---\n").append(pdf.text)
                         }
-                        if (pdf.images.isNotEmpty()) {
-                            images.addAll(pdf.images)
+
+                        for (img in pdf.images) {
+                            if (totalImageBytes + img.size <= MAX_TOTAL_IMAGE_BYTES) {
+                                images.add(img)
+                                totalImageBytes += img.size
+                                addedPages++
+                            } else {
+                                logger.w("AttachmentProcessor: лимит памяти ($MAX_TOTAL_IMAGE_BYTES байт) достигнут; часть страниц $name пропущена")
+                                break
+                            }
                         }
-                        accepted.add("$name (${pdf.images.size} стр. OCR, ${pdf.text.length} симв.)")
+
+                        // Фиксация в accepted только при наличии реального текста или успешно отрендеренных страниц
+                        if (pdf.text.isNotBlank() || addedPages > 0) {
+                            accepted.add("$name ($addedPages стр. OCR, ${pdf.text.length} симв.)")
+                        } else {
+                            logger.w("AttachmentProcessor: PDF $name пуст или поврежден; вложение пропущено")
+                        }
                     }
 
-                    // 3. Растровые изображения с аппаратной коррекцией EXIF-ориентации
+                    // 3. Растровые изображения с аппаратной коррекцией EXIF-ориентации и лимитом памяти
                     mime.startsWith("image/") || isImageExtension(name) -> {
                         val jpegBytes = loadScaledJpeg(uri)
                         if (jpegBytes != null) {
-                            images.add(jpegBytes)
-                            accepted.add("$name (изображение)")
+                            if (totalImageBytes + jpegBytes.size <= MAX_TOTAL_IMAGE_BYTES) {
+                                images.add(jpegBytes)
+                                totalImageBytes += jpegBytes.size
+                                accepted.add("$name (изображение)")
+                            } else {
+                                logger.w("AttachmentProcessor: изображение $name превышает общий лимит памяти (35 МБ) и пропущено")
+                            }
                         }
                     }
                 }
@@ -119,7 +144,6 @@ class AttachmentProcessor @Inject constructor(
     private fun loadScaledJpeg(uri: Uri): ByteArray? {
         val cr = context.contentResolver
 
-        // Определение угла поворота сенсора камеры
         val orientation = runCatching {
             cr.openInputStream(uri)?.use { stream ->
                 val exif = ExifInterface(stream)
@@ -149,7 +173,6 @@ class AttachmentProcessor @Inject constructor(
                 matrix.setRotate(270f)
         }
 
-        // Замер исходных габаритов без выделения памяти под пиксели
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
@@ -195,7 +218,7 @@ class AttachmentProcessor @Inject constructor(
 
     /**
      * Постраничный разбор PDF с выделением цифрового текстового слоя на Android 15+
-     * и повторным использованием одного буфера кадра (Zero GC Thrashing) для графических страниц.
+     * и повторным использованием одного буфера кадра для графических страниц.
      */
     private fun processPdfStream(uri: Uri, maxPages: Int): PdfProcessed {
         val images = mutableListOf<ByteArray>()
@@ -219,7 +242,6 @@ class AttachmentProcessor @Inject constructor(
                                 }
                             }
 
-                            // Если на странице обнаружен полноценный связный текст — не тратим время на растрирование
                             if (pageText.length >= 60) {
                                 textBuilder.append("--- Стр. ").append(i + 1).append(" ---\n")
                                     .append(pageText).append("\n\n")
