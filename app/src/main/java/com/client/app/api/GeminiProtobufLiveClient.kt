@@ -2,7 +2,6 @@ package com.client.app.api
 
 import android.util.Base64
 import kotlinx.coroutines.*
-import com.client.app.audio.NativeAudioBridge
 import com.client.app.audio.NativeAudioEngine
 import com.client.app.logging.AppLogManager
 import kotlinx.coroutines.channels.Channel
@@ -29,7 +28,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
-import javax.net.SocketFactory
 import javax.inject.Singleton
 
 private const val GEMINI_INPUT_AUDIO_MIME_TYPE = "audio/pcm;rate=16000"
@@ -37,7 +35,6 @@ private const val GEMINI_INPUT_AUDIO_MIME_TYPE = "audio/pcm;rate=16000"
 @Singleton
 class GeminiProtobufLiveClient @Inject constructor(
     private val audioEngine: NativeAudioEngine,
-    private val nativeBridge: NativeAudioBridge,
     private val logManager: AppLogManager
 ) {
     companion object {
@@ -201,13 +198,6 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     private val httpClient =
         OkHttpClient.Builder()
-            .socketFactory(
-                TunedSocketFactory(
-                    delegate = SocketFactory.getDefault(),
-                    nativeBridge = nativeBridge,
-                    logManager = logManager
-                )
-            )
             .eventListener(loggingEventListener)
             .connectTimeout(
                 10,
@@ -495,6 +485,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             frameIdGen.set(0L)
             protocolPhase = ProtocolPhase.CONNECTING
             cancelledToolCallIds.clear()
+            serverGenerationOpen = false
             isReady = false
             activeConfig = cfg
         }
@@ -1476,21 +1467,16 @@ class GeminiProtobufLiveClient @Inject constructor(
                                 addJsonObject {
                                     put("id", resp.id!!.trim())
                                     put("name", resp.name)
+                                    put("response", resp.response)
 
-                                    putJsonObject("response") {
-                                        resp.response.forEach { (key, value) ->
-                                            put(key, value)
-                                        }
-
-                                        if (
-                                            caps.supportsFunctionScheduling &&
-                                            resp.scheduling != null
-                                        ) {
-                                            put(
-                                                "scheduling",
-                                                resp.scheduling.name
-                                            )
-                                        }
+                                    if (
+                                        caps.supportsFunctionScheduling &&
+                                        resp.scheduling != null
+                                    ) {
+                                        put(
+                                            "scheduling",
+                                            resp.scheduling.name
+                                        )
                                     }
 
                                     if (resp.willContinue) {
@@ -2016,11 +2002,16 @@ class GeminiProtobufLiveClient @Inject constructor(
             ?.get("parts")
             ?.jsonArray
 
-        val decodedPcmParts = modelParts?.mapNotNull { partEl ->
-            val inline = partEl.jsonObject["inlineData"]?.jsonObject ?: return@mapNotNull null
+        // Keep a one-to-one positional mapping with modelTurn.parts.
+        // mapNotNull() would compact the list after a malformed/non-audio part
+        // or a Base64 decode failure, causing a later audio part to be paired
+        // with the wrong decoded PCM payload.
+        val decodedPcmParts = modelParts?.map { partEl ->
+            val inline = partEl.jsonObject["inlineData"]?.jsonObject
+                ?: return@map null
             val mime = inline["mimeType"]?.jsonPrimitive?.contentOrNull.orEmpty()
             val data = inline["data"]?.jsonPrimitive?.contentOrNull.orEmpty()
-            if (!mime.startsWith("audio/pcm") || data.isEmpty()) return@mapNotNull null
+            if (!mime.startsWith("audio/pcm") || data.isEmpty()) return@map null
             runCatching { Base64.decode(data, Base64.NO_WRAP) }.getOrNull()
         }.orEmpty()
 
@@ -2098,31 +2089,11 @@ class GeminiProtobufLiveClient @Inject constructor(
                 }
             }
 
-            (root["interactionStatus"] ?: root["interaction_status"])
-                ?.jsonPrimitive?.contentOrNull
-                ?.uppercase()
-                ?.takeIf { it == "IN_PROGRESS" || it == "IDLE" }
-                ?.let { status ->
-                    protocolPhase = if (status == "IN_PROGRESS") {
-                        ProtocolPhase.AWAITING_INTERACTION_IDLE
-                    } else {
-                        ProtocolPhase.READY
-                    }
-                    emitControl(GeminiEvent.InteractionStatus(status))
-                }
-
             root["sessionResumptionUpdate"]?.jsonObject?.let { sru ->
                 val handle = sru["newHandle"]?.jsonPrimitive?.contentOrNull
                     ?.takeIf { it.isNotBlank() }
                 val resumable = sru["resumable"]?.jsonPrimitive?.booleanOrNull ?: false
                 emitControl(GeminiEvent.ResumptionHandle(handle, resumable))
-            }
-
-            root["groundingMetadata"]?.jsonObject?.let {
-                emitData(GeminiEvent.GroundingMetadata(GroundingMetadata(it)))
-            }
-            root["urlContextMetadata"]?.jsonObject?.let {
-                emitData(GeminiEvent.UrlContextMetadata(UrlContextMetadata(it)))
             }
 
             root["goAway"]?.jsonObject?.let { goAway ->
@@ -2145,35 +2116,49 @@ class GeminiProtobufLiveClient @Inject constructor(
                     emitControl(GeminiEvent.ToolCallCancelled(ids))
                 }
 
-            // toolCall is a top-level BidiGenerateContentServerMessage variant;
-            // it is independent of serverContent and must be parsed even when
-            // the same frame does not contain serverContent.
+            val sc = root["serverContent"]?.jsonObject
+
+            // The current wire format exposes interactionStatus in the
+            // serverContent object. Some current Live API examples also show
+            // it alongside a top-level toolCall. Accept both forms without
+            // treating the top-level form as the canonical serverContent field.
+            val interactionStatusElement =
+                sc?.get("interactionStatus")
+                    ?: sc?.get("interaction_status")
+                    ?: root["interactionStatus"]
+                    ?: root["interaction_status"]
+
+            interactionStatusElement
+                ?.jsonPrimitive?.contentOrNull
+                ?.uppercase()
+                ?.takeIf { it == "IN_PROGRESS" || it == "IDLE" }
+                ?.let { status ->
+                    protocolPhase = if (status == "IN_PROGRESS") {
+                        ProtocolPhase.AWAITING_INTERACTION_IDLE
+                    } else {
+                        ProtocolPhase.READY
+                    }
+                    emitControl(GeminiEvent.InteractionStatus(status))
+                }
+
+            // toolCall is a top-level server-message union member, not a
+            // child of serverContent. Parse it independently so a pure
+            // tool-call frame is never discarded.
             root["toolCall"]?.jsonObject?.get("functionCalls")?.jsonArray
                 ?.mapNotNull { fcEl ->
                     val fc = fcEl.jsonObject
-                    val name =
-                        fc["name"]?.jsonPrimitive?.contentOrNull
-                            ?.takeIf { it.isNotBlank() }
-                            ?: return@mapNotNull null
-                    val id =
-                        fc["id"]?.jsonPrimitive?.contentOrNull
-                            ?.takeIf { it.isNotBlank() }
-                            ?: return@mapNotNull null
-                    val args =
-                        fc["args"]?.jsonObject
-                            ?: buildJsonObject {}
-                    FunctionCall(
-                        name = name,
-                        id = id,
-                        args = args
-                    )
+                    val name = fc["name"]?.jsonPrimitive?.contentOrNull
+                        ?.takeIf { it.isNotBlank() }
+                        ?: return@mapNotNull null
+                    val id = fc["id"]?.jsonPrimitive?.contentOrNull
+                        ?.takeIf { it.isNotBlank() }
+                        ?: return@mapNotNull null
+                    val args = fc["args"]?.jsonObject ?: buildJsonObject {}
+                    FunctionCall(name, id, args)
                 }
                 ?.takeIf { it.isNotEmpty() }
-                ?.let { calls ->
-                    emitControl(GeminiEvent.ToolCall(calls))
-                }
+                ?.let { emitControl(GeminiEvent.ToolCall(it)) }
 
-            val sc = root["serverContent"]?.jsonObject
             if (sc != null) {
                 val interrupted = sc["interrupted"]?.jsonPrimitive?.booleanOrNull == true
                 if (interrupted) {
@@ -2234,6 +2219,13 @@ class GeminiProtobufLiveClient @Inject constructor(
                             }
                         }
                     }
+                }
+
+                sc["groundingMetadata"]?.jsonObject?.let {
+                    emitData(GeminiEvent.GroundingMetadata(GroundingMetadata(it)))
+                }
+                sc["urlContextMetadata"]?.jsonObject?.let {
+                    emitData(GeminiEvent.UrlContextMetadata(UrlContextMetadata(it)))
                 }
 
                 sc["generationComplete"]?.jsonPrimitive?.booleanOrNull?.takeIf { it }
@@ -2342,3 +2334,4 @@ class GeminiProtobufLiveClient @Inject constructor(
             closeInternal()
         }
 }
+
