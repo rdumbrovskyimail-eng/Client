@@ -1,18 +1,12 @@
 // >>> FILE: app/src/main/shaders/plasma_orb.agsl
-uniform shader u_Content;
 uniform float2 u_Resolution;
 uniform float u_Time;
 uniform float u_State;    // 0=IDLE, 1=LISTENING, 2=THINKING, 3=SPEAKING, 4=BARGE_IN
 uniform float4 u_Spectrum; // x=SubBass, y=Bass, z=Mid, w=Presence
 uniform float4 u_Dynamics; // x=Air, y=MicRms, z=OutRms, w=Damping
 
-// P1 Fix (Проблема №17): Ультралёгкий однопроходный аналитический шейдер сферы.
-// Полностью исключён 12-шаговый цикл Raymarching и 4-выборочный численный расчёт нормалей calcNormal.
-// Вычислительная сложность снижена более чем в 50 раз (~28 ALU-инструкций на фрагмент вместо ~480),
-// что ликвидирует нагрев GPU Adreno, троттлинг и обеспечивает стабильные 120 FPS.
-
 half4 main(float2 fragCoord) {
-    float minRes = min(u_Resolution.x, u_Resolution.y);
+    float minRes = max(min(u_Resolution.x, u_Resolution.y), 1.0);
     float2 uv = (fragCoord - 0.5 * u_Resolution) / minRes;
     float dist = length(uv);
 
