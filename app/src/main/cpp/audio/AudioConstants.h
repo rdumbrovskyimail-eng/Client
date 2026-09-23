@@ -34,6 +34,16 @@ constexpr size_t BYTES_PER_SAMPLE = sizeof(int16_t);
 constexpr size_t RING_BUFFER_CAPACITY_CAPTURE = 32768;   // ~2048 ms @ 16 kHz mono (64 KiB)
 constexpr size_t RING_BUFFER_CAPACITY_PLAYBACK = 262144; // ~10.9 s @ 24 kHz / ~5.46 s @ 48 kHz (512 KiB)
 
+// Problem #7: Jitter-absorbing playback pre-buffering constants.
+// 140 ms baseline is strictly compliant with ITU-T G.114 (<150 ms conversational threshold),
+// WebRTC NetEQ playout recommendations, and comfortably absorbs Linux CFS scheduling
+// jitter, CPU cluster migrations (big.LITTLE), and DVFS frequency ramp-up delays.
+constexpr size_t PLAYBACK_TARGET_BUFFER_MS = 140;
+
+// Hardware burst multiple as recommended by Google Audio / Phil Burk (Oboe):
+// ensures buffer holds at least 8 hardware burst periods regardless of hardware quantization.
+constexpr size_t PLAYBACK_BURST_MIN_MULTIPLIER = 8;
+
 // Resampling/decimation scratch capacities (zero-allocation processing)
 constexpr size_t RESAMPLE_SCRATCH_CAPACITY = 131072;     // 262 KiB scratch space
 constexpr size_t CAPTURE_DECIMATE_CAPACITY = 32768;      // 64 KiB decimator scratch space
