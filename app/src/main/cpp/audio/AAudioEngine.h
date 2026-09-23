@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/cpp/audio/AAudioEngine.h
 #pragma once
 
 #include <aaudio/AAudio.h>
@@ -110,6 +111,10 @@ public:
         return actualPlaybackFormat_.load(std::memory_order_relaxed);
     }
 
+    int32_t getActualPlaybackBurst() const {
+        return actualPlaybackBurst_.load(std::memory_order_relaxed);
+    }
+
     int32_t getActiveInputDeviceId() const {
         return actualInputDeviceId_.load(std::memory_order_relaxed);
     }
@@ -220,6 +225,7 @@ private:
     std::atomic<int32_t> actualPlaybackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
     std::atomic<int32_t> actualPlaybackChannels_{CHANNEL_COUNT_MONO};
     std::atomic<int32_t> actualPlaybackFormat_{static_cast<int32_t>(AAUDIO_FORMAT_PCM_I16)};
+    std::atomic<int32_t> actualPlaybackBurst_{0};
 
     std::atomic<int32_t> actualInputDeviceId_{AAUDIO_UNSPECIFIED};
     std::atomic<int32_t> actualOutputDeviceId_{AAUDIO_UNSPECIFIED};
