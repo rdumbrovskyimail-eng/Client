@@ -2,6 +2,7 @@ package com.client.app.api
 
 import android.util.Base64
 import kotlinx.coroutines.*
+import com.client.app.audio.NativeAudioBridge
 import com.client.app.audio.NativeAudioEngine
 import com.client.app.logging.AppLogManager
 import kotlinx.coroutines.channels.Channel
@@ -29,13 +30,15 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
+import javax.net.SocketFactory
 
 private const val GEMINI_INPUT_AUDIO_MIME_TYPE = "audio/pcm;rate=16000"
 
 @Singleton
 class GeminiProtobufLiveClient @Inject constructor(
     private val audioEngine: NativeAudioEngine,
-    private val logManager: AppLogManager
+    private val logManager: AppLogManager,
+    private val nativeBridge: NativeAudioBridge
 ) {
     companion object {
         const val WS_HOST =
@@ -68,7 +71,6 @@ class GeminiProtobufLiveClient @Inject constructor(
             256L * 1024L
 
         private const val MAX_DATA_EVENTS_IN_FLIGHT = 256
-
     }
 
     private val json =
@@ -78,14 +80,11 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
 
     // AUD-067:
-    //
     // One ordered producer pipeline for realtime audio/activity commands.
-    //
     // Crucially:
     //   - PCM uses suspend/send(), not trySend()
     //   - AudioStreamEnd uses the same queue
     //   - ActivityStart/End use the same queue
-    //
     // Therefore stream markers cannot overtake PCM.
     private sealed interface AudioOutboundCommand {
 
@@ -198,6 +197,13 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     private val httpClient =
         OkHttpClient.Builder()
+            .socketFactory(
+                TunedSocketFactory(
+                    delegate = SocketFactory.getDefault(),
+                    nativeBridge = nativeBridge,
+                    logManager = logManager
+                )
+            )
             .eventListener(loggingEventListener)
             .connectTimeout(
                 10,
@@ -769,11 +775,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }
             )
-
-        // onOpen() publishes the socket and starts its writer before setup is
-        // sent. Keeping this return path free of writer replacement avoids a
-        // race where a fast setupComplete callback could create the writer
-        // and this path could immediately replace it.
     }
 
     private fun startAudioWriter(
@@ -1556,7 +1557,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         // values; that should be normalized rather than crash a healthy session.
         // The build path gives slidingWindow.targetTokens precedence because it
         // is the more specific retention target.
-
     }
 
     private fun normalizeToolsForModel(
@@ -2002,10 +2002,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             ?.get("parts")
             ?.jsonArray
 
-        // Keep a one-to-one positional mapping with modelTurn.parts.
-        // mapNotNull() would compact the list after a malformed/non-audio part
-        // or a Base64 decode failure, causing a later audio part to be paired
-        // with the wrong decoded PCM payload.
+        // Keep a strict one-to-one positional mapping with modelTurn.parts.
         val decodedPcmParts = modelParts?.map { partEl ->
             val inline = partEl.jsonObject["inlineData"]?.jsonObject
                 ?: return@map null
@@ -2177,8 +2174,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                     ?.let { emitControl(GeminiEvent.OutputTranscript(it)) }
 
                 if (!interrupted) {
-                    var audioIndex = 0
-                    sc["modelTurn"]?.jsonObject?.get("parts")?.jsonArray?.forEach { partEl ->
+                    sc["modelTurn"]?.jsonObject?.get("parts")?.jsonArray?.forEachIndexed { partIndex, partEl ->
                         val part = partEl.jsonObject
                         val isThought = part["thought"]?.jsonPrimitive?.booleanOrNull == true
                         if (!isThought) {
@@ -2189,7 +2185,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                         val inline = part["inlineData"]?.jsonObject
                         val mime = inline?.get("mimeType")?.jsonPrimitive?.contentOrNull.orEmpty()
                         if (mime.startsWith("audio/pcm")) {
-                            val pcm = decodedPcmParts.getOrNull(audioIndex++) ?: return@forEach
+                            val pcm = decodedPcmParts.getOrNull(partIndex) ?: return@forEachIndexed
                             val generation = audioEngine.currentPlaybackGeneration
                             val key = DataBudgetKey(mySessionId, myEpoch)
                             var accepted = false
@@ -2334,4 +2330,3 @@ class GeminiProtobufLiveClient @Inject constructor(
             closeInternal()
         }
 }
-
