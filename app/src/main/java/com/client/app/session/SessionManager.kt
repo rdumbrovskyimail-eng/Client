@@ -2063,7 +2063,7 @@ class SessionManager @Inject constructor(
         }
     }
 
-    private fun handleToolCall(
+    private suspend fun handleToolCall(
         calls: List<FunctionCall>,
         sourceSessionId: Long,
         sourceEpoch: Long
@@ -2091,6 +2091,7 @@ class SessionManager @Inject constructor(
             )
 
             if (call.name != "lookup_pronunciation") {
+                // P1 Fix (Проблема №14): Ответ функции вызывается как suspend с гарантией порядка
                 client.sendToolResponses(
                     listOf(
                         ToolResponse(
