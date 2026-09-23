@@ -254,11 +254,10 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     // AUD-006:
     // One FIFO event ingress preserves the actual server delivery order.
-    // Control events are never rejected. High-frequency data events are
+    // Control events are never rejected. High-frequency telemetry/data events are
     // bounded by count and are dropped newest when the data budget is full.
-    // This is deliberately implemented above the Channel rather than with
-    // an eviction policy so an evicted event can never leak ownership
-    // or reorder lifecycle events.
+    // Critical conversation content (ModelText, Final Transcripts) is delivered via
+    // the Control Plane to guarantee zero drops.
     private data class DataBudgetKey(
         val sessionId: Long,
         val epoch: Long
@@ -298,15 +297,17 @@ class GeminiProtobufLiveClient @Inject constructor(
     private val pendingDataBySession =
         ConcurrentHashMap<DataBudgetKey, AtomicLong>()
 
+    private val dataEventsDroppedCounter = AtomicLong(0L)
+
     private val generationIdGen = AtomicLong(0L)
     private var activeServerGenerationId = 0L
     private var serverGenerationOpen = false
 
     // One FIFO preserves control/data ordering. The physical event queue is
     // unlimited; Data Plane admission remains bounded separately by
-    // MAX_DATA_EVENTS_IN_FLIGHT so high-rate model data cannot consume
-    // unbounded application memory. Control events must never be dropped just
-    // because a fixed queue capacity was reached.
+    // MAX_DATA_EVENTS_IN_FLIGHT so high-rate telemetry cannot consume
+    // unbounded application memory. Control events (including ModelText) must
+    // never be dropped because of a fixed queue capacity.
     private val _events =
         Channel<QueuedEvent>(
             Channel.UNLIMITED
@@ -434,6 +435,13 @@ class GeminiProtobufLiveClient @Inject constructor(
                 val current = perSession.get()
                 if (current >= MAX_DATA_EVENTS_IN_FLIGHT) {
                     if (perSession.get() == 0L) pendingDataBySession.remove(key, perSession)
+                    val droppedTotal = dataEventsDroppedCounter.incrementAndGet()
+                    if (droppedTotal == 1L || droppedTotal % 50L == 0L) {
+                        logManager.w(
+                            "GeminiLive:DataQueue",
+                            "Data plane telemetry dropped due to in-flight queue saturation (current in-flight: $current, total dropped: $droppedTotal, event: ${event::class.simpleName})"
+                        )
+                    }
                     return
                 }
                 if (perSession.compareAndSet(current, current + 1L)) break
@@ -1968,7 +1976,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             runCatching { Base64.decode(data, Base64.NO_WRAP) }.getOrNull()
         }.orEmpty()
 
-        var frameGenerationId = synchronized(sessionStateLock) {
+        val frameGenerationId = synchronized(sessionStateLock) {
             if (!serverGenerationOpen && modelParts?.isNotEmpty() == true) {
                 activeServerGenerationId = generationIdGen.incrementAndGet()
                 serverGenerationOpen = true
@@ -2125,7 +2133,11 @@ class GeminiProtobufLiveClient @Inject constructor(
                         if (!isThought) {
                             part["text"]?.jsonPrimitive?.contentOrNull
                                 ?.takeIf { it.isNotBlank() }
-                                ?.let { emitData(GeminiEvent.ModelText(it)) }
+                                ?.let {
+                                    // P1 Fix (Проблема №13): Текст модели переведён в Control Plane (гарантированная доставка).
+                                    // Полностью исключается молчаливый отброс при исчерпании квоты в 256 сообщений.
+                                    emitControl(GeminiEvent.ModelText(it))
+                                }
                         }
                         val inline = part["inlineData"]?.jsonObject
                         val mime = inline?.get("mimeType")?.jsonPrimitive?.contentOrNull.orEmpty()
@@ -2153,8 +2165,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                                 }
                             }
                             if (!accepted) {
-                                // Плавный Non-Destructive сброс: исключён панический вызов invalidateAndFlushPlayback().
-                                // Играющий звук модели больше не прерывается.
                                 val backlog = audioBudgetBySession[key]?.get() ?: 0L
                                 logManager.w(
                                     "GeminiLive:AudioBacklog",
@@ -2211,6 +2221,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             isReady = false
             activeConfig = null
             cancelledToolCallIds.clear()
+            dataEventsDroppedCounter.set(0L)
 
             while (true) {
                 val frame = _audio.tryReceive().getOrNull() ?: break
