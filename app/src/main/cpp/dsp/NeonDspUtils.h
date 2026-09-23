@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <cstddef>
 #include <cmath>
+#include <cstring>
+#include <algorithm>
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -95,6 +97,106 @@ inline float calculateRms(const int16_t* src, size_t count) {
     }
 
     return static_cast<float>(std::sqrt((sum + 1e-9) / count) / 32768.0);
+}
+
+// Problem #21: Векторизованное сведение стерео -> моно с масштабированием гейна.
+// Устраняет скалярные деления, перегоны GPR <-> FPU и ветвления std::clamp.
+inline void stereoToMonoWithGain(
+    const int16_t* src,
+    int16_t* dst,
+    size_t numFrames,
+    float gain) {
+
+    if (src == nullptr || dst == nullptr || numFrames == 0) return;
+
+    size_t i = 0;
+    const bool applyGain = std::abs(gain - 1.0f) > 0.001f;
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    if (!applyGain) {
+        for (; i + 8 <= numFrames; i += 8) {
+            // Аппаратный деинтерливинг 8 стереопар на каналы L и R
+            int16x8x2_t stereo = vld2q_s16(src + i * 2);
+            // Аппаратное округленное полусуммирование без переполнения: (L + R + 1) >> 1
+            int16x8_t mono = vrhaddq_s16(stereo.val[0], stereo.val[1]);
+            vst1q_s16(dst + i, mono);
+        }
+    } else {
+        const float32x4_t vgain = vdupq_n_f32(gain);
+        for (; i + 8 <= numFrames; i += 8) {
+            int16x8x2_t stereo = vld2q_s16(src + i * 2);
+            int16x8_t mono = vrhaddq_s16(stereo.val[0], stereo.val[1]);
+
+            int32x4_t low32 = vmovl_s16(vget_low_s16(mono));
+            int32x4_t high32 = vmovl_s16(vget_high_s16(mono));
+
+            float32x4_t flow = vmulq_f32(vcvtq_f32_s32(low32), vgain);
+            float32x4_t fhigh = vmulq_f32(vcvtq_f32_s32(high32), vgain);
+
+            // Аппаратное векторное округление к ближайшему целому (ties away)
+            int32x4_t rlow = vcvtaq_s32_f32(flow);
+            int32x4_t rhigh = vcvtaq_s32_f32(fhigh);
+
+            // Аппаратное насыщающее сужение без ветвлений в диапазон [-32768, 32767]
+            int16x8_t res = vcombine_s16(vqmovn_s32(rlow), vqmovn_s32(rhigh));
+            vst1q_s16(dst + i, res);
+        }
+    }
+#endif
+
+    // Скалярный хвост для некратных остатков (numFrames % 8 != 0)
+    for (; i < numFrames; ++i) {
+        int32_t mixed = (static_cast<int32_t>(src[i * 2]) + static_cast<int32_t>(src[i * 2 + 1]) + 1) >> 1;
+        if (applyGain) {
+            mixed = static_cast<int32_t>(std::round(static_cast<float>(mixed) * gain));
+        }
+        dst[i] = static_cast<int16_t>(std::clamp(mixed, -32768, 32767));
+    }
+}
+
+// Problem #21: Векторизованное масштабирование гейна монофонического тракта.
+inline void applyGainInPlace(
+    const int16_t* src,
+    int16_t* dst,
+    size_t numFrames,
+    float gain) {
+
+    if (src == nullptr || dst == nullptr || numFrames == 0) return;
+
+    size_t i = 0;
+    const bool applyGain = std::abs(gain - 1.0f) > 0.001f;
+
+    if (!applyGain) {
+        if (src != dst) {
+            std::memcpy(dst, src, numFrames * sizeof(int16_t));
+        }
+        return;
+    }
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    const float32x4_t vgain = vdupq_n_f32(gain);
+    for (; i + 8 <= numFrames; i += 8) {
+        int16x8_t s16 = vld1q_s16(src + i);
+
+        int32x4_t low32 = vmovl_s16(vget_low_s16(s16));
+        int32x4_t high32 = vmovl_s16(vget_high_s16(s16));
+
+        float32x4_t flow = vmulq_f32(vcvtq_f32_s32(low32), vgain);
+        float32x4_t fhigh = vmulq_f32(vcvtq_f32_s32(high32), vgain);
+
+        int32x4_t rlow = vcvtaq_s32_f32(flow);
+        int32x4_t rhigh = vcvtaq_s32_f32(fhigh);
+
+        int16x8_t res = vcombine_s16(vqmovn_s32(rlow), vqmovn_s32(rhigh));
+        vst1q_s16(dst + i, res);
+    }
+#endif
+
+    // Скалярный хвост для некратных остатков
+    for (; i < numFrames; ++i) {
+        int32_t amplified = static_cast<int32_t>(std::round(static_cast<float>(src[i]) * gain));
+        dst[i] = static_cast<int16_t>(std::clamp(amplified, -32768, 32767));
+    }
 }
 
 } // namespace client::dsp
