@@ -9,15 +9,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.channels.FileChannel
+import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.concurrent.withLock
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sqrt
 
 @Singleton
@@ -39,13 +41,17 @@ class SileroVadDetector @Inject constructor(
 
         private const val MODEL_INPUT_SAMPLES =
             WINDOW_SIZE_SAMPLES +
-                CONTEXT_SIZE_SAMPLES
+                CONTEXT_SIZE_SAMPLES // 576 сэмплов
 
         private const val MODEL_PATH =
             "models/silero_vad_v5_quant.onnx"
 
         private const val MIN_VALID_MODEL_BYTES =
             500_000L
+
+        // Размер скрытого рекуррентного вектора состояния Silero V5: [2, 1, 128]
+        private const val STATE_SIZE =
+            2 * 1 * 128 // 256 float элементов
     }
 
     private var ortEnvironment:
@@ -77,10 +83,10 @@ class SileroVadDetector @Inject constructor(
     private var thresholdSpeechEnd =
         0.35f
 
-    // Состояние модели Silero V5: тензор [2, 1, 128]
+    // Состояние модели Silero V5: плоский массив 256 float [2, 1, 128]
     private val stateBuffer =
         FloatArray(
-            2 * 1 * 128
+            STATE_SIZE
         )
 
     private val contextBuffer =
@@ -88,6 +94,7 @@ class SileroVadDetector @Inject constructor(
             CONTEXT_SIZE_SAMPLES
         )
 
+    // Предвыделенные прямые нативные буферы для исключения аллокаций в аудиоцикле
     private val inputFloatBuffer:
         FloatBuffer =
         ByteBuffer
@@ -103,7 +110,7 @@ class SileroVadDetector @Inject constructor(
         FloatBuffer =
         ByteBuffer
             .allocateDirect(
-                stateBuffer.size * 4
+                STATE_SIZE * 4
             )
             .order(
                 ByteOrder.nativeOrder()
@@ -132,14 +139,9 @@ class SileroVadDetector @Inject constructor(
         Boolean
         get() = isNeuralModelLoaded
 
-    private var persistentInputTensor:
-        OnnxTensor? = null
-
-    private var persistentStateTensor:
-        OnnxTensor? = null
-
-    private var persistentSrTensor:
-        OnnxTensor? = null
+    // Адаптивное отслеживание фонового шума для RMS-фоллбэка (Проблема №5)
+    private var estimatedNoiseFloorRms =
+        0.015f
 
     suspend fun prepare():
         Boolean =
@@ -229,113 +231,49 @@ class SileroVadDetector @Inject constructor(
                             session
                         )
 
+                        // Безопасный разогрев модели с локальным временем жизни тензоров
                         inputFloatBuffer.clear()
-                        stateFloatBuffer.clear()
-
-                        stateFloatBuffer.put(
-                            stateBuffer
-                        )
-                        stateFloatBuffer.flip()
-
-                        persistentInputTensor =
-                            OnnxTensor.createTensor(
-                                env,
-                                inputFloatBuffer,
-                                longArrayOf(
-                                    1L,
-                                    MODEL_INPUT_SAMPLES
-                                        .toLong()
-                                )
-                            )
-
-                        persistentStateTensor =
-                            OnnxTensor.createTensor(
-                                env,
-                                stateFloatBuffer,
-                                longArrayOf(
-                                    2L,
-                                    1L,
-                                    128L
-                                )
-                            )
-
-                        persistentSrTensor =
-                            OnnxTensor.createTensor(
-                                env,
-                                longArrayOf(
-                                    16000L
-                                )
-                            )
-
-                        inputFloatBuffer.clear()
-                        repeat(
-                            MODEL_INPUT_SAMPLES
-                        ) {
-                            inputFloatBuffer.put(0f)
-                        }
+                        repeat(MODEL_INPUT_SAMPLES) { inputFloatBuffer.put(0f) }
                         inputFloatBuffer.flip()
 
                         stateFloatBuffer.clear()
-                        repeat(
-                            stateBuffer.size
-                        ) {
-                            stateFloatBuffer.put(0f)
-                        }
+                        repeat(STATE_SIZE) { stateFloatBuffer.put(0f) }
                         stateFloatBuffer.flip()
 
-                        val inputTensor =
-                            persistentInputTensor
-                                ?: throw IllegalStateException(
-                                    "Silero V5 input tensor was not created"
-                                )
-
-                        val stateTensor =
-                            persistentStateTensor
-                                ?: throw IllegalStateException(
-                                    "Silero V5 state tensor was not created"
-                                )
-
-                        val srTensor =
-                            persistentSrTensor
-                                ?: throw IllegalStateException(
-                                    "Silero V5 sample-rate tensor was not created"
-                                )
-
-                        session.run(
-                            mapOf(
-                                "input" to inputTensor,
-                                "state" to stateTensor,
-                                "sr" to srTensor
-                            )
-                        ).use { result ->
-
-                            if (result.size() < 2) {
-                                throw IllegalStateException(
-                                    "Silero V5 warm-up returned ${result.size()} outputs"
-                                )
-                            }
-
-                            val probability =
-                                result.get(0).value
-
-                            if (probability !is Array<*>) {
-                                throw IllegalStateException(
-                                    "Silero V5 probability output has unexpected type: ${probability?.javaClass}"
-                                )
-                            }
-
-                            val returnedState =
-                                result.get(1).value
-
-                            if (returnedState !is Array<*>) {
-                                throw IllegalStateException(
-                                    "Silero V5 state output has unexpected type: ${returnedState?.javaClass}"
-                                )
+                        OnnxTensor.createTensor(
+                            env,
+                            inputFloatBuffer,
+                            longArrayOf(1L, MODEL_INPUT_SAMPLES.toLong())
+                        ).use { warmInput ->
+                            OnnxTensor.createTensor(
+                                env,
+                                stateFloatBuffer,
+                                longArrayOf(2L, 1L, 128L)
+                            ).use { warmState ->
+                                OnnxTensor.createTensor(
+                                    env,
+                                    longArrayOf(16000L)
+                                ).use { warmSr ->
+                                    session.run(
+                                        mapOf(
+                                            "input" to warmInput,
+                                            "state" to warmState,
+                                            "sr" to warmSr
+                                        )
+                                    ).use { warmResult ->
+                                        if (warmResult.size() < 2) {
+                                            throw IllegalStateException(
+                                                "Silero V5 warm-up returned ${warmResult.size()} outputs"
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         }
 
                         stateBuffer.fill(0f)
                         contextBuffer.fill(0f)
+                        estimatedNoiseFloorRms = 0.015f
 
                         isNeuralModelLoaded =
                             true
@@ -455,20 +393,18 @@ class SileroVadDetector @Inject constructor(
         onSpeechStart: () -> Unit,
         onSpeechEnd: () -> Unit
     ) {
-        val prob = try {
-            if (
-                isNeuralModelLoaded &&
-                ortSession != null &&
-                ortEnvironment != null
-            ) {
+        // Защита от перманентной деградации нейросети: при единичном сбое инференса
+        // сессия НЕ закрывается, состояние сбрасывается локально, и работа продолжается.
+        val prob = if (isNeuralModelLoaded && ortSession != null && ortEnvironment != null) {
+            try {
                 evaluateNeural(window)
-            } else {
+            } catch (t: Throwable) {
+                logger.w("SileroVadDetector: Neural inference glitch on current window; resetting state: ${t.message}")
+                stateBuffer.fill(0f)
+                contextBuffer.fill(0f)
                 evaluateFallbackRms(window)
             }
-        } catch (t: Throwable) {
-            logger.e("SileroVadDetector: V5 inference failed; switching to RMS fallback", t)
-            isNeuralModelLoaded = false
-            closeResourcesLocked()
+        } else {
             evaluateFallbackRms(window)
         }
 
@@ -501,14 +437,21 @@ class SileroVadDetector @Inject constructor(
                     onSpeechEnd()
                 }
             } else {
-                // Адаптивное подавление шума (Hangover) по стандарту ITU-T G.729B:
-                // Вместо мгновенного сброса счётчика тишины при единичном щелчке или вздохе,
-                // плавно снижаем счётчик, исключая зависание VAD в шумной среде.
+                // Адаптивное подавление шума (Hangover) по стандарту ITU-T G.729B
                 speechEndStreak = maxOf(0, speechEndStreak - 2)
             }
         }
     }
 
+    /**
+     * Потоковый нейросетевой инференс Silero V5.
+     *
+     * 1. Устранены рассинхронизация памяти и застрявшие статические тензоры: тензоры создаются
+     *    с локальным временем жизни (.use { }) непосредственно перед вызовом session.run().
+     * 2. Zero-Allocation State Flow: обновлённое скрытое состояние вычитывается напрямую
+     *    из нативного буфера OnnxTensor в предвыделенный массив stateBuffer без создания
+     *    Java-объектов Array<Array<FloatArray>>.
+     */
     private fun evaluateNeural(
         window: ShortArray
     ): Float {
@@ -525,24 +468,7 @@ class SileroVadDetector @Inject constructor(
                     "Silero V5 session is unavailable"
                 )
 
-        val inputTensor =
-            persistentInputTensor
-                ?: throw IllegalStateException(
-                    "Silero V5 input tensor is unavailable"
-                )
-
-        val stateTensor =
-            persistentStateTensor
-                ?: throw IllegalStateException(
-                    "Silero V5 state tensor is unavailable"
-                )
-
-        val srTensor =
-            persistentSrTensor
-                ?: throw IllegalStateException(
-                    "Silero V5 sample-rate tensor is unavailable"
-                )
-
+        // 1. Формируем входной буфер: [контекст прошлых 64 сэмплов] + [текущее окно 512 сэмплов]
         inputFloatBuffer.clear()
         inputFloatBuffer.put(contextBuffer)
 
@@ -551,77 +477,81 @@ class SileroVadDetector @Inject constructor(
         }
         inputFloatBuffer.flip()
 
+        // 2. Формируем тензор скрытого состояния из актуального вектора памяти
         stateFloatBuffer.clear()
         stateFloatBuffer.put(stateBuffer)
         stateFloatBuffer.flip()
 
-        return try {
+        // 3. Детерминированное локальное создание тензоров с гарантированным освобождением нативной памяти
+        return OnnxTensor.createTensor(
+            env,
+            inputFloatBuffer,
+            longArrayOf(1L, MODEL_INPUT_SAMPLES.toLong())
+        ).use { inputTensor ->
+            OnnxTensor.createTensor(
+                env,
+                stateFloatBuffer,
+                longArrayOf(2L, 1L, 128L)
+            ).use { stateTensor ->
+                OnnxTensor.createTensor(
+                    env,
+                    longArrayOf(16000L)
+                ).use { srTensor ->
 
-            val inputs =
-                mapOf(
-                    "input" to inputTensor,
-                    "state" to stateTensor,
-                    "sr" to srTensor
-                )
+                    val inputs =
+                        mapOf(
+                            "input" to inputTensor,
+                            "state" to stateTensor,
+                            "sr" to srTensor
+                        )
 
-            session.run(inputs).use { result ->
+                    session.run(inputs).use { result ->
 
-                val outputProb =
-                    (
-                        result.get(0).value as Array<FloatArray>
-                    )[0][0]
+                        // Извлечение вероятности речи без создания промежуточных Java-массивов
+                        val outputTensor =
+                            result.get(0) as OnnxTensor
+                        val outputProb =
+                            outputTensor.floatBuffer.get(0)
 
-                @Suppress("UNCHECKED_CAST")
-                val nextState =
-                    result.get(1).value as Array<Array<FloatArray>>
+                        // Безаллокационное обновление скрытого состояния памяти напрямую из нативного буфера
+                        val nextStateTensor =
+                            result.get(1) as OnnxTensor
+                        val nextStateBuf =
+                            nextStateTensor.floatBuffer
 
-                var idx = 0
-                for (i in 0 until 2) {
-                    for (j in 0 until 128) {
-                        stateBuffer[idx++] = nextState[i][0][j]
+                        nextStateBuf.position(0)
+                        nextStateBuf.get(stateBuffer)
+
+                        // Сохранение последних 64 сэмплов текущего окна в качестве контекста для следующего шага
+                        val contextStart =
+                            WINDOW_SIZE_SAMPLES - CONTEXT_SIZE_SAMPLES
+
+                        for (i in 0 until CONTEXT_SIZE_SAMPLES) {
+                            contextBuffer[i] =
+                                window[contextStart + i] / 32768.0f
+                        }
+
+                        outputProb
                     }
                 }
-
-                val contextStart =
-                    WINDOW_SIZE_SAMPLES - CONTEXT_SIZE_SAMPLES
-
-                for (i in 0 until CONTEXT_SIZE_SAMPLES) {
-                    contextBuffer[i] =
-                        window[contextStart + i] / 32768.0f
-                }
-
-                outputProb
             }
-
-        } catch (e: Exception) {
-            logger.e(
-                "SileroVadDetector: V5 inference failure",
-                e
-            )
-
-            isNeuralModelLoaded = false
-            closeResourcesLocked()
-
-            throw IllegalStateException(
-                "Silero V5 inference failed",
-                e
-            )
         }
     }
 
     private fun closeResourcesLocked() {
-        runCatching { persistentInputTensor?.close() }
-        runCatching { persistentStateTensor?.close() }
-        runCatching { persistentSrTensor?.close() }
         runCatching { ortSession?.close() }
+        runCatching { ortEnvironment?.close() }
 
-        persistentInputTensor = null
-        persistentStateTensor = null
-        persistentSrTensor = null
         ortSession = null
         ortEnvironment = null
     }
 
+    /**
+     * Адаптивный RMS-фоллбэк с динамическим подавлением эха динамика (Проблема №5).
+     *
+     * Устранён жесткий порог 0.012 (-38 dBFS), вызывавший ложный Barge-In от собственного динамика.
+     * Реализовано динамическое отслеживание шума окружения и требование превышения SNR.
+     */
     private fun evaluateFallbackRms(
         window: ShortArray
     ): Float {
@@ -637,8 +567,20 @@ class SileroVadDetector @Inject constructor(
                 (sumSq + 1e-9) / window.size
             ).toFloat()
 
+        // Адаптивное отслеживание фонового уровня шума
+        if (rms < estimatedNoiseFloorRms * 1.5f) {
+            estimatedNoiseFloorRms = estimatedNoiseFloorRms * 0.95f + rms * 0.05f
+        } else {
+            estimatedNoiseFloorRms = min(estimatedNoiseFloorRms * 1.01f, 0.05f)
+        }
+        estimatedNoiseFloorRms = estimatedNoiseFloorRms.coerceIn(0.005f, 0.06f)
+
+        // Динамический порог SNR: требует превышения полезного сигнала над фоновым эхом
+        val dynamicThreshold = max(0.032f, estimatedNoiseFloorRms * 2.2f)
+        val dynamicRange = max(0.040f, estimatedNoiseFloorRms * 3.0f)
+
         return (
-            (rms - 0.012f) / 0.045f
+            (rms - dynamicThreshold) / dynamicRange
         ).coerceIn(0.0f, 1.0f)
     }
 
@@ -652,6 +594,8 @@ class SileroVadDetector @Inject constructor(
         accumulatorCount = 0
         speechStartStreak = 0
         speechEndStreak = 0
+
+        estimatedNoiseFloorRms = 0.015f
 
         _isSpeechDetected.value = false
         _speechProbability.value = 0f
