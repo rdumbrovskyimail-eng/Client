@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/cpp/audio/AAudioEngine.cpp
 #include "AAudioEngine.h"
 #include "NativeLogQueue.h"
 #include "dsp/NeonDspUtils.h"
@@ -301,6 +302,7 @@ bool AAudioEngine::initLocked(
     actualCaptureSampleRate_.store(0, std::memory_order_release);
     actualCaptureChannels_.store(0, std::memory_order_release);
     actualInputDeviceId_.store(AAUDIO_UNSPECIFIED, std::memory_order_release);
+    actualPlaybackBurst_.store(0, std::memory_order_release);
     isBluetoothMode_.store(isBluetoothMode, std::memory_order_relaxed);
     playbackSampleRate_.store(targetPlaybackSampleRate, std::memory_order_relaxed);
     requestedInputDeviceId_.store(inputDeviceId, std::memory_order_release);
@@ -341,10 +343,10 @@ bool AAudioEngine::initLocked(
              targetBufSize, appliedBufSize, playBurst, playCapacity);
     }
 
-    LOGI("AAudio Initialized: CapRate=%d (Ch=%d, DevId=%d), PlayRate=%d (Ch=%d, Fmt=%d, DevId=%d), EXCLUSIVE=%d, MMAP=%d",
+    LOGI("AAudio Initialized: CapRate=%d (Ch=%d, DevId=%d), PlayRate=%d (Ch=%d, Fmt=%d, Burst=%d, DevId=%d), EXCLUSIVE=%d, MMAP=%d",
          actualCaptureSampleRate_.load(), actualCaptureChannels_.load(), actualInputDeviceId_.load(),
          actualPlaybackSampleRate_.load(), actualPlaybackChannels_.load(), actualPlaybackFormat_.load(),
-         actualOutputDeviceId_.load(), isExclusiveSharingActive_.load(), isMmapActive_.load());
+         actualPlaybackBurst_.load(), actualOutputDeviceId_.load(), isExclusiveSharingActive_.load(), isMmapActive_.load());
 
     return true;
 }
@@ -486,14 +488,15 @@ bool AAudioEngine::validateAndPublishPlaybackConfigLocked(int32_t requestedOutpu
     const int32_t actualChannels = AAudioStream_getChannelCount(playbackStream_);
     const aaudio_format_t actualFormat = AAudioStream_getFormat(playbackStream_);
     const int32_t actualDeviceId = AAudioStream_getDeviceId(playbackStream_);
+    const int32_t actualBurst = AAudioStream_getFramesPerBurst(playbackStream_);
 
     if (AAudioStream_getDirection(playbackStream_) != AAUDIO_DIRECTION_OUTPUT ||
         actualRate <= 0 ||
         actualChannels != CHANNEL_COUNT_MONO ||
         actualFormat != AAUDIO_FORMAT_PCM_I16) {
         LOGE(
-            "AAudio playback unsupported actual config: rate=%d channels=%d format=%d device=%d",
-            actualRate, actualChannels, static_cast<int>(actualFormat), actualDeviceId);
+            "AAudio playback unsupported actual config: rate=%d channels=%d format=%d device=%d burst=%d",
+            actualRate, actualChannels, static_cast<int>(actualFormat), actualDeviceId, actualBurst);
         closePlaybackStreamLocked();
         return false;
     }
@@ -507,6 +510,7 @@ bool AAudioEngine::validateAndPublishPlaybackConfigLocked(int32_t requestedOutpu
     actualPlaybackSampleRate_.store(actualRate, std::memory_order_release);
     actualPlaybackChannels_.store(actualChannels, std::memory_order_release);
     actualPlaybackFormat_.store(static_cast<int32_t>(actualFormat), std::memory_order_release);
+    actualPlaybackBurst_.store(actualBurst > 0 ? actualBurst : 0, std::memory_order_release);
     actualOutputDeviceId_.store(actualDeviceId, std::memory_order_release);
     isExclusiveSharingActive_.store(
         AAudioStream_getSharingMode(playbackStream_) == AAUDIO_SHARING_MODE_EXCLUSIVE,
@@ -925,6 +929,7 @@ void AAudioEngine::stopLocked() {
     actualPlaybackChannels_.store(0, std::memory_order_relaxed);
     actualPlaybackFormat_.store(0, std::memory_order_relaxed);
     actualPlaybackSampleRate_.store(0, std::memory_order_relaxed);
+    actualPlaybackBurst_.store(0, std::memory_order_relaxed);
     actualOutputDeviceId_.store(AAUDIO_UNSPECIFIED, std::memory_order_relaxed);
     unblockPlaybackCallback();
 }
@@ -1235,7 +1240,6 @@ void AAudioEngine::playbackDspThreadLoop() {
 
     try {
 
-    constexpr size_t TARGET_BUFFER_MS = 40;
     int16_t* input =
         playbackDspInputScratch_.data();
 
@@ -1303,13 +1307,23 @@ void AAudioEngine::playbackDspThreadLoop() {
                 actualPlaybackSampleRate_.load(
                     std::memory_order_acquire));
 
-        const size_t targetBufferFrames =
-            std::max<size_t>(
-                1,
-                static_cast<size_t>(
-                    actualRate *
-                    TARGET_BUFFER_MS /
-                    1000));
+        const int32_t actualBurst =
+            actualPlaybackBurst_.load(
+                std::memory_order_acquire);
+
+        // Problem #7: Adaptive hardware-aware target buffer sizing.
+        // Derives safety margin from both ITU-T G.114 jitter guidelines (PLAYBACK_TARGET_BUFFER_MS = 140ms)
+        // and Google Oboe/Phil Burk hardware burst multiple requirements (PLAYBACK_BURST_MIN_MULTIPLIER = 8x burst).
+        const size_t timeTargetFrames = static_cast<size_t>(
+            static_cast<uint64_t>(actualRate) * PLAYBACK_TARGET_BUFFER_MS / 1000ULL);
+
+        const size_t burstTargetFrames = (actualBurst > 0)
+            ? static_cast<size_t>(actualBurst) * PLAYBACK_BURST_MIN_MULTIPLIER
+            : 0U;
+
+        const size_t targetBufferFrames = std::max<size_t>(
+            1U,
+            std::max(timeTargetFrames, burstTargetFrames));
 
         if (earconRequested_.load(
                 std::memory_order_acquire)) {
