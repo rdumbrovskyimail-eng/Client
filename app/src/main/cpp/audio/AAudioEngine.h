@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/cpp/audio/AAudioEngine.h
 #pragma once
 
 #include <aaudio/AAudio.h>
@@ -296,6 +295,8 @@ private:
     Decimator48To16 captureDecimator48To16_;
     Decimator32To16 captureDecimator32To16_;
     PolyphaseResampler24To16 captureResampler24To16_;
+    // Problem #9: Dedicated anti-aliasing decimator for 44.1 kHz capture hardware
+    Resampler44100To16000 captureResampler44100To16000_;
 
     // Stateful causal 8 kHz -> 16 kHz interpolation across capture chunks.
     int16_t lastCaptureSample8k_{0};
