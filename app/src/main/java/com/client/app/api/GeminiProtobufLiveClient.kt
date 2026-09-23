@@ -85,7 +85,8 @@ class GeminiProtobufLiveClient @Inject constructor(
     //   - PCM uses suspend/send(), not trySend()
     //   - AudioStreamEnd uses the same queue
     //   - ActivityStart/End use the same queue
-    // Therefore stream markers cannot overtake PCM.
+    //   - DirectJson (ToolResponse, RealtimeText, ClientContent) uses the same queue
+    // Therefore stream markers and tool responses cannot overtake PCM.
     private sealed interface AudioOutboundCommand {
 
         data class Pcm(
@@ -1130,12 +1131,14 @@ class GeminiProtobufLiveClient @Inject constructor(
         writerEpoch: Long,
         ws: WebSocket,
         channel: Channel<AudioOutboundCommand>
-    ) {
-        outboundCommandMutex.withLock {
-            if (!isWriterCurrent(writerEpoch, ws, channel)) return@withLock
+    ): Boolean {
+        return outboundCommandMutex.withLock {
+            if (!isWriterCurrent(writerEpoch, ws, channel)) return@withLock false
             try {
                 channel.send(AudioOutboundCommand.DirectJson(jsonMessage))
+                true
             } catch (_: ClosedSendChannelException) {
+                false
             }
         }
     }
@@ -1403,22 +1406,19 @@ class GeminiProtobufLiveClient @Inject constructor(
         return accepted
     }
 
-    fun sendToolResponses(
+    suspend fun sendToolResponses(
         responses: List<ToolResponse>
     ): Boolean {
         if (responses.isEmpty()) return false
 
-        var debugLog = ""
-        var jsonMessage = ""
-        var accepted = false
-
-        synchronized(sessionStateLock) {
-            val cfg = activeConfig ?: return@synchronized
+        val targetData = synchronized(sessionStateLock) {
+            val cfg = activeConfig ?: return@synchronized null
             val caps = LiveModelCapabilitiesRegistry.forModel(cfg.model)
-            val ws = webSocket ?: return@synchronized
+            val ws = webSocket ?: return@synchronized null
+            val channel = audioWriterChannel ?: return@synchronized null
             val sendEpoch = epoch
 
-            if (!isReady) return@synchronized
+            if (!isReady) return@synchronized null
 
             val activeResponses =
                 responses.filter { response ->
@@ -1432,10 +1432,10 @@ class GeminiProtobufLiveClient @Inject constructor(
                     "GeminiLive:ToolResp",
                     "Все FunctionResponse относятся к отменённым tool calls; ответ не отправляется"
                 )
-                return@synchronized
+                return@synchronized null
             }
 
-            jsonMessage =
+            val jsonMsg =
                 buildJsonObject {
                     putJsonObject("toolResponse") {
                         putJsonArray("functionResponses") {
@@ -1483,28 +1483,34 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }.toString()
 
-            debugLog =
+            val dbgLog =
                 activeResponses.joinToString {
                     "${it.name}(id=${it.id}, sched=${it.scheduling?.name ?: "NONE"})"
                 }
 
-            accepted =
-                synchronized(outboundSendLock) {
-                    sendEpoch == epoch &&
-                        ws === webSocket &&
-                        ws.send(jsonMessage)
-                }
-        }
+            Triple(Triple(sendEpoch, ws, channel), jsonMsg, dbgLog)
+        } ?: return false
+
+        val (target, jsonMessage, debugLog) = targetData
+
+        // P1 Fix (Проблема №14): Ответ инструмента отправляется строго через FIFO-очередь
+        // audioWriterChannel, исключая обгон звуковых данных и ошибку протокола 1002.
+        val accepted = sendOrderedJson(
+            jsonMessage,
+            target.first,
+            target.second,
+            target.third
+        )
 
         logManager.net(
             "WebSocket:ToolResp",
-            "Ответы функций accepted=$accepted: [$debugLog]"
+            "Ответы функций enqueued=$accepted: [$debugLog]"
         )
 
         if (!accepted) {
             logManager.w(
                 "GeminiLive:ToolResp",
-                "WebSocket отклонил FunctionResponse"
+                "Не удалось поставить FunctionResponse в очередь WebSocket"
             )
         }
 
