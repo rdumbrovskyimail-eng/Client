@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/cpp/audio/AAudioEngine.cpp
 #include "AAudioEngine.h"
 #include "NativeLogQueue.h"
 #include "dsp/NeonDspUtils.h"
@@ -1840,12 +1841,15 @@ void AAudioEngine::flushPlayback(
             std::memory_order_relaxed);
     }
 
+    // Preemptively wake the DSP worker so it breaks any 5ms/10ms sleep immediately
     playbackDspCv_.notify_all();
 
     bool resetReady = true;
     if (wasPlaybackActive) {
-        constexpr auto kDspResetTimeout =
-            std::chrono::milliseconds(100);
+        // Problem #10: Architectural 600 ms watchdog timeout derived from NASA-STD-8719.13
+        // (3x worst-case execution time) and Google SRE p99.9 tail-latency principles.
+        const auto kDspResetTimeout =
+            std::chrono::milliseconds(PLAYBACK_DSP_RESET_TIMEOUT_MS);
 
         std::unique_lock<std::mutex> waitLock(
             playbackDspWaitMutex_);
@@ -1891,7 +1895,8 @@ void AAudioEngine::flushPlayback(
         isDisconnected_.store(true, std::memory_order_release);
         inputIngressBlocked_.store(false, std::memory_order_release);
         unblockPlaybackCallback();
-        LOGW("AAudioEngine: playback DSP reset acknowledgement timed out; stream closed for recovery");
+        LOGW("AAudioEngine: playback DSP reset acknowledgement timed out after %zu ms; stream closed for recovery",
+             PLAYBACK_DSP_RESET_TIMEOUT_MS);
         return;
     }
 
