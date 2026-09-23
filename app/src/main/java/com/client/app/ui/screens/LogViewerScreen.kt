@@ -207,7 +207,8 @@ fun LogViewerScreen(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    LogFilter.values().forEach { filter ->
+                    // Использование entries вместо values() исключает аллокацию массивов при каждой рекомпозиции
+                    LogFilter.entries.forEach { filter ->
                         FilterChip(
                             selected = selectedFilter == filter,
                             onClick = { selectedFilter = filter },
