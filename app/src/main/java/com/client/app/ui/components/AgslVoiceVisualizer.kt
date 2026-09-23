@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/java/com/client/app/ui/components/AgslVoiceVisualizer.kt
 package com.client.app.ui.components
 
 import android.graphics.RenderEffect
@@ -25,8 +26,6 @@ import androidx.compose.ui.unit.dp
 import com.client.app.audio.NativeAudioEngine
 import com.client.app.session.LinkState
 import com.client.app.session.SessionState
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 
 private const val AGSL_SHADER_SRC = """
 uniform shader u_Content;
@@ -36,145 +35,66 @@ uniform float u_State;
 uniform float4 u_Spectrum;
 uniform float4 u_Dynamics;
 
-float mapSDF(float3 p) {
-    float bassEnergy = u_Spectrum.x * 1.1 + u_Spectrum.y * 0.7;
-    float midEnergy = u_Spectrum.z * 0.5;
-
-    float r = 0.70 + bassEnergy * 0.22;
-    r += sin(u_Time * 2.2) * 0.015;
-
-    float3 s = sin(p * 2.1 + float3(0.0, u_Time * 0.75, 0.0));
-    float3 c = cos(p.yzx * 3.8 - float3(u_Time * 1.1, 0.0, u_Time * 0.6));
-    float n = (s.x * c.y + s.y * c.z + s.z * c.x) * 0.333;
-
-    float displacement = n * (0.18 + midEnergy * 0.40);
-    return length(p) - r + displacement;
-}
-
-float3 calcNormal(float3 p) {
-    float2 e = float2(1.0, -1.0) * 0.008;
-
-    return normalize(
-        e.xyy * mapSDF(p + e.xyy) +
-        e.yyx * mapSDF(p + e.yyx) +
-        e.yxy * mapSDF(p + e.yxy) +
-        e.xxx * mapSDF(p + e.xxx)
-    );
-}
-
 half4 main(float2 fragCoord) {
-    float2 uv =
-        (fragCoord - 0.5 * u_Resolution) /
-        min(u_Resolution.x, u_Resolution.y);
+    float minRes = min(u_Resolution.x, u_Resolution.y);
+    float2 uv = (fragCoord - 0.5 * u_Resolution) / minRes;
+    float dist = length(uv);
 
-    float3 colIdle = float3(0.96, 0.62, 0.05);
+    float3 colIdle      = float3(0.96, 0.62, 0.05);
     float3 colListening = float3(0.23, 0.51, 0.96);
-    float3 colThinking = float3(0.55, 0.36, 0.96);
-    float3 colSpeaking = float3(0.06, 0.72, 0.51);
-    float3 colBargeIn = float3(0.94, 0.27, 0.27);
+    float3 colThinking  = float3(0.55, 0.36, 0.96);
+    float3 colSpeaking  = float3(0.06, 0.72, 0.51);
+    float3 colBargeIn   = float3(0.94, 0.27, 0.27);
 
     float3 coreColor = colIdle;
-
-    if (u_State < 1.5) {
-        coreColor = mix(
-            colIdle,
-            colListening,
-            clamp(u_State, 0.0, 1.0)
-        );
-    } else if (u_State < 2.5) {
-        coreColor = mix(
-            colListening,
-            colThinking,
-            clamp(u_State - 1.0, 0.0, 1.0)
-        );
-    } else if (u_State < 3.5) {
-        coreColor = mix(
-            colThinking,
-            colSpeaking,
-            clamp(u_State - 2.0, 0.0, 1.0)
-        );
+    if (u_State < 1.0) {
+        coreColor = mix(colIdle, colListening, clamp(u_State, 0.0, 1.0));
+    } else if (u_State < 2.0) {
+        coreColor = mix(colListening, colThinking, clamp(u_State - 1.0, 0.0, 1.0));
+    } else if (u_State < 3.0) {
+        coreColor = mix(colThinking, colSpeaking, clamp(u_State - 2.0, 0.0, 1.0));
     } else {
-        coreColor = mix(
-            colSpeaking,
-            colBargeIn,
-            clamp(u_State - 3.0, 0.0, 1.0)
-        );
+        coreColor = mix(colSpeaking, colBargeIn, clamp(u_State - 3.0, 0.0, 1.0));
     }
 
-    float3 ro = float3(0.0, 0.0, -2.4);
-    float3 rd = normalize(float3(uv, 1.25));
+    float bassEnergy = u_Spectrum.x * 0.85 + u_Spectrum.y * 0.55;
+    float midEnergy  = u_Spectrum.z * 0.45;
+    float voiceRms   = max(u_Dynamics.y, u_Dynamics.z);
 
-    float t = 0.0;
-    for (int i = 0; i < 12; i++) {
-        float3 p = ro + rd * t;
-        float d = mapSDF(p);
-        t += d * 1.25;
-    }
+    float angle = atan(uv.y, uv.x + 1e-6);
+    float harmonic = sin(angle * 3.0 + u_Time * 1.6) * cos(angle * 2.0 - u_Time * 0.9);
+    harmonic += sin(angle * 5.0 - u_Time * 2.4) * 0.35;
 
-    float3 finalColor = float3(0.0);
-    float alpha = 0.0;
+    float baseRadius = 0.32 + (bassEnergy * 0.08) + (voiceRms * 0.05);
+    float r = baseRadius + harmonic * (0.012 + midEnergy * 0.025);
 
-    float distToCenter = length(uv);
-    float aura = 0.032 / (distToCenter - 0.44 + 0.07);
+    float auraDist = max(0.0, dist - (r * 0.92));
+    float aura = 0.024 / (auraDist + 0.045);
     aura = clamp(aura, 0.0, 0.85);
 
-    finalColor += coreColor * aura * 0.75;
-    alpha = aura * 0.65;
+    float dNorm = clamp(dist / max(r, 1e-4), 0.0, 1.0);
+    float nz = sqrt(max(0.0, 1.0 - dNorm * dNorm));
+    float2 nxy = uv / max(r, 1e-4);
+    float3 n = normalize(float3(nxy, nz));
 
-    if (t <= 3.8) {
-        float3 p = ro + rd * t;
-        float3 n = calcNormal(p);
+    float3 lightDir = normalize(float3(0.45, 0.75, 1.0));
+    float3 viewDir  = float3(0.0, 0.0, 1.0);
+    float3 halfVec  = normalize(lightDir + viewDir);
 
-        float3 lightDir =
-            normalize(float3(0.45, 0.75, -1.0));
+    float diff    = max(dot(n, lightDir), 0.0);
+    float spec    = pow(max(dot(n, halfVec), 0.0), 24.0) * 0.45;
+    float fresnel = pow(1.0 - max(n.z, 0.0), 2.5);
+    float sss     = pow(max(dot(viewDir, lightDir), 0.0), 2.2) * 0.45;
 
-        float diff = max(dot(n, lightDir), 0.0);
+    float3 surfaceColor = coreColor * (diff * 0.55 + 0.45) + sss * coreColor;
+    surfaceColor += float3(spec);
+    surfaceColor += fresnel * (coreColor + float3(0.20, 0.20, 0.35));
 
-        float3 h =
-            normalize(lightDir - rd);
+    float edge = smoothstep(r + 0.006, r - 0.006, dist);
+    float3 finalColor = mix(coreColor * aura * 0.75, surfaceColor, edge);
+    float alpha = clamp(mix(aura * 0.65, 1.0, edge), 0.0, 1.0);
 
-        float spec =
-            pow(max(dot(n, h), 0.0), 28.0) * 0.45;
-
-        float fresnel =
-            pow(
-                1.0 - max(dot(-rd, n), 0.0),
-                2.8
-            );
-
-        float sss =
-            pow(
-                max(dot(rd, lightDir), 0.0),
-                2.2
-            ) * 0.55;
-
-        float3 surfaceColor =
-            coreColor * (diff * 0.55 + 0.45) +
-            sss * coreColor;
-
-        surfaceColor += float3(spec);
-        surfaceColor +=
-            fresnel *
-            (coreColor + float3(0.2, 0.2, 0.35));
-
-        finalColor =
-            mix(finalColor, surfaceColor, 0.92);
-
-        alpha = 1.0;
-    }
-
-    float dither =
-        (
-            fract(
-                sin(
-                    dot(
-                        fragCoord,
-                        float2(12.9898, 78.233)
-                    )
-                ) * 43758.5453
-            ) - 0.5
-        ) / 255.0;
-
+    float dither = (fract(dot(fragCoord.xy, float2(0.06711056, 0.00583715)) * 52.9829189) - 0.5) / 255.0;
     finalColor += float3(dither);
 
     return half4(finalColor, alpha);
@@ -348,22 +268,19 @@ private fun AgslOrbInternal(
             state.isAiSpeaking ||
             state.error != null
 
-    var timeParam by remember {
-        mutableFloatStateOf(0f)
-    }
-
-    LaunchedEffect(shouldAnimate) {
-        if (!shouldAnimate) {
-            return@LaunchedEffect
-        }
-
-        while (isActive) {
-            timeParam =
-                (timeParam + 0.10471976f) % 125.663704f
-
-            delay(33L)
-        }
-    }
+    // P1 Fix (Проблема №17): Аппаратная анимация времени через VSYNC 120 FPS.
+    // Заменяет корутину с delay(33L) и mutableFloatStateOf, устраняя лишние рекомпозиции
+    // и фазовый джиттер (Judder). Чтение анимированного значения происходит строго в Draw Phase.
+    val infiniteTransition = rememberInfiniteTransition(label = "agsl_vibration")
+    val animatedTime by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 62.831853f, // 20 * PI
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 20000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "agsl_time"
+    )
 
     Box(
         modifier = modifier
@@ -409,9 +326,10 @@ private fun AgslOrbInternal(
                         h
                     )
 
+                    // Draw-phase обновление времени анимации на частоте 120 Гц
                     runtimeShader.setFloatUniform(
                         "u_Time",
-                        timeParam
+                        if (shouldAnimate) animatedTime else animatedTime * 0.25f
                     )
 
                     runtimeShader.setFloatUniform(
