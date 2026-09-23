@@ -642,8 +642,6 @@ class SessionManager @Inject constructor(
     }
 
     private suspend fun startInternal(resume: Boolean) {
-        // Защита от воскрешения протухшего токена: при чистом подключении (resume == false)
-        // токен возобновления принудительно обнуляется в памяти и не вычитывается из DataStore.
         if (!resume) {
             resumptionHandle = null
         } else if (resumptionHandle.isNullOrBlank()) {
@@ -1086,11 +1084,6 @@ class SessionManager @Inject constructor(
         pendingGoAway = false
     }
 
-    /**
-     * Планирование реконнекта. При [immediate] == true (сценарий отклонения устаревшего токена)
-     * экспоненциальная задержка сбрасывается в 0, так как сетевой канал исправен и требуется
-     * немедленно начать чистую сессию.
-     */
     private fun scheduleReconnect(
         reason: String,
         sourceEpoch: Long = client.epoch,
@@ -1578,376 +1571,388 @@ class SessionManager @Inject constructor(
         while (isActive) {
             try {
                 client.events.collect { envelope ->
-                    mutex.withLock {
-                        if (
-                            envelope.sessionId != client.sessionId ||
-                            envelope.epoch != client.epoch
-                        ) {
-                            return@withLock
+                    val event = envelope.event
+                    val eventEpoch = envelope.epoch
+                    val eventSessionId = envelope.sessionId
+
+                    if (
+                        eventSessionId != client.sessionId ||
+                        eventEpoch != client.epoch
+                    ) {
+                        return@collect
+                    }
+
+                    activeSessionId = eventSessionId
+
+                    // Fast-path (Zero Lock Contention): Высокочастотные события печатного текста
+                    // и транскрипций обрабатываются немедленно без захвата жизненного mutex.
+                    // Целостность состояния гарантирована transcriptLock и атомарным Flow update.
+                    when (event) {
+                        is GeminiEvent.ModelText -> {
+                            appendTranscript(
+                                ClientRole.MODEL,
+                                event.text,
+                                false,
+                                envelope.generationId
+                            )
                         }
 
-                        val event = envelope.event
-                        val eventEpoch = envelope.epoch
-                        val eventSessionId = envelope.sessionId
-                        activeSessionId = eventSessionId
+                        is GeminiEvent.InputTranscript -> {
+                            appendTranscript(
+                                ClientRole.USER,
+                                event.text,
+                                event.interim,
+                                envelope.generationId
+                            )
+                        }
 
-                        when (event) {
-                            is GeminiEvent.SetupComplete -> {
-                                reconnectAttempts = 0
-                                pendingGoAway = false
-                                goAwayToken.incrementAndGet()
-                                interactionStatus = null
-                                turnCompleteSeen = false
+                        is GeminiEvent.OutputTranscript -> {
+                            recordTranscriptGeneration(envelope.generationId)
 
-                                synchronized(reconnectGuard) {
-                                    goAwayJob?.cancel()
-                                    goAwayJob = null
-                                }
+                            appendTranscript(
+                                ClientRole.MODEL,
+                                event.text,
+                                false,
+                                envelope.generationId
+                            )
+                        }
 
-                                _state.update {
-                                    it.copy(
-                                        link = LinkState.LIVE,
-                                        error = null
-                                    )
-                                }
-
-                                if (
-                                    userMicDesired &&
-                                    connectionDesired
-                                ) {
-                                    micMutex.withLock {
-                                        startMicLocked()
-                                    }
-                                }
+                        is GeminiEvent.Usage -> {
+                            _state.update {
+                                it.copy(
+                                    tokensUsed = event.totalTokens
+                                )
                             }
+                        }
 
-                            is GeminiEvent.ResumptionHandle -> {
-                                val usableHandle =
-                                    event.handle
-                                        ?.trim()
-                                        ?.takeIf {
-                                            event.resumable &&
-                                                it.isNotBlank()
+                        else -> {
+                            // Control Plane & Lifecycle: события управления сессией, требующие
+                            // атомарной синхронизации с жизненным циклом через mutex.
+                            mutex.withLock {
+                                if (
+                                    envelope.sessionId != client.sessionId ||
+                                    envelope.epoch != client.epoch
+                                ) {
+                                    return@withLock
+                                }
+
+                                when (event) {
+                                    is GeminiEvent.SetupComplete -> {
+                                        reconnectAttempts = 0
+                                        pendingGoAway = false
+                                        goAwayToken.incrementAndGet()
+                                        interactionStatus = null
+                                        turnCompleteSeen = false
+
+                                        synchronized(reconnectGuard) {
+                                            goAwayJob?.cancel()
+                                            goAwayJob = null
                                         }
 
-                                if (usableHandle != null) {
-                                    resumptionHandle = usableHandle
-                                    resumptionPersistenceMutex.withLock {
-                                        when (val encrypted = cryptoManager.encrypt(usableHandle)) {
-                                            is com.client.app.util.CryptoResult.Success -> {
-                                                dataStore.edit { prefs ->
-                                                    prefs[KEY_SESSION_RESUMPTION_HANDLE] =
-                                                        encrypted.value
-                                                    prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] =
-                                                        System.currentTimeMillis()
-                                                }
-                                            }
-                                            com.client.app.util.CryptoResult.Missing -> {
-                                                logger.w("SessionManager: resumption handle unexpectedly encrypted as missing")
-                                            }
-                                            is com.client.app.util.CryptoResult.Failure -> {
-                                                logger.e(
-                                                    "SessionManager: could not persist Live session resumption handle: ${encrypted.reason}",
-                                                    encrypted.cause
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                                activeConnectUsedResumption = false
-                            }
-
-                            is GeminiEvent.InteractionStatus -> {
-                                interactionStatus =
-                                    event.status.trim().uppercase()
-
-                                if (
-                                    interactionStatus ==
-                                    "IN_PROGRESS"
-                                ) {
-                                    _state.update {
-                                        it.copy(isAiSpeaking = true)
-                                    }
-                                } else if (
-                                    interactionStatus == "IDLE" &&
-                                    clientCapabilitiesForCurrentSession()
-                                        .supportsInteractionStatus
-                                ) {
-                                    finishInteractionAfterPlayback(
-                                        sourceSessionId = eventSessionId,
-                                        sourceEpoch = eventEpoch,
-                                        shouldPlanGoAway = pendingGoAway,
-                                        capabilities =
-                                            clientCapabilitiesForCurrentSession()
-                                    )
-                                }
-                            }
-
-                            is GeminiEvent.GoAway -> {
-                                val sourceEpoch = eventEpoch
-                                val timerToken =
-                                    goAwayToken.incrementAndGet()
-
-                                pendingGoAway = true
-
-                                synchronized(reconnectGuard) {
-                                    goAwayJob?.cancel()
-
-                                    goAwayJob = scope.launch {
-                                        try {
-                                            val millisLeft = event.millisLeft ?: 0L
-                                            delay(millisLeft.coerceAtLeast(0L))
-
-                                            if (
-                                                timerToken ==
-                                                    goAwayToken.get() &&
-                                                pendingGoAway &&
-                                                connectionDesired &&
-                                                client.epoch ==
-                                                    sourceEpoch
-                                            ) {
-                                                pendingGoAway = false
-                                                goAwayToken.incrementAndGet()
-
-                                                scheduleReconnect(
-                                                    "дедлайн goAway",
-                                                    sourceEpoch
-                                                )
-                                            }
-                                        } catch (cancelled: CancellationException) {
-                                            throw cancelled
-                                        } catch (t: Throwable) {
-                                            logger.e(
-                                                "SessionManager: GoAway scheduler failed",
-                                                t
+                                        _state.update {
+                                            it.copy(
+                                                link = LinkState.LIVE,
+                                                error = null
                                             )
-                                        } finally {
-                                            synchronized(reconnectGuard) {
-                                                if (
-                                                    goAwayJob ==
-                                                    coroutineContext[Job]
-                                                ) {
-                                                    goAwayJob = null
+                                        }
+
+                                        if (
+                                            userMicDesired &&
+                                            connectionDesired
+                                        ) {
+                                            micMutex.withLock {
+                                                startMicLocked()
+                                            }
+                                        }
+                                    }
+
+                                    is GeminiEvent.ResumptionHandle -> {
+                                        val usableHandle =
+                                            event.handle
+                                                ?.trim()
+                                                ?.takeIf {
+                                                    event.resumable &&
+                                                        it.isNotBlank()
+                                                }
+
+                                        if (usableHandle != null) {
+                                            resumptionHandle = usableHandle
+                                            resumptionPersistenceMutex.withLock {
+                                                when (val encrypted = cryptoManager.encrypt(usableHandle)) {
+                                                    is com.client.app.util.CryptoResult.Success -> {
+                                                        dataStore.edit { prefs ->
+                                                            prefs[KEY_SESSION_RESUMPTION_HANDLE] =
+                                                                encrypted.value
+                                                            prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] =
+                                                                System.currentTimeMillis()
+                                                        }
+                                                    }
+                                                    com.client.app.util.CryptoResult.Missing -> {
+                                                        logger.w("SessionManager: resumption handle unexpectedly encrypted as missing")
+                                                    }
+                                                    is com.client.app.util.CryptoResult.Failure -> {
+                                                        logger.e(
+                                                            "SessionManager: could not persist Live session resumption handle: ${encrypted.reason}",
+                                                            encrypted.cause
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        activeConnectUsedResumption = false
+                                    }
+
+                                    is GeminiEvent.InteractionStatus -> {
+                                        interactionStatus =
+                                            event.status.trim().uppercase()
+
+                                        if (
+                                            interactionStatus ==
+                                            "IN_PROGRESS"
+                                        ) {
+                                            _state.update {
+                                                it.copy(isAiSpeaking = true)
+                                            }
+                                        } else if (
+                                            interactionStatus == "IDLE" &&
+                                            clientCapabilitiesForCurrentSession()
+                                                .supportsInteractionStatus
+                                        ) {
+                                            finishInteractionAfterPlayback(
+                                                sourceSessionId = eventSessionId,
+                                                sourceEpoch = eventEpoch,
+                                                shouldPlanGoAway = pendingGoAway,
+                                                capabilities =
+                                                    clientCapabilitiesForCurrentSession()
+                                            )
+                                        }
+                                    }
+
+                                    is GeminiEvent.GoAway -> {
+                                        val sourceEpoch = eventEpoch
+                                        val timerToken =
+                                            goAwayToken.incrementAndGet()
+
+                                        pendingGoAway = true
+
+                                        synchronized(reconnectGuard) {
+                                            goAwayJob?.cancel()
+
+                                            goAwayJob = scope.launch {
+                                                try {
+                                                    val millisLeft = event.millisLeft ?: 0L
+                                                    delay(millisLeft.coerceAtLeast(0L))
+
+                                                    if (
+                                                        timerToken ==
+                                                            goAwayToken.get() &&
+                                                        pendingGoAway &&
+                                                        connectionDesired &&
+                                                        client.epoch ==
+                                                            sourceEpoch
+                                                    ) {
+                                                        pendingGoAway = false
+                                                        goAwayToken.incrementAndGet()
+
+                                                        scheduleReconnect(
+                                                            "дедлайн goAway",
+                                                            sourceEpoch
+                                                        )
+                                                    }
+                                                } catch (cancelled: CancellationException) {
+                                                    throw cancelled
+                                                } catch (t: Throwable) {
+                                                    logger.e(
+                                                        "SessionManager: GoAway scheduler failed",
+                                                        t
+                                                    )
+                                                } finally {
+                                                    synchronized(reconnectGuard) {
+                                                        if (
+                                                            goAwayJob ==
+                                                            coroutineContext[Job]
+                                                        ) {
+                                                            goAwayJob = null
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
                                     }
-                                }
-                            }
 
-                            is GeminiEvent.Interrupted -> {
-                                invalidateAndFlushAudio(
-                                    "server interrupted"
-                                )
-
-                                audioEngine.resetBargeInState()
-
-                                _state.update {
-                                    it.copy(isAiSpeaking = false)
-                                }
-
-                                resetTranscriptRuntime()
-                                turnCompleteSeen = false
-                                interactionStatus = null
-                            }
-
-                            is GeminiEvent.GenerationComplete -> {
-                            }
-
-                            is GeminiEvent.TurnComplete -> {
-                                turnCompleteSeen = true
-                                val capabilities =
-                                    clientCapabilitiesForCurrentSession()
-
-                                if (
-                                    !capabilities.supportsInteractionStatus ||
-                                    interactionStatus == "IDLE"
-                                ) {
-                                    finishInteractionAfterPlayback(
-                                        sourceSessionId =
-                                            eventSessionId,
-                                        sourceEpoch = eventEpoch,
-                                        shouldPlanGoAway =
-                                            pendingGoAway,
-                                        capabilities = capabilities
-                                    )
-                                }
-                            }
-
-                            is GeminiEvent.InputTranscript -> {
-                                appendTranscript(
-                                    ClientRole.USER,
-                                    event.text,
-                                    event.interim,
-                                    envelope.generationId
-                                )
-                            }
-
-                            is GeminiEvent.OutputTranscript -> {
-                                recordTranscriptGeneration(envelope.generationId)
-
-                                appendTranscript(
-                                    ClientRole.MODEL,
-                                    event.text,
-                                    false,
-                                    envelope.generationId
-                                )
-                            }
-
-                            is GeminiEvent.ModelText -> {
-                                appendTranscript(
-                                    ClientRole.MODEL,
-                                    event.text,
-                                    false,
-                                    envelope.generationId
-                                )
-                            }
-
-                            is GeminiEvent.Usage -> {
-                                _state.update {
-                                    it.copy(
-                                        tokensUsed =
-                                            event.totalTokens
-                                    )
-                                }
-                            }
-
-                            is GeminiEvent.ToolCall -> {
-                                handleToolCall(
-                                    calls = event.calls,
-                                    sourceSessionId = eventSessionId,
-                                    sourceEpoch = eventEpoch
-                                )
-                            }
-
-                            is GeminiEvent.ToolCallCancelled -> {
-                                event.ids.forEach { id ->
-                                    val key =
-                                        ToolCallKey(
-                                            sessionId =
-                                                eventSessionId,
-                                            epoch =
-                                                eventEpoch,
-                                            callId = id
+                                    is GeminiEvent.Interrupted -> {
+                                        invalidateAndFlushAudio(
+                                            "server interrupted"
                                         )
 
-                                    toolResponseMutex.withLock {
-                                        cancelledToolCallKeys.add(key)
-                                        activeToolJobs
-                                            .remove(key)
-                                            ?.cancel()
+                                        audioEngine.resetBargeInState()
+
+                                        _state.update {
+                                            it.copy(isAiSpeaking = false)
+                                        }
+
+                                        resetTranscriptRuntime()
+                                        turnCompleteSeen = false
+                                        interactionStatus = null
                                     }
-                                }
-                            }
 
-                            is GeminiEvent.Error -> {
-                                _state.update {
-                                    it.copy(
-                                        error =
-                                            event.message
-                                    )
-                                }
+                                    is GeminiEvent.GenerationComplete -> {
+                                    }
 
-                                if (event.fatal) {
-                                    activeConnectUsedResumption =
-                                        false
-                                    connectionDesired = false
-                                    userMicDesired = false
-                                    cancelReconnectWork()
-                                    stopInternal(full = true)
-                                }
-                            }
+                                    is GeminiEvent.TurnComplete -> {
+                                        turnCompleteSeen = true
+                                        val capabilities =
+                                            clientCapabilitiesForCurrentSession()
 
-                            is GeminiEvent.Disconnected -> {
-                                if (
-                                    event.sessionId !=
-                                    client.sessionId ||
-                                    event.epoch !=
-                                    client.epoch
-                                ) {
-                                    return@withLock
-                                }
+                                        if (
+                                            !capabilities.supportsInteractionStatus ||
+                                            interactionStatus == "IDLE"
+                                        ) {
+                                            finishInteractionAfterPlayback(
+                                                sourceSessionId =
+                                                    eventSessionId,
+                                                sourceEpoch = eventEpoch,
+                                                shouldPlanGoAway =
+                                                    pendingGoAway,
+                                                capabilities = capabilities
+                                            )
+                                        }
+                                    }
 
-                                cancelAllPendingToolJobs()
-
-                                val resumeRejected =
-                                    activeConnectUsedResumption &&
-                                        (
-                                            event.code == 400 ||
-                                            event.code == 403 ||
-                                            event.code == 404
+                                    is GeminiEvent.ToolCall -> {
+                                        handleToolCall(
+                                            calls = event.calls,
+                                            sourceSessionId = eventSessionId,
+                                            sourceEpoch = eventEpoch
                                         )
+                                    }
 
-                                if (resumeRejected) {
-                                    logger.w(
-                                        "SessionManager: Сервер отклонил сессионный токен (${event.code}). Сбрасываем хэндл и переключаемся на чистую сессию."
-                                    )
-                                    resumptionHandle = null
-                                    activeConnectUsedResumption = false
-                                    scope.launch {
-                                        resumptionPersistenceMutex.withLock {
-                                            dataStore.edit { prefs ->
-                                                prefs.remove(KEY_SESSION_RESUMPTION_HANDLE)
-                                                prefs.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                                    is GeminiEvent.ToolCallCancelled -> {
+                                        event.ids.forEach { id ->
+                                            val key =
+                                                ToolCallKey(
+                                                    sessionId =
+                                                        eventSessionId,
+                                                    epoch =
+                                                        eventEpoch,
+                                                    callId = id
+                                                )
+
+                                            toolResponseMutex.withLock {
+                                                cancelledToolCallKeys.add(key)
+                                                activeToolJobs
+                                                    .remove(key)
+                                                    ?.cancel()
                                             }
                                         }
                                     }
-                                }
 
-                                // Фатальными признаются:
-                                // 1. Ошибки авторизации (401) - неверный ключ
-                                // 2. Ошибки 400/403/404 ТОЛЬКО если подключение было чистым (без токена возобновления).
-                                // Если токен был отклонён, это НЕ фатальная ошибка, а сигнал к холодному старту.
-                                val authOrClientFatal = if (resumeRejected) {
-                                    false
-                                } else {
-                                    event.code == 400 ||
-                                        event.code == 401 ||
-                                        event.code == 403 ||
-                                        event.code == 404
-                                }
+                                    is GeminiEvent.Error -> {
+                                        _state.update {
+                                            it.copy(
+                                                error =
+                                                    event.message
+                                            )
+                                        }
 
-                                if (authOrClientFatal) {
-                                    logger.e(
-                                        "SessionManager: Фатальная ошибка клиента (${event.code}). Остановка сессии."
-                                    )
-                                    connectionDesired = false
-                                    userMicDesired = false
-                                    cancelReconnectWork()
-                                    stopInternal(full = true)
-                                    return@withLock
-                                }
-
-                                if (connectionDesired) {
-                                    if (
-                                        _state.value.isMicActive ||
-                                        audioEngine.isCapturing.value
-                                    ) {
-                                        micMutex.withLock {
-                                            stopMicLocked()
+                                        if (event.fatal) {
+                                            activeConnectUsedResumption =
+                                                false
+                                            connectionDesired = false
+                                            userMicDesired = false
+                                            cancelReconnectWork()
+                                            stopInternal(full = true)
                                         }
                                     }
 
-                                    scheduleReconnect(
-                                        reason =
-                                            if (resumeRejected) {
-                                                "resumption отклонён сервером (код ${event.code}), запуск чистой сессии"
-                                            } else {
-                                                "код ${event.code}"
-                                            },
-                                        sourceEpoch =
-                                            event.epoch,
-                                        immediate = resumeRejected
-                                    )
+                                    is GeminiEvent.Disconnected -> {
+                                        if (
+                                            event.sessionId !=
+                                            client.sessionId ||
+                                            event.epoch !=
+                                            client.epoch
+                                        ) {
+                                            return@withLock
+                                        }
+
+                                        cancelAllPendingToolJobs()
+
+                                        val resumeRejected =
+                                            activeConnectUsedResumption &&
+                                                (
+                                                    event.code == 400 ||
+                                                    event.code == 403 ||
+                                                    event.code == 404
+                                                )
+
+                                        if (resumeRejected) {
+                                            logger.w(
+                                                "SessionManager: Сервер отклонил сессионный токен (${event.code}). Сбрасываем хэндл и переключаемся на чистую сессию."
+                                            )
+                                            resumptionHandle = null
+                                            activeConnectUsedResumption = false
+                                            scope.launch {
+                                                resumptionPersistenceMutex.withLock {
+                                                    dataStore.edit { prefs ->
+                                                        prefs.remove(KEY_SESSION_RESUMPTION_HANDLE)
+                                                        prefs.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        val authOrClientFatal = if (resumeRejected) {
+                                            false
+                                        } else {
+                                            event.code == 400 ||
+                                                event.code == 401 ||
+                                                event.code == 403 ||
+                                                event.code == 404
+                                        }
+
+                                        if (authOrClientFatal) {
+                                            logger.e(
+                                                "SessionManager: Фатальная ошибка клиента (${event.code}). Остановка сессии."
+                                            )
+                                            connectionDesired = false
+                                            userMicDesired = false
+                                            cancelReconnectWork()
+                                            stopInternal(full = true)
+                                            return@withLock
+                                        }
+
+                                        if (connectionDesired) {
+                                            if (
+                                                _state.value.isMicActive ||
+                                                audioEngine.isCapturing.value
+                                            ) {
+                                                micMutex.withLock {
+                                                    stopMicLocked()
+                                                }
+                                            }
+
+                                            scheduleReconnect(
+                                                reason =
+                                                    if (resumeRejected) {
+                                                        "resumption отклонён сервером (код ${event.code}), запуск чистой сессии"
+                                                    } else {
+                                                        "код ${event.code}"
+                                                    },
+                                                sourceEpoch =
+                                                    event.epoch,
+                                                immediate = resumeRejected
+                                            )
+                                        }
+                                    }
+
+                                    is GeminiEvent.Connected -> Unit
+
+                                    is GeminiEvent.GroundingMetadata,
+                                    is GeminiEvent.UrlContextMetadata -> Unit
+
+                                    else -> Unit
                                 }
                             }
-
-                            is GeminiEvent.Connected -> Unit
-
-                            is GeminiEvent.GroundingMetadata,
-                            is GeminiEvent.UrlContextMetadata -> Unit
-
-                            else -> Unit
                         }
                     }
                 }
@@ -1983,13 +1988,6 @@ class SessionManager @Inject constructor(
     private fun clientCapabilitiesForCurrentSession(): LiveModelCapabilities =
         activeLiveCapabilities
 
-    /**
-     * Завершение речевого взаимодействия модели строго после того, как все сэмплы покинули ЦАП.
-     *
-     * 1. Гарантирует вычитку сетевого канала (client.hasPendingAudioFrames).
-     * 2. Ожидает физического дренажа через адаптивный прогресс-вотчдог.
-     * 3. Переводит состояние isAiSpeaking в false строго после завершения звука.
-     */
     private fun finishInteractionAfterPlayback(
         sourceSessionId: Long,
         sourceEpoch: Long,
