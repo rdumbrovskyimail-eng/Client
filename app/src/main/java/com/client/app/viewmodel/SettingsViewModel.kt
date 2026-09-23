@@ -68,11 +68,11 @@ class SettingsViewModel @Inject constructor(
 ) : ViewModel() {
 
     companion object {
+        // Актуальный перечень поддерживаемых моделей Gemini Live (устаревшие тестовые эндпоинты удалены)
         val LIVE_MODEL_OPTIONS = listOf(
             "gemini-3.8-live",
             "gemini-3.8-live-extended-thinking",
-            "gemini-3.1-flash-live-preview",
-            "gemini-2.5-flash-native-audio-preview-12-2025"
+            "gemini-3.1-flash-live-preview"
         )
 
         val VALID_SPEECH_LANGUAGES = setOf(
@@ -159,11 +159,11 @@ class SettingsViewModel @Inject constructor(
                         activityHandling = p[SessionManager.KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
                         turnCoverage = p[SessionManager.KEY_TURN_COVERAGE] ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO",
 
-                        compressionEnabled = (p[SessionManager.KEY_COMPRESSION_ENABLED] ?: true) && true,
+                        compressionEnabled = p[SessionManager.KEY_COMPRESSION_ENABLED] ?: true,
                         compressionTriggerTokens = p[SessionManager.KEY_COMPRESSION_TRIGGER_TOKENS] ?: 0,
                         compressionTargetTokens = p[SessionManager.KEY_COMPRESSION_TARGET_TOKENS] ?: 0,
 
-                        sessionResumptionEnabled = (p[SessionManager.KEY_SESSION_RESUMPTION_ENABLED] ?: true) && true,
+                        sessionResumptionEnabled = p[SessionManager.KEY_SESSION_RESUMPTION_ENABLED] ?: true,
                         initialHistoryTurns = p[SessionManager.KEY_INITIAL_HISTORY_TURNS] ?: 20,
 
                         enableForvo = p[SessionManager.KEY_ENABLE_FORVO] ?: false,
@@ -171,7 +171,7 @@ class SettingsViewModel @Inject constructor(
                             p[ForvoRepository.KEY_FORVO_API].orEmpty(),
                             "Forvo API key"
                         ),
-                        enableGoogleSearch = (p[SessionManager.KEY_ENABLE_SEARCH] ?: false) && true
+                        enableGoogleSearch = p[SessionManager.KEY_ENABLE_SEARCH] ?: false
                     )
                 }
             }
@@ -195,11 +195,13 @@ class SettingsViewModel @Inject constructor(
                 }
             }
         }
+
         viewModelScope.launch {
             promptDebounce.debounce(350).collect { sp ->
                 dataStore.edit { it[SessionManager.KEY_SYSTEM_PROMPT] = sp }
             }
         }
+
         viewModelScope.launch {
             forvoKeyDebounce.debounce(350).collect { k ->
                 when (val encrypted = cryptoManager.encrypt(k.trim())) {
@@ -218,11 +220,13 @@ class SettingsViewModel @Inject constructor(
                 }
             }
         }
+
         viewModelScope.launch {
             inputVocabDebounce.debounce(400).collect { v ->
                 dataStore.edit { it[SessionManager.KEY_INPUT_TRANSCRIPTION_VOCAB] = v }
             }
         }
+
         viewModelScope.launch {
             outputVocabDebounce.debounce(400).collect { v ->
                 dataStore.edit { it[SessionManager.KEY_OUTPUT_TRANSCRIPTION_VOCAB] = v }
@@ -237,7 +241,7 @@ class SettingsViewModel @Inject constructor(
 
     fun setThinkingLevel(level: String) {
         val normalized = level.trim().lowercase()
-        if (normalized !in setOf("low", "medium", "high")) return
+        if (normalized !in THINKING_LEVELS) return
 
         _settings.update { it.copy(thinkingLevel = normalized) }
         viewModelScope.launch {
