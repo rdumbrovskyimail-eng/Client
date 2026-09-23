@@ -1,4 +1,4 @@
-
+// >>> FILE: app/src/main/cpp/audio/AAudioEngine.cpp
 #include "AAudioEngine.h"
 #include "NativeLogQueue.h"
 #include "dsp/NeonDspUtils.h"
@@ -1024,70 +1024,27 @@ void AAudioEngine::captureDspThreadLoop() {
         const float gain =
             micGain_.load(
                 std::memory_order_relaxed);
-        const bool applyGain =
-            std::abs(gain - 1.0f) > 0.001f;
 
         const int32_t capRate =
             actualCaptureSampleRate_.load(
                 std::memory_order_relaxed);
 
+        // Problem #21: Vectorized ARM NEON stereo-to-mono downmixing and mic gain scaling.
+        // Replaces scalar division, GPR <-> FPU register shuffling, and branching std::clamp
+        // with hardware deinterleaving (vld2q_s16), rounding halving add (vrhaddq_s16),
+        // vector round-to-nearest (vcvtaq_s32_f32), and branch-free saturating narrow (vqmovn_s32).
         if (channels == 2) {
-
-            for (size_t i = 0;
-                 i < chunkFrames;
-                 ++i) {
-
-                int32_t mixed =
-                    (
-                        static_cast<int32_t>(
-                            inPtr[i * 2]) +
-                        static_cast<int32_t>(
-                            inPtr[i * 2 + 1])
-                    ) / 2;
-                if (applyGain) {
-                    mixed =
-                        static_cast<int32_t>(
-                            std::round(
-                                mixed * gain));
-                }
-
-                monoBuf[i] =
-                    static_cast<int16_t>(
-                        std::clamp(
-                            mixed,
-                            -32768,
-                            32767));
-            }
-
+            dsp::stereoToMonoWithGain(
+                inPtr,
+                monoBuf,
+                chunkFrames,
+                gain);
         } else {
-
-            if (applyGain) {
-
-                for (size_t i = 0;
-                     i < chunkFrames;
-                     ++i) {
-
-                    int32_t amplified =
-                        static_cast<int32_t>(
-                            std::round(
-                                inPtr[i] * gain));
-
-                    monoBuf[i] =
-                        static_cast<int16_t>(
-                            std::clamp(
-                                amplified,
-                                -32768,
-                                32767));
-                }
-
-            } else {
-
-                std::memcpy(
-                    monoBuf,
-                    inPtr,
-                    chunkFrames *
-                    sizeof(int16_t));
-            }
+            dsp::applyGainInPlace(
+                inPtr,
+                monoBuf,
+                chunkFrames,
+                gain);
         }
 
         const size_t decimateScratchCap =
