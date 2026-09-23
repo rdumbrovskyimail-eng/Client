@@ -169,12 +169,6 @@ private:
 
 /**
  * Stateful 2:1 FIR decimator (32 kHz -> 16 kHz) for microphone capture.
- *
- * The filter is a 95-tap linear-phase low-pass designed for a 7 kHz
- * passband and 8.5 kHz stopband at the 32 kHz input rate. Coefficients are
- * stored in Q30 with unity DC gain. The implementation uses filter
- * symmetry and a contiguous history/work buffer. State survives process()
- * chunk boundaries.
  */
 class Decimator32To16 {
 public:
@@ -327,14 +321,6 @@ private:
 
 /**
  * 2x half-band FIR interpolator, 24 kHz -> 48 kHz.
- *
- * Linear-phase half-band filter providing deterministic 2:1 sample production
- * and image rejection above the 12 kHz Nyquist boundary.
- *
- * The polyphase representation splits the 127 taps into:
- *   - Even branch: 64 symmetric taps acting on input samples (delay 31.5 input samples)
- *   - Odd branch: single center tap h[63] = 1.0 Q30 (delayed by 31 input samples)
- * Both branches yield identical group delay of 63 output samples.
  */
 class HalfbandResampler24To48 {
 public:
@@ -467,8 +453,6 @@ private:
 
 /**
  * Stateful linear streaming resampler for generic playback paths.
- *
- * Fractional clock accumulator maintains phase across chunk boundaries without allocation.
  */
 class StreamingLinearResampler {
 public:
@@ -512,16 +496,67 @@ public:
             static_cast<double>(inputRate_) /
             static_cast<double>(outputRate_);
 
-        const bool hadPreviousSample = hasPreviousSample_;
-        const size_t logicalSize =
-            inFrames + (hadPreviousSample ? 1u : 0u);
-
+        const bool hadPrev = hasPreviousSample_;
+        const size_t logicalSize = inFrames + (hadPrev ? 1u : 0u);
         size_t outCount = 0;
 
-        auto sampleAt = [&](size_t logicalIndex) -> int32_t {
-            if (hadPreviousSample && logicalIndex == 0u) {
-                return static_cast<int32_t>(previousSample_);
+        while (outCount < maxOutFrames) {
+            if (sourceIndex_ + 1u >= logicalSize) {
+                break;
             }
 
-            const size_t localIndex =
-                hadPreviousSample
+            const int32_t s0 = getSample(in, inFrames, sourceIndex_, hadPrev);
+            const int32_t s1 = getSample(in, inFrames, sourceIndex_ + 1u, hadPrev);
+
+            const double interpolated =
+                static_cast<double>(s0) +
+                (static_cast<double>(s1) - static_cast<double>(s0)) * phase_;
+
+            const long rounded = std::lround(interpolated);
+
+            out[outCount++] =
+                static_cast<int16_t>(std::clamp<long>(rounded, -32768L, 32767L));
+
+            const double advancedPhase = phase_ + step;
+            const double wholePart = std::floor(advancedPhase);
+            const size_t wholeFrames = static_cast<size_t>(wholePart);
+
+            phase_ = advancedPhase - wholePart;
+            sourceIndex_ += wholeFrames;
+        }
+
+        previousSample_ = in[inFrames - 1u];
+        hasPreviousSample_ = true;
+
+        const size_t historyShift = hadPrev ? inFrames : (inFrames - 1u);
+        if (sourceIndex_ >= historyShift) {
+            sourceIndex_ -= historyShift;
+        } else {
+            sourceIndex_ = 0;
+            phase_ = 0.0;
+        }
+
+        return outCount;
+    }
+
+private:
+    inline int32_t getSample(const int16_t* in, size_t inFrames, size_t index, bool hadPrev) const {
+        if (hadPrev && index == 0u) {
+            return static_cast<int32_t>(previousSample_);
+        }
+        const size_t localIdx = hadPrev ? (index - 1u) : index;
+        if (localIdx >= inFrames) {
+            return static_cast<int32_t>(in[inFrames - 1u]);
+        }
+        return static_cast<int32_t>(in[localIdx]);
+    }
+
+    int32_t inputRate_{0};
+    int32_t outputRate_{0};
+    size_t sourceIndex_{0};
+    double phase_{0.0};
+    int16_t previousSample_{0};
+    bool hasPreviousSample_{false};
+};
+
+} // namespace client::audio
