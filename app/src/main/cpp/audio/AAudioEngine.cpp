@@ -1,4 +1,4 @@
-// >>> FILE: app/src/main/cpp/audio/AAudioEngine.cpp
+
 #include "AAudioEngine.h"
 #include "NativeLogQueue.h"
 #include "dsp/NeonDspUtils.h"
@@ -287,8 +287,7 @@ bool AAudioEngine::initLocked(
         captureDecimator32To16_.reset();
         captureResampler24To16_.reset();
         captureResampler44100To16000_.reset();
-        lastCaptureSample8k_ = 0;
-        hasLastCaptureSample8k_ = false;
+        captureUpsampler8To16_.reset();
         resetEarcon();
         voiceEnhancer_.reset(targetPlaybackSampleRate);
         fftPos_ = 0;
@@ -705,8 +704,7 @@ bool AAudioEngine::startCapture() {
     captureDecimator32To16_.reset();
     captureResampler24To16_.reset();
     captureResampler44100To16000_.reset();
-    lastCaptureSample8k_ = 0;
-    hasLastCaptureSample8k_ = false;
+    captureUpsampler8To16_.reset();
 
     const aaudio_result_t result =
         AAudioStream_requestStart(captureStream_);
@@ -724,8 +722,7 @@ bool AAudioEngine::startCapture() {
         captureDecimator32To16_.reset();
         captureResampler24To16_.reset();
         captureResampler44100To16000_.reset();
-        lastCaptureSample8k_ = 0;
-        hasLastCaptureSample8k_ = false;
+        captureUpsampler8To16_.reset();
         isDisconnected_.store(true, std::memory_order_release);
         return false;
     }
@@ -749,8 +746,7 @@ bool AAudioEngine::startCapture() {
         captureDecimator32To16_.reset();
         captureResampler24To16_.reset();
         captureResampler44100To16000_.reset();
-        lastCaptureSample8k_ = 0;
-        hasLastCaptureSample8k_ = false;
+        captureUpsampler8To16_.reset();
         isDisconnected_.store(true, std::memory_order_release);
         return false;
     }
@@ -781,8 +777,7 @@ bool AAudioEngine::startCapture() {
         captureDecimator32To16_.reset();
         captureResampler24To16_.reset();
         captureResampler44100To16000_.reset();
-        lastCaptureSample8k_ = 0;
-        hasLastCaptureSample8k_ = false;
+        captureUpsampler8To16_.reset();
         isDisconnected_.store(true, std::memory_order_release);
         return false;
     }
@@ -865,8 +860,7 @@ void AAudioEngine::stopCaptureLocked() {
 
     captureRawBuffer_.resetQuiesced();
     captureBuffer_.resetQuiesced();
-    lastCaptureSample8k_ = 0;
-    hasLastCaptureSample8k_ = false;
+    captureUpsampler8To16_.reset();
     micRms_.store(0.0f, std::memory_order_relaxed);
 }
 
@@ -917,8 +911,7 @@ void AAudioEngine::stopLocked() {
         captureDecimator32To16_.reset();
         captureResampler24To16_.reset();
         captureResampler44100To16000_.reset();
-        lastCaptureSample8k_ = 0;
-        hasLastCaptureSample8k_ = false;
+        captureUpsampler8To16_.reset();
         resetEarcon();
         voiceEnhancer_.reset(48000);
         fftPos_ = 0;
@@ -1168,62 +1161,21 @@ void AAudioEngine::captureDspThreadLoop() {
 
         } else if (capRate == 8000) {
 
+            // Problem #11: Continuous stateful 8k -> 16k upsampling with causal anti-imaging filter.
+            // Eliminates chunk boundary clicks and phase discontinuities in Bluetooth SCO / CVSD audio.
             int16_t* upBuf =
                 captureDecimateBuffer_.data();
 
-            const size_t requiredOut =
-                chunkFrames * 2u;
-
-            if (requiredOut <= decimateScratchCap) {
-                size_t outIdx = 0;
-
-                if (chunkFrames > 0) {
-                    int16_t previous =
-                        hasLastCaptureSample8k_
-                            ? lastCaptureSample8k_
-                            : monoBuf[0];
-
-                    for (size_t i = 0; i < chunkFrames; ++i) {
-                        const int16_t current = monoBuf[i];
-
-                        const int16_t midpoint = static_cast<int16_t>(
-                            (static_cast<int32_t>(previous) + static_cast<int32_t>(current)) / 2
-                        );
-
-                        upBuf[outIdx++] = midpoint;
-                        upBuf[outIdx++] = current;
-
-                        previous = current;
-                    }
-
-                    lastCaptureSample8k_ =
-                        monoBuf[chunkFrames - 1];
-                    hasLastCaptureSample8k_ = true;
-
-                    // 3-point zero-phase anti-imaging smoothing filter to suppress
-                    // spectral images above 4 kHz before feeding Silero VAD.
-                    if (outIdx >= 2) {
-                        int32_t s0 = upBuf[0];
-                        int32_t s1 = upBuf[1];
-                        for (size_t k = 1; k < outIdx - 1; ++k) {
-                            int32_t s2 = upBuf[k + 1];
-                            upBuf[k] = static_cast<int16_t>((s0 + 2 * s1 + s2 + 2) >> 2);
-                            s0 = s1;
-                            s1 = s2;
-                        }
-                    }
-                }
-
-                finalPcm = upBuf;
-                finalFrames = outIdx;
-            } else {
-                LOGE(
-                    "AAudioEngine: 8k upsampler output capacity too small: need=%zu cap=%zu",
-                    requiredOut,
+            size_t processed =
+                captureUpsampler8To16_.process(
+                    monoBuf,
+                    chunkFrames,
+                    upBuf,
                     decimateScratchCap);
-                finalPcm = upBuf;
-                finalFrames = 0;
-            }
+
+            finalPcm = upBuf;
+            finalFrames = processed;
+
         }
 
         if (finalFrames > 0) {
