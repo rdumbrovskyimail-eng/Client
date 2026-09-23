@@ -5,13 +5,10 @@ import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.media.audiofx.DynamicsProcessing
 import android.os.Build
-import kotlinx.coroutines.CancellableContinuation
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
@@ -26,10 +23,12 @@ class PronunciationPlayer @Inject constructor() {
     private var currentState = PlayerState.IDLE
     private var activeContinuation: CancellableContinuation<Boolean>? = null
 
+    private val playerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     private val _isPlaying = MutableStateFlow(false)
     val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
 
-    suspend fun play(url: String): Boolean = withContext(Dispatchers.Main.immediate) {
+    suspend fun play(url: String): Boolean = withContext(Dispatchers.IO) {
         suspendCancellableCoroutine { cont ->
             val previousContinuation = synchronized(lock) {
                 val previous = activeContinuation
@@ -47,7 +46,7 @@ class PronunciationPlayer @Inject constructor() {
             val mp = MediaPlayer()
             synchronized(lock) {
                 if (activeContinuation !== cont) {
-                    runCatching { mp.release() }
+                    playerScope.launch { runCatching { mp.release() } }
                     return@suspendCancellableCoroutine
                 }
                 mediaPlayer = mp
@@ -115,14 +114,13 @@ class PronunciationPlayer @Inject constructor() {
                     }
 
                     if (!valid) {
-                        runCatching { player.release() }
+                        playerScope.launch { runCatching { player.release() } }
                         return@setOnPreparedListener
                     }
 
                     try {
                         player.start()
                     } catch (_: Exception) {
-                        // Do not leave the continuation suspended when start() fails.
                         finish(false)
                     }
                 }
@@ -133,6 +131,7 @@ class PronunciationPlayer @Inject constructor() {
                     true
                 }
 
+                // setDataSource выполняется на Dispatchers.IO для исключения блокировок сетевого стека
                 mp.setDataSource(url)
                 mp.prepareAsync()
             } catch (_: Exception) {
@@ -157,19 +156,28 @@ class PronunciationPlayer @Inject constructor() {
         _isPlaying.value = false
         currentState = PlayerState.RELEASED
 
-        runCatching { dynamicsProcessing?.release() }
+        val dpToRelease = dynamicsProcessing
         dynamicsProcessing = null
 
-        mediaPlayer?.let { mp ->
-            runCatching { mp.setOnPreparedListener(null) }
-            runCatching { mp.setOnCompletionListener(null) }
-            runCatching { mp.setOnErrorListener(null) }
-            runCatching {
-                if (mp.isPlaying) mp.stop()
-            }
-            runCatching { mp.reset() }
-            runCatching { mp.release() }
-        }
+        val mpToRelease = mediaPlayer
         mediaPlayer = null
+
+        // Вызов блокирующих IPC-операций mediaserver перенесен в фоновый пул Dispatchers.IO,
+        // предотвращая задержки кадров (Jank) и ANR на главном потоке.
+        if (dpToRelease != null || mpToRelease != null) {
+            playerScope.launch {
+                runCatching { dpToRelease?.release() }
+                mpToRelease?.let { mp ->
+                    runCatching { mp.setOnPreparedListener(null) }
+                    runCatching { mp.setOnCompletionListener(null) }
+                    runCatching { mp.setOnErrorListener(null) }
+                    runCatching {
+                        if (mp.isPlaying) mp.stop()
+                    }
+                    runCatching { mp.reset() }
+                    runCatching { mp.release() }
+                }
+            }
+        }
     }
 }
