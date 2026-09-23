@@ -1,7 +1,6 @@
 // >>> FILE: app/src/main/java/com/client/app/api/SocketCustomizer.kt
 package com.client.app.api
 
-import android.os.Build
 import android.os.ParcelFileDescriptor
 import com.client.app.audio.NativeAudioBridge
 import com.client.app.logging.AppLogManager
@@ -54,27 +53,19 @@ class TunedSocketFactory(
         runCatching {
             socket.tcpNoDelay = true
 
-            // Публичный мост Android к дескриптору сокета без рефлексии в SocketImpl.
-            // На API < 29 вызов .dup() предотвращает преждевременное закрытие нативного FD сокета.
-            val pfd =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    ParcelFileDescriptor.fromSocket(socket)
-                } else {
-                    ParcelFileDescriptor.fromSocket(socket)?.dup()
-                }
-
-            if (pfd != null) {
-                try {
-                    val nativeFd = pfd.fd
-                    if (nativeFd >= 0) {
-                        nativeBridge.tuneNativeSocket(nativeFd)
-                        logManager.net(
-                            "SocketCustomizer",
-                            "Применены TCP опции (fd=$nativeFd)"
-                        )
-                    }
-                } finally {
-                    pfd.close()
+            // P1 Fix (Проблема №15): Безусловное дублирование дескриптора сокета через системный вызов dup()
+            // на всех поддерживаемых версиях Android (API 28+).
+            // Это исключает закрытие оригинального сетевого сокета OkHttp в ядре Linux: pfd.close() внутри .use
+            // закрывает исключительно изолированный дубликат (декремент f_count в struct file ядра с 2 до 1),
+            // предотвращая спорадические сбои TLS 1.3 со статусом "Socket closed" или EBADF.
+            ParcelFileDescriptor.fromSocket(socket)?.dup()?.use { pfd ->
+                val nativeFd = pfd.fd
+                if (nativeFd >= 0) {
+                    nativeBridge.tuneNativeSocket(nativeFd)
+                    logManager.net(
+                        "SocketCustomizer",
+                        "Применены TCP опции (fd=$nativeFd)"
+                    )
                 }
             }
         }.onFailure {
