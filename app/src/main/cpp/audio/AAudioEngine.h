@@ -1,3 +1,4 @@
+
 #pragma once
 
 #include <aaudio/AAudio.h>
@@ -297,10 +298,8 @@ private:
     PolyphaseResampler24To16 captureResampler24To16_;
     // Problem #9: Dedicated anti-aliasing decimator for 44.1 kHz capture hardware
     Resampler44100To16000 captureResampler44100To16000_;
-
-    // Stateful causal 8 kHz -> 16 kHz interpolation across capture chunks.
-    int16_t lastCaptureSample8k_{0};
-    bool hasLastCaptureSample8k_{false};
+    // Problem #11: Dedicated continuous 8k -> 16k upsampler with causal anti-imaging filter
+    Upsampler8000To16000 captureUpsampler8To16_;
 };
 
 } // namespace client::audio
