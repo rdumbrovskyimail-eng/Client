@@ -28,9 +28,6 @@ import com.client.app.session.SessionState
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 
-// Оптимизированный высокопроизводительный AGSL-шейдер:
-// Замена тяжелого 8-точечного хэш-шума на аналитическую тригонометрическую деформацию поля
-// снижает нагрузку на Adreno GPU на два порядка, сохраняя стабильные 120 FPS без троттлинга.
 private const val AGSL_SHADER_SRC = """
 uniform shader u_Content;
 uniform float2 u_Resolution;
@@ -46,7 +43,6 @@ float mapSDF(float3 p) {
     float r = 0.70 + bassEnergy * 0.22;
     r += sin(u_Time * 2.2) * 0.015;
 
-    // Быстрая органическая деформация без сотен хэш-инструкций
     float3 s = sin(p * 2.1 + float3(0.0, u_Time * 0.75, 0.0));
     float3 c = cos(p.yzx * 3.8 - float3(u_Time * 1.1, 0.0, u_Time * 0.6));
     float n = (s.x * c.y + s.y * c.z + s.z * c.x) * 0.333;
@@ -109,7 +105,6 @@ half4 main(float2 fragCoord) {
     float3 rd = normalize(float3(uv, 1.25));
 
     float t = 0.0;
-    // Оптимизированный маршинг: 12 шагов
     for (int i = 0; i < 12; i++) {
         float3 p = ro + rd * t;
         float d = mapSDF(p);
@@ -271,11 +266,13 @@ private fun LegacyVoiceVisualizer(
         Canvas(
             Modifier.size(size)
         ) {
-            val centerX = size.width / 2f
-            val centerY = size.height / 2f
+            val canvasW = this.size.width
+            val canvasH = this.size.height
+            val centerX = canvasW / 2f
+            val centerY = canvasH / 2f
 
             val baseRadius =
-                minOf(size.width, size.height) * 0.31f
+                minOf(canvasW, canvasH) * 0.31f
 
             val pulseRadius =
                 baseRadius * (1f + animatedAmplitude * 0.28f)
@@ -297,8 +294,7 @@ private fun LegacyVoiceVisualizer(
                     centerY
                 ),
                 style = androidx.compose.ui.graphics.drawscope.Stroke(
-                    width =
-                        minOf(size.width, size.height) * 0.035f
+                    width = minOf(canvasW, canvasH) * 0.035f
                 )
             )
         }
