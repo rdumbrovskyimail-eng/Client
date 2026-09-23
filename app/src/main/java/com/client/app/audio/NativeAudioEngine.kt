@@ -197,7 +197,6 @@ class NativeAudioEngine @Inject constructor(
                 coroutineExceptionHandler
         )
 
-    // Выделенный физический поток захвата аудио с приоритетом ядра THREAD_PRIORITY_URGENT_AUDIO
     private val captureExecutor =
         Executors.newSingleThreadExecutor { runnable ->
             Thread(
@@ -1101,8 +1100,6 @@ class NativeAudioEngine @Inject constructor(
                         }
 
                     } else {
-                        // Адаптивная пауза, предотвращающая активный спинлок в потоке URGENT_AUDIO:
-                        // 5 мс при кратковременном ожидании, до 10 мс при пустом буфере (квант 160 сэмплов = 10 мс)
                         val pollDelayMs = if (++zeroReadStreak > 3) 10L else 5L
                         delay(pollDelayMs)
                     }
@@ -1548,46 +1545,75 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 
+    /**
+     * Адаптивное аппаратное ожидание полного проигрывания сэмплов из буферов ЦАП (Watchdog прогресса).
+     *
+     * Устраняет дефект жесткого тайм-аута в 2.5 с. Воспроизведение длится столько, сколько реально
+     * звучит сгенерированная речь (5, 15, 60+ секунд). Ожидание завершается неудачей ТОЛЬКО в случае,
+     * если сэмплы застряли и аппаратный ЦАП не забрал ни одного кадра за время [stallTimeoutMs].
+     */
     suspend fun awaitPlaybackDrained(
         generation: Long,
-        timeoutMs: Long = 2500L
-    ): Boolean =
-        withContext(Dispatchers.IO) {
-            val deadline =
-                SystemClock.elapsedRealtime() +
-                    timeoutMs.coerceAtLeast(0L)
+        stallTimeoutMs: Long = 1800L
+    ): Boolean = withContext(Dispatchers.IO) {
+        val sampleRate = bridge.getActualPlaybackSampleRate().let { if (it > 0) it else 48000 }
+        var lastPending = bridge.getPendingPlaybackFrames()
+        var lastProgressTime = SystemClock.elapsedRealtime()
+        val startTime = lastProgressTime
 
-            while (
-                SystemClock.elapsedRealtime() <
-                    deadline
-            ) {
-                if (
-                    generation !=
-                        currentPlaybackGeneration
-                ) {
-                    return@withContext true
-                }
+        // Расчётный динамический лимит с запасом на джиттер и ресемплинг
+        var maxAllowedDurationMs = (lastPending * 1000L / sampleRate) + 2500L
 
-                if (
-                    bridge.getPendingPlaybackFrames() == 0L
-                ) {
-                    delay(60L)
-
-                    if (
-                        generation ==
-                            currentPlaybackGeneration &&
-                        bridge.getPendingPlaybackFrames() == 0L
-                    ) {
-                        return@withContext true
-                    }
-                }
-
-                delay(10L)
+        while (isActive) {
+            if (generation != currentPlaybackGeneration) {
+                return@withContext true
             }
 
-            generation != currentPlaybackGeneration ||
-                bridge.getPendingPlaybackFrames() == 0L
+            val currentPending = bridge.getPendingPlaybackFrames()
+            val now = SystemClock.elapsedRealtime()
+
+            if (currentPending == 0L) {
+                // Выдерживаем защитную задержку опустошения DMA-буфера WCD9385
+                delay(80L)
+                if (generation == currentPlaybackGeneration && bridge.getPendingPlaybackFrames() == 0L) {
+                    return@withContext true
+                }
+                continue
+            }
+
+            if (currentPending < lastPending) {
+                // Кадры физически считываются ЦАП — прогресс есть
+                lastPending = currentPending
+                lastProgressTime = now
+
+                val remainingMs = (currentPending * 1000L / sampleRate) + 1500L
+                val projectedTotal = (now - startTime) + remainingMs
+                if (projectedTotal > maxAllowedDurationMs) {
+                    maxAllowedDurationMs = projectedTotal
+                }
+            } else if (currentPending > lastPending) {
+                // Новые кадры дописываются параллельно корутиной вычитки
+                lastPending = currentPending
+                lastProgressTime = now
+                maxAllowedDurationMs += ((currentPending - lastPending) * 1000L / sampleRate) + 500L
+            } else {
+                // Счётчик кадров замер без движения
+                if (now - lastProgressTime >= stallTimeoutMs) {
+                    logger.w("NativeAudioEngine: playback stalled for ${now - lastProgressTime} ms with $currentPending pending frames")
+                    return@withContext false
+                }
+            }
+
+            if (now - startTime > maxAllowedDurationMs) {
+                logger.w("NativeAudioEngine: playback exceeded dynamic maximum duration ($maxAllowedDurationMs ms)")
+                return@withContext false
+            }
+
+            delay(15L)
         }
+
+        generation != currentPlaybackGeneration || bridge.getPendingPlaybackFrames() == 0L
+    }
 
     fun setVolume(
         volume: Float
@@ -1686,7 +1712,6 @@ class NativeAudioEngine @Inject constructor(
                 offset += written
                 zeroWriteStreak = 0
             } else {
-                // Предотвращение бесконечного цикла зависания при переполнении/сбое ЦАП (макс 200 мс)
                 if (++zeroWriteStreak >= MAX_PLAYBACK_ZERO_WRITE_ATTEMPTS) {
                     logger.w("NativeAudioEngine: playback write stalled after 200ms; discarding frame to recover")
                     break
