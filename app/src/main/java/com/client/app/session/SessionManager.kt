@@ -642,6 +642,20 @@ class SessionManager @Inject constructor(
     }
 
     private suspend fun startInternal(resume: Boolean) {
+        // Защита от воскрешения протухшего токена: при чистом подключении (resume == false)
+        // токен возобновления принудительно обнуляется в памяти и не вычитывается из DataStore.
+        if (!resume) {
+            resumptionHandle = null
+        } else if (resumptionHandle.isNullOrBlank()) {
+            val prefs = dataStore.data.first()
+            val storedResumeHandle = decryptStoredValue(
+                prefs[KEY_SESSION_RESUMPTION_HANDLE]?.trim().orEmpty(),
+                "Live session resumption handle"
+            ).orEmpty()
+            if (storedResumeHandle.isNotBlank() && prefs[KEY_SESSION_RESUMPTION_ENABLED] != false) {
+                resumptionHandle = storedResumeHandle
+            }
+        }
         activeConnectUsedResumption = resume && (resumptionHandle?.isNotBlank() == true)
 
         synchronized(reconnectGuard) {
@@ -654,19 +668,6 @@ class SessionManager @Inject constructor(
         isManualActivityActive.set(false)
 
         val prefs = dataStore.data.first()
-        val storedResumeHandle = decryptStoredValue(
-            prefs[KEY_SESSION_RESUMPTION_HANDLE]?.trim().orEmpty(),
-            "Live session resumption handle"
-        ).orEmpty()
-        if (
-            resumptionHandle.isNullOrBlank() &&
-            storedResumeHandle.isNotBlank() &&
-            prefs[KEY_SESSION_RESUMPTION_ENABLED] != false
-        ) {
-            resumptionHandle = storedResumeHandle
-        }
-        activeConnectUsedResumption = resume && (resumptionHandle?.isNotBlank() == true)
-
         val encryptedApiKey = prefs[KEY_API]?.trim().orEmpty()
         val apiKeyResult = decryptStoredValue(
             encryptedApiKey,
@@ -1085,9 +1086,15 @@ class SessionManager @Inject constructor(
         pendingGoAway = false
     }
 
+    /**
+     * Планирование реконнекта. При [immediate] == true (сценарий отклонения устаревшего токена)
+     * экспоненциальная задержка сбрасывается в 0, так как сетевой канал исправен и требуется
+     * немедленно начать чистую сессию.
+     */
     private fun scheduleReconnect(
         reason: String,
-        sourceEpoch: Long = client.epoch
+        sourceEpoch: Long = client.epoch,
+        immediate: Boolean = false
     ) {
         if (!connectionDesired) return
 
@@ -1101,6 +1108,10 @@ class SessionManager @Inject constructor(
                 reconnectJob?.isActive == true
             ) {
                 return
+            }
+
+            if (immediate) {
+                reconnectAttempts = 0
             }
 
             if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
@@ -1157,7 +1168,7 @@ class SessionManager @Inject constructor(
                         ) {
                             return@launch
                         }
-                        ++reconnectAttempts
+                        if (immediate) 0 else ++reconnectAttempts
                     }
 
                     val stateAccepted = mutex.withLock {
@@ -1177,28 +1188,30 @@ class SessionManager @Inject constructor(
                     }
                     if (!stateAccepted) return@launch
 
-                    val baseDelay =
-                        minOf(
-                            400L *
-                                (
-                                    1L shl
-                                        (attempt - 1)
-                                            .coerceAtMost(4)
-                                ),
-                            6000L
-                        )
+                    if (!immediate) {
+                        val baseDelay =
+                            minOf(
+                                400L *
+                                    (
+                                        1L shl
+                                            (attempt - 1)
+                                                .coerceAtMost(4)
+                                    ),
+                                6000L
+                            )
 
-                    val jitteredDelay =
-                        (
-                            baseDelay *
-                                (
-                                    0.8 +
-                                        Math.random() *
-                                        0.4
-                                )
-                            ).toLong()
+                        val jitteredDelay =
+                            (
+                                baseDelay *
+                                    (
+                                        0.8 +
+                                            Math.random() *
+                                            0.4
+                                    )
+                                ).toLong()
 
-                    delay(jitteredDelay)
+                        delay(jitteredDelay)
+                    }
 
                     if (
                         token != reconnectToken.get() ||
@@ -1866,23 +1879,38 @@ class SessionManager @Inject constructor(
                                         )
 
                                 if (resumeRejected) {
+                                    logger.w(
+                                        "SessionManager: Сервер отклонил сессионный токен (${event.code}). Сбрасываем хэндл и переключаемся на чистую сессию."
+                                    )
                                     resumptionHandle = null
                                     activeConnectUsedResumption = false
-                                    resumptionPersistenceMutex.withLock {
-                                        dataStore.edit { prefs ->
-                                            prefs.remove(KEY_SESSION_RESUMPTION_HANDLE)
-                                            prefs.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                                    scope.launch {
+                                        resumptionPersistenceMutex.withLock {
+                                            dataStore.edit { prefs ->
+                                                prefs.remove(KEY_SESSION_RESUMPTION_HANDLE)
+                                                prefs.remove(KEY_SESSION_RESUMPTION_TIMESTAMP)
+                                            }
                                         }
                                     }
                                 }
 
-                                val authOrClientFatal =
+                                // Фатальными признаются:
+                                // 1. Ошибки авторизации (401) - неверный ключ
+                                // 2. Ошибки 400/403/404 ТОЛЬКО если подключение было чистым (без токена возобновления).
+                                // Если токен был отклонён, это НЕ фатальная ошибка, а сигнал к холодному старту.
+                                val authOrClientFatal = if (resumeRejected) {
+                                    false
+                                } else {
                                     event.code == 400 ||
-                                    event.code == 401 ||
-                                    event.code == 403 ||
-                                    event.code == 404
+                                        event.code == 401 ||
+                                        event.code == 403 ||
+                                        event.code == 404
+                                }
 
                                 if (authOrClientFatal) {
+                                    logger.e(
+                                        "SessionManager: Фатальная ошибка клиента (${event.code}). Остановка сессии."
+                                    )
                                     connectionDesired = false
                                     userMicDesired = false
                                     cancelReconnectWork()
@@ -1903,12 +1931,13 @@ class SessionManager @Inject constructor(
                                     scheduleReconnect(
                                         reason =
                                             if (resumeRejected) {
-                                                "resumption отклонён сервером (код ${event.code})"
+                                                "resumption отклонён сервером (код ${event.code}), запуск чистой сессии"
                                             } else {
                                                 "код ${event.code}"
                                             },
                                         sourceEpoch =
-                                            event.epoch
+                                            event.epoch,
+                                        immediate = resumeRejected
                                     )
                                 }
                             }
