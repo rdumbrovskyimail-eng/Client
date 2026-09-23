@@ -5,11 +5,12 @@
 #include <atomic>
 #include <cstdint>
 #include <array>
+#include <mutex>
 #include "audio/AudioConstants.h"
 
 namespace client::dsp {
 
-// E-03: Согласованный снимок полос БПФ и RMS с выравниванием по границе 16 байт
+// Согласованный снимок полос БПФ и RMS с выравниванием по границе 16 байт
 struct alignas(16) SpectrumSnapshot {
     float bands[audio::SPECTRUM_BANDS]{0.0f};
     float micRms{0.0f};
@@ -21,11 +22,10 @@ public:
     FastFft();
     ~FastFft() = default;
 
-    // ERR-09: Расчет спектра с учетом динамической частоты дискретизации sampleRate
+    // Расчет спектра с учетом динамической частоты дискретизации sampleRate
     void process(const float* pcmInput, size_t count, float micRms, float outRms, int32_t sampleRate = audio::SAMPLE_RATE_GEMINI_OUT);
 
-    // E-03, ERR-05: Ограниченное по числу попыток считывание когерентного среза из UI JNI.
-    // Стандарт C++ не гарантирует wait-free свойства для std::atomic<float>.
+    // Ограниченное по числу попыток считывание когерентного среза из UI JNI
     void getLatestSnapshot(SpectrumSnapshot& out) const;
 
 private:
@@ -33,10 +33,6 @@ private:
 
     float smoothedBands_[audio::SPECTRUM_BANDS]{0.0f};
 
-    // ERR-05 / concurrency fix:
-    // A snapshot is published with a sequence counter. The payload itself is
-    // stored as atomic scalar values, so concurrent readers do not form a C++
-    // data race with the writer while observing the snapshot.
     alignas(64)
     std::array<std::atomic<float>, audio::SPECTRUM_BANDS> snapshotBands_{};
 
@@ -46,8 +42,11 @@ private:
     // Even = stable snapshot, odd = writer is publishing.
     mutable std::atomic<uint32_t> snapshotSeq_{0};
 
-    // Last snapshot that passed the stability check. Used only on bounded
-    // fallback so callers never receive a mixed-epoch snapshot.
+    // Мьютекс для защиты fallback-снимка от состояния гонки (Data Race)
+    // между читающими потоками. Аудио-поток (process()) никогда не захватывает этот мьютекс.
+    mutable std::mutex fallbackMutex_;
+
+    // Последний снимок, прошедший проверку целостности Seqlock.
     mutable SpectrumSnapshot lastStableSnapshot_{};
 };
 
