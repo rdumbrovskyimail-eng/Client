@@ -289,7 +289,6 @@ object LiveModelCapabilitiesRegistry {
     }
 }
 
-
 data class LiveConfig(
     val apiKey: String,
     val model: String = "gemini-3.8-live",
@@ -391,9 +390,9 @@ class GeminiLiveClient @Inject constructor(
     suspend fun sendAudioStreamEnd() =
         protobufClient.sendAudioStreamEnd()
 
-    fun sendToolResponses(
+    suspend fun sendToolResponses(
         responses: List<ToolResponse>
-    ) =
+    ): Boolean =
         protobufClient.sendToolResponses(
             responses
         )
