@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/cpp/audio/AAudioEngine.cpp
 #include "AAudioEngine.h"
 #include "NativeLogQueue.h"
 #include "dsp/NeonDspUtils.h"
@@ -217,11 +216,12 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
     const aaudio_format_t actualInFormat = AAudioStream_getFormat(captureStream_);
     const int32_t actualInDeviceId = AAudioStream_getDeviceId(captureStream_);
 
+    // Problem #9: Explicitly allow 44100 Hz input hardware (USB microphones, external sound cards, etc.)
     if (AAudioStream_getDirection(captureStream_) != AAUDIO_DIRECTION_INPUT ||
         actualInFormat != AAUDIO_FORMAT_PCM_I16 ||
         (actualInChannels != 1 && actualInChannels != 2) ||
         (actualInRate != 8000 && actualInRate != 16000 && actualInRate != 24000 &&
-         actualInRate != 32000 && actualInRate != 48000)) {
+         actualInRate != 32000 && actualInRate != 44100 && actualInRate != 48000)) {
         LOGE("AAudio capture unsupported actual config: rate=%d, channels=%d, format=%d, device=%d",
              actualInRate, actualInChannels, static_cast<int>(actualInFormat), actualInDeviceId);
         closeCaptureStreamLocked();
@@ -285,6 +285,7 @@ bool AAudioEngine::initLocked(
         captureDecimator48To16_.reset();
         captureDecimator32To16_.reset();
         captureResampler24To16_.reset();
+        captureResampler44100To16000_.reset();
         lastCaptureSample8k_ = 0;
         hasLastCaptureSample8k_ = false;
         resetEarcon();
@@ -702,6 +703,7 @@ bool AAudioEngine::startCapture() {
     captureDecimator48To16_.reset();
     captureDecimator32To16_.reset();
     captureResampler24To16_.reset();
+    captureResampler44100To16000_.reset();
     lastCaptureSample8k_ = 0;
     hasLastCaptureSample8k_ = false;
 
@@ -720,6 +722,7 @@ bool AAudioEngine::startCapture() {
         captureDecimator48To16_.reset();
         captureDecimator32To16_.reset();
         captureResampler24To16_.reset();
+        captureResampler44100To16000_.reset();
         lastCaptureSample8k_ = 0;
         hasLastCaptureSample8k_ = false;
         isDisconnected_.store(true, std::memory_order_release);
@@ -744,6 +747,7 @@ bool AAudioEngine::startCapture() {
         captureDecimator48To16_.reset();
         captureDecimator32To16_.reset();
         captureResampler24To16_.reset();
+        captureResampler44100To16000_.reset();
         lastCaptureSample8k_ = 0;
         hasLastCaptureSample8k_ = false;
         isDisconnected_.store(true, std::memory_order_release);
@@ -775,6 +779,7 @@ bool AAudioEngine::startCapture() {
         captureDecimator48To16_.reset();
         captureDecimator32To16_.reset();
         captureResampler24To16_.reset();
+        captureResampler44100To16000_.reset();
         lastCaptureSample8k_ = 0;
         hasLastCaptureSample8k_ = false;
         isDisconnected_.store(true, std::memory_order_release);
@@ -910,6 +915,7 @@ void AAudioEngine::stopLocked() {
         captureDecimator48To16_.reset();
         captureDecimator32To16_.reset();
         captureResampler24To16_.reset();
+        captureResampler44100To16000_.reset();
         lastCaptureSample8k_ = 0;
         hasLastCaptureSample8k_ = false;
         resetEarcon();
@@ -976,9 +982,6 @@ void AAudioEngine::captureDspThreadLoop() {
                 captureDspWaitMutex_);
 
             // Problem #8: Event-driven wakeup with safety watchdog timeout.
-            // Eliminates the 500 Hz periodic timer poll (2 ms) that prevented CPU cores
-            // from entering deep C-states. Wakes up immediately upon notify_one() from
-            // captureCallback, with a 100 ms watchdog fallback for teardown and state checks.
             constexpr auto kCaptureDspWaitTimeout =
                 std::chrono::milliseconds(100);
 
@@ -1109,6 +1112,22 @@ void AAudioEngine::captureDspThreadLoop() {
 
             size_t processed =
                 captureDecimator48To16_.process(
+                    monoBuf,
+                    chunkFrames,
+                    decBuf,
+                    decimateScratchCap);
+
+            finalPcm = decBuf;
+            finalFrames = processed;
+
+        } else if (capRate == 44100) {
+
+            // Problem #9: Continuous fractional anti-aliasing decimation 44.1 kHz -> 16 kHz
+            int16_t* decBuf =
+                captureDecimateBuffer_.data();
+
+            size_t processed =
+                captureResampler44100To16000_.process(
                     monoBuf,
                     chunkFrames,
                     decBuf,
@@ -1319,8 +1338,6 @@ void AAudioEngine::playbackDspThreadLoop() {
                 std::memory_order_acquire);
 
         // Problem #7: Adaptive hardware-aware target buffer sizing.
-        // Derives safety margin from both ITU-T G.114 jitter guidelines (PLAYBACK_TARGET_BUFFER_MS = 140ms)
-        // and Google Oboe/Phil Burk hardware burst multiple requirements (PLAYBACK_BURST_MIN_MULTIPLIER = 8x burst).
         const size_t timeTargetFrames = static_cast<size_t>(
             static_cast<uint64_t>(actualRate) * PLAYBACK_TARGET_BUFFER_MS / 1000ULL);
 
@@ -2085,10 +2102,6 @@ AAudioEngine::captureCallback(
         written / ch;
 
     // Problem #8: Non-blocking event-driven wakeup for AudioCapWorker.
-    // Signals the consumer condition variable immediately upon committing new samples
-    // into the SPSC ring buffer without acquiring captureDspWaitMutex_.
-    // In Android Bionic libc this performs an O(1) non-blocking FUTEX_WAKE syscall (< 450 ns),
-    // strictly conforming to real-time audio callback safety rules.
     if (written > 0) {
         engine->captureDspCv_.notify_one();
     }
