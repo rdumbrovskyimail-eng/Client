@@ -67,8 +67,7 @@ void FastFft::process(
     int32_t sampleRate) {
 
     // A valid FFT block requires both a complete input buffer and enough
-    // samples for one N-point transform. Without the null check, a caller
-    // passing nullptr with count >= N would be dereferenced below.
+    // samples for one N-point transform.
     if (pcmInput == nullptr || count < N) {
         return;
     }
@@ -80,15 +79,23 @@ void FastFft::process(
     alignas(16) float real[N] = {0.0f};
     alignas(16) float imag[N] = {0.0f};
 
-    // Децимация входного PCM 2:1 при высоких частотах дискретизации (>= 44.1 кГц)
     int32_t effectiveSr = sampleRate;
     if (sampleRate >= 44100 && count >= N * 2) {
         effectiveSr = sampleRate / 2;
+        // 3-point anti-aliasing FIR filter [0.25, 0.5, 0.25] before 2:1 decimation
+        // to prevent high-frequency spectral components (> 11 kHz) from folding into low bins.
         for (size_t i = 0; i < N; ++i) {
             float hann = 0.5f * (1.0f - std::cos(2.0f * PI * i / (N - 1)));
-            real[i] = pcmInput[i * 2] * hann;
+            const size_t idx = i * 2;
+            const float prev = (idx > 0) ? pcmInput[idx - 1] : pcmInput[idx];
+            const float curr = pcmInput[idx];
+            const float next = (idx + 1 < count) ? pcmInput[idx + 1] : curr;
+            const float filtered = 0.25f * prev + 0.5f * curr + 0.25f * next;
+            real[i] = filtered * hann;
         }
     } else {
+        // Linear 1:1 indexing for native Gemini rates (e.g. 24 kHz or 16 kHz).
+        // Corrects previous copy-paste bug (i * 2) that caused heap buffer over-read.
         for (size_t i = 0; i < N; ++i) {
             float hann = 0.5f * (1.0f - std::cos(2.0f * PI * i / (N - 1)));
             real[i] = pcmInput[i] * hann;
@@ -97,7 +104,6 @@ void FastFft::process(
 
     computeFft(real, imag, N);
 
-    // Расчет бинов ведется строго от effectiveSr, предотвращая схлопывание Sub-Bass
     auto freqToBin = [effectiveSr](float freq) -> size_t {
         float binF = std::round((freq * static_cast<float>(N)) / static_cast<float>(effectiveSr));
         return static_cast<size_t>(std::clamp(binF, 1.0f, static_cast<float>(N / 2 - 1)));
@@ -146,8 +152,7 @@ void FastFft::process(
         }
     }
 
-    // Publish with a seqlock. The odd value means the writer owns the
-    // snapshot; the even value means a stable payload is available.
+    // Publish with a seqlock. Odd value = writer owns snapshot; even value = stable payload.
     snapshotSeq_.fetch_add(1, std::memory_order_acq_rel);
 
     for (size_t i = 0; i < audio::SPECTRUM_BANDS; ++i) {
@@ -197,13 +202,18 @@ void FastFft::getLatestSnapshot(SpectrumSnapshot& out) const {
             seq1 == seq2 &&
             (seq2 & 1u) == 0u
         ) {
-            lastStableSnapshot_ = candidate;
+            {
+                // Synchronize fallback snapshot mutation to eliminate C++ data races across reader threads.
+                std::lock_guard<std::mutex> lock(fallbackMutex_);
+                lastStableSnapshot_ = candidate;
+            }
             out = candidate;
             return;
         }
     }
 
-    // Bounded fallback: never assemble a potentially mixed-epoch snapshot.
+    // Bounded fallback: return last verified consistent snapshot under lock.
+    std::lock_guard<std::mutex> lock(fallbackMutex_);
     out = lastStableSnapshot_;
 }
 
