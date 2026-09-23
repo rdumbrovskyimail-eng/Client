@@ -2,6 +2,7 @@ package com.client.app.logging
 
 import android.content.Context
 import android.net.Uri
+import android.os.SystemClock
 import androidx.core.content.FileProvider
 import com.client.app.audio.NativeAudioBridge
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -72,7 +73,7 @@ class AppLogManager @Inject constructor(
     init {
         scope.launch {
             while (isActive) {
-                delay(100) // Keep UI/log snapshot churn bounded at <=10 Hz
+                delay(100) // Ограничение частоты обновления снимка логов UI до <= 10 Гц
                 drainNativeLogsSafely()
                 if (updateDebounce.getAndSet(0) > 0) {
                     publishSnapshot()
@@ -82,18 +83,21 @@ class AppLogManager @Inject constructor(
     }
 
     /**
-     * Выкачивает накопившиеся логи из Lock-Free очереди C++ ядра (NativeLogQueue) в память JVM
+     * Выкачивает накопившиеся логи из нативной очереди C++ ядра (NativeLogQueue) в память JVM.
+     * Обрабатывает 4 элемента на запись: [level, tag, message, timestampNs], восстанавливая
+     * точное наносекундное время события из CLOCK_MONOTONIC_RAW.
      */
     private fun drainNativeLogsSafely() {
         val bridge = runCatching { nativeBridgeProvider.get() }.getOrNull() ?: return
-        val rawTriplets = runCatching { bridge.drainNativeLogs() }.getOrNull() ?: return
-        if (rawTriplets.isEmpty()) return
+        val rawQuadruplets = runCatching { bridge.drainNativeLogs() }.getOrNull() ?: return
+        if (rawQuadruplets.isEmpty()) return
 
         var i = 0
-        while (i < rawTriplets.size - 2) {
-            val levelCode = rawTriplets[i].toIntOrNull() ?: 4
-            val tag = rawTriplets[i + 1]
-            val msg = rawTriplets[i + 2]
+        while (i < rawQuadruplets.size - 3) {
+            val levelCode = rawQuadruplets[i].toIntOrNull() ?: 4
+            val tag = rawQuadruplets[i + 1]
+            val msg = rawQuadruplets[i + 2]
+            val nativeTimestampNs = rawQuadruplets[i + 3].toLongOrNull() ?: 0L
 
             val level = when (levelCode) {
                 2 -> LogLevel.VERBOSE
@@ -110,8 +114,8 @@ class AppLogManager @Inject constructor(
                 _errorCount.update { it + 1 }
             }
 
-            internalLog(level, tag, msg, payload = null)
-            i += 3
+            internalLog(level, tag, msg, payload = null, nativeTimestampNs = nativeTimestampNs)
+            i += 4
         }
         updateDebounce.incrementAndGet()
     }
@@ -133,12 +137,26 @@ class AppLogManager @Inject constructor(
     fun vad(tag: String, msg: String, payload: String? = null) = log(LogLevel.VAD, tag, msg, payload)
 
     fun log(level: LogLevel, tag: String, message: String, payload: String? = null) {
-        internalLog(level, tag, message, payload)
+        internalLog(level, tag, message, payload, nativeTimestampNs = 0L)
         updateDebounce.incrementAndGet()
     }
 
-    private fun internalLog(level: LogLevel, tag: String, message: String, payload: String?) {
-        val now = System.currentTimeMillis()
+    private fun internalLog(
+        level: LogLevel,
+        tag: String,
+        message: String,
+        payload: String?,
+        nativeTimestampNs: Long
+    ) {
+        val now = if (nativeTimestampNs > 0L) {
+            // Преобразование нативного времени CLOCK_MONOTONIC_RAW к точному настенному времени (Wall Clock)
+            val currentMonoNs = SystemClock.elapsedRealtimeNanos()
+            val deltaMs = (currentMonoNs - nativeTimestampNs) / 1_000_000L
+            (System.currentTimeMillis() - deltaMs).coerceAtLeast(0L)
+        } else {
+            System.currentTimeMillis()
+        }
+
         val formattedTime = synchronized(timeFormat) { timeFormat.format(Date(now)) }
         val sanitizedMsg = sanitize(message).take(12_000)
         val sanitizedPayload = payload?.let { sanitize(it).take(16_000) }
