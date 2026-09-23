@@ -92,16 +92,11 @@ class NativeAudioEngine @Inject constructor(
         private const val BARGE_IN_DEBOUNCE_MS =
             500L
 
-        // AUD-068:
-        // Do not release the playback gate immediately on the same
-        // event loop tick as barge-in.
+        // Минимальное время удержания гейта перебивания (Barge-In)
         private const val BARGE_IN_MIN_HOLD_MS =
             250L
 
-        // Hard local recovery guarantee.
-        //
-        // This is an application-level safety invariant,
-        // not a claimed external standard value.
+        // Гарантированный предельный дедлайн локального восстановления
         private const val BARGE_IN_HARD_RECOVERY_MS =
             3000L
 
@@ -111,12 +106,12 @@ class NativeAudioEngine @Inject constructor(
         private const val PRE_ROLL_FRAMES_CAPACITY =
             20
 
-        // AUD-013:
-        // Bound queued capture memory without ever blocking the realtime
-        // capture producer on a slow Kotlin/network consumer. At 16 kHz
-        // mono PCM16 this is ~16 seconds of audio.
+        // Ограничение накопления необработанного захваченного аудио в памяти (~16 секунд 16 кГц PCM16)
         private const val MAX_MIC_OUTPUT_BACKLOG_BYTES =
             512L * 1024L
+
+        // Предельное число холостых попыток записи перед аварийным прерыванием цикла (50 * 4 мс = 200 мс)
+        private const val MAX_PLAYBACK_ZERO_WRITE_ATTEMPTS = 50
     }
 
     private val audioManager =
@@ -167,21 +162,12 @@ class NativeAudioEngine @Inject constructor(
         SharedFlow<Unit> =
         _bargeInEvents.asSharedFlow()
 
-    // Audio focus is authoritative state, not a disposable event stream.
-    // StateFlow therefore cannot silently drop the transition needed by the
-    // session lifecycle when collectors are briefly busy.
     private val _focusEvents =
         MutableStateFlow<AudioFocusEvent>(AudioFocusEvent.Gain)
     val focusEvents:
         StateFlow<AudioFocusEvent> =
         _focusEvents.asStateFlow()
 
-    // AUD-013 / ER-002:
-    // PCM backlog is bounded explicitly in bytes. The channel itself is
-    // unbounded so lifecycle control events never compete with a fixed
-    // element capacity. The byte budget below remains the memory ceiling for
-    // queued PCM buffers; only a bounded number of zero-byte control events
-    // can be outstanding.
     private val _micOutput =
         Channel<AudioStreamEvent>(
             Channel.UNLIMITED
@@ -211,9 +197,7 @@ class NativeAudioEngine @Inject constructor(
                 coroutineExceptionHandler
         )
 
-    // Capture work is realtime-sensitive and must not run on the shared
-    // Dispatchers.IO pool. The OS priority therefore belongs to this dedicated
-    // physical thread, not to a coroutine that may migrate between pool threads.
+    // Выделенный физический поток захвата аудио с приоритетом ядра THREAD_PRIORITY_URGENT_AUDIO
     private val captureExecutor =
         Executors.newSingleThreadExecutor { runnable ->
             Thread(
@@ -245,56 +229,35 @@ class NativeAudioEngine @Inject constructor(
     private var healthJob:
         Job? = null
 
-    // Identifies the currently active capture loop. Failure cleanup checks
-    // this token so an old loop can never stop a newer capture session.
     private val captureInstanceId =
         AtomicLong(0L)
 
     private val audioLifecycleMutex =
         Mutex()
 
-    // Serializes capture-event publication with capture-generation invalidation
-    // and draining. This prevents stale workers from winning a check/send race.
     private val captureEventLock =
         Any()
 
     private val captureDirectMutex =
         Mutex()
 
-    // Serializes all playback-affecting native operations and the
-    // generation/flush transaction. ReentrantLock is required because
-    // invalidateAndFlushPlayback() is intentionally non-suspending.
     private val playbackOperationLock =
         ReentrantLock()
 
-    // Route transitions are latest-state semantics. Intermediate hardware
-    // events do not carry independent work that must all execute; only the
-    // newest requested route matters. This also makes trySend() non-dropping
-    // while the channel is open.
     private val routeTransitionChannel =
         Channel<RouteTransitionRequest>(
             Channel.CONFLATED
         )
 
-    // Internal route lifecycle generation. This is deliberately separate from
-    // playbackGeneration: route transitions and playback invalidation are two
-    // independent synchronization domains.
     private val engineGeneration =
         AtomicLong(0)
 
-    // P0-09/P0-10: the single authoritative playback-generation owner.
-    // The native flush is performed before this value is published, so there is
-    // no Kotlin-visible "new generation" window during which old native audio
-    // can still be considered current.
     private val playbackGeneration =
         AtomicLong(1L)
 
     private val playbackStartGeneration =
         AtomicLong(0L)
 
-    // Logical lifecycle intent is distinct from the physical StateFlows.
-    // Recovery can therefore retry a failed stream reopen without reporting
-    // a false hardware-active state to callers.
     private val playbackDesired = AtomicBoolean(false)
     private val captureDesired = AtomicBoolean(false)
 
@@ -357,8 +320,6 @@ class NativeAudioEngine @Inject constructor(
     private var lastBargeInMs =
         0L
 
-    // AUD-068:
-    // This state is owned only by NativeAudioEngine.
     @Volatile
     var isBargeInActive = false
         private set
@@ -507,22 +468,6 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    /**
-     * Compatibility entry point for legacy callers. New lifecycle code must
-     * use startPlayback() and startCapture() independently.
-     */
-    suspend fun start(): Boolean {
-        if (!startPlayback()) return false
-        if (startCapture()) return true
-        stop()
-        return false
-    }
-
-    /**
-     * Starts the playback side without opening/starting microphone capture.
-     * SessionManager uses this while a Live session is connecting or idle at
-     * the microphone level.
-     */
     private fun logActualNativeRoute(profile: RouteProfile, context: String) {
         val actualIn = bridge.getActiveInputDeviceId()
         val actualOut = bridge.getActiveOutputDeviceId()
@@ -546,6 +491,13 @@ class NativeAudioEngine @Inject constructor(
         logger.d(
             "NativeAudioEngine: actual native route ($context): in=$actualIn out=$actualOut playRate=${actualPlayRate}Hz ch=$actualPlayChannels fmt=$actualPlayFormat exclusive=$exclusive mmap=$mmap"
         )
+    }
+
+    suspend fun start(): Boolean {
+        if (!startPlayback()) return false
+        if (startCapture()) return true
+        stop()
+        return false
     }
 
     suspend fun startPlayback(): Boolean =
@@ -619,13 +571,10 @@ class NativeAudioEngine @Inject constructor(
                 logActualNativeRoute(profile, "startPlayback")
 
                 vadDetector.setThresholds(
-                            profile.vadThresholdStart,
-                            profile.vadThresholdEnd
-                        )
+                    profile.vadThresholdStart,
+                    profile.vadThresholdEnd
+                )
 
-                // Establish the current native playback epoch before the first
-                // callback can consume application audio. No generation is
-                // incremented here; this is only initial physical alignment.
                 captureDirectMutex.withLock {
                     playbackOperationLock.lock()
                     try {
@@ -670,10 +619,6 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 
-    /**
-     * Starts only microphone capture. Playback owns the initialized audio
-     * route and remains untouched by this operation.
-     */
     suspend fun startCapture(): Boolean =
         audioLifecycleMutex.withLock {
             withContext(Dispatchers.IO) {
@@ -722,9 +667,9 @@ class NativeAudioEngine @Inject constructor(
                 val profile =
                     router.currentProfile.value
                 vadDetector.setThresholds(
-                            profile.vadThresholdStart,
-                            profile.vadThresholdEnd
-                        )
+                    profile.vadThresholdStart,
+                    profile.vadThresholdEnd
+                )
 
                 synchronized(captureEventLock) {
                     streamStopGeneration = -1L
@@ -764,8 +709,9 @@ class NativeAudioEngine @Inject constructor(
             captureJob =
                 engineScope.launch(captureDispatcher) {
 
-                var isSpeechActiveManual =
-                    false
+                var isSpeechActiveManual = false
+                var zeroReadStreak = 0
+
                 try {
                     while (
                         isActive &&
@@ -794,11 +740,8 @@ class NativeAudioEngine @Inject constructor(
                         }
 
                     if (bytesRead > 0) {
+                        zeroReadStreak = 0
 
-                        // A route/lifecycle transition can invalidate this
-                        // read while the native call is returning. Drop the
-                        // stale frame instead of publishing it into the next
-                        // capture generation.
                         if (
                             captureInstanceId.get() != instanceId ||
                             !captureDesired.get() ||
@@ -832,7 +775,6 @@ class NativeAudioEngine @Inject constructor(
                                 )
                             }
 
-                        // Monotonic clock for intervals.
                         val now =
                             SystemClock
                                 .elapsedRealtime()
@@ -1159,8 +1101,10 @@ class NativeAudioEngine @Inject constructor(
                         }
 
                     } else {
-
-                        delay(2)
+                        // Адаптивная пауза, предотвращающая активный спинлок в потоке URGENT_AUDIO:
+                        // 5 мс при кратковременном ожидании, до 10 мс при пустом буфере (квант 160 сэмплов = 10 мс)
+                        val pollDelayMs = if (++zeroReadStreak > 3) 10L else 5L
+                        delay(pollDelayMs)
                     }
                 }
             } catch (t: Throwable) {
@@ -1216,8 +1160,6 @@ class NativeAudioEngine @Inject constructor(
                         5
                     )
 
-                    // AtomicReference is published with a defensive copy so
-                    // readers never observe the mutable working buffer.
                     spectrumUniforms.set(spectrumUniformUpdate.copyOf())
                     if (
                         tick++ % 4 == 0
@@ -1300,9 +1242,6 @@ class NativeAudioEngine @Inject constructor(
                 val keepCapturing = captureDesired.get()
                 if (!keepPlaying && !keepCapturing) return@withContext
 
-                // A route change destroys the native capture stream. Quiesce the
-                // Kotlin capture reader first so it cannot touch a stream that
-                // the native side is about to close.
                 if (keepCapturing) {
                     _isCapturing.value = false
                     synchronized(captureEventLock) {
@@ -1314,10 +1253,6 @@ class NativeAudioEngine @Inject constructor(
                         oldCaptureJob.cancel()
                     }
 
-                    // Stop the physical capture before waiting on the Kotlin
-                    // worker. captureDirectMutex excludes an in-flight JNI
-                    // read; generation invalidation prevents a new read from
-                    // the old lifecycle.
                     captureDirectMutex.withLock {
                         bridge.stopCaptureAudio()
                     }
@@ -1428,27 +1363,6 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 
-    private suspend fun cancelAndJoinBounded(
-        job: Job,
-        timeoutMs: Long
-    ): Boolean {
-        if (job.isCompleted) {
-            return true
-        }
-
-        job.cancel()
-
-        return withTimeoutOrNull(
-            timeoutMs
-        ) {
-
-            job.join()
-
-            true
-
-        } ?: false
-    }
-
     private suspend fun enqueueStreamStopOnce(
         generation: Long,
         expectedCaptureInstanceId: Long? = null
@@ -1492,10 +1406,6 @@ class NativeAudioEngine @Inject constructor(
                         job.cancel()
                     }
 
-                    // The native AAudio stream is a separate resource owned by
-                    // AAudioEngine. captureDirectMutex excludes an in-flight
-                    // JNI ring-buffer read; it is not necessary to wait for the
-                    // Kotlin coroutine before requesting native stop.
                     captureDirectMutex.withLock {
                         bridge.stopCaptureAudio()
                     }
@@ -1580,11 +1490,6 @@ class NativeAudioEngine @Inject constructor(
                 }
                 healthJob = null
 
-                // Physical native teardown is mandatory even if the Kotlin
-                // capture worker misses its join deadline. The direct-read
-                // mutex excludes the JNI read; the capture generation has
-                // already been invalidated, so the old worker cannot publish
-                // or start another read for this lifecycle.
                 captureDirectMutex.withLock {
                     playbackOperationLock.lock()
                     try {
@@ -1643,12 +1548,6 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 
-    /**
-     * Waits until application-side playback queues no longer contain frames
-     * belonging to the supplied generation. A small quiet period is used to
-     * cover the asynchronous AAudio/DAC tail after the application buffers
-     * reach zero.
-     */
     suspend fun awaitPlaybackDrained(
         generation: Long,
         timeoutMs: Long = 2500L
@@ -1710,10 +1609,6 @@ class NativeAudioEngine @Inject constructor(
             )
         )
 
-    // P0-09/P0-10: one owner, one transition operation.
-    // The generation change and the physical native flush are serialized with
-    // every other playback-affecting native operation. The new generation is
-    // published only after native flush returns.
     fun invalidateAndFlushPlayback(reason: String = ""): Long {
         playbackOperationLock.lock()
         try {
@@ -1735,9 +1630,6 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    // AUD-005.5 + AUD-068
-    //
-    // Playback may only consume the currently authoritative generation.
     suspend fun enqueuePlayback(
         pcm: ByteArray,
         generation: Long
@@ -1767,9 +1659,8 @@ class NativeAudioEngine @Inject constructor(
         }
 
         var offset = 0
-
-        val total =
-            pcm.size
+        val total = pcm.size
+        var zeroWriteStreak = 0
 
         while (
             offset < total &&
@@ -1792,11 +1683,14 @@ class NativeAudioEngine @Inject constructor(
                 )
 
             if (written > 0) {
-
                 offset += written
-
+                zeroWriteStreak = 0
             } else {
-
+                // Предотвращение бесконечного цикла зависания при переполнении/сбое ЦАП (макс 200 мс)
+                if (++zeroWriteStreak >= MAX_PLAYBACK_ZERO_WRITE_ATTEMPTS) {
+                    logger.w("NativeAudioEngine: playback write stalled after 200ms; discarding frame to recover")
+                    break
+                }
                 delay(4)
             }
         }
@@ -1806,16 +1700,6 @@ class NativeAudioEngine @Inject constructor(
         bridge.triggerBargeInEarcon()
     }
 
-    // AUD-068:
-    //
-    // Local barge-in is a temporary gate.
-    //
-    // It has:
-    //   1. minimum hold;
-    //   2. local VAD release;
-    //   3. hard local recovery deadline.
-    //
-    // It does NOT depend solely on a server Interrupted event.
     private fun activateBargeIn(
         now: Long
     ) {
@@ -1904,15 +1788,9 @@ class NativeAudioEngine @Inject constructor(
                     releaseCapturedBuffer(event.pcm)
                 }
             }
-            // Do not blindly reset queuedMicOutputBytes here. A consumer may
-            // already own a dequeued Audio event and will decrement the same
-            // counter when it releases that buffer. Keeping the atomic count
-            // exact prevents a late release from cancelling against a newer
-            // buffer and under-reporting the real backlog.
         }
     }
 
-    /** Drops any capture events left after a consumer-side shutdown. */
     fun drainPendingMicOutput() {
         drainMicOutput()
     }
@@ -1994,9 +1872,6 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    // Called by the single consumer after it has finished sending one PCM
-    // frame downstream. This is the ownership hand-off point for pooled
-    // capture buffers.
     fun releaseCapturedBuffer(
         pcm: ByteArray
     ) {
@@ -2041,4 +1916,3 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 }
-
