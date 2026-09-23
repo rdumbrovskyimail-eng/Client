@@ -4,8 +4,7 @@ package com.client.app.api
 import android.os.ParcelFileDescriptor
 import com.client.app.audio.NativeAudioBridge
 import com.client.app.logging.AppLogManager
-import java.io.FileDescriptor
-import java.lang.reflect.Field
+import android.os.Build
 import java.net.InetAddress
 import java.net.Socket
 import javax.net.SocketFactory
@@ -27,65 +26,39 @@ class TunedSocketFactory(
     private fun configure(socket: Socket): Socket {
         runCatching {
             socket.tcpNoDelay = true
-            val fd = extractUnderlyingFileDescriptor(socket)
-            if (fd != null && fd.valid()) {
-                val nativeFd = getNativeFdInt(fd)
-                if (nativeFd > 0) {
-                    nativeBridge.tuneNativeSocket(nativeFd)
-                    logManager.net("SocketCustomizer", "Успешно применены опции TCP_NOTSENT_LOWAT & TCP_NODELAY (fd=$nativeFd)")
+
+            // Use the public Android bridge to the socket descriptor.
+            // Android restricts non-SDK reflection, so do not inspect SocketImpl
+            // or FileDescriptor internals directly. On API < 29 the documented
+            // compatibility pattern is fromSocket(socket).dup().
+            val pfd =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    ParcelFileDescriptor.fromSocket(socket)
                 } else {
-                    runCatching {
-                        ParcelFileDescriptor.dup(fd).use { pfd ->
-                            val dupFd = pfd.fd
-                            if (dupFd > 0) {
-                                nativeBridge.tuneNativeSocket(dupFd)
-                                logManager.net("SocketCustomizer", "Применены TCP опции через dupFd=$dupFd")
-                            }
-                        }
+                    ParcelFileDescriptor.fromSocket(socket)?.dup()
+                }
+
+            if (pfd != null) {
+                try {
+                    val nativeFd = pfd.fd
+                    if (nativeFd >= 0) {
+                        nativeBridge.tuneNativeSocket(nativeFd)
+                        logManager.net(
+                            "SocketCustomizer",
+                            "Применены TCP опции (fd=$nativeFd)"
+                        )
                     }
+                } finally {
+                    pfd.close()
                 }
             }
         }.onFailure {
-            logManager.w("SocketCustomizer", "Сбой конфигурации TCP опций: ${it.message}")
+            logManager.w(
+                "SocketCustomizer",
+                "Сбой конфигурации TCP опций: ${it.message}"
+            )
         }
         return socket
     }
-
-    private fun extractUnderlyingFileDescriptor(target: Any?): FileDescriptor? {
-        if (target == null) return null
-        var current: Any = target
-        for (i in 0..5) {
-            if (current is FileDescriptor) return current
-            if (current is Socket) {
-                val impl = getFieldValue(current, "impl")
-                if (impl != null) { current = impl; continue }
-            }
-            val fd = getFieldValue(current, "fd")
-            if (fd is FileDescriptor) return fd
-            val socket = getFieldValue(current, "socket") ?: break
-            current = socket
-        }
-        return null
-    }
-
-    private fun getFieldValue(obj: Any, fieldName: String): Any? {
-        var clazz: Class<*>? = obj.javaClass
-        while (clazz != null && clazz != Any::class.java) {
-            runCatching {
-                val field: Field = clazz!!.getDeclaredField(fieldName)
-                field.isAccessible = true
-                return field.get(obj)
-            }
-            clazz = clazz.superclass
-        }
-        return null
-    }
-
-    private fun getNativeFdInt(fd: FileDescriptor): Int {
-        return runCatching {
-            val descriptorField = FileDescriptor::class.java.getDeclaredField("descriptor")
-            descriptorField.isAccessible = true
-            descriptorField.getInt(fd)
-        }.getOrElse { -1 }
-    }
 }
+
