@@ -60,23 +60,28 @@ fun ClientScreen(
     }
 
     fun handleConnectClick() {
-        val missing = mutableListOf<String>()
+        val requiredMissing = mutableListOf<String>()
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            missing.add(Manifest.permission.RECORD_AUDIO)
+            requiredMissing.add(Manifest.permission.RECORD_AUDIO)
         }
+
+        val optionalMissing = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            missing.add(Manifest.permission.POST_NOTIFICATIONS)
+            optionalMissing.add(Manifest.permission.POST_NOTIFICATIONS)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-            missing.add(Manifest.permission.BLUETOOTH_CONNECT)
+            optionalMissing.add(Manifest.permission.BLUETOOTH_CONNECT)
         }
 
-        if (missing.isEmpty()) {
+        if (requiredMissing.isEmpty()) {
             viewModel.toggleConnection()
+            if (optionalMissing.isNotEmpty()) {
+                permissionsLauncher.launch(optionalMissing.toTypedArray())
+            }
         } else {
-            permissionsLauncher.launch(missing.toTypedArray())
+            permissionsLauncher.launch((requiredMissing + optionalMissing).toTypedArray())
         }
     }
 
@@ -203,10 +208,12 @@ fun ClientScreen(
                     state = state,
                     onClick = {
                         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                            if (!state.isConnected && !state.isConnecting) {
-                                viewModel.toggleConnection()
-                            } else {
+                            if (state.isConnected) {
+                                // Если сессия активна — переключаем микрофон
                                 viewModel.toggleMic()
+                            } else {
+                                // Если сессия отключена или находится в процессе подключения — управляем подключением (включая отмену)
+                                viewModel.toggleConnection()
                             }
                         } else {
                             handleConnectClick()
@@ -217,13 +224,13 @@ fun ClientScreen(
 
                 Spacer(Modifier.height(24.dp))
 
-                // Элегантная текстовая подсказка статуса
+                // Текстовая подсказка статуса
                 Text(
                     text = when {
                         state.error != null -> state.error.orEmpty()
                         state.isAiSpeaking -> "Ассистент говорит..."
-                        state.link == LinkState.CONNECTING -> "Подключение..."
-                        state.link == LinkState.RECONNECTING -> "Восстановление связи..."
+                        state.link == LinkState.CONNECTING -> "Подключение... (нажмите для отмены)"
+                        state.link == LinkState.RECONNECTING -> "Восстановление связи... (нажмите для отмены)"
                         state.isMicActive -> "Слушаю вас..."
                         state.isConnected -> "Микрофон на паузе (нажмите на сферу)"
                         else -> "Нажмите на сферу для запуска"
