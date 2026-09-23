@@ -110,8 +110,9 @@ class NativeAudioEngine @Inject constructor(
         private const val MAX_MIC_OUTPUT_BACKLOG_BYTES =
             512L * 1024L
 
-        // Предельное число холостых попыток записи перед аварийным прерыванием цикла (50 * 4 мс = 200 мс)
-        private const val MAX_PLAYBACK_ZERO_WRITE_ATTEMPTS = 50
+        // Предельный аппаратный порог замирания записи JNI в ЦАП (1.8 секунды).
+        // Предотвращает выбрасывание сэмплов длинных ответов при быстром сетевом наполнении буфера.
+        private const val PLAYBACK_WRITE_STALL_TIMEOUT_MS = 1800L
     }
 
     private val audioManager =
@@ -1561,7 +1562,6 @@ class NativeAudioEngine @Inject constructor(
         var lastProgressTime = SystemClock.elapsedRealtime()
         val startTime = lastProgressTime
 
-        // Расчётный динамический лимит с запасом на джиттер и ресемплинг
         var maxAllowedDurationMs = (lastPending * 1000L / sampleRate) + 2500L
 
         while (isActive) {
@@ -1573,7 +1573,6 @@ class NativeAudioEngine @Inject constructor(
             val now = SystemClock.elapsedRealtime()
 
             if (currentPending == 0L) {
-                // Выдерживаем защитную задержку опустошения DMA-буфера WCD9385
                 delay(80L)
                 if (generation == currentPlaybackGeneration && bridge.getPendingPlaybackFrames() == 0L) {
                     return@withContext true
@@ -1582,7 +1581,6 @@ class NativeAudioEngine @Inject constructor(
             }
 
             if (currentPending < lastPending) {
-                // Кадры физически считываются ЦАП — прогресс есть
                 lastPending = currentPending
                 lastProgressTime = now
 
@@ -1592,12 +1590,10 @@ class NativeAudioEngine @Inject constructor(
                     maxAllowedDurationMs = projectedTotal
                 }
             } else if (currentPending > lastPending) {
-                // Новые кадры дописываются параллельно корутиной вычитки
                 lastPending = currentPending
                 lastProgressTime = now
                 maxAllowedDurationMs += ((currentPending - lastPending) * 1000L / sampleRate) + 500L
             } else {
-                // Счётчик кадров замер без движения
                 if (now - lastProgressTime >= stallTimeoutMs) {
                     logger.w("NativeAudioEngine: playback stalled for ${now - lastProgressTime} ms with $currentPending pending frames")
                     return@withContext false
@@ -1656,6 +1652,13 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
+    /**
+     * Потоковая передача PCM фрейма в C++ SPSC кольцевой буфер с честным Backpressure.
+     *
+     * Устраняет дефект выбрасывания аудиокадров через 200 мс. Если C++ буфер временно полон
+     * из-за быстрого сетевого прихода пакетов, корутина ждёт освобождения места.
+     * Отказ и прерывание записи происходят только при реальной остановке ЦАПа более чем на 1.8 с.
+     */
     suspend fun enqueuePlayback(
         pcm: ByteArray,
         generation: Long
@@ -1686,7 +1689,7 @@ class NativeAudioEngine @Inject constructor(
 
         var offset = 0
         val total = pcm.size
-        var zeroWriteStreak = 0
+        var lastSuccessfulWriteMs = SystemClock.elapsedRealtime()
 
         while (
             offset < total &&
@@ -1708,12 +1711,18 @@ class NativeAudioEngine @Inject constructor(
                     generation
                 )
 
+            val now = SystemClock.elapsedRealtime()
+
             if (written > 0) {
                 offset += written
-                zeroWriteStreak = 0
+                lastSuccessfulWriteMs = now
             } else {
-                if (++zeroWriteStreak >= MAX_PLAYBACK_ZERO_WRITE_ATTEMPTS) {
-                    logger.w("NativeAudioEngine: playback write stalled after 200ms; discarding frame to recover")
+                // Нативный C++ буфер временно заполнен.
+                // Применяем честное противодавление (Non-Destructive Suspend Backpressure).
+                if (now - lastSuccessfulWriteMs >= PLAYBACK_WRITE_STALL_TIMEOUT_MS) {
+                    logger.w(
+                        "NativeAudioEngine: playback write stalled for ${now - lastSuccessfulWriteMs} ms; aborting stuck frame"
+                    )
                     break
                 }
                 delay(4)
