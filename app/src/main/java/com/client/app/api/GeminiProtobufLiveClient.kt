@@ -355,6 +355,13 @@ class GeminiProtobufLiveClient @Inject constructor(
     val audio: ReceiveChannel<AudioFrame> =
         _audio
 
+    /**
+     * Позволяет SessionManager проверить, остались ли в транспортном канале
+     * невычитанные кадры входящего аудио перед началом аппаратного дренажа.
+     */
+    val hasPendingAudioFrames: Boolean
+        get() = !_audio.isEmpty
+
     @Volatile
     var isReady: Boolean = false
         private set
@@ -404,9 +411,6 @@ class GeminiProtobufLiveClient @Inject constructor(
             ).isSuccess
 
             if (!accepted) {
-                // With Channel.UNLIMITED this can only be a closed-channel
-                // lifecycle race, not a capacity condition. Do not tear down a
-                // healthy WebSocket because an in-memory event queue filled up.
                 logManager.w(
                     "GeminiLive:EventQueue",
                     "Control event rejected because the event channel is closed"
@@ -474,15 +478,8 @@ class GeminiProtobufLiveClient @Inject constructor(
         beforeOpen: (suspend () -> Unit)? = null
     ) = wsMutex.withLock {
 
-        // Reject an impossible compression union before touching the current
-        // live session. A bad new configuration must not tear down a healthy
-        // existing connection.
         validateCompressionConfig(cfg)
 
-        // closeInternal() advances the session epoch before closing the old
-        // socket. Old callbacks therefore become stale before the new socket
-        // is exposed to the rest of the app. Playback generation is managed
-        // by NativeAudioEngine as the single authoritative owner.
         closeInternal()
 
         val newSessionId = sessionIdGen.incrementAndGet()
@@ -496,8 +493,6 @@ class GeminiProtobufLiveClient @Inject constructor(
             activeConfig = cfg
         }
 
-        // beforeOpen observes the new logical session identity and flushes the
-        // physical audio state before the new socket is allowed to receive audio.
         beforeOpen?.invoke()
 
         synchronized(sessionStateLock) {
@@ -561,9 +556,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                                 return
                             }
 
-                            // Publish the socket before sending setup so a very
-                            // fast setupComplete response cannot race with
-                            // connect()'s return path and be mistaken for stale.
                             webSocket = ws
                             protocolPhase = ProtocolPhase.CONNECTING
                         }
@@ -809,10 +801,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         scope.launch {
             try {
                 while (true) {
-                    // Keep the bounded pre-ready queue fully bounded: do not
-                    // dequeue the first command until setupComplete has been
-                    // observed. With a 32-command channel and 40 ms PCM batches
-                    // this is a deterministic ~1.28 s pre-ready ceiling.
                     if (!awaitWriterReady(ws, writerEpoch)) {
                         break
                     }
@@ -828,8 +816,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                         break
                     }
 
-                    // The ready/epoch conditions may have changed while we
-                    // waited for OkHttp's queue to drain.
                     if (
                         writerEpoch != epoch ||
                         !isReady ||
@@ -967,8 +953,6 @@ class GeminiProtobufLiveClient @Inject constructor(
             } finally {
                 channel.close()
 
-                // Never clear a newer writer that may already have replaced
-                // this one after reconnect.
                 synchronized(sessionStateLock) {
                     if (audioWriterChannel === channel) {
                         audioWriterChannel = null
@@ -1022,9 +1006,6 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     private val outboundSendLock = Any()
 
-    // Serializes only command enqueue operations. It is never held while the
-    // writer waits for OkHttp capacity or performs a network call, so direct
-    // text/image sends cannot create mutex-based HOL blocking.
     private val outboundCommandMutex = Mutex()
 
     private fun stopAudioWriter(
@@ -1051,9 +1032,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
     }
 
-    // AUD-067 / ER-046 / ER-048:
-    // All realtime producers enqueue into one FIFO. The enqueue mutex orders
-    // the logical operations, but no network wait is performed while it is held.
     suspend fun sendAudioPcm(
         pcm: ByteArray
     ) {
@@ -1087,12 +1065,10 @@ class GeminiProtobufLiveClient @Inject constructor(
             try {
                 target.first.send(AudioOutboundCommand.Pcm(target.second))
             } catch (_: ClosedSendChannelException) {
-                // Normal reconnect/close race.
             }
         }
     }
 
-    // Tail PCM is queued before AudioStreamEnd in the same ordered channel.
     suspend fun sendAudioStreamEnd() {
         outboundCommandMutex.withLock {
             val pending = synchronized(batchLock) {
@@ -1126,7 +1102,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                 }
                 pending.first.send(AudioOutboundCommand.AudioStreamEnd)
             } catch (_: ClosedSendChannelException) {
-                // Normal reconnect/close race.
             }
         }
     }
@@ -1153,7 +1128,6 @@ class GeminiProtobufLiveClient @Inject constructor(
             try {
                 channel.send(AudioOutboundCommand.DirectJson(jsonMessage))
             } catch (_: ClosedSendChannelException) {
-                // Normal reconnect/close race.
             }
         }
     }
@@ -1202,8 +1176,6 @@ class GeminiProtobufLiveClient @Inject constructor(
             Triple(epoch, currentWs, currentChannel)
         } ?: return
 
-        // Video is optional and may be shed when the OkHttp outbound queue is
-        // congested. Voice/control commands remain in the ordered channel.
         if (target.second.queueSize() > MAX_QUEUE_BYTES) {
             logManager.w(
                 "WebSocket:TxImage",
@@ -1235,9 +1207,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         )
     }
 
-    // Manual VAD activity markers are serialized with buffered PCM. Most
-    // importantly, ActivityStart no longer destroys the pre-roll already staged
-    // in audioBatchBuffer; it is emitted immediately after the marker.
     suspend fun sendActivityStart() {
         outboundCommandMutex.withLock {
             val pending = synchronized(batchLock) {
@@ -1269,7 +1238,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                     pending.first.send(AudioOutboundCommand.Pcm(it))
                 }
             } catch (_: ClosedSendChannelException) {
-                // Normal reconnect/close race.
             }
         }
     }
@@ -1305,7 +1273,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                 }
                 pending.first.send(AudioOutboundCommand.ActivityEnd)
             } catch (_: ClosedSendChannelException) {
-                // Normal reconnect/close race.
             }
         }
     }
@@ -1513,9 +1480,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                     "${it.name}(id=${it.id}, sched=${it.scheduling?.name ?: "NONE"})"
                 }
 
-            // The cancellation-membership check and the send happen under the
-            // same session lock. A ToolCallCancellation event therefore cannot
-            // land between "still active" and ws.send().
             accepted =
                 synchronized(outboundSendLock) {
                     sendEpoch == epoch &&
@@ -1553,10 +1517,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         require(target >= 0) {
             "contextWindowCompression.slidingWindow.targetTokens must be >= 0"
         }
-        // The wire schema is a oneof. Legacy/local settings may contain both
-        // values; that should be normalized rather than crash a healthy session.
-        // The build path gives slidingWindow.targetTokens precedence because it
-        // is the more specific retention target.
     }
 
     private fun normalizeToolsForModel(
@@ -1812,7 +1772,6 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                         putJsonObject("contextWindowCompression") {
                             when {
-                                // Oneof normalization: never emit both union members.
                                 target > 0 -> {
                                     putJsonObject("slidingWindow") {
                                         put("targetTokens", target)
@@ -1822,8 +1781,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                                     put("triggerTokens", trigger)
                                 }
                                 else -> {
-                                    // Empty slidingWindow enables compression using
-                                    // the documented server defaults.
                                     putJsonObject("slidingWindow") {}
                                 }
                             }
@@ -2002,7 +1959,6 @@ class GeminiProtobufLiveClient @Inject constructor(
             ?.get("parts")
             ?.jsonArray
 
-        // Keep a strict one-to-one positional mapping with modelTurn.parts.
         val decodedPcmParts = modelParts?.map { partEl ->
             val inline = partEl.jsonObject["inlineData"]?.jsonObject
                 ?: return@map null
@@ -2101,10 +2057,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                 emitControl(GeminiEvent.GoAway(timeLeft?.coerceAtLeast(0L)))
             }
 
-            // Gemini Live places toolCallCancellation at the top level of the
-            // server message, alongside toolCall/serverContent. Record the
-            // cancellation before the SessionManager can observe the event so
-            // sendToolResponses() has an immediate protocol-side send barrier.
             root["toolCallCancellation"]?.jsonObject?.get("ids")?.jsonArray
                 ?.mapNotNull { it.jsonPrimitive.contentOrNull }
                 ?.takeIf { it.isNotEmpty() }
@@ -2115,10 +2067,6 @@ class GeminiProtobufLiveClient @Inject constructor(
 
             val sc = root["serverContent"]?.jsonObject
 
-            // The current wire format exposes interactionStatus in the
-            // serverContent object. Some current Live API examples also show
-            // it alongside a top-level toolCall. Accept both forms without
-            // treating the top-level form as the canonical serverContent field.
             val interactionStatusElement =
                 sc?.get("interactionStatus")
                     ?: sc?.get("interaction_status")
@@ -2138,9 +2086,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                     emitControl(GeminiEvent.InteractionStatus(status))
                 }
 
-            // toolCall is a top-level server-message union member, not a
-            // child of serverContent. Parse it independently so a pure
-            // tool-call frame is never discarded.
             root["toolCall"]?.jsonObject?.get("functionCalls")?.jsonArray
                 ?.mapNotNull { fcEl ->
                     val fc = fcEl.jsonObject
@@ -2254,8 +2199,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         val newEpoch: Long
 
         synchronized(sessionStateLock) {
-            // One atomic lifecycle boundary: invalidate the identity, detach
-            // the socket, and drain stale queues before releasing the lock.
             ws = webSocket
             newEpoch = epochGen.incrementAndGet()
             epoch = newEpoch
@@ -2283,12 +2226,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                 }
             }
-
-            // Do not reset either global ownership counter here. A consumer may
-            // already have received an old frame/event and can execute its
-            // release/decrement after this close transaction. Preserving the
-            // outstanding ownership count prevents that late release from
-            // decrementing capacity belonging to the next session.
         }
 
         synchronized(batchLock) {
