@@ -84,7 +84,7 @@ private:
 };
 
 /**
- * ИСПРАВЛЕННЫЙ Дециматор 3:1 (48 кГц -> 16 кГц) для микрофонного тракта.
+ * Дециматор 3:1 (48 кГц -> 16 кГц) для микрофонного тракта.
  * Исключает замирание микрофона: кольцевой аккумулятор phase_ строго в пределах [0..2].
  * Устраняет поднормальное переполнение size_t и гарантирует непрерывную отдачу фреймов в VAD.
  */
@@ -111,10 +111,6 @@ public:
             return 0;
         }
 
-        // The method returns only the number of output frames and therefore
-        // cannot report a partially consumed input block. Reject insufficient
-        // output capacity up front so phase/history always describe the whole
-        // input block that was consumed by this call.
         size_t requiredOut = 0;
         switch (phase_) {
             case 0:
@@ -156,9 +152,6 @@ public:
             phase_ = (phase_ + 1) % 3;
         }
 
-        // Full-input history update is safe because insufficient output
-        // capacity was rejected before any input was consumed.
-        // Обновление истории без выхода за границы буфера.
         if (inFrames >= TAPS) {
             std::memcpy(history_, in + inFrames - TAPS, TAPS * sizeof(int16_t));
         } else {
@@ -179,13 +172,9 @@ private:
  *
  * The filter is a 95-tap linear-phase low-pass designed for a 7 kHz
  * passband and 8.5 kHz stopband at the 32 kHz input rate. Coefficients are
- * stored in Q30 with unity DC gain. The implementation uses the filter
- * symmetry and a contiguous history/work buffer, so the inner convolution
- * contains no per-tap boundary branch and performs 48 MACs per produced
- * sample. State survives process() chunk boundaries.
- *
- * The first real input sample primes the history so a constant input starts
- * without an artificial zero-state transient.
+ * stored in Q30 with unity DC gain. The implementation uses filter
+ * symmetry and a contiguous history/work buffer. State survives process()
+ * chunk boundaries.
  */
 class Decimator32To16 {
 public:
@@ -219,9 +208,6 @@ public:
             (inFrames / 2) +
             ((phase_ == 0 && (inFrames & 1u) != 0u) ? 1u : 0u);
 
-        // Never partially consume an input block when the caller did not
-        // provide enough output capacity; otherwise phase/history would no
-        // longer describe the samples actually consumed.
         if (requiredOut > maxOutFrames) {
             return 0;
         }
@@ -281,7 +267,6 @@ public:
                 if (phase_ == 0) {
                     int64_t acc = 0;
 
-                    // Symmetric 95-tap FIR: 47 mirrored pairs + center.
                     for (size_t k = 0; k < HALF_TAPS; ++k) {
                         const int32_t pair =
                             static_cast<int32_t>(workBuffer_[idx - k]) +
@@ -343,16 +328,13 @@ private:
 /**
  * 2x half-band FIR interpolator, 24 kHz -> 48 kHz.
  *
- * The public class name is retained for source/API compatibility with the
- * existing AAudioEngine. The implementation is deliberately no longer a
- * look-ahead cubic interpolator: a linear-phase half-band filter gives an
- * exactly 2:1 sample count, deterministic chunk boundaries, and no EOS
- * flush dependency. The 127-tap design has a 12 kHz half-band transition and
- * strong image rejection above the source Nyquist region.
+ * Linear-phase half-band filter providing deterministic 2:1 sample production
+ * and image rejection above the 12 kHz Nyquist boundary.
  *
- * Polyphase form uses 64 even-phase coefficients and one non-zero odd-phase
- * center coefficient. The history is primed with the first real sample, so
- * constant input has no artificial zero-state startup transient.
+ * The polyphase representation splits the 127 taps into:
+ *   - Even branch: 64 symmetric taps acting on input samples (delay 31.5 input samples)
+ *   - Odd branch: single center tap h[63] = 1.0 Q30 (delayed by 31 input samples)
+ * Both branches yield identical group delay of 63 output samples.
  */
 class HalfbandResampler24To48 {
 public:
@@ -410,7 +392,6 @@ public:
             135307, -76308, 37855, -12983
         };
 
-
         while (processed < inFrames) {
             const size_t chunk =
                 std::min(inFrames - processed, CHUNK_SIZE);
@@ -444,7 +425,6 @@ public:
                         ? (evenAcc + (1LL << 29)) >> 30
                         : -(((-evenAcc) + (1LL << 29)) >> 30);
 
-                // h[63] = 1.0 Q30; all other odd taps are exactly zero.
                 const int16_t oddSample =
                     workBuffer_[idx - (HISTORY / 2)];
 
@@ -486,12 +466,9 @@ private:
 };
 
 /**
- * Stateful linear streaming resampler for the generic playback path.
+ * Stateful linear streaming resampler for generic playback paths.
  *
- * The source clock is represented as one continuous fractional position,
- * so a non-integer conversion ratio does not restart at zero at every chunk.
- * This is intentionally simple and allocation-free; the fixed 24->16 and
- * 24->48 paths above remain the higher-quality production filters.
+ * Fractional clock accumulator maintains phase across chunk boundaries without allocation.
  */
 class StreamingLinearResampler {
 public:
@@ -535,9 +512,6 @@ public:
             static_cast<double>(inputRate_) /
             static_cast<double>(outputRate_);
 
-        // Local logical source sequence. When history exists, element 0 is
-        // the previous chunk's final sample and element 1 is in[0].
-        // phase_ is normalized to [0, 1); no absolute frame counter exists.
         const bool hadPreviousSample = hasPreviousSample_;
         const size_t logicalSize =
             inFrames + (hadPreviousSample ? 1u : 0u);
@@ -551,76 +525,3 @@ public:
 
             const size_t localIndex =
                 hadPreviousSample
-                    ? logicalIndex - 1u
-                    : logicalIndex;
-
-            if (localIndex >= inFrames) {
-                return static_cast<int32_t>(in[inFrames - 1u]);
-            }
-
-            return static_cast<int32_t>(in[localIndex]);
-        };
-
-        while (outCount < maxOutFrames) {
-            if (sourceIndex_ + 1u >= logicalSize) {
-                break;
-            }
-
-            const int32_t s0 = sampleAt(sourceIndex_);
-            const int32_t s1 = sampleAt(sourceIndex_ + 1u);
-
-            const double interpolated =
-                static_cast<double>(s0) +
-                (static_cast<double>(s1) -
-                 static_cast<double>(s0)) *
-                    phase_;
-
-            const long rounded = std::lround(interpolated);
-
-            out[outCount++] =
-                static_cast<int16_t>(
-                    std::clamp<long>(rounded, -32768L, 32767L));
-
-            // Split source advance into integer cursor motion plus a
-            // normalized fractional phase. For supported audio sample rates
-            // the integer component is safely representable by size_t.
-            const double advancedPhase = phase_ + step;
-            const double wholePart = std::floor(advancedPhase);
-            const size_t wholeFrames = static_cast<size_t>(wholePart);
-
-            phase_ = advancedPhase - wholePart;
-            sourceIndex_ += wholeFrames;
-        }
-
-        previousSample_ = in[inFrames - 1u];
-        hasPreviousSample_ = true;
-
-        // Rebase the local cursor around the newly retained history sample.
-        // A caller is expected to provide enough output capacity for the
-        // complete converted chunk (the production playback path does so).
-        const size_t historyShift =
-            hadPreviousSample ? inFrames : (inFrames - 1u);
-
-        if (sourceIndex_ >= historyShift) {
-            sourceIndex_ -= historyShift;
-        } else {
-            // Defensive recovery for a violated output-capacity contract.
-            // Avoid unsigned underflow or corrupted state; the next chunk
-            // starts cleanly at its history boundary.
-            sourceIndex_ = 0;
-            phase_ = 0.0;
-        }
-
-        return outCount;
-    }
-
-private:
-    int32_t inputRate_{0};
-    int32_t outputRate_{0};
-    size_t sourceIndex_{0};
-    double phase_{0.0};
-    int16_t previousSample_{0};
-    bool hasPreviousSample_{false};
-};
-
-} // namespace client::audio
