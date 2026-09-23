@@ -128,6 +128,16 @@ Java_com_client_app_audio_NativeAudioBridge_getPendingPlaybackFrames(
     );
 }
 
+extern "C" JNIEXPORT jfloat JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getOutRms(JNIEnv * /* env */, jobject /* this */) {
+    return AAudioEngine::getInstance().getOutRms();
+}
+
+extern "C" JNIEXPORT jfloat JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getMicRms(JNIEnv * /* env */, jobject /* this */) {
+    return AAudioEngine::getInstance().getMicRms();
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_client_app_audio_NativeAudioBridge_isMmapActive(JNIEnv * /* env */, jobject /* this */) {
     return static_cast<jboolean>(AAudioEngine::getInstance().isMmapActive());
@@ -173,7 +183,7 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
 
     if (!byteArray || offset < 0 || length <= 0) return 0;
     if (generation <= 0) return 0;
-    if ((length & 1) != 0) return 0; // Защита от нечётного количества байт PCM16
+    if ((length & 1) != 0) return 0;
     const jsize arrayLen = env->GetArrayLength(byteArray);
     if (arrayLen < 0) return 0;
 
@@ -192,7 +202,6 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     if (playbackJniBuffer.size() < frames) {
         playbackJniBuffer.resize(frames);
     }
-    // Освобождение избыточной ёмкости TLS буфера после аномально больших всплесков
     if (playbackJniBuffer.capacity() > MAX_PERSISTENT_FRAMES && frames <= MAX_PERSISTENT_FRAMES) {
         playbackJniBuffer.shrink_to_fit();
     }
@@ -213,7 +222,7 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackDirect(
 
     if (!byteBuffer || offsetBytes < 0 || lengthBytes <= 0) return 0;
     if (generation <= 0) return 0;
-    if ((lengthBytes & 1) != 0) return 0; // Защита от нечётного количества байт PCM16
+    if ((lengthBytes & 1) != 0) return 0;
     if ((offsetBytes & 1) != 0) return 0;
 
     const jlong capacity =
@@ -332,7 +341,6 @@ Java_com_client_app_audio_NativeAudioBridge_drainNativeLogs(JNIEnv *env, jobject
     jclass stringClass = env->FindClass("java/lang/String");
     if (!stringClass) return nullptr;
 
-    // 4 элемента на запись: [level, tag, message, timestampNs]
     const jsize totalElements = static_cast<jsize>(drained.size() * 4);
     jobjectArray resultArray = env->NewObjectArray(totalElements, stringClass, nullptr);
     if (!resultArray) {
