@@ -167,7 +167,6 @@ Java_com_client_app_audio_NativeAudioBridge_setMicGain(
     AAudioEngine::getInstance().setMicGain(static_cast<float>(gain));
 }
 
-// AUD-005.6: jlong generation обязателен + проверка чётности байт PCM16
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     JNIEnv *env, jobject /* this */, jbyteArray byteArray, jint offset, jint length, jlong generation) {
@@ -178,7 +177,6 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     const jsize arrayLen = env->GetArrayLength(byteArray);
     if (arrayLen < 0) return 0;
 
-    // Do the range check in jlong so offset + length cannot overflow jint.
     const jlong endOffset =
         static_cast<jlong>(offset) +
         static_cast<jlong>(length);
@@ -189,9 +187,14 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     const size_t frames =
         static_cast<size_t>(length) / sizeof(int16_t);
 
+    constexpr size_t MAX_PERSISTENT_FRAMES = 8192;
     thread_local std::vector<int16_t> playbackJniBuffer;
     if (playbackJniBuffer.size() < frames) {
-        playbackJniBuffer.resize(frames * 2);
+        playbackJniBuffer.resize(frames);
+    }
+    // Освобождение избыточной ёмкости TLS буфера после аномально больших всплесков
+    if (playbackJniBuffer.capacity() > MAX_PERSISTENT_FRAMES && frames <= MAX_PERSISTENT_FRAMES) {
+        playbackJniBuffer.shrink_to_fit();
     }
 
     env->GetByteArrayRegion(
@@ -204,7 +207,6 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     return static_cast<jint>(writtenFrames * sizeof(int16_t));
 }
 
-// AUD-005.6: jlong generation обязателен + проверка чётности байт PCM16
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackDirect(
     JNIEnv *env, jobject /* this */, jobject byteBuffer, jint offsetBytes, jint lengthBytes, jlong generation) {
@@ -261,7 +263,6 @@ Java_com_client_app_audio_NativeAudioBridge_readCaptureDirect(
     return static_cast<jint>(readFrames * sizeof(int16_t));
 }
 
-// AUD-005.6: jlong generation обязателен
 extern "C" JNIEXPORT void JNICALL
 Java_com_client_app_audio_NativeAudioBridge_flushPlayback(
     JNIEnv * /* env */, jobject /* this */, jlong generation) {
@@ -331,7 +332,8 @@ Java_com_client_app_audio_NativeAudioBridge_drainNativeLogs(JNIEnv *env, jobject
     jclass stringClass = env->FindClass("java/lang/String");
     if (!stringClass) return nullptr;
 
-    const jsize totalElements = static_cast<jsize>(drained.size() * 3);
+    // 4 элемента на запись: [level, tag, message, timestampNs]
+    const jsize totalElements = static_cast<jsize>(drained.size() * 4);
     jobjectArray resultArray = env->NewObjectArray(totalElements, stringClass, nullptr);
     if (!resultArray) {
         env->DeleteLocalRef(stringClass);
@@ -342,15 +344,18 @@ Java_com_client_app_audio_NativeAudioBridge_drainNativeLogs(JNIEnv *env, jobject
         jstring jLevel = env->NewStringUTF(std::to_string(drained[i].level).c_str());
         jstring jTag = env->NewStringUTF(drained[i].tag);
         jstring jMsg = env->NewStringUTF(drained[i].message);
+        jstring jTime = env->NewStringUTF(std::to_string(drained[i].timestampNs).c_str());
 
-        const jsize baseIdx = static_cast<jsize>(i * 3);
+        const jsize baseIdx = static_cast<jsize>(i * 4);
         env->SetObjectArrayElement(resultArray, baseIdx + 0, jLevel);
         env->SetObjectArrayElement(resultArray, baseIdx + 1, jTag);
         env->SetObjectArrayElement(resultArray, baseIdx + 2, jMsg);
+        env->SetObjectArrayElement(resultArray, baseIdx + 3, jTime);
 
         env->DeleteLocalRef(jLevel);
         env->DeleteLocalRef(jTag);
         env->DeleteLocalRef(jMsg);
+        env->DeleteLocalRef(jTime);
     }
 
     env->DeleteLocalRef(stringClass);
