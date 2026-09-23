@@ -29,7 +29,14 @@ public:
     void getLatestSnapshot(SpectrumSnapshot& out) const;
 
 private:
-    void computeFft(float* real, float* imag, size_t n);
+    void computeFft(float* real, float* imag);
+
+    // Problem #12: Precomputed lookup tables for real-time FFT execution.
+    // Aligned to 16 bytes for direct vectorization via ARM NEON (vmulq_f32).
+    alignas(16) float hannWindow_[audio::FFT_SIZE]{0.0f};
+    alignas(16) float twiddleR_[audio::FFT_SIZE / 2]{0.0f};
+    alignas(16) float twiddleI_[audio::FFT_SIZE / 2]{0.0f};
+    uint16_t bitRev_[audio::FFT_SIZE]{0};
 
     float smoothedBands_[audio::SPECTRUM_BANDS]{0.0f};
 
