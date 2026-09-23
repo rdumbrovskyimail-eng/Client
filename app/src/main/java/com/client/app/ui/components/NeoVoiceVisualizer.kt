@@ -87,14 +87,17 @@ fun NeoVoiceVisualizer(
         Canvas(
             modifier = Modifier.size(size)
         ) {
+            val canvasW = this.size.width
+            val canvasH = this.size.height
+
             val center = Offset(
-                size.width / 2f,
-                size.height / 2f
+                canvasW / 2f,
+                canvasH / 2f
             )
 
             val baseRadius = minOf(
-                size.width,
-                size.height
+                canvasW,
+                canvasH
             ) * 0.30f
 
             val radius = baseRadius * (
@@ -113,8 +116,8 @@ fun NeoVoiceVisualizer(
                 center = center,
                 style = Stroke(
                     width = minOf(
-                        size.width,
-                        size.height
+                        canvasW,
+                        canvasH
                     ) * 0.035f
                 )
             )
