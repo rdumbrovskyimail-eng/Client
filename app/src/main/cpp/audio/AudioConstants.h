@@ -44,6 +44,12 @@ constexpr size_t PLAYBACK_TARGET_BUFFER_MS = 140;
 // ensures buffer holds at least 8 hardware burst periods regardless of hardware quantization.
 constexpr size_t PLAYBACK_BURST_MIN_MULTIPLIER = 8;
 
+// Problem #10: Playback DSP worker reset acknowledgment watchdog timeout (milliseconds).
+// Extended from fragile 100 ms to 600 ms based on NASA software safety margin (3x worst-case)
+// and Google SRE tail-latency guidelines, absorbing Android ART Generational CC GC pauses,
+// CFS thread preemption, and mutex contention without falsely killing healthy AAudio streams.
+constexpr size_t PLAYBACK_DSP_RESET_TIMEOUT_MS = 600;
+
 // Resampling/decimation scratch capacities (zero-allocation processing)
 constexpr size_t RESAMPLE_SCRATCH_CAPACITY = 131072;     // 262 KiB scratch space
 constexpr size_t CAPTURE_DECIMATE_CAPACITY = 32768;      // 64 KiB decimator scratch space
