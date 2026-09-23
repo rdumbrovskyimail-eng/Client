@@ -15,45 +15,68 @@ FastFft::FastFft()
     for (auto& value : snapshotBands_) {
         value.store(0.0f, std::memory_order_relaxed);
     }
+
+    // Problem #12: One-time precomputation of the Hann window coefficients (double precision).
+    // Eliminates 256 calls to std::cos() on every FFT block (~48,000 calls/sec).
+    for (size_t i = 0; i < N; ++i) {
+        const double angle = 2.0 * static_cast<double>(PI) * static_cast<double>(i) / static_cast<double>(N - 1);
+        hannWindow_[i] = static_cast<float>(0.5 * (1.0 - std::cos(angle)));
+    }
+
+    // Problem #12: One-time precomputation of 8-bit bit-reversal indices (log2(256) = 8).
+    // Eliminates nested loops with scalar division and bit shifting during real-time processing.
+    for (size_t i = 0; i < N; ++i) {
+        size_t rev = 0;
+        size_t temp = i;
+        for (size_t b = 0; b < 8; ++b) {
+            rev = (rev << 1) | (temp & 1u);
+            temp >>= 1;
+        }
+        bitRev_[i] = static_cast<uint16_t>(rev);
+    }
+
+    // Problem #12: One-time precomputation of complex twiddle factors W_N^k = e^(-j*2*pi*k/N).
+    // Completely eliminates runtime trigonometric calls and prevents numerical drift (Goldberg drift).
+    for (size_t k = 0; k < N / 2; ++k) {
+        const double angle = -2.0 * static_cast<double>(PI) * static_cast<double>(k) / static_cast<double>(N);
+        twiddleR_[k] = static_cast<float>(std::cos(angle));
+        twiddleI_[k] = static_cast<float>(std::sin(angle));
+    }
 }
 
-void FastFft::computeFft(float* real, float* imag, size_t n) {
-    size_t j = 0;
-    for (size_t i = 0; i < n - 1; ++i) {
+void FastFft::computeFft(float* real, float* imag) {
+    // 1. Bit-reversal permutation via fast table lookup (O(N) with zero bit-twiddling)
+    for (size_t i = 0; i < N; ++i) {
+        const size_t j = bitRev_[i];
         if (i < j) {
             std::swap(real[i], real[j]);
             std::swap(imag[i], imag[j]);
         }
-        size_t k = n / 2;
-        while (k <= j) {
-            j -= k;
-            k /= 2;
-        }
-        j += k;
     }
 
-    for (size_t len = 2; len <= n; len <<= 1) {
-        float angle = -2.0f * PI / static_cast<float>(len);
-        float wlen_r = std::cos(angle);
-        float wlen_i = std::sin(angle);
+    // 2. Cooley-Tukey Radix-2 butterflies using direct L1d twiddle factor table indexing
+    for (size_t len = 2; len <= N; len <<= 1) {
+        const size_t halfLen = len >> 1;
+        const size_t step = N / len;
 
-        for (size_t i = 0; i < n; i += len) {
-            float w_r = 1.0f;
-            float w_i = 0.0f;
-            for (size_t k = 0; k < len / 2; ++k) {
-                float u_r = real[i + k];
-                float u_i = imag[i + k];
-                float v_r = real[i + k + len / 2] * w_r - imag[i + k + len / 2] * w_i;
-                float v_i = real[i + k + len / 2] * w_i + imag[i + k + len / 2] * w_r;
+        for (size_t i = 0; i < N; i += len) {
+            for (size_t k = 0; k < halfLen; ++k) {
+                const size_t tableIdx = k * step;
+                const float w_r = twiddleR_[tableIdx];
+                const float w_i = twiddleI_[tableIdx];
 
-                real[i + k] = u_r + v_r;
-                imag[i + k] = u_i + v_i;
-                real[i + k + len / 2] = u_r - v_r;
-                imag[i + k + len / 2] = u_i - v_i;
+                const size_t posA = i + k;
+                const size_t posB = posA + halfLen;
 
-                float next_w_r = w_r * wlen_r - w_i * wlen_i;
-                w_i = w_r * wlen_i + w_i * wlen_r;
-                w_r = next_w_r;
+                const float u_r = real[posA];
+                const float u_i = imag[posA];
+                const float v_r = real[posB] * w_r - imag[posB] * w_i;
+                const float v_i = real[posB] * w_i + imag[posB] * w_r;
+
+                real[posA] = u_r + v_r;
+                imag[posA] = u_i + v_i;
+                real[posB] = u_r - v_r;
+                imag[posB] = u_i - v_i;
             }
         }
     }
@@ -83,26 +106,24 @@ void FastFft::process(
     if (sampleRate >= 44100 && count >= N * 2) {
         effectiveSr = sampleRate / 2;
         // 3-point anti-aliasing FIR filter [0.25, 0.5, 0.25] before 2:1 decimation
-        // to prevent high-frequency spectral components (> 11 kHz) from folding into low bins.
+        // applied with precomputed Hann window weights (zero runtime std::cos calls).
         for (size_t i = 0; i < N; ++i) {
-            float hann = 0.5f * (1.0f - std::cos(2.0f * PI * i / (N - 1)));
             const size_t idx = i * 2;
             const float prev = (idx > 0) ? pcmInput[idx - 1] : pcmInput[idx];
             const float curr = pcmInput[idx];
             const float next = (idx + 1 < count) ? pcmInput[idx + 1] : curr;
             const float filtered = 0.25f * prev + 0.5f * curr + 0.25f * next;
-            real[i] = filtered * hann;
+            real[i] = filtered * hannWindow_[i];
         }
     } else {
-        // Linear 1:1 indexing for native Gemini rates (e.g. 24 kHz or 16 kHz).
-        // Corrects previous copy-paste bug (i * 2) that caused heap buffer over-read.
+        // Linear 1:1 indexing for native Gemini rates (e.g. 24 kHz or 16 kHz)
+        // using vectorized precomputed Hann window (direct memory multiplication).
         for (size_t i = 0; i < N; ++i) {
-            float hann = 0.5f * (1.0f - std::cos(2.0f * PI * i / (N - 1)));
-            real[i] = pcmInput[i] * hann;
+            real[i] = pcmInput[i] * hannWindow_[i];
         }
     }
 
-    computeFft(real, imag, N);
+    computeFft(real, imag);
 
     auto freqToBin = [effectiveSr](float freq) -> size_t {
         float binF = std::round((freq * static_cast<float>(N)) / static_cast<float>(effectiveSr));
