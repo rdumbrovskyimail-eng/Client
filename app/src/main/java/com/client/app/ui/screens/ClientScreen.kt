@@ -3,19 +3,24 @@ package com.client.app.ui.screens
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
+import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -33,6 +38,9 @@ import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.client.app.R
+import com.client.app.api.ClientRole
+import com.client.app.session.ChatMessage
+import com.client.app.session.ForvoWord
 import com.client.app.session.LinkState
 import com.client.app.ui.components.AgslVoiceVisualizer
 import com.client.app.viewmodel.ClientViewModel
@@ -49,6 +57,15 @@ fun ClientScreen(
     val context = LocalContext.current
 
     var isSheetOpen by remember { mutableStateOf(false) }
+    var inputText by remember { mutableStateOf("") }
+    val selectedUris = remember { mutableStateListOf<Uri>() }
+
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetMultipleContents()
+    ) { uris ->
+        selectedUris.clear()
+        selectedUris.addAll(uris)
+    }
 
     val permissionsLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -85,6 +102,13 @@ fun ClientScreen(
         }
     }
 
+    val listState = rememberLazyListState()
+    LaunchedEffect(state.messages.size) {
+        if (state.messages.isNotEmpty()) {
+            listState.animateScrollToItem(state.messages.lastIndex)
+        }
+    }
+
     Scaffold(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         containerColor = Color(0xFF09090B),
@@ -96,7 +120,6 @@ fun ClientScreen(
                     .padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Кнопка настроек
                 IconButton(
                     onClick = onNavigateSettings,
                     modifier = Modifier
@@ -115,7 +138,6 @@ fun ClientScreen(
 
                 Spacer(Modifier.width(8.dp))
 
-                // Кнопка перехода в системный логгер с индикатором ошибок
                 IconButton(
                     onClick = onNavigateLogs,
                     modifier = Modifier
@@ -146,7 +168,6 @@ fun ClientScreen(
 
                 Spacer(Modifier.width(8.dp))
 
-                // Селектор системной роли ассистента
                 Row(
                     modifier = Modifier
                         .weight(1f)
@@ -172,7 +193,6 @@ fun ClientScreen(
 
                 Spacer(Modifier.width(8.dp))
 
-                // Кнопка подключения / завершения сессии
                 IconButton(
                     onClick = { handleConnectClick() },
                     modifier = Modifier
@@ -189,61 +209,231 @@ fun ClientScreen(
                     )
                 }
             }
+        },
+        bottomBar = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .windowInsetsPadding(WindowInsets.ime)
+                    .background(Color(0xFF09090B))
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
+            ) {
+                // Горизонтальный список слов Forvo
+                if (state.forvoWords.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        state.forvoWords.forEach { item ->
+                            ForvoWordChip(
+                                word = item,
+                                onClick = { viewModel.playForvo(item) }
+                            )
+                        }
+                    }
+                }
+
+                // Список выбранных файлов перед отправкой
+                if (selectedUris.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(bottom = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        selectedUris.forEachIndexed { index, uri ->
+                            SuggestionChip(
+                                onClick = { selectedUris.removeAt(index) },
+                                label = {
+                                    Text(
+                                        uri.lastPathSegment ?: "файл",
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        fontSize = 11.sp
+                                    )
+                                },
+                                trailingIcon = {
+                                    Icon(Icons.Filled.Close, null, modifier = Modifier.size(14.dp))
+                                }
+                            )
+                        }
+                    }
+                }
+
+                // Строка ввода, кнопка вложений и микрофон
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(
+                        onClick = { filePickerLauncher.launch("*/*") },
+                        modifier = Modifier
+                            .size(42.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFF18181B))
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.AttachFile,
+                            contentDescription = stringResource(R.string.attach_file),
+                            tint = if (selectedUris.isNotEmpty()) Color(0xFF60A5FA) else Color(0xFFA1A1AA),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
+                    Spacer(Modifier.width(8.dp))
+
+                    OutlinedTextField(
+                        value = inputText,
+                        onValueChange = { inputText = it },
+                        placeholder = { Text(stringResource(R.string.prompt_hint), color = Color(0xFF71717A), fontSize = 13.sp) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 44.dp, max = 110.dp),
+                        shape = RoundedCornerShape(22.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Color(0xFF60A5FA),
+                            unfocusedBorderColor = Color(0xFF27272A),
+                            focusedContainerColor = Color(0xFF141416),
+                            unfocusedContainerColor = Color(0xFF141416),
+                            focusedTextColor = Color(0xFFFAFAFA),
+                            unfocusedTextColor = Color(0xFFFAFAFA)
+                        ),
+                        maxLines = 4
+                    )
+
+                    Spacer(Modifier.width(8.dp))
+
+                    if (inputText.isNotBlank() || selectedUris.isNotEmpty()) {
+                        IconButton(
+                            onClick = {
+                                val textToSend = inputText.trim()
+                                val urisToSend = selectedUris.toList()
+                                inputText = ""
+                                selectedUris.clear()
+                                viewModel.sendText(textToSend, urisToSend)
+                            },
+                            modifier = Modifier
+                                .size(42.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFF2563EB))
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.Send,
+                                contentDescription = stringResource(R.string.send_message),
+                                tint = Color.White,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    } else {
+                        IconButton(
+                            onClick = {
+                                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                                    if (state.isConnected) {
+                                        viewModel.toggleMic()
+                                    } else {
+                                        viewModel.toggleConnection()
+                                    }
+                                } else {
+                                    handleConnectClick()
+                                }
+                            },
+                            modifier = Modifier
+                                .size(42.dp)
+                                .clip(CircleShape)
+                                .background(if (state.isMicActive) Color(0xFF2563EB) else Color(0xFF18181B))
+                        ) {
+                            Icon(
+                                imageVector = if (state.isMicActive) Icons.Filled.Mic else Icons.Filled.MicOff,
+                                contentDescription = stringResource(R.string.mic_content_desc),
+                                tint = if (state.isMicActive) Color.White else Color(0xFFA1A1AA),
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                }
+            }
         }
     ) { padding ->
-        Box(
+        Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
                 .background(Color(0xFF09090B)),
-            contentAlignment = Alignment.Center
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Центральный полноэкранный 120 FPS AGSL-визуализатор
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center
+            // Верхний визуализатор (компактный при наличии сообщений, полный при старте)
+            val visualizerSize = if (state.messages.isEmpty()) 240.dp else 140.dp
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 12.dp),
+                contentAlignment = Alignment.Center
             ) {
-                AgslVoiceVisualizer(
-                    nativeEngine = viewModel.nativeAudioEngine,
-                    state = state,
-                    onClick = {
-                        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                            if (state.isConnected) {
-                                // Если сессия активна — переключаем микрофон
-                                viewModel.toggleMic()
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    AgslVoiceVisualizer(
+                        nativeEngine = viewModel.nativeAudioEngine,
+                        state = state,
+                        onClick = {
+                            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                                if (state.isConnected) {
+                                    viewModel.toggleMic()
+                                } else {
+                                    viewModel.toggleConnection()
+                                }
                             } else {
-                                // Если сессия отключена или находится в процессе подключения — управляем подключением (включая отмену)
-                                viewModel.toggleConnection()
+                                handleConnectClick()
                             }
-                        } else {
-                            handleConnectClick()
-                        }
-                    },
-                    size = 280.dp
-                )
+                        },
+                        size = visualizerSize
+                    )
 
-                Spacer(Modifier.height(24.dp))
+                    Spacer(Modifier.height(8.dp))
 
-                // Текстовая подсказка статуса
-                Text(
-                    text = when {
-                        state.error != null -> state.error.orEmpty()
-                        state.isAiSpeaking -> "Ассистент говорит..."
-                        state.link == LinkState.CONNECTING -> "Подключение... (нажмите для отмены)"
-                        state.link == LinkState.RECONNECTING -> "Восстановление связи... (нажмите для отмены)"
-                        state.isMicActive -> "Слушаю вас..."
-                        state.isConnected -> "Микрофон на паузе (нажмите на сферу)"
-                        else -> "Нажмите на сферу для запуска"
-                    },
-                    color = when {
-                        state.error != null -> Color(0xFFF87171)
-                        state.isAiSpeaking -> Color(0xFF34D399)
-                        state.isMicActive -> Color(0xFF60A5FA)
-                        else -> Color(0xFF71717A)
-                    },
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Medium
-                )
+                    Text(
+                        text = when {
+                            state.error != null -> state.error.orEmpty()
+                            state.isAiSpeaking -> "Ассистент говорит..."
+                            state.link == LinkState.CONNECTING -> "Подключение... (нажмите для отмены)"
+                            state.link == LinkState.RECONNECTING -> "Восстановление связи... (нажмите для отмены)"
+                            state.isMicActive -> "Слушаю вас..."
+                            state.isConnected -> "Микрофон на паузе (нажмите на сферу)"
+                            else -> "Нажмите на сферу для запуска"
+                        },
+                        color = when {
+                            state.error != null -> Color(0xFFF87171)
+                            state.isAiSpeaking -> Color(0xFF34D399)
+                            state.isMicActive -> Color(0xFF60A5FA)
+                            else -> Color(0xFF71717A)
+                        },
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+
+            // Лента сообщений
+            if (state.messages.isNotEmpty()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp),
+                    contentPadding = PaddingValues(bottom = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(state.messages, key = { it.id }) { msg ->
+                        MessageBubble(msg)
+                    }
+                }
+            } else {
+                Spacer(Modifier.weight(1f))
             }
         }
     }
@@ -292,6 +482,88 @@ fun ClientScreen(
                 ) {
                     Text(stringResource(R.string.apply_role), color = Color.White)
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MessageBubble(msg: ChatMessage) {
+    val isUser = msg.role == ClientRole.USER
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
+    ) {
+        Box(
+            modifier = Modifier
+                .widthIn(max = 320.dp)
+                .clip(RoundedCornerShape(
+                    topStart = 16.dp,
+                    topEnd = 16.dp,
+                    bottomStart = if (isUser) 16.dp else 4.dp,
+                    bottomEnd = if (isUser) 4.dp else 16.dp
+                ))
+                .background(if (isUser) Color(0xFF1E3A8A) else Color(0xFF18181B))
+                .padding(horizontal = 14.dp, vertical = 10.dp)
+        ) {
+            Column {
+                if (msg.attachmentNames.isNotEmpty()) {
+                    Text(
+                        text = "📎 " + msg.attachmentNames.joinToString(", "),
+                        color = Color(0xFF93C5FD),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(Modifier.height(4.dp))
+                }
+
+                Text(
+                    text = msg.text,
+                    color = if (msg.interim) Color(0xFFA1A1AA) else Color(0xFFFAFAFA),
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ForvoWordChip(word: ForvoWord, onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(16.dp),
+        color = Color(0xFF18181B),
+        border = androidx.compose.foundation.BorderStroke(0.5.dp, Color(0xFF27272A))
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = when {
+                    word.isLoading -> Icons.Filled.HourglassEmpty
+                    word.notFound -> Icons.Filled.VolumeOff
+                    else -> Icons.Filled.VolumeUp
+                },
+                contentDescription = null,
+                tint = if (word.audioUrl != null) Color(0xFF34D399) else Color(0xFFA1A1AA),
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = word.word,
+                color = Color(0xFFFAFAFA),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium
+            )
+            if (!word.translation.isNullOrBlank()) {
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    text = "— ${word.translation}",
+                    color = Color(0xFF71717A),
+                    fontSize = 11.sp
+                )
             }
         }
     }
