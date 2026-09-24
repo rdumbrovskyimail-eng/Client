@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include <cstdint>
@@ -330,9 +329,9 @@ private:
  */
 class Resampler44100To16000 {
 public:
-    static constexpr size_t FIR_TAPS = 21;
-    static constexpr size_t FIR_HALF_TAPS = (FIR_TAPS - 1) / 2; // 10
-    static constexpr size_t FIR_HISTORY = FIR_TAPS - 1;         // 20
+    static constexpr size_t FIR_TAPS = 19;
+    static constexpr size_t FIR_HALF_TAPS = 9;
+    static constexpr size_t FIR_HISTORY = 18;
     static constexpr size_t CHUNK_SIZE = 2048;
 
     Resampler44100To16000() {
@@ -382,9 +381,9 @@ private:
 
         if (chunkFrames == 0 || maxOut == 0) return 0;
 
-        // Stage 1: Anti-aliasing FIR Low-Pass Filter (Cutoff = 7.2 kHz, Stopband >= 8.0 kHz)
-        static constexpr int32_t COEFFS[FIR_HALF_TAPS + 1] = {
-            0, 10, 50, -30, -644, -1119, 102, 3924, 8664, 10854, 0
+        // Stage 1: Anti-aliasing FIR Low-Pass Filter (19 taps, linear phase, sum = 32768)
+        static constexpr int32_t COEFFS[10] = {
+            0, 10, 50, -30, -644, -1119, 102, 3924, 8664, 10854
         };
 
         std::memcpy(
@@ -399,12 +398,12 @@ private:
         for (size_t i = 0; i < chunkFrames; ++i) {
             const size_t idx = FIR_HISTORY + i;
 
-            int64_t acc = static_cast<int64_t>(COEFFS[9]) * static_cast<int32_t>(firWorkBuffer_[idx - 10]);
+            int64_t acc = static_cast<int64_t>(COEFFS[9]) * static_cast<int32_t>(firWorkBuffer_[idx - 9]);
 
             for (size_t k = 0; k < 9; ++k) {
                 const int32_t pair =
                     static_cast<int32_t>(firWorkBuffer_[idx - k]) +
-                    static_cast<int32_t>(firWorkBuffer_[idx - (20 - k)]);
+                    static_cast<int32_t>(firWorkBuffer_[idx - (18 - k)]);
                 acc += static_cast<int64_t>(COEFFS[k]) * pair;
             }
 
@@ -466,7 +465,6 @@ private:
             sourceIndex_ -= historyShift;
         } else {
             sourceIndex_ = 0;
-            phase_ = 0.0;
         }
 
         return outCount;
@@ -816,7 +814,6 @@ public:
             sourceIndex_ -= historyShift;
         } else {
             sourceIndex_ = 0;
-            phase_ = 0.0;
         }
 
         return outCount;
