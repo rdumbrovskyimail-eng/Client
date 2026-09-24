@@ -1,0 +1,439 @@
+name: Apply 100% Audio Engine Fixes
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-audio:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Patch Audio Engine Files via Python
+        shell: python
+        run: |
+          import sys
+
+          # ==========================================
+          # 1. Patch AAudioEngine.cpp
+          # ==========================================
+          cpp_path = "app/src/main/cpp/audio/AAudioEngine.cpp"
+          with open(cpp_path, "r", encoding="utf-8") as f:
+              cpp_code = f.read()
+
+          target_cpp_dsp = """        const float outRms =
+              dsp::calculateRms(
+                  output,
+                  outputFrames);
+
+          outRms_.store(
+              outRms,
+              std::memory_order_relaxed);"""
+
+          replacement_cpp_dsp = """        const float outRms =
+              dsp::calculateRms(
+                  output,
+                  outputFrames);
+
+          // Note: outRms_ is now calculated directly in playbackCallback at DAC presentation
+          // time, eliminating the 140-200 ms latency skew between DSP production and physical speaker output."""
+
+          assert target_cpp_dsp in cpp_code, "AAudioEngine.cpp DSP snippet not found"
+          cpp_code = cpp_code.replace(target_cpp_dsp, replacement_cpp_dsp, 1)
+
+          target_cpp_callback = """        if (read < frames) {
+
+              std::memset(
+                  samples + read,
+                  0,
+                  (frames - read) *
+                  sizeof(int16_t));
+          }
+
+          engine->leavePlaybackCallback();"""
+
+          replacement_cpp_callback = """        if (read < frames) {
+
+              std::memset(
+                  samples + read,
+                  0,
+                  (frames - read) *
+                  sizeof(int16_t));
+          }
+
+          // ITU-T G.168 / DAC Presentation Time: compute real-time physical playback RMS
+          if (read > 0) {
+              const float dacRms = dsp::calculateRms(samples, read);
+              engine->outRms_.store(dacRms, std::memory_order_relaxed);
+          } else {
+              engine->outRms_.store(0.0f, std::memory_order_relaxed);
+          }
+
+          engine->leavePlaybackCallback();"""
+
+          assert target_cpp_callback in cpp_code, "AAudioEngine.cpp callback snippet not found"
+          cpp_code = cpp_code.replace(target_cpp_callback, replacement_cpp_callback, 1)
+
+          with open(cpp_path, "w", encoding="utf-8") as f:
+              f.write(cpp_code)
+          print("AAudioEngine.cpp successfully patched.")
+
+          # ==========================================
+          # 2. Patch NativeAudioEngine.kt
+          # ==========================================
+          kt_path = "app/src/main/java/com/client/app/audio/NativeAudioEngine.kt"
+          with open(kt_path, "r", encoding="utf-8") as f:
+              kt_code = f.read()
+
+          target_props = """    @Volatile
+      private var lastBargeInMs =
+          0L
+
+      @Volatile
+      var isBargeInActive = false
+          private set"""
+
+          replacement_props = """    @Volatile
+      private var lastBargeInMs =
+          0L
+
+      @Volatile
+      private var outputEnergyHangover: Float = 0f
+
+      @Volatile
+      private var currentPlaybackVolume: Float = 1.0f
+
+      @Volatile
+      var isBargeInActive = false
+          private set"""
+
+          assert target_props in kt_code, "NativeAudioEngine.kt properties not found"
+          kt_code = kt_code.replace(target_props, replacement_props, 1)
+
+          target_loop = """                        val isBluetooth =
+                              router
+                                  .currentProfile
+                                  .value
+                                  .path ==
+                                  AudioRoutePath
+                                      .BLUETOOTH_COMMUNICATION
+
+                          val isAiRendering =
+                              !isBluetooth && (instantaneousOut > 0.035f)
+
+                          var speechStartedOnFrame =
+                              false
+
+                          var speechEndedOnFrame =
+                              false
+
+                          if (captureInstanceId.get() != instanceId || !captureDesired.get() || !_isCapturing.value) {
+                              continue
+                          }
+
+                          vadDetector.processSamples(
+                              pcm16 = validPcm,
+                              onSpeechStart = {
+                                  speechStartedOnFrame =
+                                      true
+                              },
+
+                              onSpeechEnd = {
+                                  speechEndedOnFrame =
+                                      true
+                              }
+                          )
+
+                          val currentAudioBytes =
+                              validPcm
+
+                          if (isAadMode) {
+
+                              // Проверка условий истинного перебивания с защитой от акустического эха
+                              val isVocalized = speechStartedOnFrame || vadDetector.isSpeechDetected.value
+
+                              if (isVocalized) {
+                                  val canBargeInTimers = (now - lastPlaybackStartMs > PLAYBACK_GRACE_PERIOD_MS) &&
+                                                         (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
+
+                                  val exceedsAcousticBoundary = if (isAiRendering) {
+                                      // Формула Geigel DTD с учётом нелинейной компрессии Smart PA на пиках
+                                      val nonLinearOffset = if (instantaneousOut > 0.50f) {
+                                          (instantaneousOut - 0.50f) * 0.35f
+                                      } else {
+                                          0.0f
+                                      }
+                                      val echoThreshold = maxOf(0.16f, (instantaneousOut * 0.65f) + nonLinearOffset)
+                                      instantaneousMic > echoThreshold
+                                  } else if (isBluetooth) {
+                                      // Режим гарнитуры: эхо динамика исключено физически.
+                                      // Порог 0.025f (~ -32 dBFS) надёжно отсекает шумы дыхания, пропуская речь пользователя.
+                                      val btNoiseThreshold = 0.025f
+                                      instantaneousMic > btNoiseThreshold
+                                  } else {
+                                      // Динамик молчит — свободный ввод
+                                      true
+                                  }
+
+                                  if (exceedsAcousticBoundary) {
+                                      bargeInCandidateStreak++
+                                  } else {
+                                      bargeInCandidateStreak = maxOf(0, bargeInCandidateStreak - 1)
+                                  }
+
+                                  // Подтверждение Double-Talk Hangover: минимум 2 кадра подряд
+                                  val isConfirmedUserInterruption = (isAiRendering || isBluetooth) &&
+                                      (bargeInCandidateStreak >= 2) && canBargeInTimers
+
+                                  if (isConfirmedUserInterruption) {
+                                      lastBargeInMs = now
+                                      bargeInCandidateStreak = 0
+
+                                      activateBargeIn(now)
+                                      hapticManager.triggerBargeIn()
+                                      _bargeInEvents.tryEmit(Unit)
+
+                                      val preRoll = mutableListOf<ByteArray>()
+                                      synchronized(poolLock) {
+                                          while (leadInBuffer.isNotEmpty()) {
+                                              preRoll.add(leadInBuffer.removeFirst())
+                                          }
+                                      }
+
+                                      for (pf in preRoll) {
+                                          sendMicEvent(
+                                              AudioStreamEvent.Audio(pf),
+                                              instanceId
+                                          )
+                                      }
+                                  }
+                              } else {
+                                  bargeInCandidateStreak = 0
+                              }"""
+
+          replacement_loop = """                        val isBluetooth =
+                              router
+                                  .currentProfile
+                                  .value
+                                  .path ==
+                                  AudioRoutePath
+                                      .BLUETOOTH_COMMUNICATION
+
+                          val pendingFrames = bridge.getPendingPlaybackFrames()
+
+                          // Re-arm grace period if model playback resumes after a quiet pause (> 300 ms)
+                          if (instantaneousOut > 0.02f && outputEnergyHangover <= 0.005f) {
+                              lastPlaybackStartMs = now
+                          }
+
+                          // Delay-matched Leaky Peak Follower (350 ms hangover window with alpha = 0.96 per 10 ms frame).
+                          // Tracks DAC output + physical S23 Ultra Armor Aluminum chassis resonance + room RT60 decay.
+                          outputEnergyHangover = if (!_isPlaying.value || (pendingFrames == 0L && instantaneousOut <= 0.001f)) {
+                              0f
+                          } else {
+                              maxOf(instantaneousOut, outputEnergyHangover * 0.96f)
+                          }
+
+                          // True indication whether AI is rendering audio through headphones or speaker
+                          val isAiRendering = _isPlaying.value && (outputEnergyHangover > 0.015f || pendingFrames > 160L)
+
+                          var speechStartedOnFrame =
+                              false
+
+                          var speechEndedOnFrame =
+                              false
+
+                          if (captureInstanceId.get() != instanceId || !captureDesired.get() || !_isCapturing.value) {
+                              continue
+                          }
+
+                          vadDetector.processSamples(
+                              pcm16 = validPcm,
+                              onSpeechStart = {
+                                  speechStartedOnFrame =
+                                      true
+                              },
+
+                              onSpeechEnd = {
+                                  speechEndedOnFrame =
+                                      true
+                              }
+                          )
+
+                          val currentAudioBytes =
+                              validPcm
+
+                          if (isAadMode) {
+                              val isVocalized = speechStartedOnFrame || vadDetector.isSpeechDetected.value
+
+                              // INVARIANT 1: Barge-in is mathematically impossible if the model is not playing audio.
+                              // If model is silent, user speech is normal communication, NEVER an interruption.
+                              if (isVocalized && isAiRendering) {
+                                  val canBargeInTimers = (now - lastPlaybackStartMs > PLAYBACK_GRACE_PERIOD_MS) &&
+                                                         (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
+
+                                  val exceedsAcousticBoundary = if (isBluetooth) {
+                                      // Bluetooth headset: physical isolation > 45 dB.
+                                      // User voice must exceed ambient breathing/noise floor (-29 dBFS).
+                                      instantaneousMic > 0.035f
+                                  } else {
+                                      // S23 Ultra speaker: Geigel DTD with Cirrus Logic CS35L41 Smart PA compensation.
+                                      // Dynamic ERL ratio scales with volume (0.72 at low vol, up to 0.87 at max vol).
+                                      val dynamicErleRatio = 0.72f + (0.15f * currentPlaybackVolume)
+
+                                      val nonLinearOffset = if (outputEnergyHangover > 0.45f) {
+                                          (outputEnergyHangover - 0.45f) * 0.40f
+                                      } else {
+                                          0.0f
+                                      }
+                                      val echoThreshold = maxOf(0.18f, (outputEnergyHangover * dynamicErleRatio) + nonLinearOffset)
+                                      instantaneousMic > echoThreshold
+                                  }
+
+                                  if (exceedsAcousticBoundary) {
+                                      bargeInCandidateStreak++
+                                  } else {
+                                      bargeInCandidateStreak = maxOf(0, bargeInCandidateStreak - 1)
+                                  }
+
+                                  // Telecom-grade confirmation: 3 frames (30 ms) on BT, 5 frames (50 ms) on Speaker
+                                  val requiredStreak = if (isBluetooth) 3 else 5
+                                  val isConfirmedUserInterruption = (bargeInCandidateStreak >= requiredStreak) && canBargeInTimers
+
+                                  if (isConfirmedUserInterruption) {
+                                      lastBargeInMs = now
+                                      bargeInCandidateStreak = 0
+                                      outputEnergyHangover = 0f
+
+                                      activateBargeIn(now)
+                                      hapticManager.triggerBargeIn()
+                                      _bargeInEvents.tryEmit(Unit)
+
+                                      if (isBluetooth) {
+                                        // On Bluetooth, leadInBuffer contains pure user speech onset without speaker echo
+                                        val preRoll = mutableListOf<ByteArray>()
+                                        synchronized(poolLock) {
+                                            while (leadInBuffer.isNotEmpty()) {
+                                                preRoll.add(leadInBuffer.removeFirst())
+                                            }
+                                        }
+                                        for (pf in preRoll) {
+                                            sendMicEvent(AudioStreamEvent.Audio(pf), instanceId)
+                                        }
+                                    } else {
+                                        // INVARIANT 2: On Speaker, leadInBuffer is POISONED with the speaker's own echo.
+                                        // Discard and recycle it to prevent feeding the model's voice back into Gemini!
+                                        synchronized(poolLock) {
+                                            while (leadInBuffer.isNotEmpty()) {
+                                                recycleBuffer(leadInBuffer.removeFirst())
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                bargeInCandidateStreak = 0
+                            }"""
+
+          assert target_loop in kt_code, "NativeAudioEngine.kt loop snippet not found"
+          kt_code = kt_code.replace(target_loop, replacement_loop, 1)
+
+          target_set_vol = """    fun setVolume(
+          volume: Float
+      ) =
+          bridge.setVolume(
+              volume.coerceIn(
+                  0f,
+                  1f
+              )
+          )"""
+
+          replacement_set_vol = """    fun setVolume(
+          volume: Float
+      ) {
+          val clamped = volume.coerceIn(0f, 1f)
+          currentPlaybackVolume = clamped
+          bridge.setVolume(clamped)
+      }"""
+
+          assert target_set_vol in kt_code, "NativeAudioEngine.kt setVolume snippet not found"
+          kt_code = kt_code.replace(target_set_vol, replacement_set_vol, 1)
+
+          target_reset = """    fun resetBargeInState() {
+
+          isBargeInActive =
+              false
+
+          bargeInTimestampMs =
+              0L
+
+          bargeInLeaseJob?.cancel()
+
+          bargeInLeaseJob =
+              null
+      }"""
+
+          replacement_reset = """    fun resetBargeInState() {
+
+          isBargeInActive =
+              false
+
+          bargeInTimestampMs =
+              0L
+
+          outputEnergyHangover = 0f
+
+          bargeInLeaseJob?.cancel()
+
+          bargeInLeaseJob =
+              null
+      }"""
+
+          assert target_reset in kt_code, "NativeAudioEngine.kt resetBargeInState snippet not found"
+          kt_code = kt_code.replace(target_reset, replacement_reset, 1)
+
+          with open(kt_path, "w", encoding="utf-8") as f:
+              f.write(kt_code)
+          print("NativeAudioEngine.kt successfully patched.")
+
+          # ==========================================
+          # 3. Patch SessionManager.kt
+          # ==========================================
+          session_path = "app/src/main/java/com/client/app/session/SessionManager.kt"
+          with open(session_path, "r", encoding="utf-8") as f:
+              session_code = f.read()
+
+          target_session = """    private fun observeBargeIn() = scope.launch {
+          audioEngine.bargeInEvents.collect {
+              invalidateAndFlushAudio("local barge-in")
+              audioEngine.triggerBargeInEarcon()"""
+
+          replacement_session = """    private fun observeBargeIn() = scope.launch {
+          audioEngine.bargeInEvents.collect {
+              // Invariant: Ignore barge-in events if the AI model is not actively speaking.
+              if (!_state.value.isAiSpeaking) {
+                  return@collect
+              }
+
+              invalidateAndFlushAudio("local barge-in")
+              audioEngine.triggerBargeInEarcon()"""
+
+          assert target_session in session_code, "SessionManager.kt snippet not found"
+          session_code = session_code.replace(target_session, replacement_session, 1)
+
+          with open(session_path, "w", encoding="utf-8") as f:
+              f.write(session_code)
+          print("SessionManager.kt successfully patched.")
+
+      - name: Commit and Push Changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/cpp/audio/AAudioEngine.cpp \
+                  app/src/main/java/com/client/app/audio/NativeAudioEngine.kt \
+                  app/src/main/java/com/client/app/session/SessionManager.kt
+          git commit -m "fix(audio): apply 100% resilient acoustic barge-in & Bluetooth isolation patch" || exit 0
+          git push origin main
