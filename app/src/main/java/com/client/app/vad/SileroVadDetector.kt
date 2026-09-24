@@ -132,8 +132,6 @@ class SileroVadDetector @Inject constructor(
     private var speechEndStreak =
         0
 
-    // P1 Fix (Проблема №10): Предвыделенные формы тензоров.
-    // Устраняют аллокацию LongArray в горячем пути evaluateNeural (16 окон/сек × 3 тензора).
     private val inputTensorShape =
         longArrayOf(1L, MODEL_INPUT_SAMPLES.toLong())
 
@@ -264,7 +262,7 @@ class SileroVadDetector @Inject constructor(
                             ).use { warmState ->
                                 OnnxTensor.createTensor(
                                     env,
-                                    srTensorShape
+                                    longArrayOf(16000L)
                                 ).use { warmSr ->
                                     session.run(
                                         mapOf(
@@ -463,8 +461,6 @@ class SileroVadDetector @Inject constructor(
      * 2. Zero-Allocation State Flow: обновлённое скрытое состояние вычитывается напрямую
      *    из нативного буфера OnnxTensor в предвыделенный массив stateBuffer без создания
      *    Java-объектов Array<Array<FloatArray>>.
-     * 3. P1 Fix (Проблема №10): Формы тензоров предвыделены в inputTensorShape/stateTensorShape/
-     *    srTensorShape. Горячий путь evaluateNeural больше не аллоцирует LongArray на каждом окне.
      */
     private fun evaluateNeural(
         window: ShortArray
@@ -509,7 +505,7 @@ class SileroVadDetector @Inject constructor(
             ).use { stateTensor ->
                 OnnxTensor.createTensor(
                     env,
-                    srTensorShape
+                    longArrayOf(16000L)
                 ).use { srTensor ->
 
                     val inputs =
