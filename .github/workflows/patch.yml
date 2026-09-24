@@ -13,406 +13,154 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Patch Files
+      - name: Patch Audio Engine
+        shell: python
         run: |
-          echo "aW1wb3J0IG9zLCBzeXMKCiMgMS4gQUE=
-          dWRpb0VuZ2luZS5jcHAKcF9jcHAgPSAiYXBw
-          L3NyYy9tYWluL2NwcC9hdWRpby9BQXVkaW9F
-          bmdpbmUuY3BwIgppZiBvcy5wYXRoLmV4aXN0
-          cyhwX2NwcCk6CiAgICB3aXRoIG9wZW4ocF9j
-          cHAsICJyIiwgZW5jb2Rpbmc9InV0Zi04Iikg
-          YXMgZjoKICAgICAgICBjID0gZi5yZWFkKCkK
-          CiAgICBjID0gYy5yZXBsYWNlKAogICAgICAg
-          ICJvdXRSbXNfLnN0b3JlKFxuICAgICAgICAg
-          ICAgb3V0Um1zLFxuICAgICAgICAgICAgc3Rk
-          OjptZW1vcnlfb3JkZXJfcmVsYXhlZCk7IiwK
-          ICAgICAgICAiLy8gb3V0Um1zXyBtb3ZlZCB0
-          byBwbGF5YmFja0NhbGxiYWNrIgogICAgKQoK
-          ICAgIG9sZF9jYiA9ICJjb25zdCBzaXplX3Qg
-          cmVhZCA9XG4gICAgICAgICAgICBlbmdpbmUt
-          PnBsYXliYWNrQnVmZmVyXy5yZWFkKFxuICAg
-          ICAgICAgICAgICAgIHNhbXBsZXMsXG4gICAg
-          ICAgICAgICAgICAgZnJhbWVzKTtcblxuICAg
-          ICAgICBpZiAocmVhZCA8IGZyYW1lcykge1xu
-          XG4gICAgICAgICAgICBzdGQ6Om1lbXNldChc
-          biAgICAgICAgICAgICAgICBzYW1wbGVzICsg
-          cmVhZCxcbiAgICAgICAgICAgICAgICAwLFxu
-          ICAgICAgICAgICAgICAgIChmcmFtZXMgLSBy
-          ZWFkKSAqXG4gICAgICAgICAgICAgICAgc2l6
-          ZW9mKGludDE2X3QpKTtcbiAgICAgICAgfVxu
-          XG4gICAgICAgIGVuZ2luZS0+bGVhdmVQbGF5
-          YmFja0NhbGxiYWNrKCk7IgogICAgbmV3X2Ni
-          ID0gImNvbnN0IHNpemVfdCByZWFkID1cbiAg
-          ICAgICAgICAgIGVuZ2luZS0+cGxheWJhY2tC
-          dWZmZXJfLnJlYWQoXG4gICAgICAgICAgICAg
-          ICAgc2FtcGxlcyxcbiAgICAgICAgICAgICAg
-          ICBmcmFtZXMpO1xuXG4gICAgICAgIGlmIChy
-          ZWFkIDwgZnJhbWVzKSB7XG5cbiAgICAgICAg
-          ICAgIHN0ZDo6bWVtc2V0KFxuICAgICAgICAg
-          ICAgICAgIHNhbXBsZXMgKyByZWFkLFxuICAg
-          ICAgICAgICAgICAgIDAsXG4gICAgICAgICAg
-          ICAgICAgKGZyYW1lcyAtIHJlYWQpICpcbiAg
-          ICAgICAgICAgICAgICBzaXplb2YoaW50MTZf
-          dCkpO1xuICAgICAgICB9XG5cbiAgICAgICAg
-          Ly8gRGFjIFByZXNlbnRhdGlvbiBSTVNcbiAg
-          ICAgICAgaWYgKHJlYWQgPiAwKSB7XG4gICAg
-          ICAgICAgICBjb25zdCBmbG9hdCBkYWNSbXMg
-          PSBkc3A6OmNhbGN1bGF0ZVJtcyhzYW1wbGVz
-          LCByZWFkKTtcbiAgICAgICAgICAgIGVuZ2lu
-          ZS0+b3V0Um1zXy5zdG9yZShkYWNSbXMsIHN0
-          ZDo6bWVtb3J5X29yZGVyX3JlbGF4ZWQpO1xu
-          ICAgICAgICB9IGVsc2Uge1xuICAgICAgICAg
-          ICAgZW5naW5lLT5vdXRSbXNfLnN0b3JlKDAu
-          MGYsIHN0ZDo6bWVtb3J5X29yZGVyX3JlbGF4
-          ZWQpO1xuICAgICAgICB9XG5cbiAgICAgICAg
-          ZW5naW5lLT5sZWF2ZVBsYXliYWNrQ2FsbGJh
-          Y2soKTsiCgogICAgYyA9IGMucmVwbGFjZShv
-          bGRfY2IsIG5ld19jYikKICAgIHdpdGggb3Bl
-          bihwX2NwcCwgInciLCBlbmNvZGluZz0idXRm
-          LTgiKSBhcyBmOgogICAgICAgIGYud3JpdGUo
-          YykKICAgIHByaW50KCJBQXVkaW9FbmdpbmUu
-          Y3BwIFNVQ0NFU1MiKQoKIyAyLiBOYXRpdmVB
-          dWRpb0VuZ2luZS5rdAptX2t0ID0gImFwcC9z
-          cmMvbWFpbi9qYXZhL2NvbS9jbGllbnQvYXBw
-          L2F1ZGlvL05hdGl2ZUF1ZGlvRW5naW5lLmt0
-          IgppZiBvcy5wYXRoLmV4aXN0cyhtX2t0KToK
-          ICAgIHdpdGggb3BlbihtX2t0LCAiciIsIGVu
-          Y29kaW5nPSJ1dGYtOCIpIGFzIGZzOgogICAg
-          ICAgIGsgPSBmcy5yZWFkKCkKCiAgICBrID0g
-          ay5yZXBsYWNlKAogICAgICAgICJwcml2YXRl
-          IHZhciBsYXN0QmFyZ2VJbk1zID1cbiAgICAg
-          ICAgMExcbiIsCiAgICAgICAgInByaXZhdGUg
-          dmFyIGxhc3RCYXJnZUluTXMgPVxuICAgICAg
-          ICAwTFxuXG4gICAgQFZvbGF0aWxlXG4gICAg
-          cHJpdmF0ZSB2YXIgb3V0cHV0RW5lcmd5SGFu
-          Z292ZXI6IEZsb2F0ID0gMGZcblxuICAgIEBW
-          b2xhdGlsZVxuICAgIHByaXZhdGUgdmFyIGN1
-          cnJlbnRQbGF5YmFja1ZvbHVtZTogRmxvYXQg
-          PSAxLjBmXG4iCiAgICApCgogICAgb2xkX2Fp
-          ciA9ICJ2YWwgaXNBaVJlbmRlcmluZyA9XG4g
-          ICAgICAgICAgICAgICAgICAgICAgICAhaXNC
-          bHVldG9vdGggJiYgKGluc3RhbnRhbmVvdXNP
-          dXQgPiAwLjAzNWYpIgogICAgbmV3X2FpciA9
-          ICIiInZhbCBwZW5kaW5nRnJhbWVzID0gYnJp
-          ZGdlLmdldFBlbmRpbmdQbGF5YmFja0ZyYW1l
-          cygpXG5cbiAgICAgICAgICAgICAgICAgICAg
-          ICAgIGlmIChpbnN0YW50YW5lb3VzT3V0ID4g
-          MC4wMmYgJiYgb3V0cHV0RW5lcmd5SGFuZ292
-          ZXIgPD0gMC4wMDVmKSB7XG4gICAgICAgICAg
-          ICAgICAgICAgICAgICAgbGFzdFBsYXliYWNr
-          U3RhcnRNcyA9IG5vd1xuICAgICAgICAgICAg
-          ICAgICAgICAgIH1cblxuICAgICAgICAgICAg
-          ICAgICAgICAgIC8vIERlbGF5LW1hdGNoZWQg
-          MzUwIG1zIGhhbmdvdmVyIGZvciBTMjMgVWx0
-          cmEgYWNvdXN0aWNzXG4gICAgICAgICAgICAg
-          ICAgICAgICAgIG91dHB1dEVuZXJneUhhbmdv
-          dmVyID0gaWYgKCFfaXNQbGF5aW5nLnZhbHVl
-          IHx8IChwZW5kaW5nRnJhbWVzID09IDBMICYm
-          IGluc3RhbnRhbmVvdXNPdXQgPD0gMC4wMDFm
-          KSkge1xuICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgIDBmXG4gICAgICAgICAgICAgICAg
-          ICAgICAgICB9IGVsc2Uge1xuICAgICAgICAg
-          ICAgICAgICAgICAgICAgICBtYXhPZihpbnN0
-          YW50YW5lb3VzT3V0LCBvdXRwdXRFbmVyZ3lI
-          YW5nb3ZlciAqIDAuOTZmKVxuICAgICAgICAg
-          ICAgICAgICAgICAgIH1cblxuICAgICAgICAg
-          ICAgICAgICAgICAgIHZhbCBpc0FpUmVuZGVy
-          aW5nID0gX2lzUGxheWluZy52YWx1ZSAmJiAo
-          b3V0cHV0RW5lcmd5SGFuZ292ZXIgPiAwLjAx
-          NWYgfHwgcGVuZGluZ0ZyYW1lcyA+IDE2MEwp
-          IiIiCiAgICBrID0gay5yZXBsYWNlKG9sZF9h
-          aXIsIG5ld19haXIpCgogICAgb2xkX2JnID0g
-          IiIiICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgdmFsIGV4Y2VlZHNBY291c3RpY0Jv
-          dW5kYXJ5ID0gaWYgKGlzQWlSZW5kZXJpbmcp
-          IHtcbiAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAvLyDQpNC+0YDQvNGD
-          0LvQsCBHZWlnZWwgRFREINGBIDDRh9GR0YLQ
-          vtC8INC90LXQu9C40L3QtdC50L3QvtC5INC6
-          0L7QvNC/0YDQtdGB0YHQuNC4IFNtYXJ0IFBB
-          INC90LAg0L/QuNC60LDRhVxuICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          dmFsIG5vbkxpbmVhck9mZnNldCA9IGlmIChp
-          bnN0YW50YW5lb3VzT3V0ID4gMC41MGYpIHtc
-          biAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAoaW5zdGFudGFuZW91
-          c091dCAtIDAuNTBmKSAqIDAuMzVmXG4gICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgIH0gZWxzZSB7XG4gICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          MC4wZlxuICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgfVxuICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          dmFsIGVjaG9UaHJlc2hvbGQgPSBtYXhPZigw
-          LjE2ZiwgKGluc3RhbnRhbmVvdXNPdXQgKiAw
-          LjY1ZikgKyBub25MaW5lYXJPZmZzZXQpXG4g
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgaW5zdGFudGFuZW91c01pYyA+
-          IGVjaG9UaHJlc2hvbGRcbiAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgfSBlbHNl
-          IGlmIChpc0JsdWV0b290aCkge1xuICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgIC8vINCg0LXQttC40Lwg0LPQsNGA0L3Q
-          uNGC0YPRgNGLOiDRjdGF0viDQtNC40L3QsNC8
-          0LjQutCwINC40YHQutC70Y7Rh9C10L3QviDR
-          hNC40LfQuNGH0LXRgdC60LguXG4gICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAvLyDQn9C+0YDQvtCzIDAuMDI1ZiAofiAt
-          MzIgZEJGUykg0L3QsNC00ZHQttC90L4g0L7R
-          gtGB0LXQutCw0LXRgiDRiNGD0LzRiyDQtNGL
-          0YXQsNC90LjRjywg0L/RgNC+0L/Rg9GB0LrQ
-          sNGPINGA0LXRh9GMINC/0L7Qu9GM0LfQvtCy
-          0LDRgtC10LvRjy5cbiAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgdmFsIGJ0
-          Tm9pc2VUaHJlc2hvbGQgPSAwLjAyNWZcbiAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgaW5zdGFudGFuZW91c01pYyA+
-          IGJ0Tm9pc2VUaHJlc2hvbGRcbiAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgfSBl
-          bHNlIHtcbiAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgIC8vINCU0LjQvdCw
-          0LzQuNC6INC80L7Qu9GH0LjRgiDigJQg0YHQ
-          stC+0LHQvtC00L3Ri9C5INCy0LLQvtC0XG4g
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICB0cnVlXG4gICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgIH1cblxuICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          IGlmIChleGNlZWRzQWNvdXN0aWNCb3VuZGFy
-          eSkge1xuICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgYmFyZ2VJbkNhbmRp
-          ZGF0ZVN0cmVhaysrXG4gICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgfSBlbHNlIHtc
-          biAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgIGJhcmdlSW5DYW5kaWRhdGVT
-          dHJlYWsgPSBtYXhPZigwLCBiYXJnZUluQ2Fu
-          ZGlkYXRlU3RyZWFrIC0gMSlcbiAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICB9XG5c
-          biAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgLy8g0J/QvtC00YLQstC10YDQttC0
-          0LXQvdC40LUgRG91YmxlLVRhbGsgSGFuZ292
-          ZXI6INC80LjQvdC40LzRg9C8IDIg0LrQsNC0
-          0YDQsCDQv9C+0LTRgNGP0LRcbiAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICB2YWwg
-          aXNDb25maXJtZWRVc2VySW50ZXJydXB0aW9u
-          ID0gKGlzQWlSZW5kZXJpbmcgfHwgaXNCbHVl
-          dG9vdGgpICYmXG4gICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgKGJhcmdlSW5D
-          YW5kaWRhdGVTdHJlYWsgPj0gMikgJiYgY2Fu
-          QmFyZ2VJblRpbWVyc1xuXG4gICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgaWYgKGlz
-          Q29uZmlybWVkVXNlckludGVycnVwdGlvbikg
-          e1xuICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgbGFzdEJhcmdlSW5NcyA9
-          IG5vd1xuICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICBiYXJnZUluQ2FuZGlk
-          YXRlU3RyZWFrID0gMFxuXG4gICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICBh
-          Y3RpdmF0ZUJhcmdlSW4obm93KVxuICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICBoYXB0aWNNYW5hZ2VyLnRyaWdnZXJCYXJn
-          ZUluKClcbiAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgX2JhcmdlSW5FdmVu
-          dHMudHJ5RW1pdChVbml0KVxuXG4gICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          IHZhbCBwcmVSb2xsID0gbXV0YWJsZUxpc3RP
-          ZjxCeXRlQXJyYXk+KClcbiAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgc3lu
-          Y2hyb25pemVkKHBvb2xMb2NrKSB7XG4gICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgd2hpbGUgKGxlYWRJbkJ1ZmZl
-          ci5pc05vdEVtcHR5KCkpIHtcbiAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgcHJlUm9sbC5hZGQobGVhZEluQnVm
-          ZmVyLnJlbW92ZUZpcnN0KCkpXG4gICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgIH1cbiAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgfVxuXG4gICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          IGZvciAocGYgaW4gcHJlUm9sbCkge1xuICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgc2VuZE1pY0V2ZW50KFxuICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgIEF1ZGlvU3RyZWFtRXZl
-          bnQuQXVkaW8ocGYpLFxuICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICBpbnN0YW5jZUlkXG4gICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAh
-          KVxuICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICB9XG4gICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgfSIiIgogICAg
-          bmV3X2JnID0gIiIiICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgdmFsIGR5bmFtaWNF
-          cmxlUmF0aW8gPSAwLjcyZiArICgwLjE1ZiAq
-          IGN1cnJlbnRQbGF5YmFja1ZvbHVtZSlcbiAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgdmFsIG5vbkxpbmVhck9mZnNldCA9IGlm
-          IChvdXRwdXRFbmVyZ3lIYW5nb3ZlciA+IDAu
-          NDVmKSB7XG4gICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAob3V0cHV0RW5l
-          cmd5SGFuZ292ZXIgLSAwLjQ1ZikgKiAwLjQw
-          ZlxuICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgfSBlbHNlIHtcbiAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          IDAuMGZcbiAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgIH1cbiAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgdmFsIGVj
-          aG9UaHJlc2hvbGQgPSBtYXhPZigwLjE4Ziwg
-          KG91dHB1dEVuZXJneUhhbmdvdmVyICogZHlu
-          YW1pY0VybGVSYXRpbykgKyBub25MaW5lYXJP
-          ZmZzZXQpXG4gICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgdmFsIGVmZmVjdGl2ZVRo
-          cmVzaG9sZCA9IGlmIChpc0JsdWV0b290aCkg
-          MC4wMzVmIGVsc2UgZWNob1RocmVzaG9sZFxu
-          XG4gICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgIGlmIChpbnN0YW50YW5lb3VzTWlj
-          ID4gZWZmZWN0aXZlVGhyZXNob2xkKSB7XG4g
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgYmFyZ2VJbkNhbmRpZGF0ZVN0cmVh
-          aysrXG4gICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgIH0gZWxzZSB7XG4gICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          YmFyZ2VJbkNhbmRpZGF0ZVN0cmVhayA9IG1h
-          eE9mKDAsIGJhcmdlSW5DYW5kaWRhdGVTdHJl
-          YWsgLSAxKVxuICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgIH1cblxuICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgIHZhbCBy
-          ZXF1aXJlZFN0cmVhayA9IGlmIChpc0JsdWV0
-          b290aCkgMyBlbHNlIDVcbiAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICB2YWwgaXND
-          b25maXJtZWRVc2VySW50ZXJydXB0aW9uID0g
-          KGJhcmdlSW5DYW5kaWRhdGVTdHJlYWsgPj0g
-          cmVxdWlyZWRTdHJlYWspICYmIGNhbkJhcmdl
-          SW5UaW1lcnNcblxuICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgIGlmIChpc0NvbmZp
-          cm1lZFVzZXJJbnRlcnJ1cHRpb24pIHtcbiAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgIGxhc3RCYXJnZUluTXMgPSBub3dc
-          biAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgYmFyZ2VJbkNhbmRpZGF0ZVN0
-          cmVhayA9IDBcbiAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgb3V0cHV0RW5l
-          cmd5SGFuZ292ZXIgPSAwZlxuXG4gICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          IGFjdGl2YXRlQmFyZ2VJbihub3cpXG4gICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgIGhhcHRpY01hbmFnZXIudHJpZ2dlckJh
-          cmdlSW4oKVxuICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICBfYmFyZ2VJbkV2
-          ZW50cy50cnlFbWl0KFVuaXQpXG5cbiAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgaWYgKGlzQmx1ZXRvb3RoKSB7XG4gICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgIHZhbCBwcmVSb2xsID0gbXV0YWJs
-          ZUxpc3RPZjxCeXRlQXJyYXk+KClcbiAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgc3luY2hyb25pemVkKHBvb2xMb2Nr
-          KSB7XG4gICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgd2hpbGUg
-          KGxlYWRJbkJ1ZmZlci5pc05vdEVtcHR5KCkp
-          IHtcbiAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgcHJl
-          Um9sbC5hZGQobGVhZEluQnVmZmVyLnJlbW92
-          ZUZpcnN0KCkpXG4gICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgIH1c
-          biAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgIH1cbiAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          IGZvciAocGYgaW4gcHJlUm9sbCkge1xuICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgc2VuZE1pY0V2ZW50KEF1
-          ZGlvU3RyZWFtRXZlbnQuQXVkaW8ocGYpLCBp
-          bnN0YW5jZUlkKVxuICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgfVxu
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgIH0gZWxzZSB7XG4gICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICBzeW5jaHJvbml6ZWQocG9vbExvY2spIHtc
-          biAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICB3aGlsZSAobGVh
-          ZEluQnVmZmVyLmlzTm90RW1wdHkoKSkge1xu
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICByZWN5Y2xl
-          QnVmZmVyKGxlYWRJbkJ1ZmZlci5yZW1vdmVG
-          aXJzdCgpKVxuICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgICB9XG4g
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          ICAgICAgICAgIH1cbiAgICAgICAgICAgICAg
-          ICAgICAgICAgICAgICAgICAgICAgfVxuICAg
-          ICAgICAgICAgICAgICAgICAgICAgICAgICAg
-          IH0iIiIKICAgIGsgPSBrLnJlcGxhY2Uob2xk
-          X2JnLCBuZXdfYmcpCgogICAgb2xkX2dhdGUg
-          PSAiICAgICAgICAgICAgICAgICAgICAgICAg
-          aWYgKGlzVm9jYWxpemVkKSB7XG4gICAgICAg
-          ICAgICAgICAgICAgICAgICAgdmFsIGNhbkJh
-          cmdlSW5UaW1lcnMiCiAgICBuZXdfZ2F0ZSA9
-          ICIgICAgICAgICAgICAgICAgICAgICAgICBp
-          ZiAoaXNWb2NhbGl6ZWQgJiYgaXNBaVJlbmRl
-          cmluZykge1xuICAgICAgICAgICAgICAgICAg
-          ICAgICAgICB2YWwgY2FuQmFyZ2VJblRpbWVy
-          cyIKICAgIGsgPSBrLnJlcGxhY2Uob2xkX2dh
-          dGUsIG5ld19nYXRlKQoKICAgIG9sZF92b2wg
-          PSAiIiIgICAgZnVuIHNldFZvbHVtZShcbiAg
-          ICAgICAgdm9sdW1lOiBGbG9hdFxuICAgICkg
-          PVxuICAgICAgICBicmlkZ2Uuc2V0Vm9sdW1l
-          KFxuICAgICAgICAgICAgdm9sdW1lLmNvZXJj
-          ZUluKFxuICAgICAgICAgICAgICAgIDBmLFxu
-          ICAgICAgICAgICAgICAgIDFmXG4gICAgICAg
-          ICAgICApXG4gICAgICAgICkiIiIKICAgIG5l
-          d192b2wgPSAiIiIgICAgZnVuIHNldFZvbHVt
-          ZShcbiAgICAgICAgdm9sdW1lOiBGbG9hdFxu
-          ICAgICkge1xuICAgICAgICB2YWwgY2xhbXBl
-          ZCA9IHZvbHVtZS5jb2VyY2VJbigwZiwgMWYp
-          XG4gICAgICAgIGN1cnJlbnRQbGF5YmFja1Zv
-          bHVtZSA9IGNsYW1wZWRcbiAgICAgICAgYnJp
-          ZGdlLnNldFZvbHVtZShjbGFtcGVkKVxuICAg
-          IH0iIiIKICAgIGsgPSBrLnJlcGxhY2Uob2xk
-          X3ZvbCwgbmV3X3ZvbCkKCiAgICBrID0gay5y
-          ZXBsYWNlKAogICAgICAgICJiYXJnZUluVGlt
-          ZXN0YW1wTXMgPVxuICAgICAgICAgICAgMExc
-          blxuICAgICAgICBiYXJnZUluTGVhc2VKb2I/
-          LmNhbmNlbCgpIiwKICAgICAgICAiYmFyZ2VJ
-          blRpbWVzdGFtcE1zID1cbiAgICAgICAgICAg
-          IDBMXG5cbiAgICAgICAgb3V0cHV0RW5lcmd5
-          SGFuZ292ZXIgPSAwZlxuXG4gICAgICAgIGJh
-          cmdlSW5MZWFzZUpvYj8uY2FuY2VsKCkiCiAg
-          ICApCgogICAgd2l0aCBvcGVuKG1fa3QsICJ3
-          IiwgZW5jb2Rpbmc9InV0Zi04IikgYXMgZnM6
-          CiAgICAgICAgZnMud3JpdGUoaykKICAgIHBy
-          aW50KCJOYXRpdmVBdWRpb0VuZ2luZS5rdCBT
-          VUNDRVNTIikKCgkjIDMuIFNlc3Npb25NYW5h
-          Z2VyLmt0CmlmIG9zLnBhdGguZXhpc3RzKCJh
-          cHAvc3JjL21haW4vamF2YS9jb20vY2xpZW50
-          L2FwcC9zZXNzaW9uL1Nlc3Npb25NYW5hZ2Vy
-          Lmt0Iik6CiAgICB3aXRoIG9wZW4oImFwcC9z
-          cmMvbWFpbi9qYXZhL2NvbS9jbGllbnQvYXBw
-          L3Nlc3Npb24vU2Vzc2lvbk1hbmFnZXIua3Qi
-          LCAiciIsIGVuY29kaW5nPSJ1dGYtOCIpIGFz
-          IGZzbToKICAgICAgICBzID0gZnNtLnJlYWQo
-          KQogICAgb2xkX3NtID0gImF1ZGlvRW5naW5l
-          LmJhcmdlSW5FdmVudHMuY29sbGVjdCB7XG4g
-          ICAgICAgICAgICBpbnZhbGlkYXRlQW5kRmx1
-          c2hBdWRpbyhcImxvY2FsIGJhcmdlLWluXCIp
-          IgogICAgbmV3X3NtID0gImF1ZGlvRW5naW5l
-          LmJhcmdlSW5FdmVudHMuY29sbGVjdCB7XG4g
-          ICAgICAgICAgICBpZiAoIV9zdGF0ZS52YWx1
-          ZS5pc0FpU3BlYWtpbmcpIHtcbiAgICAgICAg
-          ICAgICAgICAgcmV0dXJuQGNvbGxlY3RcbiAg
-          ICAgICAgICAgIH1cbiAgICAgICAgICAgIGlu
-          dmFsaWRhdGVBbmRGbHVzaEF1ZGlvKFwibG9j
-          YWwgYmFyZ2UtaW5cIikiCiAgICBzID0gcy5y
-          ZXBsYWNlKG9sZF9zbSwgbmV3X3NtKQogICAg
-          d2l0aCBvcGVuKCJhcHAvc3JjL21haW4vamF2
-          YS9jb20vY2xpZW50L2FwcC9zZXNzaW9uL1Nl
-          c3Npb25NYW5hZ2VyLmt0IiwgInciLCBlbmNv
-          ZGluZz0idXRmLTgiKSBhcyBmc206CiAgICAg
-          ICAgZnNtLndyaXRlKHMpCiAgICBwcmludCgi
-          U2Vzc2lvbk1hbmFnZXIua3QgU1VDQ0VTUyIp
-          " | tr -d '\n\r ' | base64 -d | python3
+          import re
+
+          # 1. Patch AAudioEngine.cpp
+          with open("app/src/main/cpp/audio/AAudioEngine.cpp", "r", encoding="utf-8") as f:
+              c = f.read()
+
+          c = re.sub(
+              r'outRms_\.store\(\s*outRms,\s*std::memory_order_relaxed\);',
+              '// outRms_ moved to playbackCallback for DAC presentation timing',
+              c
+          )
+
+          old_cb_pat = r'(if\s*\(read\s*<\s*frames\)\s*\{[\s\S]*?engine->leavePlaybackCallback\(\);)'
+          new_cb_code = (
+              'if (read < frames) {\n'
+              '            std::memset(samples + read, 0, (frames - read) * sizeof(int16_t));\n'
+              '        }\n\n'
+              '        if (read > 0) {\n'
+              '            const float dacRms = dsp::calculateRms(samples, read);\n'
+              '            engine->outRms_.store(dacRms, std::memory_order_relaxed);\n'
+              '        } else {\n'
+              '            engine->outRms_.store(0.0f, std::memory_order_relaxed);\n'
+              '        }\n\n'
+              '        engine->leavePlaybackCallback();'
+          )
+          c = re.sub(old_cb_pat, new_cb_code, c, count=1)
+
+          with open("app/src/main/cpp/audio/AAudioEngine.cpp", "w", encoding="utf-8") as f:
+              f.write(c)
+          print("AAudioEngine.cpp successfully patched.")
+
+          # 2. Patch NativeAudioEngine.kt
+          with open("app/src/main/java/com/client/app/audio/NativeAudioEngine.kt", "r", encoding="utf-8") as f:
+              k = f.read()
+
+          k = re.sub(
+              r'private\s+var\s+lastBargeInMs\s*=\s*0L',
+              'private var lastBargeInMs = 0L\n\n    @Volatile\n    private var outputEnergyHangover: Float = 0f\n\n    @Volatile\n    private var currentPlaybackVolume: Float = 1.0f',
+              k
+          )
+
+          old_air_pat = r'val\s+isAiRendering\s*=\s*!isBluetooth\s*&&\s*\(instantaneousOut\s*>\s*0\.035f\)'
+          new_air_code = (
+              'val pendingFrames = bridge.getPendingPlaybackFrames()\n\n'
+              '                        if (instantaneousOut > 0.02f && outputEnergyHangover <= 0.005f) {\n'
+              '                            lastPlaybackStartMs = now\n'
+              '                        }\n\n'
+              '                        outputEnergyHangover = if (!_isPlaying.value || (pendingFrames == 0L && instantaneousOut <= 0.001f)) {\n'
+              '                            0f\n'
+              '                        } else {\n'
+              '                            maxOf(instantaneousOut, outputEnergyHangover * 0.96f)\n'
+              '                        }\n\n'
+              '                        val isAiRendering = _isPlaying.value && (outputEnergyHangover > 0.015f || pendingFrames > 160L)'
+          )
+          k = re.sub(old_air_pat, new_air_code, k, count=1)
+
+          k = re.sub(
+              r'if\s*\(\s*isVocalized\s*\)\s*\{\s*val\s+canBargeInTimers',
+              'if (isVocalized && isAiRendering) {\n                                val canBargeInTimers',
+              k, count=1
+          )
+
+          old_barge_pat = r'val\s+exceedsAcousticBoundary\s*=\s*if\s*\(isAiRendering\)\s*\{[\s\S]*?for\s*\(pf\s+in\s+preRoll\)\s*\{[\s\S]*?\}\s*\}'
+          new_barge_code = (
+              'val dynamicErleRatio = 0.72f + (0.15f * currentPlaybackVolume)\n'
+              '                                val nonLinearOffset = if (outputEnergyHangover > 0.45f) {\n'
+              '                                    (outputEnergyHangover - 0.45f) * 0.40f\n'
+              '                                } else {\n'
+              '                                    0.0f\n'
+              '                                }\n'
+              '                                val echoThreshold = maxOf(0.18f, (outputEnergyHangover * dynamicErleRatio) + nonLinearOffset)\n'
+              '                                val effectiveThreshold = if (isBluetooth) 0.035f else echoThreshold\n\n'
+              '                                if (instantaneousMic > effectiveThreshold) {\n'
+              '                                    bargeInCandidateStreak++\n'
+              '                                } else {\n'
+              '                                    bargeInCandidateStreak = maxOf(0, bargeInCandidateStreak - 1)\n'
+              '                                }\n\n'
+              '                                val requiredStreak = if (isBluetooth) 3 else 5\n'
+              '                                val isConfirmedUserInterruption = (bargeInCandidateStreak >= requiredStreak) && canBargeInTimers\n\n'
+              '                                if (isConfirmedUserInterruption) {\n'
+              '                                    lastBargeInMs = now\n'
+              '                                    bargeInCandidateStreak = 0\n'
+              '                                    outputEnergyHangover = 0f\n\n'
+              '                                    activateBargeIn(now)\n'
+              '                                    hapticManager.triggerBargeIn()\n'
+              '                                    _bargeInEvents.tryEmit(Unit)\n\n'
+              '                                    if (isBluetooth) {\n'
+              '                                        val preRoll = mutableListOf<ByteArray>()\n'
+              '                                        synchronized(poolLock) {\n'
+              '                                            while (leadInBuffer.isNotEmpty()) {\n'
+              '                                                preRoll.add(leadInBuffer.removeFirst())\n'
+              '                                            }\n'
+              '                                        }\n'
+              '                                        for (pf in preRoll) {\n'
+              '                                            sendMicEvent(AudioStreamEvent.Audio(pf), instanceId)\n'
+              '                                        }\n'
+              '                                    } else {\n'
+              '                                        synchronized(poolLock) {\n'
+              '                                            while (leadInBuffer.isNotEmpty()) {\n'
+              '                                                recycleBuffer(leadInBuffer.removeFirst())\n'
+              '                                            }\n'
+              '                                        }\n'
+              '                                    }\n'
+              '                                }'
+          )
+          k = re.sub(old_barge_pat, new_barge_code, k, count=1)
+
+          old_vol_pat = r'fun\s+setVolume\(\s*volume:\s*Float\s*\)\s*=\s*bridge\.setVolume\([\s\S]*?\)'
+          new_vol_code = (
+              'fun setVolume(volume: Float) {\n'
+              '        val clamped = volume.coerceIn(0f, 1f)\n'
+              '        currentPlaybackVolume = clamped\n'
+              '        bridge.setVolume(clamped)\n'
+              '    }'
+          )
+          k = re.sub(old_vol_pat, new_vol_code, k, count=1)
+
+          k = re.sub(
+              r'bargeInTimestampMs\s*=\s*0L\s*bargeInLeaseJob\?\.cancel\(\)',
+              'bargeInTimestampMs = 0L\n        outputEnergyHangover = 0f\n        bargeInLeaseJob?.cancel()',
+              k
+          )
+
+          with open("app/src/main/java/com/client/app/audio/NativeAudioEngine.kt", "w", encoding="utf-8") as f:
+              f.write(k)
+          print("NativeAudioEngine.kt successfully patched.")
+
+          # 3. Patch SessionManager.kt
+          with open("app/src/main/java/com/client/app/session/SessionManager.kt", "r", encoding="utf-8") as f:
+              s = f.read()
+
+          s = re.sub(
+              r'audioEngine\.bargeInEvents\.collect\s*\{\s*invalidateAndFlushAudio',
+              'audioEngine.bargeInEvents.collect {\n            if (!_state.value.isAiSpeaking) return@collect\n            invalidateAndFlushAudio',
+              s, count=1
+          )
+
+          with open("app/src/main/java/com/client/app/session/SessionManager.kt", "w", encoding="utf-8") as f:
+              s.write(s)
+          print("SessionManager.kt successfully patched.")
 
       - name: Commit and Push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "fix(audio): apply 100% resilient acoustic barge-in & Bluetooth isolation patch" || exit 0
+          git commit -m "fix(audio): apply 100% resilient audio engine fixes" || exit 0
           git push origin main
