@@ -82,11 +82,13 @@ public:
             cell->item.message[0] = '\0';
         }
 
-        // CLOCK_MONOTONIC_RAW is supported by Android bionic on the target
-        // platform. Still, clock_gettime() can report failure; never consume
-        // an uninitialized timespec in that case.
+        // CLOCK_BOOTTIME is supported by Android bionic on the target platform
+        // and matches the time base used by the Kotlin/Java side, ensuring
+        // consistent ordering between native and JVM log entries. Still,
+        // clock_gettime() can report failure; never consume an uninitialized
+        // timespec in that case.
         timespec ts{};
-        if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) == 0) {
+        if (clock_gettime(CLOCK_BOOTTIME, &ts) == 0) {
             cell->item.timestampNs =
                 static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL +
                 static_cast<uint64_t>(ts.tv_nsec);
