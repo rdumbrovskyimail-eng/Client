@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/java/com/client/app/audio/AudioDeviceRouter.kt
 package com.client.app.audio
 
 import android.Manifest
@@ -357,9 +358,8 @@ class AudioDeviceRouter @Inject constructor(
         val btCandidates = if (hasBtPermission) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 commDevices.filter {
-                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-                        it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                        it.type == AudioDeviceInfo.TYPE_BLE_SPEAKER
+                    it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
                 }
             } else {
                 allOutputs.filter { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
@@ -377,9 +377,8 @@ class AudioDeviceRouter @Inject constructor(
         val btOutputDevice = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             currentCommunication?.takeIf { comm ->
                 comm in btCandidates ||
-                    comm.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
                     comm.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                    comm.type == AudioDeviceInfo.TYPE_BLE_SPEAKER
+                    comm.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
             }
         } else {
             btCandidates.firstOrNull().takeIf { legacyScoConnected && audioManager.isBluetoothScoOn }
@@ -403,7 +402,7 @@ class AudioDeviceRouter @Inject constructor(
                 vadThresholdStart = 0.40f,
                 vadThresholdEnd = 0.20f,
                 deviceName = btOutputDevice.productName.toString().ifBlank { "Bluetooth communication device" },
-                inputDeviceId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) 0 else btInputDevice?.id ?: 0,
+                inputDeviceId = btInputDevice?.id ?: 0,
                 outputDeviceId = btOutputDevice.id
             )
         } else {
@@ -425,27 +424,23 @@ class AudioDeviceRouter @Inject constructor(
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && hasBtPermission) {
             val candidates = runCatching {
                 audioManager.availableCommunicationDevices.filter {
-                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-                        it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                        it.type == AudioDeviceInfo.TYPE_BLE_SPEAKER
+                    it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
                 }
             }.getOrDefault(emptyList())
 
             val current = runCatching { audioManager.communicationDevice }.getOrNull()
             val currentIsBt = current != null && (
                 current in candidates ||
-                    current.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
                     current.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                    current.type == AudioDeviceInfo.TYPE_BLE_SPEAKER
+                    current.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
             )
 
             when {
-                // Если текущее устройство связи уже является валидным Bluetooth-эндпоинтом, сохраняем его
                 currentIsBt -> return
                 candidates.isNotEmpty() -> {
-                    // Выбираем лучший доступный Bluetooth-кандидат (BLE гарнитура/динамик в приоритете, затем SCO)
                     val targetDevice = candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
-                        ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_SPEAKER }
+                        ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
                         ?: candidates.first()
                     if (!bindBluetoothCommunication(targetDevice)) {
                         bindSpeakerCommunication()
