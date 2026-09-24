@@ -359,6 +359,9 @@ class GeminiLiveClient @Inject constructor(
     ) =
         protobufClient.sendAudioPcm(pcm)
 
+    suspend fun flushAudio() =
+        protobufClient.flushAudio()
+
     suspend fun sendRealtimeText(
         text: String
     ) =
