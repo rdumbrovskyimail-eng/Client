@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/java/com/client/app/audio/NativeAudioEngine.kt
 package com.client.app.audio
 
 import android.content.Context
@@ -866,8 +867,9 @@ class NativeAudioEngine @Inject constructor(
                                     val echoThreshold = maxOf(0.16f, (instantaneousOut * 0.65f) + nonLinearOffset)
                                     instantaneousMic > echoThreshold
                                 } else if (isBluetooth) {
-                                    // Режим Bluetooth-гарнитуры: проверка вокализации для отсечения дыхания и ветра
-                                    val btNoiseThreshold = 0.14f
+                                    // Режим гарнитуры: эхо динамика исключено физически.
+                                    // Порог 0.025f (~ -32 dBFS) надёжно отсекает шумы дыхания, пропуская речь пользователя.
+                                    val btNoiseThreshold = 0.025f
                                     instantaneousMic > btNoiseThreshold
                                 } else {
                                     // Динамик молчит — свободный ввод
@@ -1321,6 +1323,9 @@ class NativeAudioEngine @Inject constructor(
                                 playbackStartGeneration.set(
                                     currentPlaybackGeneration
                                 )
+                                lastPlaybackStartMs = SystemClock.elapsedRealtime() + PLAYBACK_GRACE_PERIOD_MS
+                                lastBargeInMs = SystemClock.elapsedRealtime() + BARGE_IN_DEBOUNCE_MS
+                                resetBargeInState()
                             }
 
                             if (captureRecovered && keepCapturing) {
