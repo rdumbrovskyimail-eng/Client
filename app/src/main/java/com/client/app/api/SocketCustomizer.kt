@@ -53,19 +53,22 @@ class TunedSocketFactory(
         runCatching {
             socket.tcpNoDelay = true
 
-            // P1 Fix (Проблема №15): Безусловное дублирование дескриптора сокета через системный вызов dup()
-            // на всех поддерживаемых версиях Android (API 28+).
-            // Это исключает закрытие оригинального сетевого сокета OkHttp в ядре Linux: pfd.close() внутри .use
-            // закрывает исключительно изолированный дубликат (декремент f_count в struct file ядра с 2 до 1),
-            // предотвращая спорадические сбои TLS 1.3 со статусом "Socket closed" или EBADF.
-            ParcelFileDescriptor.fromSocket(socket)?.dup()?.use { pfd ->
-                val nativeFd = pfd.fd
-                if (nativeFd >= 0) {
-                    nativeBridge.tuneNativeSocket(nativeFd)
-                    logManager.net(
-                        "SocketCustomizer",
-                        "Применены TCP опции (fd=$nativeFd)"
-                    )
+            // P1 Fix (Проблема №15): Дублирование дескриптора сокета через dup() для безопасной
+            // передачи fd в native-слой. Оригинальный ParcelFileDescriptor закрывается сразу после
+            // получения дубликата, поэтому оба .use-блока удерживают ровно по одной ссылке:
+            //   - origPfd.use закрывает оригинал после dup();
+            //   - dupPfd.use закрывает дубликат после tuneNativeSocket().
+            // Ссылочный счётчик ядра (struct file::f_count) балансируется без утечек FD.
+            ParcelFileDescriptor.fromSocket(socket)?.use { origPfd ->
+                origPfd.dup()?.use { dupPfd ->
+                    val nativeFd = dupPfd.fd
+                    if (nativeFd >= 0) {
+                        nativeBridge.tuneNativeSocket(nativeFd)
+                        logManager.net(
+                            "SocketCustomizer",
+                            "Применены TCP опции (fd=$nativeFd)"
+                        )
+                    }
                 }
             }
         }.onFailure {
