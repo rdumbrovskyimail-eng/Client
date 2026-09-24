@@ -250,15 +250,20 @@ fun ClientScreen(
                             SuggestionChip(
                                 onClick = { selectedUris.removeAt(index) },
                                 label = {
-                                    Text(
-                                        uri.lastPathSegment ?: "файл",
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        fontSize = 11.sp
-                                    )
-                                },
-                                trailingIcon = {
-                                    Icon(Icons.Filled.Close, null, modifier = Modifier.size(14.dp))
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            uri.lastPathSegment ?: "файл",
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            fontSize = 11.sp
+                                        )
+                                        Spacer(Modifier.width(4.dp))
+                                        Icon(
+                                            imageVector = Icons.Filled.Close,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                    }
                                 }
                             )
                         }
