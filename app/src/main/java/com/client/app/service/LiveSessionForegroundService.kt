@@ -3,9 +3,11 @@ package com.client.app.service
 
 import android.Manifest
 import android.app.*
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -32,6 +34,7 @@ class LiveSessionForegroundService : Service() {
     @Inject lateinit var logger: AppLogger
 
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var mediaSession: MediaSessionCompat? = null
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -80,8 +83,7 @@ class LiveSessionForegroundService : Service() {
         mediaObserverJob = serviceScope.launch {
             sessionManager.state.collect { state ->
                 val mediaState = when {
-                    state.isAiSpeaking -> PlaybackStateCompat.STATE_PLAYING
-                    state.link != com.client.app.session.LinkState.IDLE -> PlaybackStateCompat.STATE_PAUSED
+                    state.link != com.client.app.session.LinkState.IDLE -> PlaybackStateCompat.STATE_PLAYING
                     else -> PlaybackStateCompat.STATE_STOPPED
                 }
                 mediaSession?.setPlaybackState(
@@ -143,9 +145,21 @@ class LiveSessionForegroundService : Service() {
                 setReferenceCounted(false)
                 acquire()
             }
-
         }
 
+        if (wifiLock?.isHeld != true) {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                @Suppress("DEPRECATION")
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wifiLock = wm.createWifiLock(lockMode, "client:live_session_wifi").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
     }
 
     private fun promoteToForeground(): Boolean {
@@ -265,6 +279,11 @@ class LiveSessionForegroundService : Service() {
             if (wakeLock?.isHeld == true) wakeLock?.release()
         }
         wakeLock = null
+
+        runCatching {
+            if (wifiLock?.isHeld == true) wifiLock?.release()
+        }
+        wifiLock = null
 
         runCatching {
             mediaSession?.isActive = false
