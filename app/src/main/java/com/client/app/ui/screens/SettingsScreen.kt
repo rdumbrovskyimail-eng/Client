@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/java/com/client/app/ui/screens/SettingsScreen.kt
 package com.client.app.ui.screens
 
 import android.content.Intent
@@ -515,7 +516,7 @@ fun SettingsScreen(
                     value = micGainDraft,
                     onValueChange = { micGainDraft = it },
                     onValueChangeFinished = { viewModel.setMicGain(micGainDraft) },
-                    valueRange = 0.5f..1.5f,
+                    valueRange = 0.5f..2.0f,
                     colors = sliderColors()
                 )
             }
