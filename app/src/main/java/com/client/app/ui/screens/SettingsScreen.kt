@@ -339,7 +339,7 @@ fun SettingsScreen(
                         sensitivities.forEach { s ->
                             FilterChip(
                                 selected = settings.aadStartSensitivity == s,
-                                onClick = { viewModel.setAadStartSensitivity(s) },
+                                onClick = { viewModel::setAadStartSensitivity(s) },
                                 label = { Text(s.removePrefix("START_SENSITIVITY_"), fontSize = 11.sp) },
                                 colors = chipColors()
                             )
