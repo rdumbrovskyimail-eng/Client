@@ -28,7 +28,6 @@ import com.client.app.session.LinkState
 import com.client.app.session.SessionState
 
 private const val AGSL_SHADER_SRC = """
-uniform shader u_Content;
 uniform float2 u_Resolution;
 uniform float u_Time;
 uniform float u_State;
@@ -36,7 +35,7 @@ uniform float4 u_Spectrum;
 uniform float4 u_Dynamics;
 
 half4 main(float2 fragCoord) {
-    float minRes = min(u_Resolution.x, u_Resolution.y);
+    float minRes = max(min(u_Resolution.x, u_Resolution.y), 1.0);
     float2 uv = (fragCoord - 0.5 * u_Resolution) / minRes;
     float dist = length(uv);
 
@@ -230,20 +229,13 @@ private fun AgslOrbInternal(
     modifier: Modifier,
     size: Dp
 ) {
-    val runtimeShader =
-        remember {
-            RuntimeShader(AGSL_SHADER_SRC)
-        }
+    val runtimeShader = remember {
+        RuntimeShader(AGSL_SHADER_SRC)
+    }
 
-    val renderEffect =
-        remember(runtimeShader) {
-            RenderEffect
-                .createRuntimeShaderEffect(
-                    runtimeShader,
-                    "u_Content"
-                )
-                .asComposeRenderEffect()
-        }
+    val shaderBrush = remember(runtimeShader) {
+        androidx.compose.ui.graphics.ShaderBrush(runtimeShader)
+    }
 
     val targetStateId = when {
         state.error != null -> 4.0f
@@ -314,55 +306,37 @@ private fun AgslOrbInternal(
         contentAlignment = Alignment.Center
     ) {
         Canvas(
-            modifier = Modifier
-                .size(size)
-                .graphicsLayer {
-                    val w = this.size.width
-                    val h = this.size.height
-
-                    runtimeShader.setFloatUniform(
-                        "u_Resolution",
-                        w,
-                        h
-                    )
-
-                    // Draw-phase обновление времени анимации на частоте 120 Гц
-                    runtimeShader.setFloatUniform(
-                        "u_Time",
-                        if (shouldAnimate) animatedTime else animatedTime * 0.25f
-                    )
-
-                    runtimeShader.setFloatUniform(
-                        "u_State",
-                        animatedState
-                    )
-
-                    val spec =
-                        nativeEngine.spectrumUniforms.get()
-
-                    runtimeShader.setFloatUniform(
-                        "u_Spectrum",
-                        spec.getOrElse(0) { 0f },
-                        spec.getOrElse(1) { 0f },
-                        spec.getOrElse(2) { 0f },
-                        spec.getOrElse(3) { 0f }
-                    )
-
-                    runtimeShader.setFloatUniform(
-                        "u_Dynamics",
-                        spec.getOrElse(4) { 0f },
-                        nativeEngine.micLevel.value,
-                        nativeEngine.outLevel.value,
-                        0.0f
-                    )
-
-                    renderEffect
-                        .let { this.renderEffect = it }
-                }
+            modifier = Modifier.size(size)
         ) {
-            drawRect(
-                color = Color(0xFF09090B)
-            )
+            val w = this.size.width
+            val h = this.size.height
+
+            if (w > 0f && h > 0f) {
+                runtimeShader.setFloatUniform("u_Resolution", w, h)
+                runtimeShader.setFloatUniform(
+                    "u_Time",
+                    if (shouldAnimate) animatedTime else animatedTime * 0.25f
+                )
+                runtimeShader.setFloatUniform("u_State", animatedState)
+
+                val spec = nativeEngine.spectrumUniforms.get()
+                runtimeShader.setFloatUniform(
+                    "u_Spectrum",
+                    spec.getOrElse(0) { 0f },
+                    spec.getOrElse(1) { 0f },
+                    spec.getOrElse(2) { 0f },
+                    spec.getOrElse(3) { 0f }
+                )
+                runtimeShader.setFloatUniform(
+                    "u_Dynamics",
+                    spec.getOrElse(4) { 0f },
+                    nativeEngine.micLevel.value,
+                    nativeEngine.outLevel.value,
+                    0.0f
+                )
+
+                drawRect(brush = shaderBrush)
+            }
         }
     }
 }
