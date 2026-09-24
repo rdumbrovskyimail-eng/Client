@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/java/com/client/app/api/GeminiProtobufLiveClient.kt
 package com.client.app.api
 
 import android.util.Base64
@@ -1078,6 +1079,26 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
     }
 
+    suspend fun flushAudio() {
+        outboundCommandMutex.withLock {
+            val pending = synchronized(batchLock) {
+                val writerEpoch = synchronized(sessionStateLock) { epoch }
+                val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
+                val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
+
+                if (audioBatchBuffer.size() == 0) return@synchronized null
+
+                val payload = audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
+                if (!isWriterCurrent(writerEpoch, ws, channel)) null else channel to payload
+            } ?: return@withLock
+
+            try {
+                pending.first.send(AudioOutboundCommand.Pcm(pending.second))
+            } catch (_: ClosedSendChannelException) {
+            }
+        }
+    }
+
     suspend fun sendAudioStreamEnd() {
         outboundCommandMutex.withLock {
             val pending = synchronized(batchLock) {
@@ -1664,16 +1685,8 @@ class GeminiProtobufLiveClient @Inject constructor(
                                 }
                             }
 
-                            if (
-                                !cfg.speechLanguage
-                                    .isNullOrBlank()
-                            ) {
-
-                                put(
-                                    "languageCode",
-                                    cfg.speechLanguage
-                                )
-                            }
+                            val targetLang = cfg.speechLanguage?.ifBlank { "ru-RU" } ?: "ru-RU"
+                            put("languageCode", targetLang)
                         }
                     }
 
@@ -1685,22 +1698,16 @@ class GeminiProtobufLiveClient @Inject constructor(
                             "inputAudioTranscription"
                         ) {
 
-                            if (
-                                cfg.inputTranscription
-                                    .languageCodes
-                                    .isNotEmpty()
+                            val inputLangs = if (cfg.inputTranscription.languageCodes.isNotEmpty()) {
+                                cfg.inputTranscription.languageCodes
+                            } else {
+                                listOf(cfg.speechLanguage?.ifBlank { "ru-RU" } ?: "ru-RU")
+                            }
+
+                            putJsonArray(
+                                "languageCodes"
                             ) {
-
-                                putJsonArray(
-                                    "languageCodes"
-                                ) {
-
-                                    cfg.inputTranscription
-                                        .languageCodes
-                                        .forEach {
-                                            add(it)
-                                        }
-                                }
+                                inputLangs.forEach { add(it) }
                             }
 
                             if (
@@ -1737,21 +1744,16 @@ class GeminiProtobufLiveClient @Inject constructor(
                             "outputAudioTranscription"
                         ) {
 
-                            if (
-                                cfg.outputTranscription
-                                    .languageCodes
-                                    .isNotEmpty()
-                            ) {
+                            val outputLangs = if (cfg.outputTranscription.languageCodes.isNotEmpty()) {
+                                cfg.outputTranscription.languageCodes
+                            } else {
+                                listOf(cfg.speechLanguage?.ifBlank { "ru-RU" } ?: "ru-RU")
+                            }
 
-                                putJsonArray(
-                                    "languageCodes"
-                                ) {
-                                    cfg.outputTranscription
-                                        .languageCodes
-                                        .forEach {
-                                            add(it)
-                                        }
-                                }
+                            putJsonArray(
+                                "languageCodes"
+                            ) {
+                                outputLangs.forEach { add(it) }
                             }
 
                             if (
