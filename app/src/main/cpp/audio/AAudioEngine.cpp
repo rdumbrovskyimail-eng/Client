@@ -634,8 +634,8 @@ bool AAudioEngine::startPlayback() {
         unblockPlaybackCallback();
         return false;
     }
-    if (!waitForStreamState(playbackStream_, AAUDIO_STREAM_STATE_STARTED, 500)) {
-        LOGE("Playback stream did not reach STARTED within 500 ms");
+    if (!waitForStreamState(playbackStream_, AAUDIO_STREAM_STATE_STARTED, 2000)) {
+        LOGE("Playback stream did not reach STARTED within 2000 ms");
         closePlaybackStreamLocked();
         isDisconnected_.store(true, std::memory_order_release);
         unblockPlaybackCallback();
@@ -730,8 +730,8 @@ bool AAudioEngine::startCapture() {
     if (!waitForStreamState(
             captureStream_,
             AAUDIO_STREAM_STATE_STARTED,
-            500)) {
-        LOGE("Capture stream did not reach STARTED within 500 ms");
+            2000)) {
+        LOGE("Capture stream did not reach STARTED within 2000 ms");
         AAudioStream_requestStop(captureStream_);
         waitForStreamState(
             captureStream_,
@@ -852,10 +852,8 @@ void AAudioEngine::stopCaptureLocked() {
         if (res != AAUDIO_OK) {
             LOGW("AAudioStream_requestStop(capture) returned %d (%s)", res, AAudio_convertResultToText(res));
         }
-        if (!waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 500)) {
-            LOGW("Capture stream did not reach STOPPED within 500 ms; closing anyway");
-            closeCaptureStreamLocked();
-        }
+        waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 500);
+        closeCaptureStreamLocked();
     }
 
     captureRawBuffer_.resetQuiesced();
@@ -2083,6 +2081,7 @@ AAudioEngine::playbackCallback(
     }
 
     engine->leavePlaybackCallback();
+    engine->playbackDspCv_.notify_one();
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
