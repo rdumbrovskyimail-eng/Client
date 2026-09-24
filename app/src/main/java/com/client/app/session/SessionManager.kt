@@ -1,3 +1,4 @@
+// >>> FILE: app/src/main/java/com/client/app/session/SessionManager.kt
 package com.client.app.session
 
 import android.content.Context
@@ -230,6 +231,7 @@ class SessionManager @Inject constructor(
                     stopInternal(full = true)
                 } else {
                     connectionDesired = true
+                    userMicDesired = true
                     reconnectAttempts = 0
                     resumptionHandle = null
                     cancelReconnectWork()
@@ -737,8 +739,7 @@ class SessionManager @Inject constructor(
             }
 
         val voice = prefs[KEY_VOICE]?.ifBlank { null } ?: "Charon"
-        val speechLang = prefs[KEY_SPEECH_LANGUAGE]
-            ?.takeIf { it.isNotBlank() }
+        val speechLang = prefs[KEY_SPEECH_LANGUAGE]?.ifBlank { "ru-RU" } ?: "ru-RU"
         val temperature = prefs[KEY_TEMPERATURE] ?: 0.5f
         val mediaResolution =
             prefs[KEY_MEDIA_RESOLUTION] ?: "MEDIA_RESOLUTION_HIGH"
@@ -1376,7 +1377,9 @@ class SessionManager @Inject constructor(
                         }
 
                         is AudioStreamEvent.SpeechEnd -> {
-                            if (!currentAadEnabled &&
+                            if (currentAadEnabled && client.isReady) {
+                                client.flushAudio()
+                            } else if (!currentAadEnabled &&
                                 isManualActivityActive.compareAndSet(true, false) &&
                                 client.isReady
                             ) {
