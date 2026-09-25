@@ -58,9 +58,17 @@ class AudioDeviceRouter @Inject constructor(
     private var legacyScoReceiverRegistered = false
     private var lastLegacyScoStartMs = 0L
 
+    // Ошибка #5: startup must wait for actual communication-route confirmation.
+    private var pendingCommunicationDeviceId: Int? = null
+    private var pendingCommunicationAcceptSpeakerDefault = false
+    private var communicationDeviceConfirmation: CompletableDeferred<AudioDeviceInfo?>? = null
+    private var legacyScoConfirmation: CompletableDeferred<Unit>? = null
+    private var routeStartInProgress = false
+
     private companion object {
         const val LEGACY_SCO_RETRY_COOLDOWN_MS = 1500L
         const val ROUTE_DEBOUNCE_MS = 180L
+        const val COMMUNICATION_ROUTE_CONFIRM_TIMEOUT_MS = 800L
     }
 
     private val debounceTrigger = MutableSharedFlow<Unit>(
@@ -77,6 +85,22 @@ class AudioDeviceRouter @Inject constructor(
     private val communicationDeviceListener =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             AudioManager.OnCommunicationDeviceChangedListener { device ->
+                synchronized(routeLock) {
+                    val expectedId = pendingCommunicationDeviceId
+                    val acceptSpeakerDefault = pendingCommunicationAcceptSpeakerDefault
+
+                    val matchesExpected =
+                        (expectedId != null && device?.id == expectedId) ||
+                            (acceptSpeakerDefault &&
+                                (device == null ||
+                                    device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER ||
+                                    device.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE))
+
+                    if (matchesExpected) {
+                        communicationDeviceConfirmation?.complete(device)
+                    }
+                }
+
                 debounceTrigger.tryEmit(Unit)
                 logger.d("AudioDeviceRouter: OnCommunicationDeviceChangedListener -> id=${device?.id}, type=${device?.type}, name=${device?.productName}")
             }
@@ -91,8 +115,7 @@ class AudioDeviceRouter @Inject constructor(
         val sampleRate: Int
     )
 
-    @Volatile
-    private var activeFingerprint: RouteFingerprint? = null
+    @Volatile private var activeFingerprint: RouteFingerprint? = null
 
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
@@ -133,6 +156,7 @@ class AudioDeviceRouter @Inject constructor(
                 audioManager.isBluetoothScoOn = true
                 legacyScoRequested = false
                 legacyScoConnected = true
+                legacyScoConfirmation?.complete(Unit)
             }
 
             AudioManager.SCO_AUDIO_STATE_DISCONNECTED,
@@ -160,60 +184,58 @@ class AudioDeviceRouter @Inject constructor(
             AudioManager.EXTRA_SCO_AUDIO_STATE,
             AudioManager.SCO_AUDIO_STATE_DISCONNECTED
         ) ?: AudioManager.SCO_AUDIO_STATE_DISCONNECTED
-
         applyLegacyScoStateLocked(stickyState)
     }
 
     /**
-     * Безотказный запуск маршрутизатора (Zero-Exception Contract).
+     * Запуск маршрутизатора с подтверждением фактического communication route.
      *
-     * На Android 12–16 (API 31–36) переключение на Bluetooth выполняется реактивно (Event-Driven).
-     * Устранён блокирующий синхронный таймаут в 1200 мс, вызывавший ложный срыв запуска звука.
-     * Сессия стартует немедленно, а при подтверждении готовности LE Audio / SCO роутер бесшовно
-     * переключает профиль через коллбэк [onRouteChange].
+     * Ошибка #5: setCommunicationDevice() является асинхронным запросом.
+     * Поэтому native audio initialization не должна происходить до подтверждения
+     * target-device через OnCommunicationDeviceChangedListener. На legacy API
+     * аналогичный handshake выполняется через ACTION_SCO_AUDIO_STATE_UPDATED.
      */
     suspend fun start(onRouteChange: (RouteProfile) -> Unit) {
-        synchronized(routeLock) {
-            if (previousAudioMode == null) {
-                previousAudioMode = audioManager.mode
-            }
+        var scope: CoroutineScope? = null
+        var targetBtCandidate: AudioDeviceInfo? = null
 
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S && previousSpeakerphoneOn == null) {
-                @Suppress("DEPRECATION")
-                previousSpeakerphoneOn = audioManager.isSpeakerphoneOn
-            }
-
-            onRouteChangedListener = onRouteChange
-
-            if (isCallbackRegistered) {
-                runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
-                isCallbackRegistered = false
-            }
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && isCommunicationListenerRegistered) {
-                communicationDeviceListener?.let {
-                    runCatching {
-                        audioManager.removeOnCommunicationDeviceChangedListener(it)
-                    }
+        try {
+            synchronized(routeLock) {
+                if (previousAudioMode == null) {
+                    previousAudioMode = audioManager.mode
                 }
-                isCommunicationListenerRegistered = false
-            }
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S && previousSpeakerphoneOn == null) {
+                    @Suppress("DEPRECATION")
+                    previousSpeakerphoneOn = audioManager.isSpeakerphoneOn
+                }
 
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-                registerLegacyScoReceiverLocked()
-            }
+                onRouteChangedListener = onRouteChange
+                routeStartInProgress = true
 
-            routerScope?.cancel()
-            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-            routerScope = scope
+                if (isCallbackRegistered) {
+                    runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
+                    isCallbackRegistered = false
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && isCommunicationListenerRegistered) {
+                    communicationDeviceListener?.let {
+                        runCatching { audioManager.removeOnCommunicationDeviceChangedListener(it) }
+                    }
+                    isCommunicationListenerRegistered = false
+                }
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                    registerLegacyScoReceiverLocked()
+                }
 
-            scope.launch {
-                debounceTrigger
-                    .debounce(ROUTE_DEBOUNCE_MS)
-                    .collect { evaluateActiveRouteInternal() }
-            }
+                routerScope?.cancel()
+                scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+                routerScope = scope
 
-            try {
+                scope?.launch {
+                    debounceTrigger
+                        .debounce(ROUTE_DEBOUNCE_MS)
+                        .collect { evaluateActiveRouteInternal() }
+                }
+
                 audioManager.registerAudioDeviceCallback(deviceCallback, null)
                 isCallbackRegistered = true
 
@@ -227,88 +249,309 @@ class AudioDeviceRouter @Inject constructor(
                     }
                 }
 
-                reconcileRouteBindingLocked()
+                targetBtCandidate = findPreferredBluetoothCandidateLocked()
+            }
 
+            if (targetBtCandidate != null) {
+                val target = targetBtCandidate!!
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val confirmation = CompletableDeferred<AudioDeviceInfo?>()
+
+                    synchronized(routeLock) {
+                        communicationDeviceConfirmation = confirmation
+                        pendingCommunicationDeviceId = target.id
+                        pendingCommunicationAcceptSpeakerDefault = false
+                    }
+
+                    val accepted = synchronized(routeLock) {
+                        bindBluetoothCommunication(target)
+                    }
+
+                    val activated =
+                        accepted &&
+                            awaitCommunicationDeviceActivation(
+                                target,
+                                confirmation,
+                                COMMUNICATION_ROUTE_CONFIRM_TIMEOUT_MS
+                            )
+
+                    synchronized(routeLock) {
+                        pendingCommunicationDeviceId = null
+                        pendingCommunicationAcceptSpeakerDefault = false
+                        communicationDeviceConfirmation = null
+                    }
+
+                    if (!activated) {
+                        logger.w(
+                            "AudioDeviceRouter: Bluetooth communication route ${target.id} " +
+                                "was not confirmed within ${COMMUNICATION_ROUTE_CONFIRM_TIMEOUT_MS} ms; " +
+                                "falling back to speaker"
+                        )
+                        awaitSpeakerFallback()
+                    }
+                } else {
+                    val confirmation = CompletableDeferred<Unit>()
+
+                    synchronized(routeLock) {
+                        legacyScoConfirmation = confirmation
+                    }
+
+                    val requested = synchronized(routeLock) {
+                        bindBluetoothCommunication(target)
+                    }
+
+                    val activated =
+                        requested &&
+                            awaitLegacyScoActivation(
+                                confirmation,
+                                COMMUNICATION_ROUTE_CONFIRM_TIMEOUT_MS
+                            )
+
+                    synchronized(routeLock) {
+                        legacyScoConfirmation = null
+                    }
+
+                    if (!activated) {
+                        logger.w(
+                            "AudioDeviceRouter: Bluetooth SCO was not confirmed within " +
+                                "${COMMUNICATION_ROUTE_CONFIRM_TIMEOUT_MS} ms; falling back to speaker"
+                        )
+                        synchronized(routeLock) {
+                            bindSpeakerCommunication()
+                        }
+                    }
+                }
+            } else {
+                synchronized(routeLock) {
+                    bindSpeakerCommunication()
+                }
+            }
+
+            synchronized(routeLock) {
                 val profile = evaluateActiveProfileLocked()
-
                 activeFingerprint = RouteFingerprint(
                     path = profile.path,
                     inDevId = profile.inputDeviceId,
                     outDevId = profile.outputDeviceId,
                     sampleRate = profile.sampleRateOut
                 )
-
                 _currentProfile.value = profile
-
+                routeStartInProgress = false
                 logger.d(
-                    "AudioDeviceRouter: Запущен [Path=${profile.path}, Dev='${profile.deviceName}', OutId=${profile.outputDeviceId}, Rate=${profile.sampleRateOut}Hz]"
+                    "AudioDeviceRouter: Запущен после подтверждения маршрута -> " +
+                        "[Path=${profile.path}, Dev='${profile.deviceName}', " +
+                        "OutId=${profile.outputDeviceId}, Rate=${profile.sampleRateOut}Hz]"
                 )
-            } catch (t: Throwable) {
-                runCatching {
-                    audioManager.unregisterAudioDeviceCallback(deviceCallback)
-                }
-                isCallbackRegistered = false
+            }
+        } catch (t: Throwable) {
+            synchronized(routeLock) {
+                routeStartInProgress = false
+                pendingCommunicationDeviceId = null
+                pendingCommunicationAcceptSpeakerDefault = false
+                communicationDeviceConfirmation = null
+                legacyScoConfirmation = null
+            }
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                    isCommunicationListenerRegistered
-                ) {
+            synchronized(routeLock) {
+                if (isCallbackRegistered) {
+                    runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
+                    isCallbackRegistered = false
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && isCommunicationListenerRegistered) {
                     communicationDeviceListener?.let {
-                        runCatching {
-                            audioManager.removeOnCommunicationDeviceChangedListener(it)
-                        }
+                        runCatching { audioManager.removeOnCommunicationDeviceChangedListener(it) }
                     }
                     isCommunicationListenerRegistered = false
                 }
-
-                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S &&
-                    legacyScoReceiverRegistered
-                ) {
-                    runCatching {
-                        context.unregisterReceiver(legacyScoStateReceiver)
-                    }
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S && legacyScoReceiverRegistered) {
+                    runCatching { context.unregisterReceiver(legacyScoStateReceiver) }
                     legacyScoReceiverRegistered = false
                 }
-
                 onRouteChangedListener = null
                 routerScope = null
-                scope.cancel()
+                scope?.cancel()
                 restoreAudioStateLocked()
+            }
 
-                logger.e(
-                    "AudioDeviceRouter: Сбой первичной инициализации маршрута",
-                    t
-                )
+            logger.e("AudioDeviceRouter: Сбой синхронизированного запуска маршрута", t)
+            throw t
+        }
+    }
 
-                throw t
+    private suspend fun awaitCommunicationDeviceActivation(
+        targetDevice: AudioDeviceInfo,
+        confirmation: CompletableDeferred<AudioDeviceInfo?>,
+        timeoutMs: Long
+    ): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
+
+        val alreadyActive = runCatching {
+            audioManager.communicationDevice?.id == targetDevice.id
+        }.getOrDefault(false)
+
+        if (alreadyActive) return true
+
+        val signaled =
+            withTimeoutOrNull(timeoutMs) {
+                confirmation.await()
+                true
+            } ?: false
+
+        if (!signaled) return false
+
+        return runCatching {
+            audioManager.communicationDevice?.id == targetDevice.id
+        }.getOrDefault(false)
+    }
+
+    private suspend fun awaitLegacyScoActivation(
+        confirmation: CompletableDeferred<Unit>,
+        timeoutMs: Long
+    ): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) return false
+
+        if (legacyScoConnected && audioManager.isBluetoothScoOn) {
+            return true
+        }
+
+        val signaled =
+            withTimeoutOrNull(timeoutMs) {
+                confirmation.await()
+                true
+            } ?: false
+
+        return signaled && legacyScoConnected && audioManager.isBluetoothScoOn
+    }
+
+    private suspend fun awaitSpeakerFallback(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            synchronized(routeLock) {
+                return bindSpeakerCommunication()
             }
         }
+
+        val speaker = runCatching {
+            audioManager.availableCommunicationDevices.firstOrNull {
+                it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            }
+        }.getOrNull()
+
+        if (speaker == null) {
+            synchronized(routeLock) {
+                runCatching { audioManager.clearCommunicationDevice() }
+            }
+            return runCatching {
+                audioManager.communicationDevice == null
+            }.getOrDefault(false)
+        }
+
+        val confirmation = CompletableDeferred<AudioDeviceInfo?>()
+        synchronized(routeLock) {
+            communicationDeviceConfirmation = confirmation
+            pendingCommunicationDeviceId = speaker.id
+            pendingCommunicationAcceptSpeakerDefault = true
+        }
+
+        val accepted = synchronized(routeLock) {
+            bindSpeakerCommunication()
+        }
+
+        val alreadyActive = runCatching {
+            val current = audioManager.communicationDevice
+            current == null ||
+                current.id == speaker.id ||
+                current.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER ||
+                current.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+        }.getOrDefault(false)
+
+        val confirmed =
+            if (alreadyActive) {
+                true
+            } else if (accepted) {
+                withTimeoutOrNull(COMMUNICATION_ROUTE_CONFIRM_TIMEOUT_MS) {
+                    confirmation.await()
+                    true
+                } ?: false
+            } else {
+                false
+            }
+
+        val finalSpeaker = runCatching {
+            val current = audioManager.communicationDevice
+            current == null ||
+                current.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER ||
+                current.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+        }.getOrDefault(false)
+
+        synchronized(routeLock) {
+            pendingCommunicationDeviceId = null
+            pendingCommunicationAcceptSpeakerDefault = false
+            communicationDeviceConfirmation = null
+        }
+
+        if (!confirmed && !finalSpeaker) {
+            synchronized(routeLock) {
+                runCatching { audioManager.clearCommunicationDevice() }
+            }
+        }
+
+        return confirmed || finalSpeaker
+    }
+
+    private fun findPreferredBluetoothCandidateLocked(): AudioDeviceInfo? {
+        val hasBtPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.BLUETOOTH_CONNECT
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+
+        if (!hasBtPermission) return null
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val current = runCatching { audioManager.communicationDevice }.getOrNull()
+            if (current != null && (
+                    current.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                        current.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                )) {
+                return current
+            }
+        }
+
+        val candidates = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            runCatching {
+                audioManager.availableCommunicationDevices.filter {
+                    it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                }
+            }.getOrDefault(emptyList())
+        } else {
+            runCatching {
+                audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                }
+            }.getOrDefault(emptyList())
+        }
+
+        return candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
+            ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+            ?: candidates.firstOrNull()
     }
 
     fun stop() = synchronized(routeLock) {
         if (isCallbackRegistered) {
-            runCatching {
-                audioManager.unregisterAudioDeviceCallback(deviceCallback)
-            }
+            runCatching { audioManager.unregisterAudioDeviceCallback(deviceCallback) }
             isCallbackRegistered = false
         }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-            isCommunicationListenerRegistered
-        ) {
-            communicationDeviceListener?.let {
-                runCatching {
-                    audioManager.removeOnCommunicationDeviceChangedListener(it)
-                }
-            }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && isCommunicationListenerRegistered) {
+            communicationDeviceListener?.let { runCatching { audioManager.removeOnCommunicationDeviceChangedListener(it) } }
             isCommunicationListenerRegistered = false
         }
-
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S &&
-            legacyScoReceiverRegistered
-        ) {
-            runCatching {
-                context.unregisterReceiver(legacyScoStateReceiver)
-            }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S && legacyScoReceiverRegistered) {
+            runCatching { context.unregisterReceiver(legacyScoStateReceiver) }
             legacyScoReceiverRegistered = false
         }
 
@@ -316,6 +559,11 @@ class AudioDeviceRouter @Inject constructor(
         routerScope?.cancel()
         routerScope = null
         activeFingerprint = null
+        routeStartInProgress = false
+        pendingCommunicationDeviceId = null
+        pendingCommunicationAcceptSpeakerDefault = false
+        communicationDeviceConfirmation = null
+        legacyScoConfirmation = null
 
         restoreAudioStateLocked()
     }
@@ -323,45 +571,34 @@ class AudioDeviceRouter @Inject constructor(
     @Suppress("DEPRECATION")
     private fun restoreAudioStateLocked() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            runCatching {
-                audioManager.clearCommunicationDevice()
-            }
+            runCatching { audioManager.clearCommunicationDevice() }
         } else {
-            runCatching {
-                audioManager.stopBluetoothSco()
-            }
-
-            runCatching {
-                audioManager.isBluetoothScoOn = false
-            }
-
+            runCatching { audioManager.stopBluetoothSco() }
+            runCatching { audioManager.isBluetoothScoOn = false }
             previousSpeakerphoneOn?.let { desired ->
-                runCatching {
-                    audioManager.isSpeakerphoneOn = desired
-                }
+                runCatching { audioManager.isSpeakerphoneOn = desired }
             }
-
             legacyScoRequested = false
             legacyScoConnected = false
         }
 
         previousAudioMode?.let { mode ->
-            runCatching {
-                audioManager.mode = mode
-            }.onFailure {
-                logger.w(
-                    "AudioDeviceRouter: Не удалось восстановить AudioManager.mode=$mode: ${it.message}"
-                )
-            }
+            runCatching { audioManager.mode = mode }
+                .onFailure {
+                    logger.w("AudioDeviceRouter: Не удалось восстановить AudioManager.mode=$mode: ${it.message}")
+                }
         }
-
         previousAudioMode = null
         previousSpeakerphoneOn = null
     }
 
+    private fun routerStartInProgressOrUninitialized(): Boolean =
+        routerScope == null ||
+            onRouteChangedListener == null ||
+            routeStartInProgress
+
     private fun selectOptimalBluetoothSampleRate(device: AudioDeviceInfo): Int {
         val supportedRates = device.sampleRates
-
         if (supportedRates.isEmpty()) {
             return 24000
         }
@@ -374,15 +611,11 @@ class AudioDeviceRouter @Inject constructor(
     }
 
     private fun evaluateActiveRouteInternal() = synchronized(routeLock) {
-        if (routerScope == null || onRouteChangedListener == null) {
-            return@synchronized
-        }
+        if (routerStartInProgressOrUninitialized()) return@synchronized
 
         runCatching {
             reconcileRouteBindingLocked()
-
             val newProfile = evaluateActiveProfileLocked()
-
             val newFingerprint = RouteFingerprint(
                 path = newProfile.path,
                 inDevId = newProfile.inputDeviceId,
@@ -393,17 +626,11 @@ class AudioDeviceRouter @Inject constructor(
             if (activeFingerprint != newFingerprint) {
                 activeFingerprint = newFingerprint
                 _currentProfile.value = newProfile
-
-                logger.d(
-                    "AudioDeviceRouter: Аппаратный маршрут переключён -> ${newProfile.path} [InId=${newProfile.inputDeviceId}, OutId=${newProfile.outputDeviceId}, Rate=${newProfile.sampleRateOut}Hz, Name='${newProfile.deviceName}']"
-                )
-
+                logger.d("AudioDeviceRouter: Аппаратный маршрут переключён -> ${newProfile.path} [InId=${newProfile.inputDeviceId}, OutId=${newProfile.outputDeviceId}, Rate=${newProfile.sampleRateOut}Hz, Name='${newProfile.deviceName}']")
                 onRouteChangedListener?.invoke(newProfile)
             }
         }.onFailure {
-            logger.w(
-                "AudioDeviceRouter: Ошибка пересчёта маршрута: ${it.message}"
-            )
+            logger.w("AudioDeviceRouter: Ошибка пересчёта маршрута: ${it.message}")
         }
     }
 
@@ -411,24 +638,19 @@ class AudioDeviceRouter @Inject constructor(
     private fun evaluateActiveProfileLocked(): RouteProfile {
         val hasBtPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.BLUETOOTH_CONNECT
+                context, Manifest.permission.BLUETOOTH_CONNECT
             ) == PackageManager.PERMISSION_GRANTED
         } else {
             true
         }
 
-        val commDevices =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && hasBtPermission) {
-                runCatching {
-                    audioManager.availableCommunicationDevices
-                }.getOrDefault(emptyList())
-            } else {
-                emptyList()
-            }
+        val commDevices = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && hasBtPermission) {
+            runCatching { audioManager.availableCommunicationDevices }.getOrDefault(emptyList())
+        } else {
+            emptyList()
+        }
 
-        val allOutputs =
-            audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        val allOutputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
 
         val btCandidates = if (hasBtPermission) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -437,53 +659,37 @@ class AudioDeviceRouter @Inject constructor(
                         it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
                 }
             } else {
-                allOutputs.filter {
-                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-                }
+                allOutputs.filter { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
             }
         } else {
             emptyList()
         }
 
-        val currentCommunication =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                runCatching {
-                    audioManager.communicationDevice
-                }.getOrNull()
-            } else {
-                null
-            }
+        val currentCommunication = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            runCatching { audioManager.communicationDevice }.getOrNull()
+        } else {
+            null
+        }
 
-        val btOutputDevice =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                currentCommunication?.takeIf { comm ->
-                    comm in btCandidates ||
-                        comm.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                        comm.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-                }
-            } else {
-                btCandidates.firstOrNull()
-                    .takeIf {
-                        legacyScoConnected &&
-                            audioManager.isBluetoothScoOn
-                    }
+        val btOutputDevice = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            currentCommunication?.takeIf { comm ->
+                comm in btCandidates ||
+                    comm.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                    comm.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
             }
+        } else {
+            btCandidates.firstOrNull().takeIf { legacyScoConnected && audioManager.isBluetoothScoOn }
+        }
 
         return if (btOutputDevice != null) {
-            val sampleRate =
-                selectOptimalBluetoothSampleRate(btOutputDevice)
-
+            val sampleRate = selectOptimalBluetoothSampleRate(btOutputDevice)
             RouteProfile(
                 path = AudioRoutePath.BLUETOOTH_COMMUNICATION,
                 sampleRateOut = sampleRate,
                 leadInBufferSizeFrames = 260 * 16,
                 vadThresholdStart = 0.40f,
                 vadThresholdEnd = 0.20f,
-                deviceName = btOutputDevice.productName
-                    .toString()
-                    .ifBlank {
-                        "Bluetooth communication device"
-                    },
+                deviceName = btOutputDevice.productName.toString().ifBlank { "Bluetooth communication device" },
                 inputDeviceId = 0,
                 outputDeviceId = btOutputDevice.id
             )
@@ -503,9 +709,7 @@ class AudioDeviceRouter @Inject constructor(
             true
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-            hasBtPermission
-        ) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && hasBtPermission) {
             val candidates = runCatching {
                 audioManager.availableCommunicationDevices.filter {
                     it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
@@ -513,105 +717,73 @@ class AudioDeviceRouter @Inject constructor(
                 }
             }.getOrDefault(emptyList())
 
-            val current =
-                runCatching {
-                    audioManager.communicationDevice
-                }.getOrNull()
-
-            val currentIsBt =
-                current != null &&
-                    (
-                        current in candidates ||
-                            current.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                            current.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-                        )
+            val current = runCatching { audioManager.communicationDevice }.getOrNull()
+            val currentIsBt = current != null && (
+                current in candidates ||
+                    current.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                    current.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            )
 
             when {
                 currentIsBt -> return
-
                 candidates.isNotEmpty() -> {
-                    val targetDevice =
-                        candidates.firstOrNull {
-                            it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
-                        }
-                            ?: candidates.firstOrNull {
-                                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-                            }
-                            ?: candidates.first()
-
+                    val targetDevice = candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
+                        ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+                        ?: candidates.first()
                     if (!bindBluetoothCommunication(targetDevice)) {
                         bindSpeakerCommunication()
                     }
                 }
-
                 else -> {
                     bindSpeakerCommunication()
                 }
             }
-
             return
         }
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
             val candidates = runCatching {
-                audioManager
-                    .getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-                    .filter {
-                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-                    }
+                audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                }
             }.getOrDefault(emptyList())
 
             when {
-                legacyScoConnected &&
-                    audioManager.isBluetoothScoOn -> return
-
+                legacyScoConnected && audioManager.isBluetoothScoOn -> return
                 legacyScoRequested -> return
-
                 candidates.isNotEmpty() -> {
                     if (!bindBluetoothCommunication(candidates.first())) {
                         bindSpeakerCommunication()
                     }
                 }
-
-                else -> {
-                    bindSpeakerCommunication()
-                }
+                else -> bindSpeakerCommunication()
             }
         }
     }
 
     @Suppress("DEPRECATION")
-    private fun bindBluetoothCommunication(
-        device: AudioDeviceInfo
-    ): Boolean = runCatching {
+    private fun bindBluetoothCommunication(device: AudioDeviceInfo): Boolean = runCatching {
         if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val currentComm = audioManager.communicationDevice
-
             if (currentComm?.id == device.id) {
                 true
             } else {
                 audioManager.setCommunicationDevice(device)
             }
         } else {
-            if (legacyScoConnected &&
-                audioManager.isBluetoothScoOn
-            ) {
+            if (legacyScoConnected && audioManager.isBluetoothScoOn) {
                 return@runCatching true
             }
 
             if (!legacyScoRequested) {
                 val now = SystemClock.elapsedRealtime()
-
-                if (now - lastLegacyScoStartMs >=
-                    LEGACY_SCO_RETRY_COOLDOWN_MS
-                ) {
+                if (now - lastLegacyScoStartMs >= LEGACY_SCO_RETRY_COOLDOWN_MS) {
                     audioManager.isBluetoothScoOn = true
                     audioManager.startBluetoothSco()
-
                     legacyScoRequested = true
                     legacyScoConnected = false
                     lastLegacyScoStartMs = now
@@ -621,9 +793,7 @@ class AudioDeviceRouter @Inject constructor(
             true
         }
     }.onFailure {
-        logger.w(
-            "AudioDeviceRouter: Не удалось привязать Bluetooth-устройство связи: ${it.message}"
-        )
+        logger.w("AudioDeviceRouter: Не удалось привязать Bluetooth-устройство связи: ${it.message}")
     }.getOrDefault(false)
 
     /**
@@ -642,63 +812,36 @@ class AudioDeviceRouter @Inject constructor(
             }.getOrNull()
 
             if (speaker != null) {
-                val currentComm =
-                    runCatching {
-                        audioManager.communicationDevice
-                    }.getOrNull()
-
+                val currentComm = runCatching { audioManager.communicationDevice }.getOrNull()
                 if (currentComm?.id != speaker.id) {
-                    val assigned =
-                        runCatching {
-                            audioManager.setCommunicationDevice(speaker)
-                        }.getOrDefault(false)
-
+                    val assigned = runCatching { audioManager.setCommunicationDevice(speaker) }.getOrDefault(false)
                     if (!assigned) {
-                        logger.w(
-                            "AudioDeviceRouter: setCommunicationDevice(speaker) вернул false; выполняем откат через clearCommunicationDevice()"
-                        )
-
-                        runCatching {
-                            audioManager.clearCommunicationDevice()
-                        }
+                        logger.w("AudioDeviceRouter: setCommunicationDevice(speaker) вернул false; выполняем откат через clearCommunicationDevice()")
+                        runCatching { audioManager.clearCommunicationDevice() }
                     }
                 }
             } else {
                 // На Samsung One UI / Android 16 сброс к системному дефолту спикера выполняется через clear
-                runCatching {
-                    audioManager.clearCommunicationDevice()
-                }.onFailure {
-                    logger.w(
-                        "AudioDeviceRouter: clearCommunicationDevice() сбой: ${it.message}"
-                    )
-                }
+                runCatching { audioManager.clearCommunicationDevice() }
+                    .onFailure {
+                        logger.w("AudioDeviceRouter: clearCommunicationDevice() сбой: ${it.message}")
+                    }
             }
         } else {
             audioManager.isBluetoothScoOn = false
             audioManager.stopBluetoothSco()
-
             legacyScoRequested = false
             legacyScoConnected = false
-
             audioManager.isSpeakerphoneOn = true
         }
 
         if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
-            runCatching {
-                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            }.onFailure {
-                logger.w(
-                    "AudioDeviceRouter: Смена режима на MODE_IN_COMMUNICATION не удалась: ${it.message}"
-                )
-            }
+            runCatching { audioManager.mode = AudioManager.MODE_IN_COMMUNICATION }
+                .onFailure { logger.w("AudioDeviceRouter: Смена режима на MODE_IN_COMMUNICATION не удалась: ${it.message}") }
         }
 
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val comm =
-                runCatching {
-                    audioManager.communicationDevice
-                }.getOrNull()
-
+            val comm = runCatching { audioManager.communicationDevice }.getOrNull()
             // В Android 12–16 null означает активный системный маршрут динамика по умолчанию
             comm == null ||
                 comm.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER ||
@@ -709,24 +852,12 @@ class AudioDeviceRouter @Inject constructor(
     }
 
     private fun createSpeakerProfile(): RouteProfile {
-        val allOutputs =
-            audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        val allOutputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        val allInputs = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
 
-        val allInputs =
-            audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-
-        val builtInSpeaker =
-            allOutputs.firstOrNull {
-                it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-            }
-                ?: allOutputs.firstOrNull {
-                    it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
-                }
-
-        val builtInMic =
-            allInputs.firstOrNull {
-                it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC
-            }
+        val builtInSpeaker = allOutputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+            ?: allOutputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
+        val builtInMic = allInputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
 
         return RouteProfile(
             path = AudioRoutePath.SPEAKER_SHARED,
@@ -734,15 +865,10 @@ class AudioDeviceRouter @Inject constructor(
             leadInBufferSizeFrames = 160 * 16,
             vadThresholdStart = 0.50f,
             vadThresholdEnd = 0.25f,
-            deviceName = builtInSpeaker
-                ?.productName
-                ?.toString()
-                ?.ifBlank {
-                    "Built-in speaker"
-                }
-                ?: "Built-in speaker",
+            deviceName = builtInSpeaker?.productName?.toString()?.ifBlank { "Built-in speaker" } ?: "Built-in speaker",
             inputDeviceId = builtInMic?.id ?: 0,
             outputDeviceId = builtInSpeaker?.id ?: 0
         )
     }
 }
+
