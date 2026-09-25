@@ -187,7 +187,7 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
 
     AAudioStreamBuilder_setDirection(inBuilder, AAUDIO_DIRECTION_INPUT);
     AAudioStreamBuilder_setPerformanceMode(inBuilder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-    AAudioStreamBuilder_setSampleRate(inBuilder, SAMPLE_RATE_GEMINI_IN);
+    AAudioStreamBuilder_setSampleRate(inBuilder, AAUDIO_UNSPECIFIED);
     AAudioStreamBuilder_setChannelCount(inBuilder, CHANNEL_COUNT_MONO);
     AAudioStreamBuilder_setFormat(inBuilder, AAUDIO_FORMAT_PCM_I16);
 
