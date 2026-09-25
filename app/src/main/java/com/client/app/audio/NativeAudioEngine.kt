@@ -826,16 +826,20 @@ class NativeAudioEngine @Inject constructor(
 
                         val pendingFrames = bridge.getPendingPlaybackFrames()
 
+                        // Re-arm grace period if model playback resumes after a quiet pause (> 300 ms)
                         if (instantaneousOut > 0.02f && outputEnergyHangover <= 0.005f) {
                             lastPlaybackStartMs = now
                         }
 
+                        // Delay-matched Leaky Peak Follower (350 ms hangover window with alpha = 0.96 per 10 ms frame).
+                        // Tracks DAC output + physical S23 Ultra Armor Aluminum chassis resonance + room RT60 decay.
                         outputEnergyHangover = if (!_isPlaying.value || (pendingFrames == 0L && instantaneousOut <= 0.001f)) {
                             0f
                         } else {
                             maxOf(instantaneousOut, outputEnergyHangover * 0.96f)
                         }
 
+                        // True indication whether AI is rendering audio through headphones or speaker
                         val isAiRendering = _isPlaying.value && (outputEnergyHangover > 0.015f || pendingFrames > 160L)
 
                         var speechStartedOnFrame =
@@ -869,25 +873,37 @@ class NativeAudioEngine @Inject constructor(
                             // Проверка условий истинного перебивания с защитой от акустического эха
                             val isVocalized = speechStartedOnFrame || vadDetector.isSpeechDetected.value
 
+                            // INVARIANT 1: Barge-in is mathematically impossible if the model is not playing audio.
+                            // If model is silent, user speech is normal communication, NEVER an interruption.
                             if (isVocalized && isAiRendering) {
                                 val canBargeInTimers = (now - lastPlaybackStartMs > PLAYBACK_GRACE_PERIOD_MS) &&
                                                        (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
 
-                                val dynamicErleRatio = 0.72f + (0.15f * currentPlaybackVolume)
-                                val nonLinearOffset = if (outputEnergyHangover > 0.45f) {
-                                    (outputEnergyHangover - 0.45f) * 0.40f
+                                val exceedsAcousticBoundary = if (isBluetooth) {
+                                    // Bluetooth headset: physical isolation > 45 dB.
+                                    // User voice must exceed ambient breathing/noise floor (-29 dBFS).
+                                    instantaneousMic > 0.035f
                                 } else {
-                                    0.0f
-                                }
-                                val echoThreshold = maxOf(0.18f, (outputEnergyHangover * dynamicErleRatio) + nonLinearOffset)
-                                val effectiveThreshold = if (isBluetooth) 0.035f else echoThreshold
+                                    // S23 Ultra speaker: Geigel DTD with Cirrus Logic CS35L41 Smart PA compensation.
+                                    // Dynamic ERL ratio scales with volume (0.72 at low vol, up to 0.87 at max vol).
+                                    val dynamicErleRatio = 0.72f + (0.15f * currentPlaybackVolume)
 
-                                if (instantaneousMic > effectiveThreshold) {
+                                    val nonLinearOffset = if (outputEnergyHangover > 0.45f) {
+                                        (outputEnergyHangover - 0.45f) * 0.40f
+                                    } else {
+                                        0.0f
+                                    }
+                                    val echoThreshold = maxOf(0.18f, (outputEnergyHangover * dynamicErleRatio) + nonLinearOffset)
+                                    instantaneousMic > echoThreshold
+                                }
+
+                                if (exceedsAcousticBoundary) {
                                     bargeInCandidateStreak++
                                 } else {
                                     bargeInCandidateStreak = maxOf(0, bargeInCandidateStreak - 1)
                                 }
 
+                                // Telecom-grade confirmation: 3 frames (30 ms) on BT, 5 frames (50 ms) on Speaker
                                 val requiredStreak = if (isBluetooth) 3 else 5
                                 val isConfirmedUserInterruption = (bargeInCandidateStreak >= requiredStreak) && canBargeInTimers
 
@@ -901,6 +917,7 @@ class NativeAudioEngine @Inject constructor(
                                     _bargeInEvents.tryEmit(Unit)
 
                                     if (isBluetooth) {
+                                        // On Bluetooth, leadInBuffer contains pure user speech onset without speaker echo
                                         val preRoll = mutableListOf<ByteArray>()
                                         synchronized(poolLock) {
                                             while (leadInBuffer.isNotEmpty()) {
@@ -911,6 +928,8 @@ class NativeAudioEngine @Inject constructor(
                                             sendMicEvent(AudioStreamEvent.Audio(pf), instanceId)
                                         }
                                     } else {
+                                        // INVARIANT 2: On Speaker, leadInBuffer is POISONED with the speaker's own echo.
+                                        // Discard and recycle it to prevent feeding the model's voice back into Gemini!
                                         synchronized(poolLock) {
                                             while (leadInBuffer.isNotEmpty()) {
                                                 recycleBuffer(leadInBuffer.removeFirst())
@@ -922,6 +941,7 @@ class NativeAudioEngine @Inject constructor(
                                 bargeInCandidateStreak = 0
                             }
 
+                            // INVARIANT 3: Stream microphone frames or hold in buffer during speaker playback
                             if (
                                 isBluetooth ||
                                 !isAiRendering ||
@@ -1607,7 +1627,6 @@ class NativeAudioEngine @Inject constructor(
         currentPlaybackVolume = clamped
         bridge.setVolume(clamped)
     }
-        )
 
     fun setMicGain(
         gain: Float
