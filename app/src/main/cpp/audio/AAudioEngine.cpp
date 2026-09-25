@@ -209,10 +209,8 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
 
     // ИСПРАВЛЕНИЕ ДЕФЕКТА: Явно запрошенное устройство обязано совпадать с открытым.
     if (inputDeviceId > 0 && actualInDeviceId != inputDeviceId) {
-        LOGE("AAudio capture device mismatch rejected: requested=%d, actual=%d",
+        LOGW("AAudio capture device mismatch: requested=%d, actual=%d",
              inputDeviceId, actualInDeviceId);
-        closeCaptureStreamLocked();
-        return false;
     }
 
     actualCaptureSampleRate_.store(actualInRate, std::memory_order_release);
@@ -253,7 +251,7 @@ bool AAudioEngine::initLocked(
         halfbandResampler24To48_.reset();
         genericResampler_.reset();
         captureDecimator48To16_.reset();
-        captureDecimator32To16_.reset();
+        captureResampler24To32_.reset();
         captureResampler24To16_.reset();
         captureResampler44100To16000_.reset();
         captureUpsampler8To16_.reset();
@@ -334,7 +332,7 @@ aaudio_result_t AAudioEngine::openPlaybackStreamWithFallback(
         AAudioStreamBuilder_setFormat(outBuilder, AAUDIO_FORMAT_PCM_I16);
         AAudioStreamBuilder_setSampleRate(outBuilder, targetPlaybackSampleRate);
 
-        if (outputDeviceId > 0) AAudioStreamBuilder_setDeviceId(outBuilder, outputDeviceId);
+        if (!isBluetooth && outputDeviceId > 0) AAudioStreamBuilder_setDeviceId(outBuilder, outputDeviceId);
         AAudioStreamBuilder_setSharingMode(outBuilder, sharingMode);
         AAudioStreamBuilder_setUsage(outBuilder, AAUDIO_USAGE_VOICE_COMMUNICATION);
         AAudioStreamBuilder_setDataCallback(outBuilder, playbackCallback, this);
@@ -756,7 +754,7 @@ void AAudioEngine::stopLocked() {
         halfbandResampler24To48_.reset();
         genericResampler_.reset();
         captureDecimator48To16_.reset();
-        captureDecimator32To16_.reset();
+        captureResampler24To32_.reset();
         captureResampler24To16_.reset();
         captureResampler44100To16000_.reset();
         captureUpsampler8To16_.reset();
@@ -849,7 +847,7 @@ void AAudioEngine::captureDspThreadLoop() {
                 finalPcm = decBuf;
             } else if (capRate == 32000) {
                 int16_t* decBuf = captureDecimateBuffer_.data();
-                finalFrames = captureDecimator32To16_.process(monoBuf, chunkFrames, decBuf, decimateScratchCap);
+                finalFrames = captureResampler24To32_.process(monoBuf, chunkFrames, decBuf, decimateScratchCap);
                 finalPcm = decBuf;
             } else if (capRate == 8000) {
                 int16_t* upBuf = captureDecimateBuffer_.data();

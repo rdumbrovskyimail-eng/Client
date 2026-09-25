@@ -279,6 +279,7 @@ private:
     Decimator48To16 captureDecimator48To16_;
     Decimator32To16 captureDecimator32To16_;
     PolyphaseResampler24To16 captureResampler24To16_;
+    PolyphaseResampler24To32 captureResampler24To32_;
     Resampler44100To16000 captureResampler44100To16000_;
     Upsampler8000To16000 captureUpsampler8To16_;
 };
