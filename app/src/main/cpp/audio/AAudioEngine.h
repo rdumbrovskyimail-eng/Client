@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include <aaudio/AAudio.h>
@@ -70,14 +69,16 @@ public:
     void stop();
 
     bool startPlayback();
+
+    // Трёхфазный барьер захвата
     bool startCapture();
+    bool activateCaptureDsp();
+    bool commitCaptureAdmission();
     void stopCapture();
 
-    // AUD-005: generation строго обязателен
     size_t writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation);
     size_t readCapturePcm(int16_t* pcm, size_t maxFrames);
 
-    // AUD-005: generation строго обязателен
     void flushPlayback(uint64_t generation);
     void triggerBargeInEarcon();
     void resetEarcon();
@@ -125,7 +126,6 @@ public:
 
     size_t getPendingPlaybackFrames() const;
 
-    // AUD-004: Метрика отброшенных входных аудио-фреймов
     uint64_t getCaptureDroppedFrames() const {
         return captureDroppedFrames_.load(std::memory_order_relaxed);
     }
@@ -179,12 +179,6 @@ private:
         void* userData,
         aaudio_result_t error);
 
-    // AUD-063:
-    // High bit blocks new callback entries.
-    // Low 31 bits count callbacks already inside the critical section.
-    //
-    // This lets lifecycle code quiesce the playback consumer without
-    // modifying the SPSC consumer index while the callback is active.
     static constexpr uint32_t PLAYBACK_CALLBACK_BLOCKED = 0x80000000u;
     static constexpr uint32_t PLAYBACK_CALLBACK_COUNT_MASK = 0x7fffffffu;
 
@@ -196,17 +190,12 @@ private:
     AAudioStream* captureStream_{nullptr};
     AAudioStream* playbackStream_{nullptr};
 
-    // Atomic identity barriers let the error callback distinguish an old
-    // stream closing in the background from the currently active stream.
-    // The callback only publishes a recovery signal; lifecycle code owns close/reopen.
     std::atomic<AAudioStream*> activeCaptureStream_{nullptr};
     std::atomic<AAudioStream*> activePlaybackStream_{nullptr};
 
-    // AUD-003: SPSC queues захвата
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_CAPTURE> captureRawBuffer_;
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_CAPTURE> captureBuffer_;
 
-    // AUD-001: SPSC queues воспроизведения
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_PLAYBACK> playbackDspInputBuffer_;
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_PLAYBACK> playbackBuffer_;
 
@@ -230,8 +219,6 @@ private:
     std::atomic<int32_t> actualInputDeviceId_{AAUDIO_UNSPECIFIED};
     std::atomic<int32_t> actualOutputDeviceId_{AAUDIO_UNSPECIFIED};
 
-    // Requested route identifiers are kept separately from actual opened IDs.
-    // This is required for independent stream reopen after a disconnect.
     std::atomic<int32_t> requestedInputDeviceId_{AAUDIO_UNSPECIFIED};
     std::atomic<int32_t> requestedOutputDeviceId_{AAUDIO_UNSPECIFIED};
 
@@ -253,13 +240,12 @@ private:
     std::mutex captureDspWaitMutex_;
     std::condition_variable captureDspCv_;
 
-    alignas(64) std::atomic<uint64_t> playbackEpoch_{0};
+    // Шлюз допуска входящих сэмплов захвата
+    std::atomic<bool> captureIngressBlocked_{true};
 
-    // Generation reset acknowledgement from the sole playback DSP consumer.
-    // The input SPSC ring may only be discarded by its consumer thread.
+    alignas(64) std::atomic<uint64_t> playbackEpoch_{0};
     alignas(64) std::atomic<uint64_t> playbackDspResetAcknowledgedEpoch_{0};
 
-    // AUD-063: realtime callback admission/quiescence state.
     alignas(64)
     std::atomic<uint32_t> playbackCallbackState_{PLAYBACK_CALLBACK_BLOCKED};
 
@@ -285,9 +271,6 @@ private:
     std::vector<int16_t> captureDecimateBuffer_;
     std::vector<int16_t> captureInputScratchBuffer_;
 
-    // Stateful playback DSP belongs to this engine instance. Lifecycle code
-    // only resets it while the playback worker is quiescent; the worker itself
-    // owns normal-time processing. This removes the global DSP state race.
     AnalogVoiceEnhancer voiceEnhancer_;
 
     PolyphaseResampler24To16 resampler24To16_;
@@ -296,9 +279,7 @@ private:
     Decimator48To16 captureDecimator48To16_;
     Decimator32To16 captureDecimator32To16_;
     PolyphaseResampler24To16 captureResampler24To16_;
-    // Problem #9: Dedicated anti-aliasing decimator for 44.1 kHz capture hardware
     Resampler44100To16000 captureResampler44100To16000_;
-    // Problem #11: Dedicated continuous 8k -> 16k upsampler with causal anti-imaging filter
     Upsampler8000To16000 captureUpsampler8To16_;
 };
 
