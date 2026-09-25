@@ -12,6 +12,7 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Build
 import android.os.SystemClock
+import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import com.client.app.util.AppLogger
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -379,13 +380,12 @@ class AudioDeviceRouter @Inject constructor(
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.S)
     private suspend fun awaitCommunicationDeviceActivation(
         targetDevice: AudioDeviceInfo,
         confirmation: CompletableDeferred<AudioDeviceInfo?>,
         timeoutMs: Long
     ): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
-
         val alreadyActive = runCatching {
             audioManager.communicationDevice?.id == targetDevice.id
         }.getOrDefault(false)
@@ -405,6 +405,7 @@ class AudioDeviceRouter @Inject constructor(
         }.getOrDefault(false)
     }
 
+    @Suppress("DEPRECATION")
     private suspend fun awaitLegacyScoActivation(
         confirmation: CompletableDeferred<Unit>,
         timeoutMs: Long
@@ -424,13 +425,8 @@ class AudioDeviceRouter @Inject constructor(
         return signaled && legacyScoConnected && audioManager.isBluetoothScoOn
     }
 
+    @RequiresApi(Build.VERSION_CODES.S)
     private suspend fun awaitSpeakerFallback(): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-            synchronized(routeLock) {
-                return bindSpeakerCommunication()
-            }
-        }
-
         val speaker = runCatching {
             audioManager.availableCommunicationDevices.firstOrNull {
                 it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
@@ -871,4 +867,3 @@ class AudioDeviceRouter @Inject constructor(
         )
     }
 }
-
