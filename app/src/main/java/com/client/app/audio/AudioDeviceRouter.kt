@@ -114,23 +114,12 @@ class AudioDeviceRouter @Inject constructor(
 
     @Volatile private var activeFingerprint: RouteFingerprint? = null
 
-    private fun isRelevantAudioDevice(device: AudioDeviceInfo): Boolean {
-        val type = device.type
-        return type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER ||
-            type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE ||
-            type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-            type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-            type == AudioDeviceInfo.TYPE_BUILTIN_MIC
-    }
-
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
-            if (addedDevices.isNullOrEmpty() || !addedDevices.any { isRelevantAudioDevice(it) }) return
             debounceTrigger.tryEmit(Unit)
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
-            if (removedDevices.isNullOrEmpty() || !removedDevices.any { isRelevantAudioDevice(it) }) return
             debounceTrigger.tryEmit(Unit)
         }
     }
@@ -595,13 +584,14 @@ class AudioDeviceRouter @Inject constructor(
     private fun selectOptimalBluetoothSampleRate(device: AudioDeviceInfo): Int {
         val supportedRates = device.sampleRates
         if (supportedRates.isEmpty()) {
-            return 0
+            return 24000
         }
 
         return supportedRates
             .filter { it in 16000..48000 }
             .minByOrNull { kotlin.math.abs(it - 24000) }
-            ?: 0
+            ?: supportedRates.minByOrNull { kotlin.math.abs(it - 24000) }
+            ?: 24000
     }
 
     private fun evaluateActiveRouteInternal() = synchronized(routeLock) {
@@ -629,10 +619,8 @@ class AudioDeviceRouter @Inject constructor(
     }
 
     private fun isBluetoothDeviceType(type: Int): Boolean {
-        val isSamsung = Build.MANUFACTURER.equals("samsung", ignoreCase = true)
         return type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-            type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-            (isSamsung && type == AudioDeviceInfo.TYPE_UNKNOWN)
+            type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
     }
 
     /**
@@ -892,30 +880,26 @@ class AudioDeviceRouter @Inject constructor(
     @Suppress("DEPRECATION")
     private fun bindSpeakerCommunication(): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val currentComm = runCatching { audioManager.communicationDevice }.getOrNull()
-            if (currentComm?.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER ||
-                currentComm?.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
-            ) {
-                // Optimized: already correctly routed
-            } else {
-                val speaker = runCatching {
-                    audioManager.availableCommunicationDevices.firstOrNull {
-                        it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-                    }
-                }.getOrNull()
+            val speaker = runCatching {
+                audioManager.availableCommunicationDevices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                }
+            }.getOrNull()
 
-                if (speaker != null) {
+            if (speaker != null) {
+                val currentComm = runCatching { audioManager.communicationDevice }.getOrNull()
+                if (currentComm?.id != speaker.id) {
                     val assigned = runCatching { audioManager.setCommunicationDevice(speaker) }.getOrDefault(false)
                     if (!assigned) {
                         logger.w("AudioDeviceRouter: setCommunicationDevice(speaker) вернул false; выполняем откат через clearCommunicationDevice()")
                         runCatching { audioManager.clearCommunicationDevice() }
                     }
-                } else {
-                    runCatching { audioManager.clearCommunicationDevice() }
-                        .onFailure {
-                            logger.w("AudioDeviceRouter: clearCommunicationDevice() сбой: ${it.message}")
-                        }
                 }
+            } else {
+                runCatching { audioManager.clearCommunicationDevice() }
+                    .onFailure {
+                        logger.w("AudioDeviceRouter: clearCommunicationDevice() сбой: ${it.message}")
+                    }
             }
         } else {
             audioManager.isBluetoothScoOn = false
