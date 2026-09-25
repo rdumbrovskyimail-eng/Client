@@ -25,6 +25,8 @@ class NativeAudioBridge @Inject constructor() {
     external fun startAudio(): Boolean
     external fun startPlaybackAudio(): Boolean
     external fun startCaptureAudio(): Boolean
+    external fun activateCaptureDspAudio(): Boolean
+    external fun commitCaptureAdmission(): Boolean
     external fun stopCaptureAudio()
     external fun stopAudio()
     external fun isAudioDisconnected(): Boolean
