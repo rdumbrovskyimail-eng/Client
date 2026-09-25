@@ -38,6 +38,7 @@ class NativeAudioBridge @Inject constructor() {
     external fun getActiveInputDeviceId(): Int
     external fun getActiveOutputDeviceId(): Int
     external fun getPendingPlaybackFrames(): Long
+    external fun getNativeAudioState(): Int
 
     /** Мгновенный атомарный RMS ЦАП (без задержек UI-рендеринга) для Geigel DTD */
     external fun getOutRms(): Float
