@@ -154,7 +154,7 @@ jobs:
           )
 
           with open("app/src/main/java/com/client/app/session/SessionManager.kt", "w", encoding="utf-8") as f:
-              s.write(s)
+              f.write(s)
           print("SessionManager.kt successfully patched.")
 
       - name: Commit and Push
