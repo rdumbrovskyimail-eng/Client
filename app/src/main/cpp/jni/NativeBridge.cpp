@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/cpp/jni/NativeBridge.cpp
 #include <jni.h>
 #include <cstdio>
 #include <string>
@@ -83,6 +82,18 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_client_app_audio_NativeAudioBridge_startCaptureAudio(JNIEnv * /* env */, jobject /* this */) {
     LOGI("startCaptureAudio called");
     return static_cast<jboolean>(AAudioEngine::getInstance().startCapture());
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_activateCaptureDspAudio(JNIEnv * /* env */, jobject /* this */) {
+    LOGI("activateCaptureDspAudio called");
+    return static_cast<jboolean>(AAudioEngine::getInstance().activateCaptureDsp());
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_commitCaptureAdmission(JNIEnv * /* env */, jobject /* this */) {
+    LOGI("commitCaptureAdmission called");
+    return static_cast<jboolean>(AAudioEngine::getInstance().commitCaptureAdmission());
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -368,4 +379,77 @@ Java_com_client_app_audio_NativeAudioBridge_drainNativeLogs(JNIEnv *env, jobject
 
     env->DeleteLocalRef(stringClass);
     return resultArray;
+}
+
+Файл 4: app/src/main/java/com/client/app/audio/NativeAudioBridge.kt
+
+package com.client.app.audio
+
+import javax.inject.Inject
+import javax.inject.Singleton
+import java.nio.ByteBuffer
+
+@Singleton
+class NativeAudioBridge @Inject constructor() {
+    companion object {
+        init {
+            System.loadLibrary("client_core")
+        }
+    }
+
+    external fun getHardwareCoreInfo(): String
+
+    external fun initAudioRoute(
+        isBluetooth: Boolean,
+        sampleRate: Int,
+        inputDeviceId: Int = 0,
+        outputDeviceId: Int = 0
+    ): Boolean
+
+    external fun startAudio(): Boolean
+    external fun startPlaybackAudio(): Boolean
+    external fun startCaptureAudio(): Boolean
+    external fun activateCaptureDspAudio(): Boolean
+    external fun commitCaptureAdmission(): Boolean
+    external fun stopCaptureAudio()
+    external fun stopAudio()
+    external fun isAudioDisconnected(): Boolean
+    external fun getActualPlaybackSampleRate(): Int
+    external fun getActualPlaybackChannels(): Int
+    external fun getActualPlaybackFormat(): Int
+    external fun getActualCaptureSampleRate(): Int
+    external fun getActualCaptureChannels(): Int
+    external fun getActiveInputDeviceId(): Int
+    external fun getActiveOutputDeviceId(): Int
+    external fun getPendingPlaybackFrames(): Long
+
+    external fun getOutRms(): Float
+    external fun getMicRms(): Float
+
+    external fun isMmapActive(): Boolean
+    external fun isExclusiveSharingActive(): Boolean
+    external fun setVolume(volume: Float)
+    external fun setMicGain(gain: Float)
+
+    external fun writePlaybackByteArray(
+        pcmArray: ByteArray,
+        offsetBytes: Int,
+        lengthBytes: Int,
+        generation: Long
+    ): Int
+
+    external fun writePlaybackDirect(
+        byteBuffer: ByteBuffer,
+        offsetBytes: Int,
+        lengthBytes: Int,
+        generation: Long
+    ): Int
+
+    external fun readCaptureDirect(byteBuffer: ByteBuffer, capacityBytes: Int): Int
+
+    external fun flushPlayback(generation: Long)
+    external fun triggerBargeInEarcon()
+    external fun tuneNativeSocket(fd: Int)
+    external fun getSpectrumData(outArray: FloatArray)
+    external fun drainNativeLogs(): Array<String>?
 }
