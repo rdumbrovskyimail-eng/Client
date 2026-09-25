@@ -274,7 +274,6 @@ private:
     AnalogVoiceEnhancer voiceEnhancer_;
 
     PolyphaseResampler24To16 resampler24To16_;
-    PolyphaseResampler24To32 resampler24To32_;
     HalfbandResampler24To48 halfbandResampler24To48_;
     StreamingLinearResampler genericResampler_;
     Decimator48To16 captureDecimator48To16_;
