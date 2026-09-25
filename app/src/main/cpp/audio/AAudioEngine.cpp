@@ -209,8 +209,10 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
 
     // ИСПРАВЛЕНИЕ ДЕФЕКТА: Явно запрошенное устройство обязано совпадать с открытым.
     if (inputDeviceId > 0 && actualInDeviceId != inputDeviceId) {
-        LOGW("AAudio capture device mismatch tolerated: requested=%d, actual=%d",
+        LOGE("AAudio capture device mismatch rejected: requested=%d, actual=%d",
              inputDeviceId, actualInDeviceId);
+        closeCaptureStreamLocked();
+        return false;
     }
 
     actualCaptureSampleRate_.store(actualInRate, std::memory_order_release);
