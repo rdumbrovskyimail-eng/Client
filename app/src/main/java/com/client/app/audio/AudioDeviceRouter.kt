@@ -495,33 +495,28 @@ class AudioDeviceRouter @Inject constructor(
 
         if (!hasBtPermission) return null
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val current = runCatching { audioManager.communicationDevice }.getOrNull()
-            if (current != null && (
-                    current.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                        current.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-                )) {
-                return current
-            }
-        }
-
         val candidates = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             runCatching {
                 audioManager.availableCommunicationDevices.filter {
                     it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                        it.type == AudioDeviceInfo.TYPE_BLE_SPEAKER ||
+                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
                 }
             }.getOrDefault(emptyList())
         } else {
             runCatching {
                 audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter {
-                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
                 }
             }.getOrDefault(emptyList())
         }
 
         return candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
             ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+            ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_SPEAKER }
+            ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP }
             ?: candidates.firstOrNull()
     }
 
