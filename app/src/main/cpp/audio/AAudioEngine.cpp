@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/cpp/audio/AAudioEngine.cpp
 #include "AAudioEngine.h"
 #include "NativeLogQueue.h"
 #include "dsp/NeonDspUtils.h"
@@ -192,7 +191,13 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
     AAudioStreamBuilder_setChannelCount(inBuilder, CHANNEL_COUNT_MONO);
     AAudioStreamBuilder_setFormat(inBuilder, AAUDIO_FORMAT_PCM_I16);
 
-    if (inputDeviceId > 0) {
+    // Error #2: explicit AAudio input-device routing is not used for
+    // Bluetooth communication. AudioManager owns the communication route;
+    // the capture stream follows the system-selected communication source.
+    const bool isBt =
+        isBluetoothMode_.load(std::memory_order_relaxed);
+
+    if (!isBt && inputDeviceId > 0) {
         AAudioStreamBuilder_setDeviceId(inBuilder, inputDeviceId);
     }
 
@@ -229,7 +234,11 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
         return false;
     }
 
-    if (inputDeviceId > 0 && actualInDeviceId != inputDeviceId) {
+    // Explicit-device mismatch is meaningful only for non-Bluetooth input.
+    // In Bluetooth communication mode, the active source is selected by
+    // Android's communication routing and is intentionally not compared
+    // against an explicit inputDeviceId.
+    if (!isBt && inputDeviceId > 0 && actualInDeviceId != inputDeviceId) {
         LOGW("AAudio capture device preference not strictly matched: requested=%d actual=%d; continuing with routed device",
              inputDeviceId, actualInDeviceId);
     }
@@ -306,7 +315,17 @@ bool AAudioEngine::initLocked(
     actualPlaybackBurst_.store(0, std::memory_order_release);
     isBluetoothMode_.store(isBluetoothMode, std::memory_order_relaxed);
     playbackSampleRate_.store(targetPlaybackSampleRate, std::memory_order_relaxed);
-    requestedInputDeviceId_.store(inputDeviceId, std::memory_order_release);
+
+    // Error #2: Bluetooth input is routed by Android communication routing,
+    // not by an explicit AAudio input device ID. Keep the persisted request
+    // normalized so every capture reopen uses AAUDIO_UNSPECIFIED in BT mode.
+    const int32_t effectiveInputDeviceId =
+        isBluetoothMode ? AAUDIO_UNSPECIFIED : inputDeviceId;
+
+    requestedInputDeviceId_.store(
+        effectiveInputDeviceId,
+        std::memory_order_release
+    );
     requestedOutputDeviceId_.store(outputDeviceId, std::memory_order_release);
 
     LOGI("AAudioEngine::initLocked: BT=%d, targetRate=%d, inDevId=%d, outDevId=%d",
