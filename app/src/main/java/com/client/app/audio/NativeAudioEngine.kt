@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/java/com/client/app/audio/NativeAudioEngine.kt
 package com.client.app.audio
 
 import android.content.Context
@@ -33,19 +32,10 @@ import javax.inject.Singleton
 import kotlin.math.sqrt
 
 sealed interface AudioStreamEvent {
-
-    class Audio(
-        val pcm: ByteArray
-    ) : AudioStreamEvent
-
-    data object SpeechStart :
-        AudioStreamEvent
-
-    data object SpeechEnd :
-        AudioStreamEvent
-
-    data object StreamStop :
-        AudioStreamEvent
+    class Audio(val pcm: ByteArray) : AudioStreamEvent
+    data object SpeechStart : AudioStreamEvent
+    data object SpeechEnd : AudioStreamEvent
+    data object StreamStop : AudioStreamEvent
 }
 
 enum class CaptureShutdownResult {
@@ -66,200 +56,93 @@ private data class RouteTransitionRequest(
 
 @Singleton
 class NativeAudioEngine @Inject constructor(
-    @ApplicationContext
-    private val context: Context,
-
+    @ApplicationContext private val context: Context,
     private val bridge: NativeAudioBridge,
-
     private val vadDetector: SileroVadDetector,
-
-    private val hapticManager:
-        HapticBargeInManager,
-
-    private val router:
-        AudioDeviceRouter,
-
-    private val logger:
-        AppLogger
+    private val hapticManager: HapticBargeInManager,
+    private val router: AudioDeviceRouter,
+    private val logger: AppLogger
 ) {
 
     companion object {
-
-        private const val BURST_BYTES =
-            160 * 2
-
-        // По стандартам ITU-T G.168: защитный интервал для подавления переходных процессов включения ЦАП
-        private const val PLAYBACK_GRACE_PERIOD_MS =
-            350L
-
-        private const val BARGE_IN_DEBOUNCE_MS =
-            500L
-
-        // Минимальное время удержания гейта перебивания (Barge-In)
-        private const val BARGE_IN_MIN_HOLD_MS =
-            250L
-
-        // Гарантированный предельный дедлайн локального восстановления
-        private const val BARGE_IN_HARD_RECOVERY_MS =
-            3000L
-
-        private const val BARGE_IN_RECOVERY_POLL_MS =
-            50L
-
-        private const val PRE_ROLL_FRAMES_CAPACITY =
-            20
-
-        // Ограничение накопления необработанного захваченного аудио в памяти (~16 секунд 16 кГц PCM16)
-        private const val MAX_MIC_OUTPUT_BACKLOG_BYTES =
-            512L * 1024L
-
-        // Предельный аппаратный порог замирания записи JNI в ЦАП (1.8 секунды).
-        // Предотвращает выбрасывание сэмплов длинных ответов при быстром сетевом наполнении буфера.
+        private const val BURST_BYTES = 160 * 2
+        private const val PLAYBACK_GRACE_PERIOD_MS = 350L
+        private const val BARGE_IN_DEBOUNCE_MS = 500L
+        private const val BARGE_IN_MIN_HOLD_MS = 250L
+        private const val BARGE_IN_HARD_RECOVERY_MS = 3000L
+        private const val BARGE_IN_RECOVERY_POLL_MS = 50L
+        private const val PRE_ROLL_FRAMES_CAPACITY = 20
+        private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 512L * 1024L
         private const val PLAYBACK_WRITE_STALL_TIMEOUT_MS = 1800L
     }
 
     private val audioManager =
-        context.getSystemService(
-            Context.AUDIO_SERVICE
-        ) as AudioManager
+        context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-    private var focusRequest:
-        AudioFocusRequest? = null
+    private var focusRequest: AudioFocusRequest? = null
 
-    private val _isCapturing =
-        MutableStateFlow(false)
+    private val _isCapturing = MutableStateFlow(false)
+    val isCapturing: StateFlow<Boolean> = _isCapturing.asStateFlow()
 
-    val isCapturing:
-        StateFlow<Boolean> =
-        _isCapturing.asStateFlow()
+    private val _isPlaying = MutableStateFlow(false)
+    val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
 
-    private val _isPlaying =
-        MutableStateFlow(false)
+    private val _micLevel = MutableStateFlow(0f)
+    val micLevel: StateFlow<Float> = _micLevel.asStateFlow()
 
-    val isPlaying:
-        StateFlow<Boolean> =
-        _isPlaying.asStateFlow()
+    private val _outLevel = MutableStateFlow(0f)
+    val outLevel: StateFlow<Float> = _outLevel.asStateFlow()
 
-    private val _micLevel =
-        MutableStateFlow(0f)
+    private val _bargeInEvents = MutableSharedFlow<Unit>(
+        replay = 0,
+        extraBufferCapacity = 8,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val bargeInEvents: SharedFlow<Unit> = _bargeInEvents.asSharedFlow()
 
-    val micLevel:
-        StateFlow<Float> =
-        _micLevel.asStateFlow()
+    private val _focusEvents = MutableStateFlow<AudioFocusEvent>(AudioFocusEvent.Gain)
+    val focusEvents: StateFlow<AudioFocusEvent> = _focusEvents.asStateFlow()
 
-    private val _outLevel =
-        MutableStateFlow(0f)
+    private val _micOutput = Channel<AudioStreamEvent>(Channel.UNLIMITED)
+    private val queuedMicOutputBytes = AtomicLong(0L)
+    val micOutput: ReceiveChannel<AudioStreamEvent> = _micOutput
 
-    val outLevel:
-        StateFlow<Float> =
-        _outLevel.asStateFlow()
+    private val coroutineExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        logger.e("Unhandled coroutine exception in NativeAudioEngine", throwable)
+    }
 
-    private val _bargeInEvents =
-        MutableSharedFlow<Unit>(
-            replay = 0,
-            extraBufferCapacity = 8,
-            onBufferOverflow =
-                BufferOverflow.DROP_OLDEST
-        )
+    private val engineScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO + coroutineExceptionHandler
+    )
 
-    val bargeInEvents:
-        SharedFlow<Unit> =
-        _bargeInEvents.asSharedFlow()
+    private val captureExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread({
+            runCatching {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+            }.onFailure {
+                logger.w("NativeAudioEngine: failed to set capture thread priority: ${it.message}")
+            }
+            runnable.run()
+        }, "NativeAudioCapture")
+    }
 
-    private val _focusEvents =
-        MutableStateFlow<AudioFocusEvent>(AudioFocusEvent.Gain)
-    val focusEvents:
-        StateFlow<AudioFocusEvent> =
-        _focusEvents.asStateFlow()
+    private val captureDispatcher = captureExecutor.asCoroutineDispatcher()
 
-    private val _micOutput =
-        Channel<AudioStreamEvent>(
-            Channel.UNLIMITED
-        )
+    private var captureJob: Job? = null
+    private var spectrumJob: Job? = null
+    private var healthJob: Job? = null
 
-    private val queuedMicOutputBytes =
-        AtomicLong(0L)
+    private val captureInstanceId = AtomicLong(0L)
+    private val audioLifecycleMutex = Mutex()
+    private val captureEventLock = Any()
+    private val captureDirectMutex = Mutex()
+    private val playbackOperationLock = ReentrantLock()
 
-    val micOutput:
-        ReceiveChannel<AudioStreamEvent> =
-        _micOutput
+    private val routeTransitionChannel = Channel<RouteTransitionRequest>(Channel.CONFLATED)
 
-    private val coroutineExceptionHandler =
-        CoroutineExceptionHandler {
-                _,
-                throwable ->
-            logger.e(
-                "Unhandled coroutine exception in NativeAudioEngine",
-                throwable
-            )
-        }
-
-    private val engineScope =
-        CoroutineScope(
-            SupervisorJob() +
-                Dispatchers.IO +
-                coroutineExceptionHandler
-        )
-
-    private val captureExecutor =
-        Executors.newSingleThreadExecutor { runnable ->
-            Thread(
-                {
-                    runCatching {
-                        Process.setThreadPriority(
-                            Process.THREAD_PRIORITY_URGENT_AUDIO
-                        )
-                    }.onFailure {
-                        logger.w(
-                            "NativeAudioEngine: failed to set capture thread priority: ${it.message}"
-                        )
-                    }
-                    runnable.run()
-                },
-                "NativeAudioCapture"
-            )
-        }
-
-    private val captureDispatcher =
-        captureExecutor.asCoroutineDispatcher()
-
-    private var captureJob:
-        Job? = null
-
-    private var spectrumJob:
-        Job? = null
-
-    private var healthJob:
-        Job? = null
-
-    private val captureInstanceId =
-        AtomicLong(0L)
-
-    private val audioLifecycleMutex =
-        Mutex()
-
-    private val captureEventLock =
-        Any()
-
-    private val captureDirectMutex =
-        Mutex()
-
-    private val playbackOperationLock =
-        ReentrantLock()
-
-    private val routeTransitionChannel =
-        Channel<RouteTransitionRequest>(
-            Channel.CONFLATED
-        )
-
-    private val engineGeneration =
-        AtomicLong(0)
-
-    private val playbackGeneration =
-        AtomicLong(1L)
-
-    private val playbackStartGeneration =
-        AtomicLong(0L)
+    private val engineGeneration = AtomicLong(0)
+    private val playbackGeneration = AtomicLong(1L)
+    private val playbackStartGeneration = AtomicLong(0L)
 
     private val playbackDesired = AtomicBoolean(false)
     private val captureDesired = AtomicBoolean(false)
@@ -273,205 +156,97 @@ class NativeAudioEngine @Inject constructor(
         vadDetector.setThresholds(s, e)
     }
 
-    @Volatile
-    private var streamStopGeneration:
-        Long = -1L
+    @Volatile private var streamStopGeneration: Long = -1L
+    @Volatile var isAadMode: Boolean = true
 
-    @Volatile
-    var isAadMode: Boolean = true
+    private val captureDirectBuffer = ByteBuffer.allocateDirect(BURST_BYTES * 4).order(ByteOrder.LITTLE_ENDIAN)
+    private val spectrumRawData = FloatArray(7)
+    private val spectrumUniformUpdate = FloatArray(5)
+    val spectrumUniforms = AtomicReference(FloatArray(5))
 
-    private val captureDirectBuffer =
-        ByteBuffer.allocateDirect(
-            BURST_BYTES * 4
-        ).order(
-            ByteOrder.LITTLE_ENDIAN
-        )
+    private val bufferPool = ArrayDeque<ByteArray>(32).apply {
+        repeat(32) { add(ByteArray(BURST_BYTES)) }
+    }
+    private val poolLock = Any()
+    private val leadInBuffer = ArrayDeque<ByteArray>(32)
 
-    private val spectrumRawData =
-        FloatArray(7)
+    @Volatile private var lastPlaybackStartMs = 0L
+    @Volatile private var lastBargeInMs = 0L
+    @Volatile private var outputEnergyHangover: Float = 0f
+    @Volatile private var currentPlaybackVolume: Float = 1.0f
 
-    private val spectrumUniformUpdate =
-        FloatArray(5)
-
-    val spectrumUniforms =
-        AtomicReference(
-            FloatArray(5)
-        )
-
-    private val bufferPool =
-        ArrayDeque<ByteArray>(32).apply {
-            repeat(32) {
-                add(
-                    ByteArray(
-                        BURST_BYTES
-                    )
-                )
-            }
-        }
-
-    private val poolLock =
-        Any()
-
-    private val leadInBuffer =
-        ArrayDeque<ByteArray>(32)
-
-    @Volatile
-    private var lastPlaybackStartMs =
-        0L
-
-    @Volatile
-    private var lastBargeInMs = 0L
-
-    @Volatile
-    private var outputEnergyHangover: Float = 0f
-
-    @Volatile
-    private var currentPlaybackVolume: Float = 1.0f
-
-    @Volatile
-    var isBargeInActive = false
+    @Volatile var isBargeInActive = false
         private set
 
-    @Volatile
-    private var bargeInTimestampMs =
-        0L
-
-    private var bargeInLeaseJob:
-        Job? = null
+    @Volatile private var bargeInTimestampMs = 0L
+    private var bargeInLeaseJob: Job? = null
 
     init {
         engineScope.launch {
-            for (
-                req in
-                routeTransitionChannel
-            ) {
+            for (req in routeTransitionChannel) {
                 applyRouteInternal(req)
             }
         }
     }
 
-    private fun requestAudioFocus():
-        Boolean {
+    private fun requestAudioFocus(): Boolean {
+        val attrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
 
-        val attrs =
-            AudioAttributes.Builder()
-                .setUsage(
-                    AudioAttributes
-                        .USAGE_VOICE_COMMUNICATION
-                )
-                .setContentType(
-                    AudioAttributes
-                        .CONTENT_TYPE_SPEECH
-                )
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(attrs)
+                .setAcceptsDelayedFocusGain(false)
+                .setOnAudioFocusChangeListener { change ->
+                    when (change) {
+                        AudioManager.AUDIOFOCUS_LOSS,
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                            logger.w("NativeAudioEngine: AudioFocus потерян ($change)")
+                            _focusEvents.tryEmit(
+                                if (change == AudioManager.AUDIOFOCUS_LOSS) AudioFocusEvent.LossPermanent
+                                else AudioFocusEvent.LossTransient
+                            )
+                        }
+                        AudioManager.AUDIOFOCUS_GAIN -> {
+                            logger.d("NativeAudioEngine: AudioFocus восстановлен")
+                            _focusEvents.tryEmit(AudioFocusEvent.Gain)
+                        }
+                        else -> Unit
+                    }
+                }
                 .build()
 
-        return if (
-            Build.VERSION.SDK_INT >=
-                Build.VERSION_CODES.O
-        ) {
-
-            val req =
-                AudioFocusRequest.Builder(
-                    AudioManager.AUDIOFOCUS_GAIN
-                )
-                    .setAudioAttributes(attrs)
-                    .setAcceptsDelayedFocusGain(
-                        false
-                    )
-                    .setOnAudioFocusChangeListener {
-                        change ->
-                        when (change) {
-
-                            AudioManager.AUDIOFOCUS_LOSS,
-                            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-
-                                logger.w(
-                                    "NativeAudioEngine: AudioFocus потерян ($change)"
-                                )
-
-                                _focusEvents.tryEmit(
-                                    if (change == AudioManager.AUDIOFOCUS_LOSS) AudioFocusEvent.LossPermanent
-                                    else AudioFocusEvent.LossTransient
-                                )
-                            }
-
-                            AudioManager.AUDIOFOCUS_GAIN -> {
-
-                                logger.d(
-                                    "NativeAudioEngine: AudioFocus восстановлен"
-                                )
-
-                                _focusEvents.tryEmit(AudioFocusEvent.Gain)
-                            }
-
-                            else -> Unit
-                        }
-                    }
-                    .build()
-
             focusRequest = req
-
-            audioManager.requestAudioFocus(
-                req
-            ) ==
-                AudioManager
-                    .AUDIOFOCUS_REQUEST_GRANTED
-
+            audioManager.requestAudioFocus(req) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
         } else {
-
             @Suppress("DEPRECATION")
             audioManager.requestAudioFocus(
                 { change ->
-                    if (
-                        change ==
-                            AudioManager.AUDIOFOCUS_LOSS ||
-                        change ==
-                            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT
-                    ) {
-
+                    if (change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
                         _focusEvents.tryEmit(
                             if (change == AudioManager.AUDIOFOCUS_LOSS) AudioFocusEvent.LossPermanent
                             else AudioFocusEvent.LossTransient
                         )
-
-                    } else if (
-                        change ==
-                            AudioManager.AUDIOFOCUS_GAIN
-                    ) {
-
+                    } else if (change == AudioManager.AUDIOFOCUS_GAIN) {
                         _focusEvents.tryEmit(AudioFocusEvent.Gain)
                     }
                 },
                 AudioManager.STREAM_VOICE_CALL,
                 AudioManager.AUDIOFOCUS_GAIN
-            ) ==
-                AudioManager
-                    .AUDIOFOCUS_REQUEST_GRANTED
+            ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
         }
     }
 
     private fun abandonAudioFocus() {
-
         runCatching {
-
-            if (
-                Build.VERSION.SDK_INT >=
-                    Build.VERSION_CODES.O
-            ) {
-
-                focusRequest?.let {
-                    audioManager
-                        .abandonAudioFocusRequest(it)
-                }
-
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
                 focusRequest = null
-
             } else {
-
                 @Suppress("DEPRECATION")
-                audioManager.abandonAudioFocus(
-                    null
-                )
+                audioManager.abandonAudioFocus(null)
             }
         }
     }
@@ -486,19 +261,13 @@ class NativeAudioEngine @Inject constructor(
         val exclusive = bridge.isExclusiveSharingActive()
 
         if (profile.inputDeviceId > 0 && actualIn > 0 && actualIn != profile.inputDeviceId) {
-            logger.w(
-                "NativeAudioEngine: actual input device differs from requested route ($context): requested=${profile.inputDeviceId}, actual=$actualIn"
-            )
+            logger.w("NativeAudioEngine: actual input device differs from requested route ($context): requested=${profile.inputDeviceId}, actual=$actualIn")
         }
         if (profile.outputDeviceId > 0 && actualOut > 0 && actualOut != profile.outputDeviceId) {
-            logger.w(
-                "NativeAudioEngine: actual output device differs from requested route ($context): requested=${profile.outputDeviceId}, actual=$actualOut"
-            )
+            logger.w("NativeAudioEngine: actual output device differs from requested route ($context): requested=${profile.outputDeviceId}, actual=$actualOut")
         }
 
-        logger.d(
-            "NativeAudioEngine: actual native route ($context): in=$actualIn out=$actualOut playRate=${actualPlayRate}Hz ch=$actualPlayChannels fmt=$actualPlayFormat exclusive=$exclusive mmap=$mmap"
-        )
+        logger.d("NativeAudioEngine: actual native route ($context): in=$actualIn out=$actualOut playRate=${actualPlayRate}Hz ch=$actualPlayChannels fmt=$actualPlayFormat exclusive=$exclusive mmap=$mmap")
     }
 
     suspend fun start(): Boolean {
@@ -518,9 +287,7 @@ class NativeAudioEngine @Inject constructor(
 
                 if (!requestAudioFocus()) {
                     playbackDesired.set(false)
-                    logger.e(
-                        "NativeAudioEngine: Сбой запроса AudioFocus"
-                    )
+                    logger.e("NativeAudioEngine: Сбой запроса AudioFocus")
                     return@withContext false
                 }
 
@@ -530,13 +297,9 @@ class NativeAudioEngine @Inject constructor(
 
                 try {
                     router.start { profile ->
-                        routeTransitionChannel
-                            .trySend(
-                                RouteTransitionRequest(
-                                    profile,
-                                    engineGeneration.get()
-                                )
-                            )
+                        routeTransitionChannel.trySend(
+                            RouteTransitionRequest(profile, engineGeneration.get())
+                        )
                     }
                 } catch (t: Throwable) {
                     logger.e("NativeAudioEngine: AudioDeviceRouter startup failed", t)
@@ -544,33 +307,24 @@ class NativeAudioEngine @Inject constructor(
                     return@withContext false
                 }
 
-                val profile =
-                    router.currentProfile.value
+                val profile = router.currentProfile.value
 
-                val inited =
-                    captureDirectMutex.withLock {
-                        playbackOperationLock.lock()
-                        try {
-                            bridge.initAudioRoute(
-                                isBluetooth =
-                                    profile.path ==
-                                        AudioRoutePath.BLUETOOTH_COMMUNICATION,
-                                sampleRate =
-                                    profile.sampleRateOut,
-                                inputDeviceId =
-                                    profile.inputDeviceId,
-                                outputDeviceId =
-                                    profile.outputDeviceId
-                            )
-                        } finally {
-                            playbackOperationLock.unlock()
-                        }
+                val inited = captureDirectMutex.withLock {
+                    playbackOperationLock.lock()
+                    try {
+                        bridge.initAudioRoute(
+                            isBluetooth = profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION,
+                            sampleRate = profile.sampleRateOut,
+                            inputDeviceId = profile.inputDeviceId,
+                            outputDeviceId = profile.outputDeviceId
+                        )
+                    } finally {
+                        playbackOperationLock.unlock()
                     }
+                }
 
                 if (!inited) {
-                    logger.e(
-                        "NativeAudioEngine: Сбой инициализации playback route"
-                    )
+                    logger.e("NativeAudioEngine: Сбой инициализации playback route")
                     router.stop()
                     abandonAudioFocus()
                     return@withContext false
@@ -592,21 +346,18 @@ class NativeAudioEngine @Inject constructor(
                     }
                 }
 
-                val started =
-                    captureDirectMutex.withLock {
-                        playbackOperationLock.lock()
-                        try {
-                            bridge.startPlaybackAudio()
-                        } finally {
-                            playbackOperationLock.unlock()
-                        }
+                val started = captureDirectMutex.withLock {
+                    playbackOperationLock.lock()
+                    try {
+                        bridge.startPlaybackAudio()
+                    } finally {
+                        playbackOperationLock.unlock()
                     }
+                }
 
                 if (!started) {
                     playbackDesired.set(false)
-                    logger.e(
-                        "NativeAudioEngine: Сбой запуска playback AAudio"
-                    )
+                    logger.e("NativeAudioEngine: Сбой запуска playback AAudio")
                     captureDirectMutex.withLock {
                         playbackOperationLock.lock()
                         try {
@@ -627,6 +378,95 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 
+    private suspend fun startVerifiedCapture(
+        profile: RouteProfile,
+        context: String
+    ): Boolean {
+        val maxAttempts = if (profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION) 5 else 1
+        var captureOpened = false
+        var dspActivated = false
+        var admissionCommitted = false
+
+        try {
+            repeat(maxAttempts) { attempt ->
+                captureOpened = captureDirectMutex.withLock {
+                    bridge.startCaptureAudio()
+                }
+
+                if (!captureOpened) {
+                    logger.w("NativeAudioEngine: physical capture start failed [$context], attempt=${attempt + 1}/$maxAttempts")
+                } else {
+                    var actualInputId = bridge.getActiveInputDeviceId()
+                    var routeValid = router.isInputDeviceMatchingRoute(profile, actualInputId)
+
+                    // Немедленная повторная проверка перед стартом DSP
+                    if (routeValid) {
+                        actualInputId = bridge.getActiveInputDeviceId()
+                        routeValid = router.isInputDeviceMatchingRoute(profile, actualInputId)
+                    }
+
+                    if (routeValid) {
+                        val dspStarted = captureDirectMutex.withLock {
+                            bridge.activateCaptureDspAudio()
+                        }
+
+                        if (!dspStarted) {
+                            logger.e("NativeAudioEngine: DSP activation failed [$context]")
+                        } else {
+                            dspActivated = true
+
+                            // Вторая верификация: DSP запущен, но шлюз ингресса всё ещё закрыт
+                            actualInputId = bridge.getActiveInputDeviceId()
+                            val finalRouteValid = router.isInputDeviceMatchingRoute(profile, actualInputId)
+
+                            if (finalRouteValid) {
+                                val committed = captureDirectMutex.withLock {
+                                    bridge.commitCaptureAdmission()
+                                }
+
+                                if (committed) {
+                                    admissionCommitted = true
+                                    logger.d("NativeAudioEngine: capture route verified and committed [$context], attempt=${attempt + 1}/$maxAttempts, input=$actualInputId")
+                                    return true
+                                }
+                                logger.e("NativeAudioEngine: capture admission commit failed [$context]")
+                            } else {
+                                logger.w("NativeAudioEngine: FINAL route verification failed [$context], actualInput=$actualInputId")
+                            }
+                        }
+                    } else {
+                        logger.w("NativeAudioEngine: capture route rejected [$context], attempt=${attempt + 1}/$maxAttempts, actualInput=$actualInputId, expected=${profile.inputDeviceId}")
+                    }
+
+                    // Маршрут не подтвердился — закрываем стрим перед следующей попыткой
+                    captureDirectMutex.withLock {
+                        runCatching { bridge.stopCaptureAudio() }
+                    }
+                    captureOpened = false
+                    dspActivated = false
+                }
+
+                if (attempt + 1 < maxAttempts) {
+                    delay(100L)
+                }
+            }
+        } finally {
+            // Безопасное освобождение нативного стрима при отмене корутины
+            if (captureOpened && !admissionCommitted) {
+                withContext(NonCancellable) {
+                    captureDirectMutex.withLock {
+                        runCatching { bridge.stopCaptureAudio() }.onFailure {
+                            logger.e("NativeAudioEngine: failed to cleanup capture after cancellation [$context]", it)
+                        }
+                    }
+                }
+            }
+        }
+
+        logger.e("NativeAudioEngine: capture route could not be established [$context]")
+        return false
+    }
+
     suspend fun startCapture(): Boolean =
         audioLifecycleMutex.withLock {
             withContext(Dispatchers.IO) {
@@ -637,43 +477,32 @@ class NativeAudioEngine @Inject constructor(
 
                 val existingCaptureJob = captureJob
                 if (existingCaptureJob != null && !existingCaptureJob.isCompleted) {
-                    val joined =
-                        withTimeoutOrNull(500L) {
-                            existingCaptureJob.join()
-                            true
-                        } ?: false
+                    val joined = withTimeoutOrNull(500L) {
+                        existingCaptureJob.join()
+                        true
+                    } ?: false
 
                     if (!joined) {
-                        logger.e(
-                            "NativeAudioEngine: previous capture worker is still terminating; refusing a second producer"
-                        )
+                        logger.e("NativeAudioEngine: previous capture worker is still terminating; refusing second producer")
                         return@withContext false
                     }
                 }
-
-                if (captureJob != null) {
-                    captureJob = null
-                }
+                captureJob = null
 
                 if (!_isPlaying.value) {
-                    logger.e(
-                        "NativeAudioEngine: Нельзя запустить capture без активного playback"
-                    )
+                    logger.e("NativeAudioEngine: Нельзя запустить capture без активного playback")
                     return@withContext false
                 }
 
                 if (!vadDetector.prepare()) {
-                    logger.e(
-                        "NativeAudioEngine: Silero VAD model is unavailable or invalid"
-                    )
+                    logger.e("NativeAudioEngine: Silero VAD model is unavailable or invalid")
                     return@withContext false
                 }
 
                 vadDetector.resetState()
                 resetBargeInState()
 
-                val profile =
-                    router.currentProfile.value
+                val profile = router.currentProfile.value
                 vadDetector.setThresholds(
                     profile.vadThresholdStart,
                     profile.vadThresholdEnd
@@ -683,16 +512,15 @@ class NativeAudioEngine @Inject constructor(
                     streamStopGeneration = -1L
                 }
 
-                val started =
-                    captureDirectMutex.withLock {
-                        bridge.startCaptureAudio()
-                    }
+                val started = startVerifiedCapture(
+                    profile = profile,
+                    context = "startCapture"
+                )
 
                 if (!started) {
                     captureDesired.set(false)
-                    logger.e(
-                        "NativeAudioEngine: Сбой запуска capture AAudio"
-                    )
+                    _isCapturing.value = false
+                    logger.e("NativeAudioEngine: capture startup rejected because actual input route could not be verified")
                     return@withContext false
                 }
 
@@ -706,9 +534,6 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 
-    /**
-     * Быстрый безаллокационный расчёт среднеквадратичной мощности (RMS) для 10-мс кванта PCM16.
-     */
     private fun calculatePcm16Rms(pcm: ByteArray, bytesCount: Int): Float {
         val sampleCount = bytesCount / 2
         if (sampleCount <= 0) return 0f
@@ -725,652 +550,352 @@ class NativeAudioEngine @Inject constructor(
     }
 
     private fun startLoops() {
-
-        if (
-            _isCapturing.value &&
-            captureJob?.isCompleted != false
-        ) {
+        if (_isCapturing.value && captureJob?.isCompleted != false) {
             val instanceId = captureInstanceId.get()
 
-            captureJob =
-                engineScope.launch(captureDispatcher) {
-
+            captureJob = engineScope.launch(captureDispatcher) {
                 var isSpeechActiveManual = false
                 var zeroReadStreak = 0
-                // Фильтр подтверждения перебивания (Double-Talk Hangover по ITU-T G.168 / ACM TOCHI)
                 var bargeInCandidateStreak = 0
 
                 try {
-                    while (
-                        isActive &&
-                        _isCapturing.value &&
-                        captureDesired.get() &&
-                        captureInstanceId.get() == instanceId
-                    ) {
+                    while (isActive && _isCapturing.value && captureDesired.get() && captureInstanceId.get() == instanceId) {
+                        captureDirectBuffer.clear()
 
-                    captureDirectBuffer.clear()
-
-                    val bytesRead =
-                        captureDirectMutex.withLock {
-
-                            if (
-                                !_isCapturing.value ||
-                                !captureDesired.get() ||
-                                captureInstanceId.get() != instanceId
-                            ) {
+                        val bytesRead = captureDirectMutex.withLock {
+                            if (!_isCapturing.value || !captureDesired.get() || captureInstanceId.get() != instanceId) {
                                 return@withLock 0
                             }
+                            bridge.readCaptureDirect(captureDirectBuffer, BURST_BYTES)
+                        }
 
-                            bridge.readCaptureDirect(
-                                captureDirectBuffer,
-                                BURST_BYTES
+                        if (bytesRead > 0) {
+                            zeroReadStreak = 0
+                            if (captureInstanceId.get() != instanceId || !captureDesired.get() || !_isCapturing.value) {
+                                continue
+                            }
+
+                            val frame = obtainBuffer()
+                            captureDirectBuffer.position(0)
+                            captureDirectBuffer.get(frame, 0, bytesRead)
+
+                            val validPcm = if (bytesRead == BURST_BYTES) frame else frame.copyOf(bytesRead)
+                            val now = SystemClock.elapsedRealtime()
+
+                            val instantaneousMic = maxOf(
+                                calculatePcm16Rms(validPcm, bytesRead),
+                                bridge.getMicRms()
                             )
-                        }
+                            val instantaneousOut = bridge.getOutRms()
 
-                    if (bytesRead > 0) {
-                        zeroReadStreak = 0
+                            val isBluetooth = router.currentProfile.value.path == AudioRoutePath.BLUETOOTH_COMMUNICATION
+                            val pendingFrames = bridge.getPendingPlaybackFrames()
 
-                        if (
-                            captureInstanceId.get() != instanceId ||
-                            !captureDesired.get() ||
-                            !_isCapturing.value
-                        ) {
-                            continue
-                        }
+                            if (instantaneousOut > 0.02f && outputEnergyHangover <= 0.005f) {
+                                lastPlaybackStartMs = now
+                            }
 
-                        val frame =
-                            obtainBuffer()
-
-                        captureDirectBuffer.position(
-                            0
-                        )
-
-                        captureDirectBuffer.get(
-                            frame,
-                            0,
-                            bytesRead
-                        )
-
-                        val validPcm =
-                            if (
-                                bytesRead ==
-                                    BURST_BYTES
-                            ) {
-                                frame
+                            outputEnergyHangover = if (!_isPlaying.value || (pendingFrames == 0L && instantaneousOut <= 0.001f)) {
+                                0f
                             } else {
-                                frame.copyOf(
-                                    bytesRead
-                                )
+                                maxOf(instantaneousOut, outputEnergyHangover * 0.96f)
                             }
 
-                        val now =
-                            SystemClock
-                                .elapsedRealtime()
+                            val isAiRendering = _isPlaying.value && (outputEnergyHangover > 0.015f || pendingFrames > 160L)
 
-                        // Мгновенные уровни с нулевым лагом:
-                        // 1. Мощность микрофона рассчитывается прямо из текущего кадра
-                        val instantaneousMic = maxOf(
-                            calculatePcm16Rms(validPcm, bytesRead),
-                            bridge.getMicRms()
-                        )
-                        // 2. Мощность динамика считывается атомарно из C++ движка
-                        val instantaneousOut = bridge.getOutRms()
+                            var speechStartedOnFrame = false
+                            var speechEndedOnFrame = false
 
-                        val isBluetooth =
-                            router
-                                .currentProfile
-                                .value
-                                .path ==
-                                AudioRoutePath
-                                    .BLUETOOTH_COMMUNICATION
-
-                        val pendingFrames = bridge.getPendingPlaybackFrames()
-
-                        // Re-arm grace period if model playback resumes after a quiet pause (> 300 ms)
-                        if (instantaneousOut > 0.02f && outputEnergyHangover <= 0.005f) {
-                            lastPlaybackStartMs = now
-                        }
-
-                        // Delay-matched Leaky Peak Follower (350 ms hangover window with alpha = 0.96 per 10 ms frame).
-                        // Tracks DAC output + physical S23 Ultra Armor Aluminum chassis resonance + room RT60 decay.
-                        outputEnergyHangover = if (!_isPlaying.value || (pendingFrames == 0L && instantaneousOut <= 0.001f)) {
-                            0f
-                        } else {
-                            maxOf(instantaneousOut, outputEnergyHangover * 0.96f)
-                        }
-
-                        // True indication whether AI is rendering audio through headphones or speaker
-                        val isAiRendering = _isPlaying.value && (outputEnergyHangover > 0.015f || pendingFrames > 160L)
-
-                        var speechStartedOnFrame =
-                            false
-
-                        var speechEndedOnFrame =
-                            false
-
-                        if (captureInstanceId.get() != instanceId || !captureDesired.get() || !_isCapturing.value) {
-                            continue
-                        }
-
-                        vadDetector.processSamples(
-                            pcm16 = validPcm,
-                            onSpeechStart = {
-                                speechStartedOnFrame =
-                                    true
-                            },
-
-                            onSpeechEnd = {
-                                speechEndedOnFrame =
-                                    true
+                            if (captureInstanceId.get() != instanceId || !captureDesired.get() || !_isCapturing.value) {
+                                continue
                             }
-                        )
 
-                        val currentAudioBytes =
-                            validPcm
+                            vadDetector.processSamples(
+                                pcm16 = validPcm,
+                                onSpeechStart = { speechStartedOnFrame = true },
+                                onSpeechEnd = { speechEndedOnFrame = true }
+                            )
 
-                        if (isAadMode) {
+                            val currentAudioBytes = validPcm
 
-                            // Проверка условий истинного перебивания с защитой от акустического эха
-                            val isVocalized = speechStartedOnFrame || vadDetector.isSpeechDetected.value
+                            if (isAadMode) {
+                                val isVocalized = speechStartedOnFrame || vadDetector.isSpeechDetected.value
 
-                            // INVARIANT 1: Barge-in is mathematically impossible if the model is not playing audio.
-                            // If model is silent, user speech is normal communication, NEVER an interruption.
-                            if (isVocalized && isAiRendering) {
-                                val canBargeInTimers = (now - lastPlaybackStartMs > PLAYBACK_GRACE_PERIOD_MS) &&
-                                                       (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
+                                if (isVocalized && isAiRendering) {
+                                    val canBargeInTimers = (now - lastPlaybackStartMs > PLAYBACK_GRACE_PERIOD_MS) &&
+                                                           (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
 
-                                val exceedsAcousticBoundary = if (isBluetooth) {
-                                    // Bluetooth headset: physical isolation > 45 dB.
-                                    // User voice must exceed ambient breathing/noise floor (-29 dBFS).
-                                    instantaneousMic > 0.035f
-                                } else {
-                                    // S23 Ultra speaker: Geigel DTD with Cirrus Logic CS35L41 Smart PA compensation.
-                                    // Dynamic ERL ratio scales with volume (0.72 at low vol, up to 0.87 at max vol).
                                     val dynamicErleRatio = 0.72f + (0.15f * currentPlaybackVolume)
-
                                     val nonLinearOffset = if (outputEnergyHangover > 0.45f) {
                                         (outputEnergyHangover - 0.45f) * 0.40f
                                     } else {
                                         0.0f
                                     }
                                     val echoThreshold = maxOf(0.18f, (outputEnergyHangover * dynamicErleRatio) + nonLinearOffset)
-                                    instantaneousMic > echoThreshold
-                                }
+                                    val effectiveThreshold = if (isBluetooth) 0.035f else echoThreshold
 
-                                if (exceedsAcousticBoundary) {
-                                    bargeInCandidateStreak++
-                                } else {
-                                    bargeInCandidateStreak = maxOf(0, bargeInCandidateStreak - 1)
-                                }
-
-                                // Telecom-grade confirmation: 3 frames (30 ms) on BT, 5 frames (50 ms) on Speaker
-                                val requiredStreak = if (isBluetooth) 3 else 5
-                                val isConfirmedUserInterruption = (bargeInCandidateStreak >= requiredStreak) && canBargeInTimers
-
-                                if (isConfirmedUserInterruption) {
-                                    lastBargeInMs = now
-                                    bargeInCandidateStreak = 0
-                                    outputEnergyHangover = 0f
-
-                                    activateBargeIn(now)
-                                    hapticManager.triggerBargeIn()
-                                    _bargeInEvents.tryEmit(Unit)
-
-                                    if (isBluetooth) {
-                                        // On Bluetooth, leadInBuffer contains pure user speech onset without speaker echo
-                                        val preRoll = mutableListOf<ByteArray>()
-                                        synchronized(poolLock) {
-                                            while (leadInBuffer.isNotEmpty()) {
-                                                preRoll.add(leadInBuffer.removeFirst())
-                                            }
-                                        }
-                                        for (pf in preRoll) {
-                                            sendMicEvent(AudioStreamEvent.Audio(pf), instanceId)
-                                        }
+                                    if (instantaneousMic > effectiveThreshold) {
+                                        bargeInCandidateStreak++
                                     } else {
-                                        // INVARIANT 2: On Speaker, leadInBuffer is POISONED with the speaker's own echo.
-                                        // Discard and recycle it to prevent feeding the model's voice back into Gemini!
-                                        synchronized(poolLock) {
-                                            while (leadInBuffer.isNotEmpty()) {
-                                                recycleBuffer(leadInBuffer.removeFirst())
+                                        bargeInCandidateStreak = maxOf(0, bargeInCandidateStreak - 1)
+                                    }
+
+                                    val requiredStreak = if (isBluetooth) 3 else 5
+                                    val isConfirmedUserInterruption = (bargeInCandidateStreak >= requiredStreak) && canBargeInTimers
+
+                                    if (isConfirmedUserInterruption) {
+                                        lastBargeInMs = now
+                                        bargeInCandidateStreak = 0
+                                        outputEnergyHangover = 0f
+
+                                        activateBargeIn(now)
+                                        hapticManager.triggerBargeIn()
+                                        _bargeInEvents.tryEmit(Unit)
+
+                                        if (isBluetooth) {
+                                            val preRoll = mutableListOf<ByteArray>()
+                                            synchronized(poolLock) {
+                                                while (leadInBuffer.isNotEmpty()) {
+                                                    preRoll.add(leadInBuffer.removeFirst())
+                                                }
+                                            }
+                                            for (pf in preRoll) {
+                                                sendMicEvent(AudioStreamEvent.Audio(pf), instanceId)
+                                            }
+                                        } else {
+                                            synchronized(poolLock) {
+                                                while (leadInBuffer.isNotEmpty()) {
+                                                    recycleBuffer(leadInBuffer.removeFirst())
+                                                }
                                             }
                                         }
                                     }
+                                } else {
+                                    bargeInCandidateStreak = 0
                                 }
-                            } else {
-                                bargeInCandidateStreak = 0
-                            }
 
-                            // INVARIANT 3: Stream microphone frames or hold in buffer during speaker playback
-                            if (
-                                isBluetooth ||
-                                !isAiRendering ||
-                                isBargeInActive
-                            ) {
-
-                                sendMicEvent(
-                                    AudioStreamEvent
-                                        .Audio(
-                                            currentAudioBytes
-                                        ),
-                                    instanceId
-                                )
-
-                            } else {
-
-                                synchronized(
-                                    poolLock
-                                ) {
-
-                                    leadInBuffer
-                                        .addLast(
-                                            currentAudioBytes
-                                        )
-
-                                    val maxPreRoll =
-                                        router
-                                            .currentProfile
-                                            .value
-                                            .leadInBufferSizeFrames /
-                                            160
-
-                                    while (
-                                        leadInBuffer.size >
-                                            maxPreRoll
-                                    ) {
-
-                                        recycleBuffer(
-                                            leadInBuffer
-                                                .removeFirst()
-                                        )
+                                if (isBluetooth || !isAiRendering || isBargeInActive) {
+                                    sendMicEvent(AudioStreamEvent.Audio(currentAudioBytes), instanceId)
+                                } else {
+                                    synchronized(poolLock) {
+                                        leadInBuffer.addLast(currentAudioBytes)
+                                        val maxPreRoll = router.currentProfile.value.leadInBufferSizeFrames / 160
+                                        while (leadInBuffer.size > maxPreRoll) {
+                                            recycleBuffer(leadInBuffer.removeFirst())
+                                        }
                                     }
                                 }
+
+                                if (speechEndedOnFrame && _isCapturing.value && captureInstanceId.get() == instanceId) {
+                                    sendMicEvent(AudioStreamEvent.SpeechEnd, instanceId)
+                                }
+                            } else {
+                                if (speechStartedOnFrame) {
+                                    val preRoll = mutableListOf<ByteArray>()
+                                    synchronized(poolLock) {
+                                        while (leadInBuffer.isNotEmpty()) {
+                                            preRoll.add(leadInBuffer.removeFirst())
+                                        }
+                                    }
+
+                                    sendMicEvent(AudioStreamEvent.SpeechStart, instanceId)
+                                    for (pf in preRoll) {
+                                        sendMicEvent(AudioStreamEvent.Audio(pf), instanceId)
+                                    }
+                                    sendMicEvent(AudioStreamEvent.Audio(currentAudioBytes), instanceId)
+                                    isSpeechActiveManual = true
+                                } else if (isSpeechActiveManual) {
+                                    sendMicEvent(AudioStreamEvent.Audio(currentAudioBytes), instanceId)
+                                } else {
+                                    synchronized(poolLock) {
+                                        leadInBuffer.addLast(currentAudioBytes)
+                                        while (leadInBuffer.size > PRE_ROLL_FRAMES_CAPACITY) {
+                                            recycleBuffer(leadInBuffer.removeFirst())
+                                        }
+                                    }
+                                }
+
+                                if (speechEndedOnFrame && _isCapturing.value && captureInstanceId.get() == instanceId) {
+                                    sendMicEvent(AudioStreamEvent.SpeechEnd, instanceId)
+                                    isSpeechActiveManual = false
+                                }
                             }
 
-                            if (
-                                speechEndedOnFrame &&
-                                _isCapturing.value &&
-                                captureInstanceId.get() == instanceId
-                            ) {
-                                sendMicEvent(
-                                    AudioStreamEvent
-                                        .SpeechEnd,
-                                    instanceId
-                                )
+                            if (currentAudioBytes !== frame) {
+                                recycleBuffer(frame)
                             }
-
                         } else {
-
-                            if (
-                                speechStartedOnFrame
-                            ) {
-
-                                val preRoll =
-                                    mutableListOf<
-                                        ByteArray
-                                    >()
-
-                                synchronized(
-                                    poolLock
-                                ) {
-
-                                    while (
-                                        leadInBuffer
-                                            .isNotEmpty()
-                                    ) {
-
-                                        preRoll.add(
-                                            leadInBuffer
-                                                .removeFirst()
-                                        )
-                                    }
-                                }
-
-                                sendMicEvent(
-                                    AudioStreamEvent
-                                        .SpeechStart,
-                                    instanceId
-                                )
-
-                                for (
-                                    pf in
-                                    preRoll
-                                ) {
-
-                                    sendMicEvent(
-                                        AudioStreamEvent
-                                            .Audio(pf)
-                                    )
-                                }
-
-                                sendMicEvent(
-                                    AudioStreamEvent
-                                        .Audio(
-                                            currentAudioBytes
-                                        ),
-                                    instanceId
-                                )
-
-                                isSpeechActiveManual =
-                                    true
-
-                            } else if (
-                                isSpeechActiveManual
-                            ) {
-
-                                sendMicEvent(
-                                    AudioStreamEvent
-                                        .Audio(
-                                            currentAudioBytes
-                                        ),
-                                    instanceId
-                                )
-
-                            } else {
-
-                                synchronized(
-                                    poolLock
-                                ) {
-
-                                    leadInBuffer
-                                        .addLast(
-                                            currentAudioBytes
-                                        )
-
-                                    while (
-                                        leadInBuffer.size >
-                                            PRE_ROLL_FRAMES_CAPACITY
-                                    ) {
-
-                                        recycleBuffer(
-                                            leadInBuffer
-                                                .removeFirst()
-                                        )
-                                    }
-                                }
-                            }
-
-                            if (
-                                speechEndedOnFrame &&
-                                _isCapturing.value &&
-                                captureInstanceId.get() == instanceId
-                            ) {
-                                sendMicEvent(
-                                    AudioStreamEvent
-                                        .SpeechEnd,
-                                    instanceId
-                                )
-                                isSpeechActiveManual = false
-                            }
+                            val pollDelayMs = if (++zeroReadStreak > 3) 10L else 5L
+                            delay(pollDelayMs)
                         }
-
-                        if (currentAudioBytes !== frame) {
-                            recycleBuffer(frame)
-                        }
-
-                    } else {
-                        val pollDelayMs = if (++zeroReadStreak > 3) 10L else 5L
-                        delay(pollDelayMs)
                     }
-                }
-            } catch (t: Throwable) {
-                if (t !is CancellationException) {
-                    logger.e(
-                        "NativeAudioEngine: capture loop failed",
-                        t
-                    )
-                }
-                throw t
-            } finally {
-                if (captureInstanceId.get() == instanceId) {
-                    _isCapturing.value = false
-                    enqueueStreamStopOnce(
-                        engineGeneration.get(),
-                        instanceId
-                    )
-                    runCatching {
-                        captureDirectMutex.withLock {
-                            bridge.stopCaptureAudio()
+                } catch (t: Throwable) {
+                    if (t !is CancellationException) {
+                        logger.e("NativeAudioEngine: capture loop failed", t)
+                    }
+                    throw t
+                } finally {
+                    if (captureInstanceId.get() == instanceId) {
+                        _isCapturing.value = false
+                        enqueueStreamStopOnce(engineGeneration.get(), instanceId)
+                        runCatching {
+                            captureDirectMutex.withLock { bridge.stopCaptureAudio() }
+                        }.onFailure {
+                            logger.e("NativeAudioEngine: failed to stop capture after loop termination", it)
                         }
-                    }.onFailure {
-                        logger.e(
-                            "NativeAudioEngine: failed to stop capture after loop termination",
-                            it
-                        )
                     }
                 }
             }
         }
 
-        }
-
-        if (
-            _isPlaying.value &&
-            spectrumJob?.isActive != true
-        ) {
-            spectrumJob =
-                engineScope.launch {
-
+        if (_isPlaying.value && spectrumJob?.isActive != true) {
+            spectrumJob = engineScope.launch {
                 var tick = 0
                 while (isActive) {
-
-                    bridge.getSpectrumData(
-                        spectrumRawData
-                    )
-
-                    System.arraycopy(
-                        spectrumRawData,
-                        0,
-                        spectrumUniformUpdate,
-                        0,
-                        5
-                    )
-
+                    bridge.getSpectrumData(spectrumRawData)
+                    System.arraycopy(spectrumRawData, 0, spectrumUniformUpdate, 0, 5)
                     spectrumUniforms.set(spectrumUniformUpdate.copyOf())
-                    if (
-                        tick++ % 4 == 0
-                    ) {
 
-                        _micLevel.value =
-                            (
-                                spectrumRawData[5] *
-                                    3.5f
-                            ).coerceIn(
-                                0f,
-                                1f
-                            )
-
-                        _outLevel.value =
-                            (
-                                spectrumRawData[6] *
-                                    3.5f
-                            ).coerceIn(
-                                0f,
-                                1f
-                            )
+                    if (tick++ % 4 == 0) {
+                        _micLevel.value = (spectrumRawData[5] * 3.5f).coerceIn(0f, 1f)
+                        _outLevel.value = (spectrumRawData[6] * 3.5f).coerceIn(0f, 1f)
                     }
-
                     delay(8)
                 }
             }
         }
 
-        if (
-            _isPlaying.value &&
-            healthJob?.isActive != true
-        ) {
-            healthJob =
-                engineScope.launch {
-                    while (
-                        isActive &&
-                        (playbackDesired.get() || captureDesired.get())
-                    ) {
-                        try {
-                            if (!vadDetector.isNeuralActive) {
-                                vadDetector.prepare()
-                            }
-                            if (bridge.isAudioDisconnected()) {
-                                logger.w(
-                                    "NativeAudioEngine: AAudio health fault detected; restarting active streams"
-                                )
-
-                                applyRouteInternal(
-                                    RouteTransitionRequest(
-                                        router.currentProfile.value,
-                                        engineGeneration.get()
-                                    )
-                                )
-                            }
-                        } catch (t: Throwable) {
-                            if (t !is CancellationException) {
-                                logger.e(
-                                    "NativeAudioEngine: audio recovery attempt failed",
-                                    t
-                                )
-                            }
+        if (_isPlaying.value && healthJob?.isActive != true) {
+            healthJob = engineScope.launch {
+                while (isActive && (playbackDesired.get() || captureDesired.get())) {
+                    try {
+                        if (!vadDetector.isNeuralActive) {
+                            vadDetector.prepare()
                         }
-
-                        delay(100)
+                        if (bridge.isAudioDisconnected()) {
+                            logger.w("NativeAudioEngine: AAudio health fault detected; restarting active streams")
+                            applyRouteInternal(
+                                RouteTransitionRequest(router.currentProfile.value, engineGeneration.get())
+                            )
+                        }
+                    } catch (t: Throwable) {
+                        if (t !is CancellationException) {
+                            logger.e("NativeAudioEngine: audio recovery attempt failed", t)
+                        }
                     }
+                    delay(100)
                 }
+            }
         }
     }
 
     private suspend fun applyRouteInternal(
         req: RouteTransitionRequest
-    ) =
-        audioLifecycleMutex.withLock {
-            withContext(Dispatchers.IO) {
-                val currentGeneration = engineGeneration.get()
-                if (req.generation != currentGeneration) return@withContext
+    ) = audioLifecycleMutex.withLock {
+        withContext(Dispatchers.IO) {
+            val currentGeneration = engineGeneration.get()
+            if (req.generation != currentGeneration) return@withContext
 
-                val keepPlaying = playbackDesired.get()
-                val keepCapturing = captureDesired.get()
-                if (!keepPlaying && !keepCapturing) return@withContext
+            val keepPlaying = playbackDesired.get()
+            val keepCapturing = captureDesired.get()
+            if (!keepPlaying && !keepCapturing) return@withContext
 
-                if (keepCapturing) {
-                    _isCapturing.value = false
-                    synchronized(captureEventLock) {
-                        captureInstanceId.incrementAndGet()
-                    }
-
-                    val oldCaptureJob = captureJob
-                    if (oldCaptureJob != null && oldCaptureJob.isActive) {
-                        oldCaptureJob.cancel()
-                    }
-
-                    captureDirectMutex.withLock {
-                        bridge.stopCaptureAudio()
-                    }
-
-                    if (oldCaptureJob != null) {
-                        val stopped =
-                            withTimeoutOrNull(1000L) {
-                                oldCaptureJob.join()
-                                true
-                            } ?: false
-
-                        if (!stopped) {
-                            logger.e(
-                                "NativeAudioEngine: previous capture worker did not terminate during route recovery; keeping it as the lifecycle ownership barrier"
-                            )
-                            engineScope.launch {
-                                delay(100L)
-                                if (
-                                    req.generation == engineGeneration.get() &&
-                                    captureDesired.get()
-                                ) {
-                                    routeTransitionChannel.trySend(req)
-                                }
-                            }
-                            return@withContext
-                        }
-                    }
-
-                    captureJob = null
-
-                    synchronized(poolLock) {
-                        recycleLeadInBuffersLocked()
-                    }
-                    vadDetector.resetState()
+            if (keepCapturing) {
+                _isCapturing.value = false
+                synchronized(captureEventLock) {
+                    captureInstanceId.incrementAndGet()
                 }
 
-                if (keepPlaying) {
-                    invalidateAndFlushPlayback("route recovery")
-                }
+                val oldCaptureJob = captureJob
+                oldCaptureJob?.cancel()
 
                 captureDirectMutex.withLock {
-                    playbackOperationLock.lock()
-                    try {
-                        bridge.stopAudio()
+                    bridge.stopCaptureAudio()
+                }
 
-                        val success = bridge.initAudioRoute(
-                            isBluetooth =
-                                req.profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION,
-                            sampleRate = req.profile.sampleRateOut,
-                            inputDeviceId = req.profile.inputDeviceId,
-                            outputDeviceId = req.profile.outputDeviceId
-                        )
-
-                        if (!success) {
-                            _isPlaying.value = false
-                            _isCapturing.value = false
-                            logger.e(
-                                "NativeAudioEngine: route reinitialization failed; desired lifecycle remains armed for health retry"
-                            )
-                        } else {
-                            logActualNativeRoute(req.profile, "routeRecovery")
-                            vadDetector.resetState()
-                            synchronized(poolLock) {
-                                recycleLeadInBuffersLocked()
-                            }
-                            vadDetector.setThresholds(
-                                req.profile.vadThresholdStart,
-                                req.profile.vadThresholdEnd
-                            )
-
-                            val playbackRecovered =
-                                !keepPlaying || bridge.startPlaybackAudio()
-                            _isPlaying.value = playbackRecovered && keepPlaying
-
-                            if (!playbackRecovered && keepPlaying) {
-                                logger.e(
-                                    "NativeAudioEngine: не удалось восстановить playback после смены route; health loop повторит попытку"
-                                )
-                            }
-
-                            val captureRecovered =
-                                !keepCapturing || bridge.startCaptureAudio()
-                            _isCapturing.value = captureRecovered && keepCapturing
-
-                            if (!captureRecovered && keepCapturing) {
-                                logger.e(
-                                    "NativeAudioEngine: не удалось восстановить capture после смены route; health loop повторит попытку"
-                                )
-                            }
-
-                            if (playbackRecovered && keepPlaying) {
-                                playbackStartGeneration.set(
-                                    currentPlaybackGeneration
-                                )
-                                lastPlaybackStartMs = SystemClock.elapsedRealtime() + PLAYBACK_GRACE_PERIOD_MS
-                                lastBargeInMs = SystemClock.elapsedRealtime() + BARGE_IN_DEBOUNCE_MS
-                                resetBargeInState()
-                            }
-
-                            if (captureRecovered && keepCapturing) {
-                                synchronized(captureEventLock) {
-                                    captureInstanceId.incrementAndGet()
-                                }
-                                startLoops()
-                            }
-                        }
-                    } finally {
-                        playbackOperationLock.unlock()
+                if (oldCaptureJob != null) {
+                    withTimeoutOrNull(1000L) {
+                        oldCaptureJob.join()
+                        true
                     }
                 }
+
+                captureJob = null
+                synchronized(poolLock) {
+                    recycleLeadInBuffersLocked()
+                }
+                vadDetector.resetState()
+            }
+
+            if (keepPlaying) {
+                invalidateAndFlushPlayback("route recovery")
+            }
+
+            var routeInited = false
+            var playbackRecovered = false
+
+            // ФАЗА 1: Реинициализация оборудования и воспроизведения под мьютексом
+            captureDirectMutex.withLock {
+                playbackOperationLock.lock()
+                try {
+                    bridge.stopAudio()
+                    routeInited = bridge.initAudioRoute(
+                        isBluetooth = req.profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION,
+                        sampleRate = req.profile.sampleRateOut,
+                        inputDeviceId = req.profile.inputDeviceId,
+                        outputDeviceId = req.profile.outputDeviceId
+                    )
+
+                    if (routeInited) {
+                        logActualNativeRoute(req.profile, "routeRecovery")
+                        vadDetector.resetState()
+                        synchronized(poolLock) {
+                            recycleLeadInBuffersLocked()
+                        }
+                        vadDetector.setThresholds(
+                            req.profile.vadThresholdStart,
+                            req.profile.vadThresholdEnd
+                        )
+
+                        playbackRecovered = !keepPlaying || bridge.startPlaybackAudio()
+                        _isPlaying.value = playbackRecovered && keepPlaying
+                    }
+                } finally {
+                    playbackOperationLock.unlock()
+                }
+            }
+
+            if (!routeInited || (!playbackRecovered && keepPlaying)) {
+                _isPlaying.value = false
+                _isCapturing.value = false
+                logger.e("NativeAudioEngine: route recovery playback initialization failed")
+                return@withContext
+            }
+
+            // ФАЗА 2: Запуск захвата СНАРУЖИ captureDirectMutex (Устранение Deadlock!)
+            // Передаём строго req.profile
+            val captureRecovered = if (!keepCapturing) {
+                true
+            } else {
+                startVerifiedCapture(
+                    profile = req.profile,
+                    context = "routeRecovery"
+                )
+            }
+
+            _isCapturing.value = captureRecovered && keepCapturing
+
+            if (captureRecovered && keepCapturing) {
+                synchronized(captureEventLock) {
+                    captureInstanceId.incrementAndGet()
+                }
+                startLoops()
+            } else if (keepCapturing) {
+                captureDesired.set(false)
+                logger.e("NativeAudioEngine: capture route recovery rejected by verifier")
             }
         }
+    }
 
     private suspend fun enqueueStreamStopOnce(
         generation: Long,
@@ -1381,16 +906,14 @@ class NativeAudioEngine @Inject constructor(
                 return@synchronized true
             }
 
-            val enqueued =
-                sendMicEventLocked(
-                    AudioStreamEvent.StreamStop,
-                    expectedCaptureInstanceId
-                )
+            val enqueued = sendMicEventLocked(
+                AudioStreamEvent.StreamStop,
+                expectedCaptureInstanceId
+            )
 
             if (enqueued) {
                 streamStopGeneration = generation
             }
-
             enqueued
         }
 
@@ -1407,8 +930,7 @@ class NativeAudioEngine @Inject constructor(
                         captureInstanceId.incrementAndGet()
                     }
 
-                    var shutdownStatus =
-                        CaptureShutdownResult.GRACEFUL_LOSSLESS
+                    var shutdownStatus = CaptureShutdownResult.GRACEFUL_LOSSLESS
                     val job = captureJob
 
                     if (job?.isActive == true) {
@@ -1420,20 +942,14 @@ class NativeAudioEngine @Inject constructor(
                     }
 
                     if (job != null) {
-                        val completed =
-                            withTimeoutOrNull(
-                                gracefulTimeoutMs.coerceAtLeast(0L)
-                            ) {
-                                job.join()
-                                true
-                            } ?: false
+                        val completed = withTimeoutOrNull(gracefulTimeoutMs.coerceAtLeast(0L)) {
+                            job.join()
+                            true
+                        } ?: false
 
                         if (!completed) {
-                            shutdownStatus =
-                                CaptureShutdownResult.FORCED_TIMEOUT
-                            logger.e(
-                                "NativeAudioEngine: capture worker did not terminate after native capture stop"
-                            )
+                            shutdownStatus = CaptureShutdownResult.FORCED_TIMEOUT
+                            logger.e("NativeAudioEngine: capture worker did not terminate after native capture stop")
                         }
                     }
 
@@ -1447,8 +963,7 @@ class NativeAudioEngine @Inject constructor(
                     vadDetector.resetState()
 
                     if (!enqueueStreamStopOnce(engineGeneration.get())) {
-                        shutdownStatus =
-                            CaptureShutdownResult.FORCED_TIMEOUT
+                        shutdownStatus = CaptureShutdownResult.FORCED_TIMEOUT
                     }
 
                     return@withContext shutdownStatus
@@ -1460,110 +975,82 @@ class NativeAudioEngine @Inject constructor(
         withContext(NonCancellable) {
             audioLifecycleMutex.withLock {
                 withContext(Dispatchers.IO) {
+                    captureDesired.set(false)
+                    playbackDesired.set(false)
+                    _isCapturing.value = false
+                    _isPlaying.value = false
 
-                captureDesired.set(false)
-                playbackDesired.set(false)
+                    engineGeneration.incrementAndGet()
 
-                _isCapturing.value =
-                    false
-
-                _isPlaying.value =
-                    false
-
-                engineGeneration
-                    .incrementAndGet()
-
-                synchronized(captureEventLock) {
-                    streamStopGeneration = -1L
-                    captureInstanceId.incrementAndGet()
-                }
-
-                val captureToStop = captureJob
-                if (captureToStop?.isActive == true) {
-                    captureToStop.cancel()
-                }
-
-                spectrumJob?.let { job ->
-                    if (job.isActive) {
-                        job.cancel()
-                        withTimeoutOrNull(500L) { job.join() }
+                    synchronized(captureEventLock) {
+                        streamStopGeneration = -1L
+                        captureInstanceId.incrementAndGet()
                     }
-                }
-                spectrumJob = null
 
-                healthJob?.let { job ->
-                    if (job.isActive) {
-                        job.cancel()
-                        withTimeoutOrNull(500L) { job.join() }
+                    val captureToStop = captureJob
+                    if (captureToStop?.isActive == true) {
+                        captureToStop.cancel()
                     }
-                }
-                healthJob = null
 
-                captureDirectMutex.withLock {
-                    playbackOperationLock.lock()
-                    try {
-                        bridge.stopAudio()
-                    } finally {
-                        playbackOperationLock.unlock()
+                    spectrumJob?.let { job ->
+                        if (job.isActive) {
+                            job.cancel()
+                            withTimeoutOrNull(500L) { job.join() }
+                        }
                     }
-                }
+                    spectrumJob = null
 
-                if (captureToStop != null) {
-                    val completed =
-                        withTimeoutOrNull(500L) {
+                    healthJob?.let { job ->
+                        if (job.isActive) {
+                            job.cancel()
+                            withTimeoutOrNull(500L) { job.join() }
+                        }
+                    }
+                    healthJob = null
+
+                    captureDirectMutex.withLock {
+                        playbackOperationLock.lock()
+                        try {
+                            bridge.stopAudio()
+                        } finally {
+                            playbackOperationLock.unlock()
+                        }
+                    }
+
+                    if (captureToStop != null) {
+                        val completed = withTimeoutOrNull(500L) {
                             captureToStop.join()
                             true
                         } ?: false
 
-                    if (completed) {
-                        captureJob = null
+                        if (completed) {
+                            captureJob = null
+                        } else {
+                            logger.e("NativeAudioEngine: terminal capture worker still terminating after native stop")
+                        }
                     } else {
-                        logger.e(
-                            "NativeAudioEngine: terminal capture worker still terminating after native stop; retaining lifecycle ownership barrier"
-                        )
+                        captureJob = null
                     }
-                } else {
-                    captureJob = null
-                }
 
-                abandonAudioFocus()
+                    abandonAudioFocus()
+                    router.stop()
+                    vadDetector.resetState()
 
-                router.stop()
+                    _micLevel.value = 0f
+                    _outLevel.value = 0f
 
-                vadDetector.resetState()
+                    resetBargeInState()
 
-                _micLevel.value =
-                    0f
+                    synchronized(poolLock) {
+                        recycleLeadInBuffersLocked()
+                    }
+                    drainMicOutput()
 
-                _outLevel.value =
-                    0f
-
-                resetBargeInState()
-
-                synchronized(
-                    poolLock
-                ) {
-
-                    recycleLeadInBuffersLocked()
-                }
-                drainMicOutput()
-
-                while (
-                    routeTransitionChannel
-                        .tryReceive()
-                        .isSuccess
-                ) {}
+                    while (routeTransitionChannel.tryReceive().isSuccess) {}
                 }
             }
         }
 
-    /**
-     * Адаптивное аппаратное ожидание полного проигрывания сэмплов из буферов ЦАП (Watchdog прогресса).
-     *
-     * Устраняет дефект жесткого тайм-аута в 2.5 с (Проблема №1). Воспроизведение длится столько, сколько реально
-     * звучит сгенерированная речь (5, 15, 60+ секунд). Ожидание завершается неудачей ТОЛЬКО в случае,
-     * если сэмплы застряли и аппаратный ЦАП не забрал ни одного кадра за время [stallTimeoutMs].
-     */
     suspend fun awaitPlaybackDrained(
         generation: Long,
         stallTimeoutMs: Long = 1800L
@@ -1628,108 +1115,58 @@ class NativeAudioEngine @Inject constructor(
         bridge.setVolume(clamped)
     }
 
-    fun setMicGain(
-        gain: Float
-    ) =
-        bridge.setMicGain(
-            gain.coerceIn(
-                0.5f,
-                2.0f
-            )
-        )
+    fun setMicGain(gain: Float) =
+        bridge.setMicGain(gain.coerceIn(0.5f, 2.0f))
 
     fun invalidateAndFlushPlayback(reason: String = ""): Long {
         playbackOperationLock.lock()
         try {
             val current = playbackGeneration.get()
-            val next =
-                if (current == Long.MAX_VALUE) 1L
-                else current + 1L
+            val next = if (current == Long.MAX_VALUE) 1L else current + 1L
 
             bridge.flushPlayback(next)
             playbackGeneration.set(next)
 
             _outLevel.value = 0f
-            logger.d(
-                "NativeAudioEngine: playback generation committed [Gen=$next, Reason='$reason']"
-            )
+            logger.d("NativeAudioEngine: playback generation committed [Gen=$next, Reason='$reason']")
             return next
         } finally {
             playbackOperationLock.unlock()
         }
     }
 
-    /**
-     * Потоковая передача PCM фрейма в C++ SPSC кольцевой буфер с честным Backpressure.
-     *
-     * Устраняет дефект выбрасывания аудиокадров через 200 мс (Проблема №2). Если C++ буфер временно полон
-     * из-за быстрого сетевого прихода пакетов, корутина ждёт освобождения места.
-     * Отказ и прерывание записи происходят только при реальной остановке ЦАПа более чем на 1.8 с.
-     */
     suspend fun enqueuePlayback(
         pcm: ByteArray,
         generation: Long
     ) {
+        if (pcm.isEmpty() || !_isPlaying.value) return
+        if (isBargeInActive || generation != currentPlaybackGeneration) return
 
-        if (
-            pcm.isEmpty() ||
-            !_isPlaying.value
-        ) {
-            return
-        }
-
-        if (
-            isBargeInActive ||
-            generation != currentPlaybackGeneration
-        ) {
-            return
-        }
-
-        if (
-            playbackStartGeneration.getAndSet(
-                generation
-            ) != generation
-        ) {
-            lastPlaybackStartMs =
-                SystemClock.elapsedRealtime()
+        if (playbackStartGeneration.getAndSet(generation) != generation) {
+            lastPlaybackStartMs = SystemClock.elapsedRealtime()
         }
 
         var offset = 0
         val total = pcm.size
         var lastSuccessfulWriteMs = SystemClock.elapsedRealtime()
 
-        while (
-            offset < total &&
-            _isPlaying.value
-        ) {
+        while (offset < total && _isPlaying.value) {
+            if (isBargeInActive || generation != currentPlaybackGeneration) return
 
-            if (
-                isBargeInActive ||
-                generation != currentPlaybackGeneration
-            ) {
-                return
-            }
-
-            val written =
-                bridge.writePlaybackByteArray(
-                    pcm,
-                    offset,
-                    total - offset,
-                    generation
-                )
+            val written = bridge.writePlaybackByteArray(
+                pcm,
+                offset,
+                total - offset,
+                generation
+            )
 
             val now = SystemClock.elapsedRealtime()
-
             if (written > 0) {
                 offset += written
                 lastSuccessfulWriteMs = now
             } else {
-                // Нативный C++ буфер временно заполнен.
-                // Применяем честное противодавление (Non-Destructive Suspend Backpressure).
                 if (now - lastSuccessfulWriteMs >= PLAYBACK_WRITE_STALL_TIMEOUT_MS) {
-                    logger.w(
-                        "NativeAudioEngine: playback write stalled for ${now - lastSuccessfulWriteMs} ms; aborting stuck frame"
-                    )
+                    logger.w("NativeAudioEngine: playback write stalled for ${now - lastSuccessfulWriteMs} ms; aborting stuck frame")
                     break
                 }
                 delay(4)
@@ -1741,82 +1178,39 @@ class NativeAudioEngine @Inject constructor(
         bridge.triggerBargeInEarcon()
     }
 
-    private fun activateBargeIn(
-        now: Long
-    ) {
-
-        isBargeInActive =
-            true
-
-        bargeInTimestampMs =
-            now
+    private fun activateBargeIn(now: Long) {
+        isBargeInActive = true
+        bargeInTimestampMs = now
 
         bargeInLeaseJob?.cancel()
+        bargeInLeaseJob = engineScope.launch {
+            val minReleaseAt = now + BARGE_IN_MIN_HOLD_MS
+            val hardDeadline = now + BARGE_IN_HARD_RECOVERY_MS
 
-        bargeInLeaseJob =
-            engineScope.launch {
-
-                val minReleaseAt =
-                    now +
-                    BARGE_IN_MIN_HOLD_MS
-
-                val hardDeadline =
-                    now +
-                    BARGE_IN_HARD_RECOVERY_MS
-
-                while (
-                    isActive &&
-                    isBargeInActive
-                ) {
-
-                    val current =
-                        SystemClock
-                            .elapsedRealtime()
-
-                    if (
-                        current >=
-                            hardDeadline
-                    ) {
-
-                        logger.w(
-                            "NativeAudioEngine: Barge-in hard recovery deadline reached"
-                        )
-
-                        resetBargeInState()
-
-                        break
-                    }
-
-                    if (
-                        current >=
-                            minReleaseAt &&
-                        !vadDetector
-                            .isSpeechDetected
-                            .value
-                    ) {
-
-                        resetBargeInState()
-                        break
-                    }
-
-                    delay(
-                        BARGE_IN_RECOVERY_POLL_MS
-                    )
+            while (isActive && isBargeInActive) {
+                val current = SystemClock.elapsedRealtime()
+                if (current >= hardDeadline) {
+                    logger.w("NativeAudioEngine: Barge-in hard recovery deadline reached")
+                    resetBargeInState()
+                    break
                 }
+
+                if (current >= minReleaseAt && !vadDetector.isSpeechDetected.value) {
+                    resetBargeInState()
+                    break
+                }
+
+                delay(BARGE_IN_RECOVERY_POLL_MS)
             }
+        }
     }
 
     fun resetBargeInState() {
-
-        isBargeInActive =
-            false
-
+        isBargeInActive = false
         bargeInTimestampMs = 0L
         outputEnergyHangover = 0f
         bargeInLeaseJob?.cancel()
-
-        bargeInLeaseJob =
-            null
+        bargeInLeaseJob = null
     }
 
     private fun drainMicOutput() {
@@ -1840,23 +1234,15 @@ class NativeAudioEngine @Inject constructor(
         expectedCaptureInstanceId: Long? = null
     ): Boolean =
         synchronized(captureEventLock) {
-            sendMicEventLocked(
-                event,
-                expectedCaptureInstanceId
-            )
+            sendMicEventLocked(event, expectedCaptureInstanceId)
         }
 
     private fun sendMicEventLocked(
         event: AudioStreamEvent,
         expectedCaptureInstanceId: Long?
     ): Boolean {
-        if (
-            expectedCaptureInstanceId != null &&
-            captureInstanceId.get() != expectedCaptureInstanceId
-        ) {
-            if (event is AudioStreamEvent.Audio) {
-                recycleBuffer(event.pcm)
-            }
+        if (expectedCaptureInstanceId != null && captureInstanceId.get() != expectedCaptureInstanceId) {
+            if (event is AudioStreamEvent.Audio) recycleBuffer(event.pcm)
             return false
         }
 
@@ -1868,41 +1254,27 @@ class NativeAudioEngine @Inject constructor(
                 queuedMicOutputBytes.addAndGet(-bytes)
                 recycleBuffer(event.pcm)
 
-                logger.e(
-                    "NativeAudioEngine: mic output backlog exceeded ${MAX_MIC_OUTPUT_BACKLOG_BYTES} bytes; stopping capture producer"
-                )
-
+                logger.e("NativeAudioEngine: mic output backlog exceeded ${MAX_MIC_OUTPUT_BACKLOG_BYTES} bytes; stopping capture producer")
                 _isCapturing.value = false
 
                 if (streamStopGeneration != engineGeneration.get()) {
-                    if (
-                        _micOutput
-                            .trySend(AudioStreamEvent.StreamStop)
-                            .isSuccess
-                    ) {
-                        streamStopGeneration =
-                            engineGeneration.get()
+                    if (_micOutput.trySend(AudioStreamEvent.StreamStop).isSuccess) {
+                        streamStopGeneration = engineGeneration.get()
                     }
                 }
-
                 return false
             }
         }
 
         val result = _micOutput.trySend(event)
-
         if (result.isFailure && event is AudioStreamEvent.Audio) {
             releaseCapturedBuffer(event.pcm)
         }
-
         return result.isSuccess
     }
 
-    private fun decrementQueuedMicOutputBytes(
-        bytes: Long
-    ) {
+    private fun decrementQueuedMicOutputBytes(bytes: Long) {
         if (bytes <= 0L) return
-
         while (true) {
             val current = queuedMicOutputBytes.get()
             val next = (current - bytes).coerceAtLeast(0L)
@@ -1912,9 +1284,7 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    fun releaseCapturedBuffer(
-        pcm: ByteArray
-    ) {
+    fun releaseCapturedBuffer(pcm: ByteArray) {
         val bytes = pcm.size.toLong()
         decrementQueuedMicOutputBytes(bytes)
         recycleBuffer(pcm)
@@ -1926,33 +1296,16 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    private fun obtainBuffer():
-        ByteArray =
+    private fun obtainBuffer(): ByteArray =
         synchronized(poolLock) {
-
-            if (
-                bufferPool.isNotEmpty()
-            ) {
-                bufferPool.removeFirst()
-            } else {
-                ByteArray(
-                    BURST_BYTES
-                )
-            }
+            if (bufferPool.isNotEmpty()) bufferPool.removeFirst()
+            else ByteArray(BURST_BYTES)
         }
 
-    private fun recycleBuffer(
-        buf: ByteArray
-    ) =
+    private fun recycleBuffer(buf: ByteArray) =
         synchronized(poolLock) {
-
-            if (
-                buf.size == BURST_BYTES &&
-                bufferPool.size < 64
-            ) {
-                bufferPool.addLast(
-                    buf
-                )
+            if (buf.size == BURST_BYTES && bufferPool.size < 64) {
+                bufferPool.addLast(buf)
             }
         }
 }
