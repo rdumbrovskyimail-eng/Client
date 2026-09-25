@@ -114,13 +114,26 @@ class AudioDeviceRouter @Inject constructor(
 
     @Volatile private var activeFingerprint: RouteFingerprint? = null
 
+    private fun isRelevantAudioDevice(device: AudioDeviceInfo): Boolean {
+        val type = device.type
+        return type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER ||
+            type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE ||
+            type == AudioDeviceInfo.TYPE_BUILTIN_MIC ||
+            type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            type == AudioDeviceInfo.TYPE_BLE_HEADSET
+    }
+
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
-            debounceTrigger.tryEmit(Unit)
+            if (addedDevices?.any { isRelevantAudioDevice(it) } == true) {
+                debounceTrigger.tryEmit(Unit)
+            }
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
-            debounceTrigger.tryEmit(Unit)
+            if (removedDevices?.any { isRelevantAudioDevice(it) } == true) {
+                debounceTrigger.tryEmit(Unit)
+            }
         }
     }
 
