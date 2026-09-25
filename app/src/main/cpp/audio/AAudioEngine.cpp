@@ -209,10 +209,8 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
 
     // ИСПРАВЛЕНИЕ ДЕФЕКТА: Явно запрошенное устройство обязано совпадать с открытым.
     if (inputDeviceId > 0 && actualInDeviceId != inputDeviceId) {
-        LOGE("AAudio capture device mismatch rejected: requested=%d, actual=%d",
+        LOGW("AAudio capture device mismatch accepted (OneUI workaround): requested=%d, actual=%d",
              inputDeviceId, actualInDeviceId);
-        closeCaptureStreamLocked();
-        return false;
     }
 
     actualCaptureSampleRate_.store(actualInRate, std::memory_order_release);
@@ -250,6 +248,7 @@ bool AAudioEngine::initLocked(
     {
         std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
         resampler24To16_.reset();
+        resampler24To32_.reset();
         halfbandResampler24To48_.reset();
         genericResampler_.reset();
         captureDecimator48To16_.reset();
@@ -332,9 +331,11 @@ aaudio_result_t AAudioEngine::openPlaybackStreamWithFallback(
         AAudioStreamBuilder_setPerformanceMode(outBuilder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
         AAudioStreamBuilder_setChannelCount(outBuilder, CHANNEL_COUNT_MONO);
         AAudioStreamBuilder_setFormat(outBuilder, AAUDIO_FORMAT_PCM_I16);
-        AAudioStreamBuilder_setSampleRate(outBuilder, targetPlaybackSampleRate);
+        AAudioStreamBuilder_setSampleRate(outBuilder, AAUDIO_UNSPECIFIED);
 
-        if (outputDeviceId > 0) AAudioStreamBuilder_setDeviceId(outBuilder, outputDeviceId);
+        if (!isBluetooth && outputDeviceId > 0) {
+            AAudioStreamBuilder_setDeviceId(outBuilder, outputDeviceId);
+        }
         AAudioStreamBuilder_setSharingMode(outBuilder, sharingMode);
         AAudioStreamBuilder_setUsage(outBuilder, AAUDIO_USAGE_VOICE_COMMUNICATION);
         AAudioStreamBuilder_setDataCallback(outBuilder, playbackCallback, this);
@@ -753,6 +754,7 @@ void AAudioEngine::stopLocked() {
     {
         std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
         resampler24To16_.reset();
+        resampler24To32_.reset();
         halfbandResampler24To48_.reset();
         genericResampler_.reset();
         captureDecimator48To16_.reset();
@@ -894,6 +896,7 @@ void AAudioEngine::playbackDspThreadLoop() {
                 voiceEnhancer_.reset(currentRate);
                 halfbandResampler24To48_.reset();
                 resampler24To16_.reset();
+                resampler24To32_.reset();
                 genericResampler_.reset();
                 genericResampler_.configure(SAMPLE_RATE_GEMINI_OUT, currentRate);
                 fftPos_ = 0;
@@ -975,6 +978,8 @@ void AAudioEngine::playbackDspThreadLoop() {
                 outputFrames = halfbandResampler24To48_.process(input, inputFrames, output);
             } else if (actualRate == SAMPLE_RATE_BT_HFP) {
                 outputFrames = resampler24To16_.process(input, inputFrames, output);
+            } else if (actualRate == 32000) {
+                outputFrames = resampler24To32_.process(input, inputFrames, output);
             } else {
                 genericResampler_.configure(SAMPLE_RATE_GEMINI_OUT, actualRate);
                 outputFrames = genericResampler_.process(input, inputFrames, output, playbackDspOutputScratch_.size());

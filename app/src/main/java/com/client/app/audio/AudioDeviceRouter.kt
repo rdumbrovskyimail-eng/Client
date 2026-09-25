@@ -649,70 +649,74 @@ class AudioDeviceRouter @Inject constructor(
         }
 
         return when (profile.path) {
-            AudioRoutePath.BLUETOOTH_COMMUNICATION -> {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    val communicationDevice = runCatching { audioManager.communicationDevice }.getOrNull()
-                    if (communicationDevice == null) {
-                        logger.w("AudioDeviceRouter: Bluetooth capture validation failed: communicationDevice == null")
-                        return false
-                    }
-
-                    if (communicationDevice.id != profile.outputDeviceId) {
-                        logger.w("AudioDeviceRouter: communication sink mismatch: expected=${profile.outputDeviceId}, actual=${communicationDevice.id}")
-                        return false
-                    }
-
-                    if (!isBluetoothDeviceType(communicationDevice.type)) {
-                        logger.w("AudioDeviceRouter: communication sink is not Bluetooth")
-                        return false
-                    }
-
-                    if (!isBluetoothDeviceType(actualInput.type)) {
-                        logger.e("AudioDeviceRouter: Bluetooth route resolved to non-BT input: id=${actualInput.id}, type=${actualInput.type}")
-                        return false
-                    }
-
-                    if (profile.inputDeviceId > 0 && actualInputDeviceId != profile.inputDeviceId) {
-                        logger.e("AudioDeviceRouter: explicit BT input mismatch: expected=${profile.inputDeviceId}, actual=$actualInputDeviceId")
-                        return false
-                    }
-                    true
-                } else {
-                    val scoActive = synchronized(routeLock) {
-                        @Suppress("DEPRECATION")
-                        legacyScoConnected && audioManager.isBluetoothScoOn
-                    }
-                    if (!scoActive) {
-                        logger.w("AudioDeviceRouter: legacy Bluetooth SCO is not active")
-                        return false
-                    }
-
-                    if (actualInput.type != AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
-                        logger.e("AudioDeviceRouter: legacy SCO route resolved to non-SCO input")
-                        return false
-                    }
-
-                    if (profile.inputDeviceId > 0 && actualInputDeviceId != profile.inputDeviceId) {
-                        logger.e("AudioDeviceRouter: legacy SCO input mismatch: expected=${profile.inputDeviceId}, actual=$actualInputDeviceId")
-                        return false
-                    }
-                    true
-                }
-            }
-
-            AudioRoutePath.SPEAKER_SHARED -> {
-                if (actualInput.type != AudioDeviceInfo.TYPE_BUILTIN_MIC) {
-                    logger.e("AudioDeviceRouter: SPEAKER_SHARED resolved to non-built-in input: id=${actualInput.id}, type=${actualInput.type}")
-                    return false
-                }
-
-                if (profile.inputDeviceId > 0 && actualInputDeviceId != profile.inputDeviceId) {
-                    logger.e("AudioDeviceRouter: built-in microphone mismatch: expected=${profile.inputDeviceId}, actual=$actualInputDeviceId")
-                    return false
-                }
-                true
-            }
+            AudioRoutePath.BLUETOOTH_COMMUNICATION -> isInputMatchingBluetooth(profile, actualInputDeviceId, actualInput)
+            AudioRoutePath.SPEAKER_SHARED -> isInputMatchingSpeaker(profile, actualInputDeviceId, actualInput)
         }
+    }
+
+    private fun isInputMatchingBluetooth(profile: RouteProfile, actualInputDeviceId: Int, actualInput: AudioDeviceInfo): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val communicationDevice = runCatching { audioManager.communicationDevice }.getOrNull()
+            if (communicationDevice == null) {
+                logger.w("AudioDeviceRouter: Bluetooth capture validation failed: communicationDevice == null")
+                return false
+            }
+
+            if (communicationDevice.id != profile.outputDeviceId) {
+                logger.w("AudioDeviceRouter: communication sink mismatch: expected=${profile.outputDeviceId}, actual=${communicationDevice.id}")
+                return false
+            }
+
+            if (!isBluetoothDeviceType(communicationDevice.type)) {
+                logger.w("AudioDeviceRouter: communication sink is not Bluetooth")
+                return false
+            }
+
+            if (!isBluetoothDeviceType(actualInput.type)) {
+                logger.e("AudioDeviceRouter: Bluetooth route resolved to non-BT input: id=${actualInput.id}, type=${actualInput.type}")
+                return false
+            }
+
+            if (profile.inputDeviceId > 0 && actualInputDeviceId != profile.inputDeviceId) {
+                logger.e("AudioDeviceRouter: explicit BT input mismatch: expected=${profile.inputDeviceId}, actual=$actualInputDeviceId")
+                return false
+            }
+            return true
+        } else {
+            val scoActive = synchronized(routeLock) {
+                @Suppress("DEPRECATION")
+                legacyScoConnected && audioManager.isBluetoothScoOn
+            }
+            if (!scoActive) {
+                logger.w("AudioDeviceRouter: legacy Bluetooth SCO is not active")
+                return false
+            }
+
+            if (actualInput.type != AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+                logger.e("AudioDeviceRouter: legacy SCO route resolved to non-SCO input")
+                return false
+            }
+
+            if (profile.inputDeviceId > 0 && actualInputDeviceId != profile.inputDeviceId) {
+                logger.e("AudioDeviceRouter: legacy SCO input mismatch: expected=${profile.inputDeviceId}, actual=$actualInputDeviceId")
+                return false
+            }
+            return true
+        }
+    }
+
+    private fun isInputMatchingSpeaker(profile: RouteProfile, actualInputDeviceId: Int, actualInput: AudioDeviceInfo): Boolean {
+        if (actualInput.type != AudioDeviceInfo.TYPE_BUILTIN_MIC) {
+            logger.e("AudioDeviceRouter: SPEAKER_SHARED resolved to non-built-in input: id=${actualInput.id}, type=${actualInput.type}")
+            return false
+        }
+
+        if (profile.inputDeviceId > 0 && actualInputDeviceId != profile.inputDeviceId) {
+            logger.e("AudioDeviceRouter: built-in microphone mismatch: expected=${profile.inputDeviceId}, actual=$actualInputDeviceId")
+            return false
+        }
+        return true
+    }
     }
 
     @Suppress("DEPRECATION")
@@ -763,10 +767,9 @@ class AudioDeviceRouter @Inject constructor(
         }
 
         return if (btOutputDevice != null) {
-            val sampleRate = selectOptimalBluetoothSampleRate(btOutputDevice)
             RouteProfile(
                 path = AudioRoutePath.BLUETOOTH_COMMUNICATION,
-                sampleRateOut = sampleRate,
+                sampleRateOut = 0,
                 leadInBufferSizeFrames = 260 * 16,
                 vadThresholdStart = 0.40f,
                 vadThresholdEnd = 0.20f,
@@ -888,7 +891,12 @@ class AudioDeviceRouter @Inject constructor(
 
             if (speaker != null) {
                 val currentComm = runCatching { audioManager.communicationDevice }.getOrNull()
-                if (currentComm?.id != speaker.id) {
+                val isAlreadySpeaker = currentComm != null && (
+                    currentComm.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER ||
+                    currentComm.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+                )
+
+                if (!isAlreadySpeaker) {
                     val assigned = runCatching { audioManager.setCommunicationDevice(speaker) }.getOrDefault(false)
                     if (!assigned) {
                         logger.w("AudioDeviceRouter: setCommunicationDevice(speaker) вернул false; выполняем откат через clearCommunicationDevice()")
