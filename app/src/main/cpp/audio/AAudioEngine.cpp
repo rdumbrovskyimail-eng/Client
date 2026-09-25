@@ -1513,9 +1513,7 @@ void AAudioEngine::playbackDspThreadLoop() {
                 output,
                 outputFrames);
 
-        outRms_.store(
-            outRms,
-            std::memory_order_relaxed);
+        // outRms_ moved to playbackCallback for DAC presentation timing
 
         const float micRms =
             micRms_.load(
@@ -2072,15 +2070,17 @@ AAudioEngine::playbackCallback(
             frames);
 
     if (read < frames) {
+            std::memset(samples + read, 0, (frames - read) * sizeof(int16_t));
+        }
 
-        std::memset(
-            samples + read,
-            0,
-            (frames - read) *
-            sizeof(int16_t));
-    }
+        if (read > 0) {
+            const float dacRms = dsp::calculateRms(samples, read);
+            engine->outRms_.store(dacRms, std::memory_order_relaxed);
+        } else {
+            engine->outRms_.store(0.0f, std::memory_order_relaxed);
+        }
 
-    engine->leavePlaybackCallback();
+        engine->leavePlaybackCallback();
     engine->playbackDspCv_.notify_one();
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;

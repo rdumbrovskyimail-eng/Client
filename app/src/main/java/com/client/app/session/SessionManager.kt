@@ -1516,6 +1516,7 @@ class SessionManager @Inject constructor(
 
     private fun observeBargeIn() = scope.launch {
         audioEngine.bargeInEvents.collect {
+            if (!_state.value.isAiSpeaking) return@collect
             invalidateAndFlushAudio("local barge-in")
             audioEngine.triggerBargeInEarcon()
 

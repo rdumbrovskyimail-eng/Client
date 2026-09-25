@@ -320,8 +320,13 @@ class NativeAudioEngine @Inject constructor(
         0L
 
     @Volatile
-    private var lastBargeInMs =
-        0L
+    private var lastBargeInMs = 0L
+
+    @Volatile
+    private var outputEnergyHangover: Float = 0f
+
+    @Volatile
+    private var currentPlaybackVolume: Float = 1.0f
 
     @Volatile
     var isBargeInActive = false
@@ -819,8 +824,19 @@ class NativeAudioEngine @Inject constructor(
                                 AudioRoutePath
                                     .BLUETOOTH_COMMUNICATION
 
-                        val isAiRendering =
-                            !isBluetooth && (instantaneousOut > 0.035f)
+                        val pendingFrames = bridge.getPendingPlaybackFrames()
+
+                        if (instantaneousOut > 0.02f && outputEnergyHangover <= 0.005f) {
+                            lastPlaybackStartMs = now
+                        }
+
+                        outputEnergyHangover = if (!_isPlaying.value || (pendingFrames == 0L && instantaneousOut <= 0.001f)) {
+                            0f
+                        } else {
+                            maxOf(instantaneousOut, outputEnergyHangover * 0.96f)
+                        }
+
+                        val isAiRendering = _isPlaying.value && (outputEnergyHangover > 0.015f || pendingFrames > 160L)
 
                         var speechStartedOnFrame =
                             false
@@ -853,59 +869,53 @@ class NativeAudioEngine @Inject constructor(
                             // Проверка условий истинного перебивания с защитой от акустического эха
                             val isVocalized = speechStartedOnFrame || vadDetector.isSpeechDetected.value
 
-                            if (isVocalized) {
+                            if (isVocalized && isAiRendering) {
                                 val canBargeInTimers = (now - lastPlaybackStartMs > PLAYBACK_GRACE_PERIOD_MS) &&
                                                        (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
 
-                                val exceedsAcousticBoundary = if (isAiRendering) {
-                                    // Формула Geigel DTD с учётом нелинейной компрессии Smart PA на пиках
-                                    val nonLinearOffset = if (instantaneousOut > 0.50f) {
-                                        (instantaneousOut - 0.50f) * 0.35f
-                                    } else {
-                                        0.0f
-                                    }
-                                    val echoThreshold = maxOf(0.16f, (instantaneousOut * 0.65f) + nonLinearOffset)
-                                    instantaneousMic > echoThreshold
-                                } else if (isBluetooth) {
-                                    // Режим гарнитуры: эхо динамика исключено физически.
-                                    // Порог 0.025f (~ -32 dBFS) надёжно отсекает шумы дыхания, пропуская речь пользователя.
-                                    val btNoiseThreshold = 0.025f
-                                    instantaneousMic > btNoiseThreshold
+                                val dynamicErleRatio = 0.72f + (0.15f * currentPlaybackVolume)
+                                val nonLinearOffset = if (outputEnergyHangover > 0.45f) {
+                                    (outputEnergyHangover - 0.45f) * 0.40f
                                 } else {
-                                    // Динамик молчит — свободный ввод
-                                    true
+                                    0.0f
                                 }
+                                val echoThreshold = maxOf(0.18f, (outputEnergyHangover * dynamicErleRatio) + nonLinearOffset)
+                                val effectiveThreshold = if (isBluetooth) 0.035f else echoThreshold
 
-                                if (exceedsAcousticBoundary) {
+                                if (instantaneousMic > effectiveThreshold) {
                                     bargeInCandidateStreak++
                                 } else {
                                     bargeInCandidateStreak = maxOf(0, bargeInCandidateStreak - 1)
                                 }
 
-                                // Подтверждение Double-Talk Hangover: минимум 2 кадра подряд
-                                val isConfirmedUserInterruption = (isAiRendering || isBluetooth) &&
-                                    (bargeInCandidateStreak >= 2) && canBargeInTimers
+                                val requiredStreak = if (isBluetooth) 3 else 5
+                                val isConfirmedUserInterruption = (bargeInCandidateStreak >= requiredStreak) && canBargeInTimers
 
                                 if (isConfirmedUserInterruption) {
                                     lastBargeInMs = now
                                     bargeInCandidateStreak = 0
+                                    outputEnergyHangover = 0f
 
                                     activateBargeIn(now)
                                     hapticManager.triggerBargeIn()
                                     _bargeInEvents.tryEmit(Unit)
 
-                                    val preRoll = mutableListOf<ByteArray>()
-                                    synchronized(poolLock) {
-                                        while (leadInBuffer.isNotEmpty()) {
-                                            preRoll.add(leadInBuffer.removeFirst())
+                                    if (isBluetooth) {
+                                        val preRoll = mutableListOf<ByteArray>()
+                                        synchronized(poolLock) {
+                                            while (leadInBuffer.isNotEmpty()) {
+                                                preRoll.add(leadInBuffer.removeFirst())
+                                            }
                                         }
-                                    }
-
-                                    for (pf in preRoll) {
-                                        sendMicEvent(
-                                            AudioStreamEvent.Audio(pf),
-                                            instanceId
-                                        )
+                                        for (pf in preRoll) {
+                                            sendMicEvent(AudioStreamEvent.Audio(pf), instanceId)
+                                        }
+                                    } else {
+                                        synchronized(poolLock) {
+                                            while (leadInBuffer.isNotEmpty()) {
+                                                recycleBuffer(leadInBuffer.removeFirst())
+                                            }
+                                        }
                                     }
                                 }
                             } else {
@@ -1592,14 +1602,11 @@ class NativeAudioEngine @Inject constructor(
         generation != currentPlaybackGeneration || bridge.getPendingPlaybackFrames() == 0L
     }
 
-    fun setVolume(
-        volume: Float
-    ) =
-        bridge.setVolume(
-            volume.coerceIn(
-                0f,
-                1f
-            )
+    fun setVolume(volume: Float) {
+        val clamped = volume.coerceIn(0f, 1f)
+        currentPlaybackVolume = clamped
+        bridge.setVolume(clamped)
+    }
         )
 
     fun setMicGain(
@@ -1785,9 +1792,8 @@ class NativeAudioEngine @Inject constructor(
         isBargeInActive =
             false
 
-        bargeInTimestampMs =
-            0L
-
+        bargeInTimestampMs = 0L
+        outputEnergyHangover = 0f
         bargeInLeaseJob?.cancel()
 
         bargeInLeaseJob =
