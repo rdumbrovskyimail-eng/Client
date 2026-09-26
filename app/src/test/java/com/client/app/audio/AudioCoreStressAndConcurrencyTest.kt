@@ -2,14 +2,10 @@ package com.client.app.audio
 
 import kotlinx.coroutines.*
 import java.nio.ByteBuffer
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
-import kotlin.math.sin
 import kotlin.test.*
 
 /**
@@ -41,98 +37,99 @@ class AudioCoreStressAndConcurrencyTest {
      * Проверяет отсутствие взаимных блокировок (Deadlock-Free Invariant) и корректность иерархии блокировок.
      */
     @Test
-    fun testHighContentionConcurrencyAndDeadlockFreedom() = runBlocking {
-        val totalOperations = 500
-        val isRunning = AtomicBoolean(true)
-        val activeGeneration = AtomicLong(1L)
-        val bufferCapacityFrames = 4096
-        val availableFrames = AtomicInteger(0)
-        val deadlocksDetected = AtomicBoolean(false)
+    fun testHighContentionConcurrencyAndDeadlockFreedom() {
+        runBlocking {
+            val isRunning = AtomicBoolean(true)
+            val activeGeneration = AtomicLong(1L)
+            val bufferCapacityFrames = 4096
+            val availableFrames = AtomicInteger(0)
+            val deadlocksDetected = AtomicBoolean(false)
 
-        val writeSuccesses = AtomicInteger(0)
-        val flushCount = AtomicInteger(0)
-        val routeChangeCount = AtomicInteger(0)
-        val callbacksExecuted = AtomicInteger(0)
+            val writeSuccesses = AtomicInteger(0)
+            val flushCount = AtomicInteger(0)
+            val routeChangeCount = AtomicInteger(0)
+            val callbacksExecuted = AtomicInteger(0)
 
-        val routeLock = Any()
-        val playoutLock = Any()
+            val routeLock = Any()
+            val playoutLock = Any()
 
-        // Потоки 1-2: Интенсивная неблокирующая запись Try-Write (JNI Simulation)
-        val writerJobs = List(2) {
-            launch(Dispatchers.Default) {
-                var localGen = activeGeneration.get()
-                while (isRunning.get()) {
-                    val gen = activeGeneration.get()
-                    if (gen != localGen) {
-                        localGen = gen
-                    }
-                    synchronized(playoutLock) {
-                        if (availableFrames.get() + 240 <= bufferCapacityFrames) {
-                            availableFrames.addAndGet(240)
-                            writeSuccesses.incrementAndGet()
+            // Потоки 1-2: Интенсивная неблокирующая запись Try-Write (JNI Simulation)
+            val writerJobs = List(2) {
+                launch(Dispatchers.Default) {
+                    var localGen = activeGeneration.get()
+                    while (isRunning.get()) {
+                        val gen = activeGeneration.get()
+                        if (gen != localGen) {
+                            localGen = gen
                         }
+                        synchronized(playoutLock) {
+                            if (availableFrames.get() + 240 <= bufferCapacityFrames) {
+                                availableFrames.addAndGet(240)
+                                writeSuccesses.incrementAndGet()
+                            }
+                        }
+                        delay(2)
                     }
-                    delay(2)
                 }
             }
-        }
 
-        // Потоки 3-4: Аппаратный колбэк ЦАП (Dumb RT Callback Simulation)
-        val callbackJobs = List(2) {
-            launch(Dispatchers.Default) {
+            // Потоки 3-4: Аппаратный колбэк ЦАП (Dumb RT Callback Simulation)
+            val callbackJobs = List(2) {
+                launch(Dispatchers.Default) {
+                    while (isRunning.get()) {
+                        synchronized(playoutLock) {
+                            val current = availableFrames.get()
+                            val toRead = minOf(current, 192) // 4 мс бёрст @ 48 кГц
+                            availableFrames.addAndGet(-toRead)
+                            callbacksExecuted.incrementAndGet()
+                        }
+                        delay(4)
+                    }
+                }
+            }
+
+            // Поток 5: Мгновенный Soft-Flush (0 мс Barge-in)
+            val flushJob = launch(Dispatchers.Default) {
                 while (isRunning.get()) {
-                    synchronized(playoutLock) {
-                        val current = availableFrames.get()
-                        val toRead = minOf(current, 192) // 4 мс бёрст @ 48 кГц
-                        availableFrames.addAndGet(-toRead)
-                        callbacksExecuted.incrementAndGet()
-                    }
-                    delay(4)
-                }
-            }
-        }
-
-        // Поток 5: Мгновенный Soft-Flush (0 мс Barge-in)
-        val flushJob = launch(Dispatchers.Default) {
-            while (isRunning.get()) {
-                delay(35)
-                synchronized(playoutLock) {
-                    activeGeneration.incrementAndGet()
-                    availableFrames.set(0) // 0-мс сброс без остановки генератора
-                    flushCount.incrementAndGet()
-                }
-            }
-        }
-
-        // Поток 6: Резкие смены аппаратного маршрута (Route Transitions)
-        val routeJob = launch(Dispatchers.Default) {
-            while (isRunning.get()) {
-                delay(50)
-                synchronized(routeLock) {
+                    delay(35)
                     synchronized(playoutLock) {
                         activeGeneration.incrementAndGet()
-                        availableFrames.set(0)
-                        routeChangeCount.incrementAndGet()
+                        availableFrames.set(0) // 0-мс сброс без остановки генератора
+                        flushCount.incrementAndGet()
                     }
                 }
             }
-        }
 
-        // Выполняем стресс-тест в течение 1.5 секунд высокой многопоточной нагрузки
-        withTimeoutOrNull(2500) {
-            delay(1500)
-            isRunning.set(false)
-            joinAll(*(writerJobs + callbackJobs + listOf(flushJob, routeJob)).toTypedArray())
-        } ?: run {
-            deadlocksDetected.set(true)
-            isRunning.set(false)
-        }
+            // Поток 6: Резкие смены аппаратного маршрута (Route Transitions)
+            val routeJob = launch(Dispatchers.Default) {
+                while (isRunning.get()) {
+                    delay(50)
+                    synchronized(routeLock) {
+                        synchronized(playoutLock) {
+                            activeGeneration.incrementAndGet()
+                            availableFrames.set(0)
+                            routeChangeCount.incrementAndGet()
+                        }
+                    }
+                }
+            }
 
-        assertFalse(deadlocksDetected.get(), "Обнаружен дедлок при одновременной записи, сбросе, смене маршрута и колбэке!")
-        assertTrue(writeSuccesses.get() > 50, "Запись должна успешно выполняться в условиях конкуренции")
-        assertTrue(callbacksExecuted.get() > 50, "Колбэк ЦАП обязан непрерывно получать кванты без зависаний")
-        assertTrue(flushCount.get() > 10, "Soft-flush обязан отрабатывать без задержек")
-        assertTrue(routeChangeCount.get() > 5, "Маршрутизация обязана переключаться без блокировки аудиоядра")
+            // Выполняем стресс-тест в течение 1.5 секунд высокой многопоточной нагрузки
+            withTimeoutOrNull(2500) {
+                delay(1500)
+                isRunning.set(false)
+                joinAll(*(writerJobs + callbackJobs + listOf(flushJob, routeJob)).toTypedArray())
+            } ?: run {
+                deadlocksDetected.set(true)
+                isRunning.set(false)
+            }
+
+            assertFalse(deadlocksDetected.get(), "Обнаружен дедлок при одновременной записи, сбросе, смене маршрута и колбэке!")
+            assertTrue(writeSuccesses.get() > 50, "Запись должна успешно выполняться в условиях конкуренции")
+            assertTrue(callbacksExecuted.get() > 50, "Колбэк ЦАП обязан непрерывно получать кванты без зависаний")
+            assertTrue(flushCount.get() > 10, "Soft-flush обязан отрабатывать без задержек")
+            assertTrue(routeChangeCount.get() > 5, "Маршрутизация обязана переключаться без блокировки аудиоядра")
+        }
     }
 
     /**
@@ -202,13 +199,13 @@ class AudioCoreStressAndConcurrencyTest {
      */
     @Test
     fun testHardwareSoftFlushLatencyAndStreamContinuity() {
-        var physicalStreamState = "STARTED"
+        val physicalStreamState = "STARTED"
         val playbackEpoch = AtomicLong(1L)
         val bufferOccupancy = AtomicInteger(2048)
 
         fun softFlush(newGeneration: Long) {
             val startNs = System.nanoTime()
-            playbackEpoch.set(newGeneration) // Исправлено: set вместо store
+            playbackEpoch.set(newGeneration)
             bufferOccupancy.set(0) // Зануление буфера
             val durationUs = (System.nanoTime() - startNs) / 1000
 
@@ -359,37 +356,39 @@ class AudioCoreStressAndConcurrencyTest {
      * Проверяет отсутствие рассинхронизации состояний и зависаний корутин.
      */
     @Test
-    fun testRapidRouteTransitionsStress() = runBlocking {
-        var currentProfile = RouteProfile(
-            path = AudioRoutePath.SPEAKER_SHARED,
-            targetSampleRate = 48000,
-            deviceName = "Built-in Speaker"
-        )
-        val transitionCount = AtomicInteger(0)
+    fun testRapidRouteTransitionsStress() {
+        runBlocking {
+            var currentProfile = RouteProfile(
+                path = AudioRoutePath.SPEAKER_SHARED,
+                targetSampleRate = 48000,
+                deviceName = "Built-in Speaker"
+            )
+            val transitionCount = AtomicInteger(0)
 
-        val profiles = listOf(
-            RouteProfile(AudioRoutePath.SPEAKER_SHARED, 48000, deviceName = "Speaker"),
-            RouteProfile(AudioRoutePath.BLUETOOTH_SCO, 16000, deviceName = "CMF Buds 2 (mSBC)"),
-            RouteProfile(AudioRoutePath.BLUETOOTH_BLE_HEADSET, 24000, deviceName = "CMF Buds 2 (LC3)")
-        )
+            val profiles = listOf(
+                RouteProfile(AudioRoutePath.SPEAKER_SHARED, 48000, deviceName = "Speaker"),
+                RouteProfile(AudioRoutePath.BLUETOOTH_SCO, 16000, deviceName = "CMF Buds 2 (mSBC)"),
+                RouteProfile(AudioRoutePath.BLUETOOTH_BLE_HEADSET, 24000, deviceName = "CMF Buds 2 (LC3)")
+            )
 
-        val switchJob = launch(Dispatchers.Default) {
-            repeat(100) { i ->
-                val target = profiles[i % profiles.size]
-                if (currentProfile.path != target.path) {
-                    currentProfile = target
-                    transitionCount.incrementAndGet()
+            val switchJob = launch(Dispatchers.Default) {
+                repeat(100) { i ->
+                    val target = profiles[i % profiles.size]
+                    if (currentProfile.path != target.path) {
+                        currentProfile = target
+                        transitionCount.incrementAndGet()
+                    }
+                    delay(5)
                 }
-                delay(5)
             }
-        }
 
-        withTimeout(2000) {
-            switchJob.join()
-        }
+            withTimeout(2000) {
+                switchJob.join()
+            }
 
-        assertTrue(transitionCount.get() >= 90, "Должно успешно выполниться не менее 90 переключений маршрута")
-        assertNotNull(currentProfile)
+            assertTrue(transitionCount.get() >= 90, "Должно успешно выполниться не менее 90 переключений маршрута")
+            assertNotNull(currentProfile)
+        }
     }
 
     /**
