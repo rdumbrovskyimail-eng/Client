@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/java/com/client/app/api/SocketCustomizer.kt
 package com.client.app.api
 
 import android.os.ParcelFileDescriptor
@@ -53,11 +52,11 @@ class TunedSocketFactory(
         runCatching {
             socket.tcpNoDelay = true
 
-            // P1 Fix (Проблема №15): Безусловное дублирование дескриптора сокета через системный вызов dup()
-            // на всех поддерживаемых версиях Android (API 28+).
-            // Это исключает закрытие оригинального сетевого сокета OkHttp в ядре Linux: pfd.close() внутри .use
-            // закрывает исключительно изолированный дубликат (декремент f_count в struct file ядра с 2 до 1),
-            // предотвращая спорадические сбои TLS 1.3 со статусом "Socket closed" или EBADF.
+            // УСТРАНЕНИЕ БУФЕРБЛОАТА (RFC 8860): Рациональные 64 КБ буферы TCP для низкой задержки
+            socket.sendBufferSize = 64 * 1024
+            socket.receiveBufferSize = 64 * 1024
+
+            // Безусловное дублирование дескриптора сокета через dup() для исключения случайного закрытия сокета
             ParcelFileDescriptor.fromSocket(socket)?.use { origPfd ->
                 origPfd.dup()?.use { dupPfd ->
                     val nativeFd = dupPfd.fd
@@ -65,7 +64,7 @@ class TunedSocketFactory(
                         nativeBridge.tuneNativeSocket(nativeFd)
                         logManager.net(
                             "SocketCustomizer",
-                            "Применены TCP опции (fd=$nativeFd)"
+                            "Применены TCP опции (fd=$nativeFd, tcpNoDelay=true, sndBuf=64K, rcvBuf=64K)"
                         )
                     }
                 }
