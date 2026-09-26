@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdio>
+#include <queue>
 #include "AudioConstants.h"
 #include "LockFreeRingBuffer.h"
 #include "PolyphaseResampler.h"
@@ -21,6 +22,34 @@ constexpr size_t PLAYBACK_DSP_INPUT_CHUNK_FRAMES = 1024;
 constexpr size_t PLAYBACK_DSP_MAX_OUTPUT_FRAMES = 8192;
 constexpr size_t EARCON_SCRATCH_MAX_FRAMES = 2048;
 constexpr size_t CAPTURE_RAW_SCRATCH_FRAMES = 2048;
+
+/**
+ * УСТРАНЕНИЕ ДЕФЕКТА 45: Строгий детерминированный конечный автомат движка.
+ */
+enum class EngineState : int32_t {
+    IDLE = 0,
+    STARTING = 1,
+    RUNNING = 2,
+    RECOVERING = 3,
+    STOPPING = 4
+};
+
+/**
+ * УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 43: Таксономия аппаратных сбоев и событий.
+ */
+enum class StreamFaultType : int32_t {
+    NONE = 0,
+    SOFT_TIMEOUT = 1,
+    HARD_DISCONNECTED = 2,
+    SYSTEM_ERROR = 3
+};
+
+struct StreamErrorEvent {
+    int32_t direction{0}; // 1 = Input (Capture), 2 = Output (Playback)
+    int32_t errorCode{0}; // Код AAUDIO_ERROR_*
+    StreamFaultType faultType{StreamFaultType::NONE};
+    uint64_t timestampNs{0};
+};
 
 struct Biquad {
     float b0{1.0f};
@@ -76,6 +105,10 @@ public:
     bool commitCaptureAdmission();
     void stopCapture();
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 44: Изолированный целевой перезапуск конкретных стримов
+    bool restartCaptureStream();
+    bool restartPlaybackStream();
+
     size_t writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation);
     size_t readCapturePcm(int16_t* pcm, size_t maxFrames);
 
@@ -91,36 +124,60 @@ public:
     float getOutRms() const { return outRms_.load(std::memory_order_relaxed); }
     bool isMmapActive() const { return isMmapActive_.load(std::memory_order_relaxed); }
     bool isExclusiveSharingActive() const { return isExclusiveSharingActive_.load(std::memory_order_relaxed); }
-    bool isDisconnected() const { return isDisconnected_.load(std::memory_order_relaxed); }
+
+    // УСТРАНЕНИЕ ДЕФЕКТА 46: Состояние вычисляется непосредственно из инвариантов FSM
+    bool isRunning() const {
+        return engineState_.load(std::memory_order_acquire) == EngineState::RUNNING;
+    }
+    bool isDisconnected() const {
+        return engineState_.load(std::memory_order_acquire) == EngineState::RECOVERING ||
+               isDisconnectedExplicit_.load(std::memory_order_acquire);
+    }
+    EngineState getEngineState() const {
+        return engineState_.load(std::memory_order_acquire);
+    }
+
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 42: Реактивное извлечение событий аппаратных сбоев
+    bool pollErrorEvent(StreamErrorEvent& outEvent);
+    bool hasPendingError() const {
+        return errorEventPending_.load(std::memory_order_acquire);
+    }
+
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Метрология аппаратных таймстемпов и номеров пакетов
+    uint64_t getCaptureSequenceNumber() const {
+        return captureSequenceNumber_.load(std::memory_order_relaxed);
+    }
+    uint64_t getCaptureTimestampNs() const {
+        return lastCaptureTimestampNs_.load(std::memory_order_relaxed);
+    }
+    uint64_t getPlaybackSequenceNumber() const {
+        return playbackSequenceNumber_.load(std::memory_order_relaxed);
+    }
+    uint64_t getPlaybackPresentationTimestampNs() const {
+        return lastPlaybackPresentationTimestampNs_.load(std::memory_order_relaxed);
+    }
 
     int32_t getActualCaptureSampleRate() const {
         return actualCaptureSampleRate_.load(std::memory_order_relaxed);
     }
-
     int32_t getActualCaptureChannels() const {
         return actualCaptureChannels_.load(std::memory_order_relaxed);
     }
-
     int32_t getActualPlaybackSampleRate() const {
         return actualPlaybackSampleRate_.load(std::memory_order_relaxed);
     }
-
     int32_t getActualPlaybackChannels() const {
         return actualPlaybackChannels_.load(std::memory_order_relaxed);
     }
-
     int32_t getActualPlaybackFormat() const {
         return actualPlaybackFormat_.load(std::memory_order_relaxed);
     }
-
     int32_t getActualPlaybackBurst() const {
         return actualPlaybackBurst_.load(std::memory_order_relaxed);
     }
-
     int32_t getActiveInputDeviceId() const {
         return actualInputDeviceId_.load(std::memory_order_relaxed);
     }
-
     int32_t getActiveOutputDeviceId() const {
         return actualOutputDeviceId_.load(std::memory_order_relaxed);
     }
@@ -168,7 +225,6 @@ private:
         void* audioData,
         int32_t numFrames);
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 23, 24, 25: Wait-free RT колбэк без математики и спин-локов
     static aaudio_data_callback_result_t playbackCallback(
         AAudioStream* stream,
         void* userData,
@@ -179,6 +235,8 @@ private:
         AAudioStream* stream,
         void* userData,
         aaudio_result_t error);
+
+    void pushErrorEvent(int32_t direction, aaudio_result_t errorCode);
 
     AAudioStream* captureStream_{nullptr};
     AAudioStream* playbackStream_{nullptr};
@@ -194,11 +252,23 @@ private:
 
     std::mutex lifecycleMutex_;
 
-    std::atomic<bool> isRunning_{false};
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 45 и 46: Консолидация жизненного цикла в конечный автомат FSM
+    alignas(64) std::atomic<EngineState> engineState_{EngineState::IDLE};
     std::atomic<bool> isBluetoothMode_{false};
     std::atomic<bool> isMmapActive_{false};
     std::atomic<bool> isExclusiveSharingActive_{false};
-    std::atomic<bool> isDisconnected_{false};
+    std::atomic<bool> isDisconnectedExplicit_{false};
+
+    // Очередь аппаратных сбоев
+    std::mutex errorQueueMutex_;
+    std::queue<StreamErrorEvent> errorEventQueue_;
+    std::atomic<bool> errorEventPending_{false};
+
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Аппаратные счетчики последовательности и таймстемпы
+    alignas(64) std::atomic<uint64_t> captureSequenceNumber_{0};
+    alignas(64) std::atomic<uint64_t> lastCaptureTimestampNs_{0};
+    alignas(64) std::atomic<uint64_t> playbackSequenceNumber_{0};
+    alignas(64) std::atomic<uint64_t> lastPlaybackPresentationTimestampNs_{0};
 
     std::atomic<int32_t> playbackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
 
@@ -233,7 +303,6 @@ private:
     std::mutex captureDspWaitMutex_;
     std::condition_variable captureDspCv_;
 
-    // Шлюз допуска входящих сэмплов захвата
     std::atomic<bool> captureIngressBlocked_{true};
 
     alignas(64) std::atomic<uint64_t> playbackEpoch_{0};
