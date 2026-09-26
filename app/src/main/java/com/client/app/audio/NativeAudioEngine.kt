@@ -260,13 +260,6 @@ class NativeAudioEngine @Inject constructor(
         val mmap = bridge.isMmapActive()
         val exclusive = bridge.isExclusiveSharingActive()
 
-        if (profile.inputDeviceId > 0 && actualIn > 0 && actualIn != profile.inputDeviceId) {
-            logger.w("NativeAudioEngine: actual input device differs from requested route ($context): requested=${profile.inputDeviceId}, actual=$actualIn")
-        }
-        if (profile.outputDeviceId > 0 && actualOut > 0 && actualOut != profile.outputDeviceId) {
-            logger.w("NativeAudioEngine: actual output device differs from requested route ($context): requested=${profile.outputDeviceId}, actual=$actualOut")
-        }
-
         logger.d("NativeAudioEngine: actual native route ($context): in=$actualIn out=$actualOut playRate=${actualPlayRate}Hz ch=$actualPlayChannels fmt=$actualPlayFormat exclusive=$exclusive mmap=$mmap")
     }
 
@@ -382,7 +375,7 @@ class NativeAudioEngine @Inject constructor(
         profile: RouteProfile,
         context: String
     ): Boolean {
-        val maxAttempts = if (profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION) 5 else 1
+        val maxAttempts = if (profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION) 3 else 1
         var captureOpened = false
         var dspActivated = false
         var admissionCommitted = false
@@ -396,14 +389,8 @@ class NativeAudioEngine @Inject constructor(
                 if (!captureOpened) {
                     logger.w("NativeAudioEngine: physical capture start failed [$context], attempt=${attempt + 1}/$maxAttempts")
                 } else {
-                    var actualInputId = bridge.getActiveInputDeviceId()
-                    var routeValid = router.isInputDeviceMatchingRoute(profile, actualInputId)
-
-                    // Немедленная повторная проверка перед стартом DSP
-                    if (routeValid) {
-                        actualInputId = bridge.getActiveInputDeviceId()
-                        routeValid = router.isInputDeviceMatchingRoute(profile, actualInputId)
-                    }
+                    val actualInputId = bridge.getActiveInputDeviceId()
+                    val routeValid = router.isInputDeviceMatchingRoute(profile, actualInputId)
 
                     if (routeValid) {
                         val dspStarted = captureDirectMutex.withLock {
@@ -415,30 +402,21 @@ class NativeAudioEngine @Inject constructor(
                         } else {
                             dspActivated = true
 
-                            // Вторая верификация: DSP запущен, но шлюз ингресса всё ещё закрыт
-                            actualInputId = bridge.getActiveInputDeviceId()
-                            val finalRouteValid = router.isInputDeviceMatchingRoute(profile, actualInputId)
-
-                            if (finalRouteValid) {
-                                val committed = captureDirectMutex.withLock {
-                                    bridge.commitCaptureAdmission()
-                                }
-
-                                if (committed) {
-                                    admissionCommitted = true
-                                    logger.d("NativeAudioEngine: capture route verified and committed [$context], attempt=${attempt + 1}/$maxAttempts, input=$actualInputId")
-                                    return true
-                                }
-                                logger.e("NativeAudioEngine: capture admission commit failed [$context]")
-                            } else {
-                                logger.w("NativeAudioEngine: FINAL route verification failed [$context], actualInput=$actualInputId")
+                            val committed = captureDirectMutex.withLock {
+                                bridge.commitCaptureAdmission()
                             }
+
+                            if (committed) {
+                                admissionCommitted = true
+                                logger.d("NativeAudioEngine: capture route verified and committed [$context], attempt=${attempt + 1}/$maxAttempts, input=$actualInputId")
+                                return true
+                            }
+                            logger.e("NativeAudioEngine: capture admission commit failed [$context]")
                         }
                     } else {
-                        logger.w("NativeAudioEngine: capture route rejected [$context], attempt=${attempt + 1}/$maxAttempts, actualInput=$actualInputId, expected=${profile.inputDeviceId}")
+                        logger.w("NativeAudioEngine: capture route rejected [$context], attempt=${attempt + 1}/$maxAttempts, actualInput=$actualInputId")
                     }
 
-                    // Маршрут не подтвердился — закрываем стрим перед следующей попыткой
                     captureDirectMutex.withLock {
                         runCatching { bridge.stopCaptureAudio() }
                     }
@@ -451,7 +429,6 @@ class NativeAudioEngine @Inject constructor(
                 }
             }
         } finally {
-            // Безопасное освобождение нативного стрима при отмене корутины
             if (captureOpened && !admissionCommitted) {
                 withContext(NonCancellable) {
                     captureDirectMutex.withLock {
@@ -834,7 +811,6 @@ class NativeAudioEngine @Inject constructor(
             var routeInited = false
             var playbackRecovered = false
 
-            // ФАЗА 1: Реинициализация оборудования и воспроизведения под мьютексом
             captureDirectMutex.withLock {
                 playbackOperationLock.lock()
                 try {
@@ -872,8 +848,6 @@ class NativeAudioEngine @Inject constructor(
                 return@withContext
             }
 
-            // ФАЗА 2: Запуск захвата СНАРУЖИ captureDirectMutex (Устранение Deadlock!)
-            // Передаём строго req.profile
             val captureRecovered = if (!keepCapturing) {
                 true
             } else {
