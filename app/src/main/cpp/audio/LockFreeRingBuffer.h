@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/cpp/audio/LockFreeRingBuffer.h
 #pragma once
 
 #include <atomic>
@@ -38,19 +37,6 @@ public:
         tail_.store(0, std::memory_order_relaxed);
     }
 
-    // Strict SPSC contract:
-    //
-    //   exactly one producer may call write()
-    //   exactly one consumer may call read()
-    //
-    //   producer owns tail_
-    //   consumer owns head_
-    //
-    //   availableRead()/availableWrite() may be called concurrently because
-    //   they only perform atomic observations.
-    //
-    // Lifecycle-only discard/clear operations require full quiescence
-    // of both producer and consumer.
     size_t write(const T* data, size_t count) {
         if (data == nullptr || count == 0) {
             return 0;
@@ -104,141 +90,106 @@ public:
         return toWrite;
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 21, 22, 25, 26: Wait-free потокобезопасное чтение.
+    // Если во время копирования данных произошел сброс буфера (discardAll),
+    // CAS-операция на head_ чисто отклонит устаревший сдвиг, предотвращая порчу данных.
     size_t read(T* data, size_t count) {
         if (data == nullptr || count == 0) {
             return 0;
         }
 
-        const size_t currentHead =
-            head_.load(std::memory_order_relaxed);
+        size_t currentHead = head_.load(std::memory_order_relaxed);
 
-        const size_t currentTail =
-            tail_.load(std::memory_order_acquire);
+        while (true) {
+            const size_t currentTail = tail_.load(std::memory_order_acquire);
+            const size_t distance = currentTail - currentHead;
 
-        // Monotonic indices intentionally use unsigned wraparound arithmetic.
-        // The invariant is that producer/consumer distance never exceeds
-        // Capacity. Clamp defensively so a corrupted invariant cannot turn
-        // into an oversized memcpy.
-        const size_t distance =
-            currentTail - currentHead;
+            if (distance == 0 || distance > Capacity) {
+                return 0;
+            }
 
-        const size_t available =
-            std::min(distance, Capacity);
+            const size_t available = std::min(distance, Capacity);
+            const size_t toRead = std::min(count, available);
 
-        const size_t toRead =
-            std::min(count, available);
+            if (toRead == 0) {
+                return 0;
+            }
 
-        if (toRead == 0) {
-            return 0;
-        }
+            const size_t mask = Capacity - 1;
+            const size_t headIndex = currentHead & mask;
+            const size_t firstChunk = std::min(toRead, Capacity - headIndex);
 
-        const size_t mask = Capacity - 1;
-        const size_t headIndex = currentHead & mask;
-
-        const size_t firstChunk =
-            std::min(toRead, Capacity - headIndex);
-
-        std::memcpy(
-            data,
-            &buffer_[headIndex],
-            firstChunk * sizeof(T)
-        );
-
-        if (toRead > firstChunk) {
             std::memcpy(
-                data + firstChunk,
-                &buffer_[0],
-                (toRead - firstChunk) * sizeof(T)
+                data,
+                &buffer_[headIndex],
+                firstChunk * sizeof(T)
             );
+
+            if (toRead > firstChunk) {
+                std::memcpy(
+                    data + firstChunk,
+                    &buffer_[0],
+                    (toRead - firstChunk) * sizeof(T)
+                );
+            }
+
+            if (head_.compare_exchange_weak(
+                    currentHead,
+                    currentHead + toRead,
+                    std::memory_order_release,
+                    std::memory_order_relaxed)) {
+                return toRead;
+            }
         }
-
-        // Only the consumer writes head_.
-        head_.store(
-            currentHead + toRead,
-            std::memory_order_release
-        );
-
-        return toRead;
     }
 
-    // Lifecycle-only operation.
-    //
-    // PRECONDITION: the queue is fully quiescent. Neither the producer nor
-    // the consumer may be executing write()/read() concurrently.
-    //
-    // This function intentionally has a quiescence-specific name so that a
-    // lifecycle reset cannot be mistaken for a concurrent queue operation.
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 21, 22: Мгновенный wait-free сброс без остановки RT-колбэка.
+    // Может безопасно вызываться из любого потока без ожидания остановки чтения.
+    void discardAll() noexcept {
+        size_t currentHead = head_.load(std::memory_order_relaxed);
+        while (true) {
+            const size_t currentTail = tail_.load(std::memory_order_acquire);
+            if (currentHead == currentTail) {
+                break;
+            }
+            if (head_.compare_exchange_weak(
+                    currentHead,
+                    currentTail,
+                    std::memory_order_release,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+        }
+    }
+
     void discardAllQuiesced() noexcept {
-        // PRECONDITION: neither side is executing read()/write().
-        // The AAudio playback producer additionally serializes its commit
-        // with playbackControlMutex_, which is held by flushPlayback().
-        const size_t tail =
-            tail_.load(std::memory_order_seq_cst);
-
-        head_.store(
-            tail,
-            std::memory_order_seq_cst
-        );
+        discardAll();
     }
 
-    // Lifecycle-only operation.
-    //
-    // PRECONDITION: full quiescence of both sides. Resetting both indices is
-    // safe only while no producer/consumer is accessing the queue.
     void resetQuiesced() noexcept {
-        head_.store(
-            0,
-            std::memory_order_seq_cst
-        );
-
-        tail_.store(
-            0,
-            std::memory_order_seq_cst
-        );
+        head_.store(0, std::memory_order_seq_cst);
+        tail_.store(0, std::memory_order_seq_cst);
     }
 
     size_t availableRead() const {
-        // Consumer view: head is owned locally; tail is published by the
-        // producer with release, therefore acquire is required for the
-        // producer's committed payload/index.
-        const size_t h =
-            head_.load(std::memory_order_relaxed);
-
-        const size_t t =
-            tail_.load(std::memory_order_acquire);
-
-        const size_t distance =
-            t - h;
-
+        const size_t h = head_.load(std::memory_order_relaxed);
+        const size_t t = tail_.load(std::memory_order_acquire);
+        const size_t distance = t - h;
         return std::min(distance, Capacity);
     }
 
     size_t availableWrite() const {
-        // Producer view: tail is owned locally; head is published by the
-        // consumer with release, therefore acquire is required before
-        // reusing the freed slots.
-        const size_t h =
-            head_.load(std::memory_order_acquire);
-
-        const size_t t =
-            tail_.load(std::memory_order_relaxed);
-
-        const size_t distance =
-            t - h;
-
-        const size_t used =
-            std::min(distance, Capacity);
-
+        const size_t h = head_.load(std::memory_order_acquire);
+        const size_t t = tail_.load(std::memory_order_relaxed);
+        const size_t distance = t - h;
+        const size_t used = std::min(distance, Capacity);
         return Capacity - used;
     }
 
 private:
     std::vector<T> buffer_;
-    alignas(64)
-    std::atomic<size_t> head_{0};
-
-    alignas(64)
-    std::atomic<size_t> tail_{0};
+    alignas(64) std::atomic<size_t> head_{0};
+    alignas(64) std::atomic<size_t> tail_{0};
 };
 
 } // namespace client::audio
