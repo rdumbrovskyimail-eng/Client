@@ -7,7 +7,7 @@
 
 namespace client::audio {
 
-// Gemini Live API's native audio rates.
+// Gemini Live API native audio rates.
 // Live API input is natively 16 kHz and output is 24 kHz.
 constexpr int32_t SAMPLE_RATE_GEMINI_IN = 16000;    // 16 kHz Gemini input
 constexpr int32_t SAMPLE_RATE_GEMINI_OUT = 24000;   // 24 kHz Gemini output
@@ -21,23 +21,28 @@ constexpr int32_t SAMPLE_RATE_BT_A2DP = 48000;        // Common A2DP high-qualit
 
 constexpr int32_t CHANNEL_COUNT_MONO = 1;
 
-// Processing quanta
+// Processing quanta (ITU-T G.114 10 ms framing standard)
 constexpr size_t BURST_10MS_16K = 160;              // 10 ms @ 16 kHz
 constexpr size_t BURST_10MS_24K = 240;              // 10 ms @ 24 kHz
 constexpr size_t BURST_10MS_32K = 320;              // 10 ms @ 32 kHz
 constexpr size_t BURST_10MS_48K = 480;              // 10 ms @ 48 kHz
-constexpr size_t BURST_40MS_16K = 640;              // 40 ms @ 16 kHz (send batch)
+constexpr size_t BURST_40MS_16K = 640;              // 40 ms @ 16 kHz
 
 constexpr size_t BYTES_PER_SAMPLE = sizeof(int16_t);
 
-// УСТРАНЕНИЕ ДЕФЕКТА 30: Рациональные размеры кольцевых буферов под L2/L3 кэш процессора
-constexpr size_t RING_BUFFER_CAPACITY_CAPTURE = 32768;   // ~2048 ms @ 16 kHz mono (64 KiB)
-constexpr size_t RING_BUFFER_CAPACITY_PLAYBACK = 32768;  // ~1365 ms @ 24 kHz / ~682 ms @ 48 kHz (64 KiB)
+// УСТРАНЕНИЕ ДЕФЕКТА 51: Квант DSP воспроизведения 10 мс (240 сэмплов) вместо 1024 сэмплов (42.7 мс)
+constexpr size_t PLAYBACK_DSP_INPUT_CHUNK_FRAMES = BURST_10MS_24K;
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 28 и 29: Снижение аппаратного буферного балласта со 140 мс до 25 мс (ITU-T G.114)
+// УСТРАНЕНИЕ ДЕФЕКТА 52: Рациональный буфер захвата ~256 мс @ 16 кГц (4096 сэмплов, 8 KiB)
+constexpr size_t RING_BUFFER_CAPACITY_CAPTURE = 4096;
+
+// УСТРАНЕНИЕ ДЕФЕКТА 53: Рациональный буфер воспроизведения ~341 мс @ 24 кГц (8192 сэмпла, 16 KiB)
+constexpr size_t RING_BUFFER_CAPACITY_PLAYBACK = 8192;
+
+// Аппаратный целевой буфер задержки (ITU-T G.114)
 constexpr size_t PLAYBACK_TARGET_BUFFER_MS = 25;
 
-// Аппаратный множитель бёрстов AAudio (снижен с 8 до 3 для достижения минимальной задержки)
+// Аппаратный множитель бёрстов AAudio для минимизации джиттера
 constexpr size_t PLAYBACK_BURST_MIN_MULTIPLIER = 3;
 
 // Таймаут синхронизации воркера при смене поколения эпохи (миллисекунды)
