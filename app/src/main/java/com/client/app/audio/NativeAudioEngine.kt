@@ -73,7 +73,8 @@ class NativeAudioEngine @Inject constructor(
         private const val BARGE_IN_RECOVERY_POLL_MS = 50L
         private const val PRE_ROLL_FRAMES_CAPACITY = 20
         private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 512L * 1024L
-        private const val PLAYBACK_WRITE_STALL_TIMEOUT_MS = 1800L
+        // УСТРАНЕНИЕ ДЕФЕКТА 36: Снижение таймаута зависания записи с 1800 до 150 мс
+        private const val PLAYBACK_WRITE_STALL_TIMEOUT_MS = 150L
     }
 
     private val audioManager =
@@ -568,7 +569,6 @@ class NativeAudioEngine @Inject constructor(
                             val isBluetooth = router.currentProfile.value.path == AudioRoutePath.BLUETOOTH_COMMUNICATION
                             val pendingFrames = bridge.getPendingPlaybackFrames()
 
-                            // УСТРАНЕНИЕ ДЕФЕКТА 18: outputEnergyHangover не задерживает систему после окончания речи
                             if (instantaneousOut > 0.02f && outputEnergyHangover <= 0.005f) {
                                 lastPlaybackStartMs = now
                             }
@@ -601,8 +601,6 @@ class NativeAudioEngine @Inject constructor(
 
                                 // УСТРАНЕНИЕ ДЕФЕКТОВ 14, 15, 16, 17: Разделение акустических моделей TWS и спикерфона
                                 val isConfirmedUserInterruption = if (isBluetooth) {
-                                    // TWS (CMF Buds 2): полная изоляция динамика в ушном канале.
-                                    // Чистый VAD с чувствительным порогом (RMS >= 0.012f) без подавления эха.
                                     val canBargeInTimers = (now - lastPlaybackStartMs > 180L) &&
                                                            (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
 
@@ -614,8 +612,6 @@ class NativeAudioEngine @Inject constructor(
 
                                     (bargeInCandidateStreak >= 2) && canBargeInTimers && isAiRendering
                                 } else {
-                                    // Спикерфон: открытый акустический канал в воздухе.
-                                    // DTD на базе физического порога утечки звука без вымышленного ERLE.
                                     val canBargeInTimers = (now - lastPlaybackStartMs > PLAYBACK_GRACE_PERIOD_MS) &&
                                                            (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
 
@@ -639,8 +635,7 @@ class NativeAudioEngine @Inject constructor(
                                     hapticManager.triggerBargeIn()
                                     _bargeInEvents.tryEmit(Unit)
 
-                                    // УСТРАНЕНИЕ ДЕФЕКТА 19: Полное сохранение и передача pre-roll буфера
-                                    // в ОБОИХ режимах. Исключает стирание первых фонем («Стой», «Подожди»).
+                                    // УСТРАНЕНИЕ ДЕФЕКТА 19: Полное сохранение pre-roll буфера в ОБОИХ режимах
                                     val preRoll = mutableListOf<ByteArray>()
                                     synchronized(poolLock) {
                                         while (leadInBuffer.isNotEmpty()) {
@@ -655,7 +650,6 @@ class NativeAudioEngine @Inject constructor(
                                 if (isBargeInActive || !isAiRendering) {
                                     sendMicEvent(AudioStreamEvent.Audio(currentAudioBytes), instanceId)
                                 } else {
-                                    // Накопление скользящего предзаписанного буфера во время речи модели
                                     synchronized(poolLock) {
                                         leadInBuffer.addLast(currentAudioBytes)
                                         val maxPreRoll = router.currentProfile.value.leadInBufferSizeFrames / 160
@@ -669,7 +663,6 @@ class NativeAudioEngine @Inject constructor(
                                     sendMicEvent(AudioStreamEvent.SpeechEnd, instanceId)
                                 }
                             } else {
-                                // Ручной режим VAD
                                 if (speechStartedOnFrame) {
                                     val preRoll = mutableListOf<ByteArray>()
                                     synchronized(poolLock) {
@@ -1028,6 +1021,7 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 34: Исправление порядка операций при вычислении дельты прироста
     suspend fun awaitPlaybackDrained(
         generation: Long,
         stallTimeoutMs: Long = 1800L
@@ -1037,7 +1031,7 @@ class NativeAudioEngine @Inject constructor(
         var lastProgressTime = SystemClock.elapsedRealtime()
         val startTime = lastProgressTime
 
-        var maxAllowedDurationMs = (lastPending * 1000L / sampleRate) + 2500L
+        var maxAllowedDurationMs = (lastPending * 1000L / sampleRate) + 1200L
 
         while (isActive) {
             if (generation != currentPlaybackGeneration) {
@@ -1048,7 +1042,7 @@ class NativeAudioEngine @Inject constructor(
             val now = SystemClock.elapsedRealtime()
 
             if (currentPending == 0L) {
-                delay(80L)
+                delay(40L)
                 if (generation == currentPlaybackGeneration && bridge.getPendingPlaybackFrames() == 0L) {
                     return@withContext true
                 }
@@ -1059,15 +1053,16 @@ class NativeAudioEngine @Inject constructor(
                 lastPending = currentPending
                 lastProgressTime = now
 
-                val remainingMs = (currentPending * 1000L / sampleRate) + 1500L
+                val remainingMs = (currentPending * 1000L / sampleRate) + 800L
                 val projectedTotal = (now - startTime) + remainingMs
                 if (projectedTotal > maxAllowedDurationMs) {
                     maxAllowedDurationMs = projectedTotal
                 }
             } else if (currentPending > lastPending) {
+                val deltaGrowth = currentPending - lastPending
                 lastPending = currentPending
                 lastProgressTime = now
-                maxAllowedDurationMs += ((currentPending - lastPending) * 1000L / sampleRate) + 500L
+                maxAllowedDurationMs += ((deltaGrowth * 1000L / sampleRate) + 300L)
             } else {
                 if (now - lastProgressTime >= stallTimeoutMs) {
                     logger.w("NativeAudioEngine: playback stalled for ${now - lastProgressTime} ms with $currentPending pending frames")
@@ -1112,6 +1107,7 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 36: Снижение таймаута зависания с 1800 до 150 мс и мгновенный выход
     suspend fun enqueuePlayback(
         pcm: ByteArray,
         generation: Long
