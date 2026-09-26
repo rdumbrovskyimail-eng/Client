@@ -864,6 +864,7 @@ bool AAudioEngine::pollErrorEvent(StreamErrorEvent& outEvent) {
     return true;
 }
 
+// УСТРАНЕНИЕ ДЕФЕКТА 55: Исключение поллинга с тайм-аутом 100 мс в пользу чистого wait()
 void AAudioEngine::captureDspThreadLoop() {
     pthread_setname_np(pthread_self(), "AudioCapWorker");
     dsp::enableHardwareFtz();
@@ -950,6 +951,7 @@ void AAudioEngine::captureDspThreadLoop() {
     captureDspCv_.notify_all();
 }
 
+// УСТРАНЕНИЕ ДЕФЕКТА 55: Исключение поллинга с тайм-аутом 5 мс в пользу чистого ожидания условий
 void AAudioEngine::playbackDspThreadLoop() {
     pthread_setname_np(pthread_self(), "AudioDspWorker");
     dsp::enableHardwareFtz();
@@ -1016,7 +1018,8 @@ void AAudioEngine::playbackDspThreadLoop() {
 
             if (buffered >= targetBufferFrames || freeSpace < maxOutputFrames) {
                 std::unique_lock<std::mutex> waitLock(playbackDspWaitMutex_);
-                playbackDspCv_.wait_for(waitLock, std::chrono::milliseconds(5), [this, activeEpoch, targetBufferFrames, maxOutputFrames]() {
+                // Ожидание освобождения места в буфере без жесткого тайм-аута: пробуждается от notify_one() в ЦАП
+                playbackDspCv_.wait(waitLock, [this, activeEpoch, targetBufferFrames, maxOutputFrames]() {
                     if (!playbackDspRunning_.load(std::memory_order_acquire)) return true;
                     if (playbackEpoch_.load(std::memory_order_acquire) != activeEpoch) return true;
                     return playbackBuffer_.availableRead() < targetBufferFrames && playbackBuffer_.availableWrite() >= maxOutputFrames;
@@ -1027,6 +1030,7 @@ void AAudioEngine::playbackDspThreadLoop() {
             size_t inputFrames = playbackDspInputBuffer_.read(input, PLAYBACK_DSP_INPUT_CHUNK_FRAMES);
             if (inputFrames == 0) {
                 std::unique_lock<std::mutex> waitLock(playbackDspWaitMutex_);
+                // Ожидание поступления входящих сэмплов от Gemini без холостого спина
                 playbackDspCv_.wait(waitLock, [this, activeEpoch]() {
                     return !playbackDspRunning_.load(std::memory_order_acquire) ||
                         playbackEpoch_.load(std::memory_order_acquire) != activeEpoch ||
@@ -1162,7 +1166,6 @@ void AAudioEngine::getSpectrumData(dsp::SpectrumSnapshot& outSnapshot) {
     fftProcessor_->getLatestSnapshot(outSnapshot);
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Наносекундный таймстемпинг и счетчик последовательности в RT-колбэке
 aaudio_data_callback_result_t AAudioEngine::captureCallback(
     AAudioStream* stream,
     void* userData,
@@ -1175,7 +1178,6 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
 
     auto* engine = static_cast<AAudioEngine*>(userData);
 
-    // Замер точного аппаратного таймстемпа АЦП
     int64_t framePosition = 0;
     int64_t hwTimestampNs = 0;
     if (stream != nullptr && AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &framePosition, &hwTimestampNs) == AAUDIO_OK) {
@@ -1216,7 +1218,7 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Наносекундный таймстемпинг ЦАП в RT-колбэке
+// УСТРАНЕНИЕ ДЕФЕКТА 55: Нотификация DSP-воркера из колбэка ЦАП при появлении свободного места
 aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     AAudioStream* stream,
     void* userData,
@@ -1244,14 +1246,16 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
         std::memset(samples + read, 0, (frames - read) * sizeof(int16_t));
     }
 
-    if (read == 0) {
+    if (read > 0) {
+        // Мгновенное пробуждение воркера для генерации следующей 10-мс порции
+        engine->playbackDspCv_.notify_one();
+    } else {
         engine->outRms_.store(0.0f, std::memory_order_relaxed);
     }
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 43: Исчерпывающий разбор ошибок и диспетчеризация
 void AAudioEngine::errorCallback(
     AAudioStream* stream,
     void* userData,
@@ -1276,3 +1280,378 @@ void AAudioEngine::errorCallback(
 }
 
 } // namespace client::audio
+
+FILE 3: app/src/main/java/com/client/app/api/GeminiLiveClient.kt
+
+package com.client.app.api
+
+import android.os.SystemClock
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.channels.ReceiveChannel
+import kotlinx.serialization.json.*
+import javax.inject.Inject
+import javax.inject.Singleton
+
+enum class FunctionResponseScheduling {
+    INTERRUPT,
+    WHEN_IDLE,
+    SILENT
+}
+
+enum class ClientRole(val value: String) {
+    USER("user"),
+    MODEL("model")
+}
+
+sealed interface GeminiEvent {
+    data object Connected : GeminiEvent
+
+    data object SetupComplete : GeminiEvent
+
+    data object Interrupted : GeminiEvent
+
+    data object GenerationComplete : GeminiEvent
+
+    data object TurnComplete : GeminiEvent
+
+    data class InteractionStatus(
+        val status: String
+    ) : GeminiEvent
+
+    data class ModelText(
+        val text: String
+    ) : GeminiEvent
+
+    data class InputTranscript(
+        val text: String,
+        val interim: Boolean
+    ) : GeminiEvent
+
+    data class OutputTranscript(
+        val text: String
+    ) : GeminiEvent
+
+    data class ToolCall(
+        val calls: List<FunctionCall>
+    ) : GeminiEvent
+
+    data class ToolCallCancelled(
+        val ids: List<String>
+    ) : GeminiEvent
+
+    data class GoAway(
+        val millisLeft: Long?
+    ) : GeminiEvent
+
+    data class ResumptionHandle(
+        val handle: String?,
+        val resumable: Boolean
+    ) : GeminiEvent
+
+    data class GroundingMetadata(
+        val metadata: com.client.app.api.GroundingMetadata
+    ) : GeminiEvent
+
+    data class UrlContextMetadata(
+        val metadata: com.client.app.api.UrlContextMetadata
+    ) : GeminiEvent
+
+    data class Usage(
+        val totalTokens: Int
+    ) : GeminiEvent
+
+    data class Error(
+        val message: String,
+        val fatal: Boolean
+    ) : GeminiEvent
+
+    data class Disconnected(
+        val code: Int,
+        val reason: String,
+        val sessionId: Long,
+        val epoch: Long
+    ) : GeminiEvent
+}
+
+data class FunctionCall(
+    val name: String,
+    val id: String?,
+    val args: JsonObject
+) {
+    fun getString(
+        key: String,
+        default: String = ""
+    ): String =
+        args[key]
+            ?.jsonPrimitive
+            ?.contentOrNull
+            ?: default
+
+    fun getStringList(
+        key: String
+    ): List<String> {
+        val value = args[key] ?: return emptyList()
+        return when (value) {
+            is JsonArray -> value.mapNotNull { it.jsonPrimitive.contentOrNull?.takeIf(String::isNotBlank) }
+            else -> value.jsonPrimitive.contentOrNull
+                ?.split(',', ';')
+                ?.map { it.trim() }
+                ?.filter(String::isNotBlank)
+                ?: emptyList()
+        }
+    }
+}
+
+data class FunctionResponsePart(
+    val mimeType: String,
+    val base64Data: String
+)
+
+data class ToolResponse(
+    val name: String,
+    val id: String?,
+    val response: JsonObject,
+    val parts: List<FunctionResponsePart> = emptyList(),
+    val scheduling: FunctionResponseScheduling? = null,
+    val willContinue: Boolean = false
+)
+
+data class ClientTurn(
+    val role: ClientRole,
+    val text: String
+)
+
+/**
+ * УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Сквозная привязка аппаратного монотонного таймстемпа и sequence-номера
+ */
+class AudioFrame(
+    val pcm: ByteArray,
+    val sessionId: Long,
+    val epoch: Long,
+    val generation: Long,
+    val frameId: Long,
+    val timestampMs: Long = SystemClock.elapsedRealtime(),
+    val sequenceNumber: Long = 0L,
+    val timestampNs: Long = SystemClock.elapsedRealtimeNanos()
+)
+
+data class GeminiEventEnvelope(
+    val sessionId: Long,
+    val epoch: Long,
+    val frameId: Long,
+    val generationId: Long,
+    val event: GeminiEvent
+)
+
+data class TranscriptionSettings(
+    val enabled: Boolean = true,
+    val languageCodes: List<String> = emptyList(),
+    val customVocabulary: List<String> = emptyList(),
+    val mode: String = "VERBATIM"
+)
+
+data class RealtimeInputSettings(
+    val aadEnabled: Boolean = true,
+    val startSensitivity: String = "START_SENSITIVITY_HIGH",
+    val endSensitivity: String = "END_SENSITIVITY_LOW",
+    val prefixPaddingMs: Int = 60,
+    val silenceDurationMs: Int = 600,
+    val activityHandling: String = "START_OF_ACTIVITY_INTERRUPTS",
+    val turnCoverage: String = "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
+)
+
+data class CompressionSettings(
+    val enabled: Boolean = true,
+    val triggerTokens: Int = 0,
+    val targetTokens: Int = 0
+)
+
+data class GroundingMetadata(
+    val raw: JsonObject
+)
+
+data class UrlContextMetadata(
+    val raw: JsonObject
+)
+
+data class LiveModelCapabilities(
+    val supportsThinkingConfig: Boolean,
+    val supportsInteractionStatus: Boolean,
+    val supportsAsyncFunctionCalling: Boolean,
+    val supportsFunctionScheduling: Boolean,
+    val supportsContextCache: Boolean,
+    val requiresNonBlockingTools: Boolean,
+    val supportsSearchGrounding: Boolean,
+    val supportsUrlContext: Boolean,
+    val maxInputTokens: Int
+)
+
+object LiveModelCapabilitiesRegistry {
+    private fun normalize(model: String): String =
+        model.trim()
+            .removePrefix("publishers/google/models/")
+            .removePrefix("models/")
+
+    fun normalizeResourceName(model: String): String {
+        val id = normalize(model)
+        require(id.matches(Regex("[a-zA-Z0-9._-]+"))) {
+            "Invalid Gemini model resource name: '$model'"
+        }
+        return "models/$id"
+    }
+
+    fun requireBcp47Language(language: String): String {
+        val clean = language.trim()
+        require(clean.matches(Regex("^[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?(?:-[A-Za-z0-9]{2,8})*$"))) {
+            "Invalid BCP-47 speech language: '$language'"
+        }
+        return clean
+    }
+
+    fun requireVoiceName(voice: String): String {
+        val clean = voice.trim()
+        require(clean.matches(Regex("^[A-Za-z][A-Za-z0-9_-]{1,63}$"))) {
+            "Invalid Gemini voice name: '$voice'"
+        }
+        return clean
+    }
+
+    fun forModel(model: String): LiveModelCapabilities {
+        return when (normalize(model)) {
+            "gemini-3.8-live" -> LiveModelCapabilities(
+                supportsThinkingConfig = false,
+                supportsInteractionStatus = false,
+                supportsAsyncFunctionCalling = true,
+                supportsFunctionScheduling = true,
+                supportsContextCache = false,
+                requiresNonBlockingTools = false,
+                supportsSearchGrounding = true,
+                supportsUrlContext = false,
+                maxInputTokens = 131_072
+            )
+            "gemini-3.8-live-extended-thinking" -> LiveModelCapabilities(
+                supportsThinkingConfig = true,
+                supportsInteractionStatus = true,
+                supportsAsyncFunctionCalling = true,
+                supportsFunctionScheduling = false,
+                supportsContextCache = false,
+                requiresNonBlockingTools = true,
+                supportsSearchGrounding = true,
+                supportsUrlContext = false,
+                maxInputTokens = 131_072
+            )
+            "gemini-3.1-flash-live-preview" -> LiveModelCapabilities(
+                supportsThinkingConfig = true,
+                supportsInteractionStatus = false,
+                supportsAsyncFunctionCalling = false,
+                supportsFunctionScheduling = false,
+                supportsContextCache = false,
+                requiresNonBlockingTools = false,
+                supportsSearchGrounding = false,
+                supportsUrlContext = false,
+                maxInputTokens = 131_072
+            )
+            "gemini-2.5-flash-native-audio-preview-12-2025" -> LiveModelCapabilities(
+                supportsThinkingConfig = false,
+                supportsInteractionStatus = false,
+                supportsAsyncFunctionCalling = false,
+                supportsFunctionScheduling = false,
+                supportsContextCache = false,
+                requiresNonBlockingTools = false,
+                supportsSearchGrounding = false,
+                supportsUrlContext = false,
+                maxInputTokens = 131_072
+            )
+            else -> throw IllegalArgumentException(
+                "Unsupported Gemini Live model '${normalize(model)}'. Add it to LiveModelCapabilitiesRegistry only after verifying its official protocol contract."
+            )
+        }
+    }
+}
+
+data class LiveConfig(
+    val apiKey: String,
+    val model: String = "gemini-3.8-live",
+    val systemInstruction: String,
+    val voiceName: String = "Charon",
+    val speechLanguage: String? = null,
+    val temperature: Float = 0.5f,
+    val mediaResolution: String = "MEDIA_RESOLUTION_HIGH",
+    val inputTranscription: TranscriptionSettings = TranscriptionSettings(),
+    val outputTranscription: TranscriptionSettings = TranscriptionSettings(),
+    val realtimeInput: RealtimeInputSettings = RealtimeInputSettings(),
+    val compression: CompressionSettings = CompressionSettings(),
+    val sessionResumptionEnabled: Boolean = true,
+    val resumptionHandle: String? = null,
+    val thinkingLevel: String? = null,
+    val toolsJson: JsonArray? = null,
+    val enableGoogleSearch: Boolean = false,
+    val initialHistory: List<ClientTurn> = emptyList()
+)
+
+@Singleton
+class GeminiLiveClient @Inject constructor(
+    private val protobufClient: GeminiProtobufLiveClient
+) {
+    val events: Flow<GeminiEventEnvelope>
+        get() = protobufClient.events
+
+    val audio: ReceiveChannel<AudioFrame>
+        get() = protobufClient.audio
+
+    val isReady: Boolean
+        get() = protobufClient.isReady
+
+    val epoch: Long
+        get() = protobufClient.epoch
+
+    val sessionId: Long
+        get() = protobufClient.sessionId
+
+    val audioGeneration: Long
+        get() = protobufClient.audioGeneration
+
+    suspend fun connect(
+        cfg: LiveConfig,
+        beforeOpen: (suspend () -> Unit)? = null
+    ) = protobufClient.connect(cfg, beforeOpen)
+
+    suspend fun sendAudio(pcm: ByteArray) =
+        protobufClient.sendAudioPcm(pcm)
+
+    suspend fun flushAudio() =
+        protobufClient.flushAudio()
+
+    suspend fun sendRealtimeText(text: String) =
+        protobufClient.sendRealtimeText(text)
+
+    suspend fun sendRealtimeImage(jpegBytes: ByteArray) =
+        protobufClient.sendRealtimeImage(jpegBytes)
+
+    suspend fun sendActivityStart() =
+        protobufClient.sendActivityStart()
+
+    suspend fun sendActivityEnd() =
+        protobufClient.sendActivityEnd()
+
+    suspend fun sendClientContent(
+        turns: List<ClientTurn>,
+        turnComplete: Boolean = true
+    ) = protobufClient.sendClientContent(turns, turnComplete)
+
+    suspend fun sendAudioStreamEnd() =
+        protobufClient.sendAudioStreamEnd()
+
+    suspend fun sendToolResponses(
+        responses: List<ToolResponse>
+    ): Boolean = protobufClient.sendToolResponses(responses)
+
+    fun invalidateAudio(): Long =
+        protobufClient.invalidateAudio()
+
+    fun releaseAudio(frame: AudioFrame) =
+        protobufClient.releaseAudio(frame)
+
+    suspend fun disconnect() =
+        protobufClient.disconnect()
+}
