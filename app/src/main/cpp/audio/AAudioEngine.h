@@ -57,8 +57,7 @@ struct StreamErrorEvent {
 };
 
 /**
- * Разделение физических возможностей оборудования (Capabilities)
- * и применённой действующей конфигурации дескриптора (Active Configuration).
+ * Разделение физических возможностей оборудования и активной конфигурации.
  */
 struct HardwareAudioCapabilities {
     bool supports16k{false};
@@ -156,11 +155,11 @@ public:
     bool restartCaptureStream();
     bool restartPlaybackStream();
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 218: Неблокирующий Try-Write контракт
+    // Неблокирующий Try-Write контракт
     size_t writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation);
     size_t readCapturePcm(int16_t* pcm, size_t maxFrames);
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 181 и 214: Аппаратный Soft-Flush без остановки потока ЦАП
+    // Аппаратный Soft-Flush без остановки потока ЦАП
     void flushPlayback(uint64_t generation);
     void triggerBargeInEarcon();
     void resetEarcon();
@@ -293,7 +292,7 @@ private:
     void captureDspThreadLoop();
     void fftTapThreadLoop();
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 23, 24, 215: Пассивный Dumb RT Callback
+    // Пассивные RT колбэки (без блокировок, IPC и getTimestamp)
     static aaudio_data_callback_result_t captureCallback(
         AAudioStream* stream,
         void* userData,
@@ -377,7 +376,7 @@ private:
     alignas(64) std::atomic<float> micNoiseFloorRms_{0.015f};
     std::atomic<bool> isPlaybackRenderingActive_{false};
 
-    // Сквозные счетчики потерь данных (E2E Loss & Glitch Tracking)
+    // Сквозные счетчики потерь данных
     alignas(64) std::atomic<uint64_t> totalHardwareCapturedFrames_{0};
     alignas(64) std::atomic<uint64_t> totalDspProcessedFrames_{0};
     alignas(64) std::atomic<uint64_t> captureDroppedFrames_{0};
@@ -391,6 +390,9 @@ private:
     alignas(64) std::atomic<uint32_t> captureErrorCount_{0};
     alignas(64) std::atomic<uint32_t> playbackErrorCount_{0};
     alignas(64) std::atomic<int32_t> lastXRunCount_{0};
+
+    // УСТРАНЕНИЕ ДЕФЕКТА 9: Счётчик XRun, учтённых DSP-потоком для безопасной адаптации размера буфера
+    alignas(64) std::atomic<int32_t> lastTunedXRunCount_{0};
 
     // Гистограмма кодов ошибок (RFC 7004)
     alignas(64) std::array<std::atomic<uint32_t>, ERROR_HISTOGRAM_BUCKETS> errorHistogram_{};
@@ -410,7 +412,6 @@ private:
     std::mutex fftTapWaitMutex_;
     std::condition_variable fftTapCv_;
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 223: Однозначный позитивный флаг допуска микрофона
     std::atomic<bool> micPipelineAdmitted_{false};
 
     alignas(64) std::atomic<uint64_t> playbackEpoch_{0};
