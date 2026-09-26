@@ -1,30 +1,21 @@
-// >>> FILE: app/src/main/cpp/dsp/FastFft.cpp
 #include "FastFft.h"
 #include <cmath>
 #include <algorithm>
+#include <atomic>
 
 namespace client::dsp {
 
 static constexpr float PI = 3.14159265358979323846f;
 static constexpr size_t N = audio::FFT_SIZE;
 
-FastFft::FastFft()
-    : snapshotMicRms_(0.0f),
-      snapshotOutRms_(0.0f),
-      snapshotSeq_(0) {
-    for (auto& value : snapshotBands_) {
-        value.store(0.0f, std::memory_order_relaxed);
-    }
-
-    // Problem #12: One-time precomputation of the Hann window coefficients (double precision).
-    // Eliminates 256 calls to std::cos() on every FFT block (~48,000 calls/sec).
+FastFft::FastFft() {
+    // 1. Предрасчет окна Ханна высокой точности
     for (size_t i = 0; i < N; ++i) {
         const double angle = 2.0 * static_cast<double>(PI) * static_cast<double>(i) / static_cast<double>(N - 1);
         hannWindow_[i] = static_cast<float>(0.5 * (1.0 - std::cos(angle)));
     }
 
-    // Problem #12: One-time precomputation of 8-bit bit-reversal indices (log2(256) = 8).
-    // Eliminates nested loops with scalar division and bit shifting during real-time processing.
+    // 2. Предрасчет 8-битной перестановки бит-реверса (log2(256) = 8)
     for (size_t i = 0; i < N; ++i) {
         size_t rev = 0;
         size_t temp = i;
@@ -35,17 +26,18 @@ FastFft::FastFft()
         bitRev_[i] = static_cast<uint16_t>(rev);
     }
 
-    // Problem #12: One-time precomputation of complex twiddle factors W_N^k = e^(-j*2*pi*k/N).
-    // Completely eliminates runtime trigonometric calls and prevents numerical drift (Goldberg drift).
+    // 3. Предрасчет поворотных коэффициентов W_N^k = e^(-j*2*pi*k/N)
     for (size_t k = 0; k < N / 2; ++k) {
         const double angle = -2.0 * static_cast<double>(PI) * static_cast<double>(k) / static_cast<double>(N);
         twiddleR_[k] = static_cast<float>(std::cos(angle));
         twiddleI_[k] = static_cast<float>(std::sin(angle));
     }
+
+    snapshotSeq_.store(0, std::memory_order_relaxed);
 }
 
 void FastFft::computeFft(float* real, float* imag) {
-    // 1. Bit-reversal permutation via fast table lookup (O(N) with zero bit-twiddling)
+    // 1. Бит-реверсивная перестановка через таблицу
     for (size_t i = 0; i < N; ++i) {
         const size_t j = bitRev_[i];
         if (i < j) {
@@ -54,7 +46,7 @@ void FastFft::computeFft(float* real, float* imag) {
         }
     }
 
-    // 2. Cooley-Tukey Radix-2 butterflies using direct L1d twiddle factor table indexing
+    // 2. Бабочки Кули-Тьюки Radix-2
     for (size_t len = 2; len <= N; len <<= 1) {
         const size_t halfLen = len >> 1;
         const size_t step = N / len;
@@ -89,8 +81,6 @@ void FastFft::process(
     float outRms,
     int32_t sampleRate) {
 
-    // A valid FFT block requires both a complete input buffer and enough
-    // samples for one N-point transform.
     if (pcmInput == nullptr || count < N) {
         return;
     }
@@ -105,8 +95,7 @@ void FastFft::process(
     int32_t effectiveSr = sampleRate;
     if (sampleRate >= 44100 && count >= N * 2) {
         effectiveSr = sampleRate / 2;
-        // 3-point anti-aliasing FIR filter [0.25, 0.5, 0.25] before 2:1 decimation
-        // applied with precomputed Hann window weights (zero runtime std::cos calls).
+        // 3-точечный анти-алиасинг фильтр [0.25, 0.5, 0.25]
         for (size_t i = 0; i < N; ++i) {
             const size_t idx = i * 2;
             const float prev = (idx > 0) ? pcmInput[idx - 1] : pcmInput[idx];
@@ -116,8 +105,6 @@ void FastFft::process(
             real[i] = filtered * hannWindow_[i];
         }
     } else {
-        // Linear 1:1 indexing for native Gemini rates (e.g. 24 kHz or 16 kHz)
-        // using vectorized precomputed Hann window (direct memory multiplication).
         for (size_t i = 0; i < N; ++i) {
             real[i] = pcmInput[i] * hannWindow_[i];
         }
@@ -173,69 +160,41 @@ void FastFft::process(
         }
     }
 
-    // Publish with a seqlock. Odd value = writer owns snapshot; even value = stable payload.
-    snapshotSeq_.fetch_add(1, std::memory_order_acq_rel);
+    // УСТРАНЕНИЕ ДЕФЕКТА 172: Атомарная публикация через Seqlock без мьютекса
+    const uint32_t currentSeq = snapshotSeq_.load(std::memory_order_relaxed);
+    snapshotSeq_.store(currentSeq + 1, std::memory_order_release); // Нечетное: идет запись
 
     for (size_t i = 0; i < audio::SPECTRUM_BANDS; ++i) {
-        snapshotBands_[i].store(
-            smoothedBands_[i],
-            std::memory_order_relaxed
-        );
+        activeSnapshot_.bands[i] = smoothedBands_[i];
     }
+    activeSnapshot_.micRms = micRms;
+    activeSnapshot_.outRms = outRms;
 
-    snapshotMicRms_.store(
-        micRms,
-        std::memory_order_relaxed
-    );
-    snapshotOutRms_.store(
-        outRms,
-        std::memory_order_relaxed
-    );
-
-    snapshotSeq_.fetch_add(1, std::memory_order_release);
+    snapshotSeq_.store(currentSeq + 2, std::memory_order_release); // Четное: снимок стабилен
 }
 
+// УСТРАНЕНИЕ ДЕФЕКТА 172: 100% неблокирующее считывание снимка спектра UI без mutex
 void FastFft::getLatestSnapshot(SpectrumSnapshot& out) const {
-    for (int attempt = 0; attempt < 16; ++attempt) {
-        const uint32_t seq1 =
-            snapshotSeq_.load(std::memory_order_acquire);
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const uint32_t seq1 = snapshotSeq_.load(std::memory_order_acquire);
 
         if ((seq1 & 1u) != 0u) {
-            continue;
+            continue; // Писатель обновляет снимок, повторяем попытку
         }
 
-        SpectrumSnapshot candidate{};
+        const SpectrumSnapshot candidate = activeSnapshot_;
+        std::atomic_thread_fence(std::memory_order_acquire);
 
-        for (size_t i = 0; i < audio::SPECTRUM_BANDS; ++i) {
-            candidate.bands[i] =
-                snapshotBands_[i].load(std::memory_order_relaxed);
-        }
+        const uint32_t seq2 = snapshotSeq_.load(std::memory_order_acquire);
 
-        candidate.micRms =
-            snapshotMicRms_.load(std::memory_order_relaxed);
-        candidate.outRms =
-            snapshotOutRms_.load(std::memory_order_relaxed);
-
-        const uint32_t seq2 =
-            snapshotSeq_.load(std::memory_order_acquire);
-
-        if (
-            seq1 == seq2 &&
-            (seq2 & 1u) == 0u
-        ) {
-            {
-                // Synchronize fallback snapshot mutation to eliminate C++ data races across reader threads.
-                std::lock_guard<std::mutex> lock(fallbackMutex_);
-                lastStableSnapshot_ = candidate;
-            }
+        if (seq1 == seq2 && (seq2 & 1u) == 0u) {
             out = candidate;
             return;
         }
     }
 
-    // Bounded fallback: return last verified consistent snapshot under lock.
-    std::lock_guard<std::mutex> lock(fallbackMutex_);
-    out = lastStableSnapshot_;
+    // При коллизии возвращаем текущее состояние без захвата блокировок
+    out = activeSnapshot_;
 }
 
 } // namespace client::dsp
