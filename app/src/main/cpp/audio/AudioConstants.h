@@ -38,18 +38,19 @@ constexpr size_t PLAYBACK_DSP_INPUT_CHUNK_FRAMES = BURST_10MS_24K;
 constexpr size_t RING_BUFFER_CAPACITY_CAPTURE = 4096; // ~256 мс @ 16 кГц (8 КиБ)
 constexpr size_t RING_BUFFER_CAPACITY_PLAYBACK = 8192; // ~341 мс @ 24 кГц (16 КиБ)
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 216 и 217: Адаптивный сетевой горизонт воспроизведения (RFC 3550 / NetEQ)
-constexpr size_t PLAYBACK_TARGET_BUFFER_MS = 25;
-constexpr size_t PLAYBACK_TARGET_BUFFER_BT_MIN_MS = 30;     // 30 мс адаптивный минимум для CMF Buds 2
-constexpr size_t PLAYBACK_TARGET_BUFFER_BT_MAX_MS = 60;     // 60 мс адаптивный максимум для CMF Buds 2
-constexpr size_t PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS = 20; // 20 мс для встроенного динамика S23 Ultra
-constexpr size_t PLAYBACK_TARGET_BUFFER_SPEAKER_MAX_MS = 40; // 40 мс для встроенного динамика S23 Ultra
-constexpr size_t PLAYBACK_MAX_QUEUE_HORIZON_MS = 150;       // Защитный предел против bufferbloat
+// УСТРАНЕНИЕ ДЕФЕКТА 12: Адаптивный сетевой горизонт воспроизведения по ITU-T G.114 и RFC 3550
+// Базовый порог увеличен с 25 мс до 45 мс для поглощения радиоджиттера eSCO/BLE BAP (20–45 мс)
+constexpr size_t PLAYBACK_TARGET_BUFFER_MS = 45;
+constexpr size_t PLAYBACK_TARGET_BUFFER_BT_MIN_MS = 45;      // 45 мс адаптивный минимум для гарнитур
+constexpr size_t PLAYBACK_TARGET_BUFFER_BT_MAX_MS = 90;      // 90 мс адаптивный максимум для гарнитур
+constexpr size_t PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS = 30; // 30 мс для встроенного динамика S23 Ultra
+constexpr size_t PLAYBACK_TARGET_BUFFER_SPEAKER_MAX_MS = 50; // 50 мс для встроенного динамика S23 Ultra
+constexpr size_t PLAYBACK_MAX_QUEUE_HORIZON_MS = 150;        // Защитный предел против bufferbloat
 
 // Множитель бёрстов AAudio для минимизации джиттера
 constexpr size_t PLAYBACK_BURST_MIN_MULTIPLIER = 2;
 
-// УСТРАНЕНИЕ ДЕФЕКТА 181: Мгновенный Soft-Flush без 600-мс блокирующего ожидания
+// Таймаут сброса очереди DSP
 constexpr size_t PLAYBACK_DSP_RESET_TIMEOUT_MS = 15;
 
 // Ресемплинг и децимация (Zero-Allocation scratch space)
@@ -69,7 +70,7 @@ constexpr size_t SPECTRUM_BANDS = 5;
 // Размер гистограммы ошибок AAudio (RFC 7004)
 constexpr size_t ERROR_HISTOGRAM_BUCKETS = 16;
 
-// Аппаратные особенности наушников CMF Buds 2 (чип Bestechnic BES2600)
+// Аппаратные особенности гарнитур (чип Bestechnic BES2600)
 constexpr uint32_t CMF_BUDS_2_ENC_LATENCY_MS = 35; // Алгоритмическая задержка Clear Voice ENC
 
 // Физические задержки контроллеров и аудиосервера
@@ -83,13 +84,10 @@ constexpr float NOISE_FLOOR_MAX_RMS = 0.080f;
 constexpr float NOISE_FLOOR_DECAY_COEFF = 0.995f;
 constexpr float NOISE_FLOOR_ATTACK_COEFF = 0.005f;
 
-/**
- * УСТРАНЕНИЕ ДЕФЕКТА 225:
- * Формальные измеримые приёмочные критерии качества (Engineering KPIs по IEEE 29119).
- */
-constexpr uint32_t KPI_MAX_CALLBACK_LATENCY_US = 800; // < 0.8 мс при кванте 2.0 мс на S23 Ultra
-constexpr uint32_t KPI_MAX_BARGE_IN_REACTION_MS = 45; // < 45 мс от детекции до тишины динамика
-constexpr uint32_t KPI_MAX_ROUTE_SWITCH_MS = 80;      // < 80 мс переключение маршрута на CMF Buds 2
+// Инженерные KPI по IEEE 29119
+constexpr uint32_t KPI_MAX_CALLBACK_LATENCY_US = 800;  // < 0.8 мс при кванте 2.0 мс на S23 Ultra
+constexpr uint32_t KPI_MAX_BARGE_IN_REACTION_MS = 45;  // < 45 мс от детекции до тишины динамика
+constexpr uint32_t KPI_MAX_ROUTE_SWITCH_MS = 80;       // < 80 мс переключение маршрута
 constexpr float KPI_MAX_BATTERY_DRAIN_PER_HOUR = 7.0f; // < 7.0% аккумулятора в час на Snapdragon 8 Gen 2
 
 } // namespace client::audio
