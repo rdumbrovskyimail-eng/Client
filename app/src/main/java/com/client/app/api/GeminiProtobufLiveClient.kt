@@ -97,7 +97,6 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     @Volatile private var writerReadySignal: CompletableDeferred<Unit>? = null
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 119, 120, 121: Атомарные числовые счетчики баланса консервации фреймов
     private val totalServerAudioFramesReceived = AtomicLong(0L)
     private val totalServerAudioBytesReceived = AtomicLong(0L)
     private val transportAudioDroppedBytes = AtomicLong(0L)
@@ -685,7 +684,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
         }
 
-        // Воркер 2 (Data Plane): Монопольная передача PCM с подсчетом сквозного баланса фреймов
+        // Воркер 2 (Data Plane): Передача PCM с подсчетом сквозного баланса фреймов
         scope.launch {
             try {
                 while (true) {
@@ -719,7 +718,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
 
                     if (sendAccepted) {
-                        // УСТРАНЕНИЕ ДЕФЕКТА 120: Сквозная фиксация доставленных в сокет фреймов
                         totalOutboundMicBytesDelivered.addAndGet(pcmBytes.size.toLong())
                         totalOutboundMicFramesDelivered.addAndGet(pcmBytes.size / 2L)
                     } else {
@@ -1597,7 +1595,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                             val pcm = decodedPcmParts.getOrNull(partIndex) ?: return@forEachIndexed
                             val bytes = pcm.size.toLong()
 
-                            // УСТРАНЕНИЕ ДЕФЕКТА 121: Учет общего числа полученных аудиофреймов модели
                             totalServerAudioBytesReceived.addAndGet(bytes)
                             totalServerAudioFramesReceived.addAndGet(bytes / 2L)
 
@@ -1636,7 +1633,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                             }
 
                             if (!accepted) {
-                                // УСТРАНЕНИЕ ДЕФЕКТА 119: Числовая фиксация потерь транспорта вместо текстового лога
                                 transportAudioDroppedBytes.addAndGet(bytes)
                                 transportAudioDroppedFrames.addAndGet(bytes / 2L)
                                 val dropEvents = transportBacklogDropEvents.incrementAndGet()
