@@ -269,6 +269,12 @@ private:
     alignas(64) std::atomic<uint64_t> playbackSequenceNumber_{0};
     alignas(64) std::atomic<uint64_t> lastPlaybackPresentationTimestampNs_{0};
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 64 и 65: Адаптивный джиттер-буфер (AJB) и контроллер скорости воспроизведения (TSM)
+    alignas(64) std::atomic<size_t> playbackTargetBufferMs_{PLAYBACK_TARGET_BUFFER_MS};
+    alignas(64) std::atomic<uint64_t> lastPlaybackWriteNs_{0};
+    alignas(64) std::atomic<int64_t> interArrivalJitterNs_{0};
+    float smoothedRateFactor_{1.0f};
+
     std::atomic<int32_t> playbackSampleRate_{SAMPLE_RATE_GEMINI_OUT};
 
     std::atomic<int32_t> actualCaptureSampleRate_{SAMPLE_RATE_GEMINI_IN};
