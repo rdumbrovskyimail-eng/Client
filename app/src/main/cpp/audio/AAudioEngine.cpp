@@ -16,7 +16,6 @@
 
 #define LOG_TAG "NativeAudioEngine"
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 173, 174, 175: Неблокирующий pushRt без блокирующих сокетов в RT
 #define LOGI(...) do { \
     char _buf[256]; \
     snprintf(_buf, sizeof(_buf), __VA_ARGS__); \
@@ -57,7 +56,6 @@ void Biquad::makeLowShelf(float fc, float gainDb, float fs) {
     a2 = ((A + 1.0f) - (A - 1.0f) * cs - beta) / a0;
 }
 
-// УСТРАНЕНИЕ ОШИБКИ 1: Математически строгие формулы знаков Роберта Бристоу-Джонсона (RBJ Cookbook)
 void Biquad::makeHighShelf(float fc, float gainDb, float fs) {
     const float A = std::pow(10.0f, gainDb / 40.0f);
     const float omega = 2.0f * 3.14159265f * fc / fs;
@@ -69,8 +67,8 @@ void Biquad::makeHighShelf(float fc, float gainDb, float fs) {
     const float a0 = (A + 1.0f) - (A - 1.0f) * cs + beta;
     b0 = (A * ((A + 1.0f) + (A - 1.0f) * cs + beta)) / a0;
     b1 = (-2.0f * A * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
-    b2 = (A * ((A + 1.0f) + (A - 1.0f) * cs - beta)) / a0; // Знак +
-    a1 = (2.0f * ((A - 1.0f) - (A + 1.0f) * cs)) / a0;     // Знак -
+    b2 = (A * ((A + 1.0f) + (A - 1.0f) * cs - beta)) / a0;
+    a1 = (2.0f * ((A - 1.0f) - (A + 1.0f) * cs)) / a0;
     a2 = ((A + 1.0f) - (A - 1.0f) * cs - beta) / a0;
 }
 
@@ -278,6 +276,7 @@ bool AAudioEngine::initLocked(
     actualCaptureChannels_.store(0, std::memory_order_release);
     actualInputDeviceId_.store(AAUDIO_UNSPECIFIED, std::memory_order_release);
     actualPlaybackBurst_.store(0, std::memory_order_release);
+    lastTunedXRunCount_.store(0, std::memory_order_release);
     isBluetoothMode_.store(isBluetoothMode, std::memory_order_relaxed);
     playbackSampleRate_.store(targetPlaybackSampleRate, std::memory_order_relaxed);
 
@@ -1100,6 +1099,23 @@ void AAudioEngine::playbackDspThreadLoop() {
             const int32_t actualRate = std::max(1, actualPlaybackSampleRate_.load(std::memory_order_acquire));
             const int32_t actualBurst = actualPlaybackBurst_.load(std::memory_order_acquire);
 
+            // УСТРАНЕНИЕ ДЕФЕКТА 9: Безопасная адаптация размера буфера в потоке DSP вне RT-колбэка
+            AAudioStream* playStream = activePlaybackStream_.load(std::memory_order_acquire);
+            if (playStream != nullptr) {
+                const int32_t currentXRun = lastXRunCount_.load(std::memory_order_relaxed);
+                const int32_t prevTuned = lastTunedXRunCount_.load(std::memory_order_relaxed);
+                if (currentXRun > prevTuned && prevTuned >= 0) {
+                    lastTunedXRunCount_.store(currentXRun, std::memory_order_relaxed);
+                    const int32_t burst = AAudioStream_getFramesPerBurst(playStream);
+                    const int32_t capacity = AAudioStream_getBufferCapacityInFrames(playStream);
+                    const int32_t currentBufSize = AAudioStream_getBufferSizeInFrames(playStream);
+                    if (burst > 0 && currentBufSize < capacity) {
+                        const int32_t tunedSize = std::min(currentBufSize + burst, capacity);
+                        AAudioStream_setBufferSizeInFrames(playStream, tunedSize);
+                    }
+                }
+            }
+
             const size_t currentTargetMs = playbackTargetBufferMs_.load(std::memory_order_relaxed);
             const size_t timeTargetFrames = static_cast<size_t>(
                 static_cast<uint64_t>(actualRate) * currentTargetMs / 1000ULL);
@@ -1137,9 +1153,10 @@ void AAudioEngine::playbackDspThreadLoop() {
             const size_t buffered = playbackBuffer_.availableRead();
             const size_t freeSpace = playbackBuffer_.availableWrite();
 
+            // УСТРАНЕНИЕ ДЕФЕКТА 7: wait_for с таймаутом 5 мс предотвращает мёртвое зависание при опустошении буфера ЦАП
             if (buffered >= highWatermarkFrames || freeSpace < maxOutputFrames) {
                 std::unique_lock<std::mutex> waitLock(playbackDspWaitMutex_);
-                playbackDspCv_.wait(waitLock, [this, activeEpoch, lowWatermarkFrames, maxOutputFrames]() {
+                playbackDspCv_.wait_for(waitLock, std::chrono::milliseconds(5), [this, activeEpoch, lowWatermarkFrames, maxOutputFrames]() {
                     if (!playbackDspRunning_.load(std::memory_order_acquire)) return true;
                     if (playbackEpoch_.load(std::memory_order_acquire) != activeEpoch) return true;
                     return playbackBuffer_.availableRead() <= lowWatermarkFrames && playbackBuffer_.availableWrite() >= maxOutputFrames;
@@ -1150,7 +1167,7 @@ void AAudioEngine::playbackDspThreadLoop() {
             size_t inputFrames = playbackDspInputBuffer_.read(input, PLAYBACK_DSP_INPUT_CHUNK_FRAMES);
             if (inputFrames == 0) {
                 std::unique_lock<std::mutex> waitLock(playbackDspWaitMutex_);
-                playbackDspCv_.wait(waitLock, [this, activeEpoch]() {
+                playbackDspCv_.wait_for(waitLock, std::chrono::milliseconds(10), [this, activeEpoch]() {
                     return !playbackDspRunning_.load(std::memory_order_acquire) ||
                         playbackEpoch_.load(std::memory_order_acquire) != activeEpoch ||
                         playbackDspInputBuffer_.availableRead() > 0;
@@ -1197,7 +1214,6 @@ void AAudioEngine::playbackDspThreadLoop() {
                 }
             }
 
-            // УСТРАНЕНИЕ ДЕФЕКТОВ 23, 24, 215, 220: Расчет мощности сигнала вынесен из прерывания ЦАП в поток DSP
             const float dacRms = dsp::calculateRms(output, outputFrames);
             outRms_.store(dacRms, std::memory_order_relaxed);
 
@@ -1224,7 +1240,6 @@ void AAudioEngine::playbackDspThreadLoop() {
     playbackDspCv_.notify_all();
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТА 218: Неблокирующий Try-Write контракт
 size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation) {
     if (pcm == nullptr || frames == 0 || generation == 0) return 0;
     if (!playbackDspRunning_.load(std::memory_order_acquire)) return 0;
@@ -1252,7 +1267,9 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_
         interArrivalJitterNs_.store(jitter, std::memory_order_relaxed);
 
         const size_t dynamicTargetMs = static_cast<size_t>(
-            std::clamp<int64_t>((jitter / 1000000LL) * 2 + 15, 20LL, 75LL)
+            std::clamp<int64_t>((jitter / 1000000LL) * 2 + 25,
+                                static_cast<int64_t>(PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS),
+                                static_cast<int64_t>(PLAYBACK_TARGET_BUFFER_BT_MAX_MS))
         );
         playbackTargetBufferMs_.store(dynamicTargetMs, std::memory_order_relaxed);
     }
@@ -1271,7 +1288,6 @@ size_t AAudioEngine::readCapturePcm(int16_t* pcm, size_t maxFrames) {
     return captureBuffer_.read(pcm, maxFrames);
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 181 и 214: Аппаратный Soft-Flush за 0 мс без остановки стрима ЦАП
 void AAudioEngine::flushPlayback(uint64_t generation) {
     if (generation == 0) return;
 
@@ -1320,6 +1336,7 @@ void AAudioEngine::getSpectrumData(dsp::SpectrumSnapshot& outSnapshot) {
     fftProcessor_->getLatestSnapshot(outSnapshot);
 }
 
+// УСТРАНЕНИЕ ДЕФЕКТОВ 8 и 11: Полностью RT-безопасный колбэк захвата без getTimestamp
 aaudio_data_callback_result_t AAudioEngine::captureCallback(
     AAudioStream* stream,
     void* userData,
@@ -1331,18 +1348,23 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     }
 
     auto* engine = static_cast<AAudioEngine*>(userData);
+
+    // УСТРАНЕНИЕ ДЕФЕКТА 11: Немедленная остановка при аппаратном разрыве стрима
+    if (stream != nullptr) {
+        const aaudio_stream_state_t st = AAudioStream_getState(stream);
+        if (st == AAUDIO_STREAM_STATE_DISCONNECTED || st == AAUDIO_STREAM_STATE_CLOSING || st == AAUDIO_STREAM_STATE_CLOSED) {
+            engine->pushErrorEvent(AAUDIO_DIRECTION_INPUT, AAUDIO_ERROR_DISCONNECTED);
+            return AAUDIO_CALLBACK_RESULT_STOP;
+        }
+    }
+
     engine->totalHardwareCapturedFrames_.fetch_add(static_cast<uint64_t>(numFrames), std::memory_order_relaxed);
 
-    int64_t framePosition = 0;
-    int64_t hwTimestampNs = 0;
-    if (stream != nullptr && AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &framePosition, &hwTimestampNs) == AAUDIO_OK) {
-        engine->lastCaptureTimestampNs_.store(static_cast<uint64_t>(hwTimestampNs), std::memory_order_relaxed);
-    } else {
-        timespec ts{};
-        clock_gettime(CLOCK_BOOTTIME, &ts);
-        const uint64_t nowNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
-        engine->lastCaptureTimestampNs_.store(nowNs, std::memory_order_relaxed);
-    }
+    // УСТРАНЕНИЕ ДЕФЕКТА 8: Замена non-thread-safe вызова AAudioStream_getTimestamp на lock-free clock_gettime
+    timespec ts{};
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    const uint64_t nowNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+    engine->lastCaptureTimestampNs_.store(nowNs, std::memory_order_relaxed);
 
     engine->captureSequenceNumber_.fetch_add(1, std::memory_order_relaxed);
 
@@ -1355,7 +1377,6 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     const size_t ch = static_cast<size_t>(channels > 0 ? channels : 1);
 
     const size_t samplesToWrite = static_cast<size_t>(numFrames) * ch;
-
     const size_t written = engine->captureRawBuffer_.writeAllOrNothing(inSamples, samplesToWrite);
     const size_t writtenFrames = written / ch;
 
@@ -1368,7 +1389,7 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 23, 24, 215: Полностью пассивный Dumb RT Callback без аналитики и системных вызовов
+// УСТРАНЕНИЕ ДЕФЕКТОВ 8, 9, 11: Пассивный RT-колбэк ЦАП без getTimestamp, без IPC setBufferSize и со своевременным STOP
 aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     AAudioStream* stream,
     void* userData,
@@ -1383,30 +1404,32 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     auto* samples = static_cast<int16_t*>(audioData);
     const size_t frames = static_cast<size_t>(numFrames);
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 11: Немедленная остановка при аппаратном разрыве стрима
+    if (stream != nullptr) {
+        const aaudio_stream_state_t st = AAudioStream_getState(stream);
+        if (st == AAUDIO_STREAM_STATE_DISCONNECTED || st == AAUDIO_STREAM_STATE_CLOSING || st == AAUDIO_STREAM_STATE_CLOSED) {
+            engine->pushErrorEvent(AAUDIO_DIRECTION_OUTPUT, AAUDIO_ERROR_DISCONNECTED);
+            return AAUDIO_CALLBACK_RESULT_STOP;
+        }
+    }
+
     engine->totalHardwarePlaybackFrames_.fetch_add(static_cast<uint64_t>(numFrames), std::memory_order_relaxed);
 
-    int64_t framePosition = 0;
-    int64_t dacTimestampNs = 0;
-    if (stream != nullptr && AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &framePosition, &dacTimestampNs) == AAUDIO_OK) {
-        engine->lastPlaybackPresentationTimestampNs_.store(static_cast<uint64_t>(dacTimestampNs), std::memory_order_relaxed);
-    }
+    // УСТРАНЕНИЕ ДЕФЕКТА 8: Замена non-thread-safe вызова AAudioStream_getTimestamp на lock-free clock_gettime
+    timespec ts{};
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    const uint64_t nowNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+    engine->lastPlaybackPresentationTimestampNs_.store(nowNs, std::memory_order_relaxed);
 
     engine->playbackSequenceNumber_.fetch_add(1, std::memory_order_relaxed);
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 9: Исключительно атомарный учёт XRun без блокирующего вызова setBufferSizeInFrames
     if (stream != nullptr) {
         const int32_t currentXRun = AAudioStream_getXRunCount(stream);
         const int32_t prevXRun = engine->lastXRunCount_.exchange(currentXRun, std::memory_order_relaxed);
         if (currentXRun > prevXRun && prevXRun >= 0) {
             const int32_t deltaXRun = currentXRun - prevXRun;
             engine->playbackUnderrunCount_.fetch_add(static_cast<uint64_t>(deltaXRun), std::memory_order_relaxed);
-
-            const int32_t burst = AAudioStream_getFramesPerBurst(stream);
-            const int32_t capacity = AAudioStream_getBufferCapacityInFrames(stream);
-            const int32_t currentBufSize = AAudioStream_getBufferSizeInFrames(stream);
-            if (burst > 0 && currentBufSize < capacity) {
-                const int32_t tunedSize = std::min(currentBufSize + burst, capacity);
-                AAudioStream_setBufferSizeInFrames(stream, tunedSize);
-            }
         }
     }
 
