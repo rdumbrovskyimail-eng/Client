@@ -27,6 +27,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.net.URLEncoder
+import java.util.ArrayDeque
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
@@ -47,9 +48,14 @@ class GeminiProtobufLiveClient @Inject constructor(
         const val WS_PATH = "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
         private const val MAX_QUEUE_BYTES = 256L * 1024L
-        // УСТРАНЕНИЕ ДЕФЕКТА 60: Снижение порога пакетизации микрофона с 40 мс (1280 байт) до 20 мс (640 байт)
-        private const val AUDIO_BATCH_THRESHOLD_BYTES = 640
-        private const val WS_QUEUE_POLL_MS = 5L
+
+        // УСТРАНЕНИЕ ДЕФЕКТОВ 61 и 62: Адаптивные пределы пакетизации (RFC 3551 / 3GPP TS 26.114)
+        private const val DEFAULT_AUDIO_BATCH_THRESHOLD_BYTES = 640 // 20 мс @ 16 кГц
+        private const val MIN_AUDIO_BATCH_THRESHOLD_BYTES = 320     // 10 мс @ 16 кГц (низкий RTT)
+        private const val MAX_AUDIO_BATCH_THRESHOLD_BYTES = 1280    // 40 мс @ 16 кГц (высокий RTT)
+        private const val DEFAULT_BATCH_DEADLINE_MS = 20L           // Предельный тайм-аут удержания хвоста
+        private const val AUDIO_FRAME_DEFAULT_TTL_MS = 500L         // RFC 5481 / RFC 3550 Playout TTL
+
         private const val AUDIO_COMMAND_CHANNEL_CAPACITY = 32
         private const val MAX_INITIAL_HISTORY_TURNS = 20
 
@@ -72,7 +78,67 @@ class GeminiProtobufLiveClient @Inject constructor(
         data class DirectJson(val jsonMessage: String) : AudioOutboundCommand
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 62: Отслеживание RTT и характеристик транспортного уровня
+    @Volatile private var dynamicBatchThresholdBytes: Int = DEFAULT_AUDIO_BATCH_THRESHOLD_BYTES
+    @Volatile private var dynamicBatchDeadlineMs: Long = DEFAULT_BATCH_DEADLINE_MS
+    @Volatile private var smoothedRttMs: Float = 40.0f
+    @Volatile private var audioBatchFirstWriteMs: Long = 0L
+    @Volatile private var lastOutboundAudioSendMs: Long = 0L
+
+    // УСТРАНЕНИЕ ДЕФЕКТА 63: Событийная синхронизация готовности без таймерного поллинга
+    @Volatile private var writerReadySignal: CompletableDeferred<Unit>? = null
+
+    // УСТРАНЕНИЕ ДЕФЕКТА 79: Пул объектов AudioFrame для полного исключения GC Pressure
+    private val audioFramePool = ArrayDeque<AudioFrame>(64)
+    private val audioFramePoolLock = Any()
+
+    private fun obtainAudioFrame(
+        pcm: ByteArray,
+        sessionId: Long,
+        epoch: Long,
+        generation: Long,
+        frameId: Long,
+        timestampMs: Long,
+        sequenceNumber: Long,
+        timestampNs: Long,
+        ttlMs: Long
+    ): AudioFrame = synchronized(audioFramePoolLock) {
+        if (audioFramePool.isNotEmpty()) {
+            val f = audioFramePool.removeFirst()
+            f.pcm = pcm
+            f.sessionId = sessionId
+            f.epoch = epoch
+            f.generation = generation
+            f.frameId = frameId
+            f.timestampMs = timestampMs
+            f.sequenceNumber = sequenceNumber
+            f.timestampNs = timestampNs
+            f.ttlMs = ttlMs
+            f
+        } else {
+            AudioFrame(pcm, sessionId, epoch, generation, frameId, timestampMs, sequenceNumber, timestampNs, ttlMs)
+        }
+    }
+
+    fun updateNetworkRtt(rttMs: Long) {
+        if (rttMs <= 0L || rttMs > 2000L) return
+        val current = smoothedRttMs
+        val next = current * 0.85f + rttMs.toFloat() * 0.15f
+        smoothedRttMs = next
+
+        val (threshold, deadline) = when {
+            next < 35.0f -> MIN_AUDIO_BATCH_THRESHOLD_BYTES to 15L // 10 мс @ 16 кГц
+            next < 90.0f -> DEFAULT_AUDIO_BATCH_THRESHOLD_BYTES to 20L // 20 мс @ 16 кГц
+            else -> MAX_AUDIO_BATCH_THRESHOLD_BYTES to 35L // 40 мс @ 16 кГц
+        }
+        dynamicBatchThresholdBytes = threshold
+        dynamicBatchDeadlineMs = deadline
+    }
+
     private val loggingEventListener = object : EventListener() {
+        private var tcpConnectStartNs = 0L
+        private var tlsConnectStartNs = 0L
+
         override fun dnsStart(call: Call, domainName: String) {
             logManager.net("OkHttp:DNS", "Старт DNS-резолва: $domainName")
         }
@@ -82,21 +148,27 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
 
         override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) {
+            tcpConnectStartNs = SystemClock.elapsedRealtimeNanos()
             logManager.net("OkHttp:TCP", "Подключение к $inetSocketAddress...")
         }
 
         override fun connectEnd(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy, protocol: Protocol?) {
-            logManager.net("OkHttp:TCP", "TCP соединение установлено ($protocol)")
+            val tcpRttMs = (SystemClock.elapsedRealtimeNanos() - tcpConnectStartNs) / 1_000_000L
+            updateNetworkRtt(tcpRttMs)
+            logManager.net("OkHttp:TCP", "TCP соединение установлено ($protocol, RTT=${tcpRttMs}ms)")
         }
 
         override fun secureConnectStart(call: Call) {
+            tlsConnectStartNs = SystemClock.elapsedRealtimeNanos()
             logManager.net("OkHttp:TLS", "Старт TLS 1.3 хендшейка...")
         }
 
         override fun secureConnectEnd(call: Call, handshake: Handshake?) {
+            val tlsRttMs = (SystemClock.elapsedRealtimeNanos() - tlsConnectStartNs) / 1_000_000L
+            updateNetworkRtt(tlsRttMs)
             val tls = handshake?.tlsVersion
             val cipher = handshake?.cipherSuite
-            logManager.net("OkHttp:TLS", "TLS успешен: $tls [$cipher]")
+            logManager.net("OkHttp:TLS", "TLS успешен: $tls [$cipher] (RTT=${tlsRttMs}ms)")
         }
 
         override fun connectFailed(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy, protocol: Protocol?, ioe: IOException) {
@@ -228,7 +300,7 @@ class GeminiProtobufLiveClient @Inject constructor(
     @Volatile
     private var activeConfig: LiveConfig? = null
 
-    private val audioBatchBuffer = ByteArrayOutputStream(AUDIO_BATCH_THRESHOLD_BYTES * 2)
+    private val audioBatchBuffer = ByteArrayOutputStream(MAX_AUDIO_BATCH_THRESHOLD_BYTES * 2)
     private val batchLock = Any()
     private var isAudioStreamEnded = true
 
@@ -317,17 +389,46 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
     }
 
-    fun invalidateAudio(): Long =
-        audioEngine.invalidateAndFlushPlayback("transport invalidate")
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 68 и 69: Мгновенная атомарная очистка очереди аудиокадров при смене поколения
+    fun purgeAudioQueue(targetGeneration: Long = -1L): Int {
+        var purgedCount = 0
+        synchronized(sessionStateLock) {
+            while (true) {
+                val frame = _audio.tryReceive().getOrNull() ?: break
+                if (targetGeneration == -1L || frame.generation <= targetGeneration) {
+                    releaseAudio(frame)
+                    purgedCount++
+                } else {
+                    releaseAudio(frame)
+                    purgedCount++
+                }
+            }
+        }
+        return purgedCount
+    }
 
+    fun invalidateAudio(): Long {
+        purgeAudioQueue(-1L)
+        return audioEngine.invalidateAndFlushPlayback("transport invalidate")
+    }
+
+    // УСТРАНЕНИЕ ДЕФЕКТА 79: Возврат отработанного объекта AudioFrame в пул
     fun releaseAudio(frame: AudioFrame) {
         val bytes = frame.pcm.size
-        if (bytes <= 0) return
-        val key = DataBudgetKey(frame.sessionId, frame.epoch)
-        val counter = audioBudgetBySession[key] ?: return
-        if (counter.addAndGet(-bytes.toLong()) <= 0L) {
-            counter.set(0L)
-            audioBudgetBySession.remove(key, counter)
+        if (bytes > 0) {
+            val key = DataBudgetKey(frame.sessionId, frame.epoch)
+            val counter = audioBudgetBySession[key]
+            if (counter != null) {
+                if (counter.addAndGet(-bytes.toLong()) <= 0L) {
+                    counter.set(0L)
+                    audioBudgetBySession.remove(key, counter)
+                }
+            }
+        }
+        synchronized(audioFramePoolLock) {
+            if (audioFramePool.size < 64) {
+                audioFramePool.addLast(frame)
+            }
         }
     }
 
@@ -361,6 +462,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         synchronized(batchLock) {
             isAudioStreamEnded = true
             audioBatchBuffer.reset()
+            audioBatchFirstWriteMs = 0L
         }
 
         val myEpoch = epoch
@@ -508,6 +610,7 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val channel = Channel<AudioOutboundCommand>(capacity = AUDIO_COMMAND_CHANNEL_CAPACITY)
+        val readySignal = CompletableDeferred<Unit>()
 
         synchronized(sessionStateLock) {
             if (writerEpoch != epoch || webSocket !== ws) {
@@ -517,6 +620,39 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
             audioWriterScope = scope
             audioWriterChannel = channel
+            writerReadySignal = readySignal
+        }
+
+        // УСТРАНЕНИЕ ДЕФЕКТА 61: Сторожевой таймер сброса частичного аудиобуфера по ограниченному дедлайну
+        scope.launch {
+            while (isActive) {
+                delay(10L)
+                if (writerEpoch != epoch || webSocket !== ws) break
+                if (!isReady) continue
+
+                val pendingPayload = synchronized(batchLock) {
+                    if (isAudioStreamEnded || audioBatchBuffer.size() == 0) return@synchronized null
+                    val now = SystemClock.elapsedRealtime()
+                    if (audioBatchFirstWriteMs > 0L && (now - audioBatchFirstWriteMs) >= dynamicBatchDeadlineMs) {
+                        val payload = audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
+                        audioBatchFirstWriteMs = 0L
+                        payload
+                    } else {
+                        null
+                    }
+                }
+
+                if (pendingPayload != null) {
+                    val ch = synchronized(sessionStateLock) {
+                        if (writerEpoch == epoch && webSocket === ws) audioWriterChannel else null
+                    } ?: break
+                    try {
+                        ch.send(AudioOutboundCommand.Pcm(pendingPayload))
+                    } catch (_: ClosedSendChannelException) {
+                        break
+                    }
+                }
+            }
         }
 
         scope.launch {
@@ -532,6 +668,7 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                     val jsonMessage = when (command) {
                         is AudioOutboundCommand.Pcm -> {
+                            lastOutboundAudioSendMs = SystemClock.elapsedRealtime()
                             val base64Data = Base64.encodeToString(command.payload, Base64.NO_WRAP)
                             buildJsonObject {
                                 putJsonObject("realtimeInput") {
@@ -612,23 +749,29 @@ class GeminiProtobufLiveClient @Inject constructor(
                 synchronized(sessionStateLock) {
                     if (audioWriterChannel === channel) audioWriterChannel = null
                     if (audioWriterScope === scope) audioWriterScope = null
+                    writerReadySignal = null
                 }
             }
         }
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 63: Ожидание сигнала готовности без циклического polling delay(5L)
     private suspend fun awaitWriterReady(ws: WebSocket, writerEpoch: Long): Boolean {
-        while (!isReady) {
-            if (writerEpoch != epoch || webSocket !== ws) return false
-            delay(WS_QUEUE_POLL_MS)
-        }
-        return (writerEpoch == epoch && webSocket === ws)
+        if (isReady && writerEpoch == epoch && webSocket === ws) return true
+        val signal = synchronized(sessionStateLock) { writerReadySignal } ?: return false
+        return withTimeoutOrNull(5000L) {
+            signal.await()
+            writerEpoch == epoch && webSocket === ws
+        } ?: false
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 63: Адаптивный экспоненциальный backoff при насыщении очереди сокета
     private suspend fun awaitWebSocketQueueCapacity(ws: WebSocket, writerEpoch: Long): Boolean {
+        var backoffMs = 2L
         while (ws.queueSize() > MAX_QUEUE_BYTES) {
             if (writerEpoch != epoch || webSocket !== ws) return false
-            delay(WS_QUEUE_POLL_MS)
+            delay(backoffMs)
+            backoffMs = minOf(backoffMs * 2, 16L)
         }
         return (writerEpoch == epoch && isReady && webSocket === ws)
     }
@@ -648,14 +791,17 @@ class GeminiProtobufLiveClient @Inject constructor(
             val scope = audioWriterScope
             audioWriterChannel = null
             audioWriterScope = null
+            writerReadySignal = null
 
             channel?.close()
             scope?.cancel()
         }
     }
 
-    suspend fun sendAudioPcm(pcm: ByteArray) {
-        if (pcm.isEmpty()) return
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 61, 62, 77: Адаптивная пакетизация PCM с фиксацией длины без аллокаций
+    suspend fun sendAudioPcm(pcm: ByteArray, length: Int = pcm.size) {
+        if (pcm.isEmpty() || length <= 0) return
+        val safeLen = minOf(length, pcm.size)
 
         outboundCommandMutex.withLock {
             val target = synchronized(batchLock) {
@@ -664,9 +810,13 @@ class GeminiProtobufLiveClient @Inject constructor(
                 val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
 
                 isAudioStreamEnded = false
-                audioBatchBuffer.write(pcm)
+                if (audioBatchBuffer.size() == 0) {
+                    audioBatchFirstWriteMs = SystemClock.elapsedRealtime()
+                }
+                audioBatchBuffer.write(pcm, 0, safeLen)
 
-                val payload = if (audioBatchBuffer.size() >= AUDIO_BATCH_THRESHOLD_BYTES) {
+                val payload = if (audioBatchBuffer.size() >= dynamicBatchThresholdBytes) {
+                    audioBatchFirstWriteMs = 0L
                     audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
                 } else {
                     null
@@ -695,6 +845,7 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 if (audioBatchBuffer.size() == 0) return@synchronized null
 
+                audioBatchFirstWriteMs = 0L
                 val payload = audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
                 if (!isWriterCurrent(writerEpoch, ws, channel)) null else channel to payload
             } ?: return@withLock
@@ -715,6 +866,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                 val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
                 val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
 
+                audioBatchFirstWriteMs = 0L
                 val tailPayload = if (audioBatchBuffer.size() == 0) {
                     null
                 } else {
@@ -822,6 +974,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                 val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
                 val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
 
+                audioBatchFirstWriteMs = 0L
                 val preRoll = if (audioBatchBuffer.size() == 0) {
                     null
                 } else {
@@ -854,6 +1007,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                 val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
                 val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
 
+                audioBatchFirstWriteMs = 0L
                 val tailPayload = if (audioBatchBuffer.size() == 0) {
                     null
                 } else {
@@ -1316,6 +1470,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                     if (myEpoch == epoch && webSocket === sourceWebSocket && !isReady) {
                         isReady = true
                         protocolPhase = ProtocolPhase.READY
+                        writerReadySignal?.complete(Unit)
                         emitControl(GeminiEvent.SetupComplete)
                     } else {
                         return
@@ -1384,7 +1539,13 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 extractTranscriptText(sc["interimInputTranscription"])
                     ?.takeIf { it.isNotBlank() }
-                    ?.let { emitData(GeminiEvent.InputTranscript(it, interim = true)) }
+                    ?.let {
+                        if (lastOutboundAudioSendMs > 0L) {
+                            val rttSample = SystemClock.elapsedRealtime() - lastOutboundAudioSendMs
+                            updateNetworkRtt(rttSample)
+                        }
+                        emitData(GeminiEvent.InputTranscript(it, interim = true))
+                    }
                 extractTranscriptText(sc["inputTranscription"])
                     ?.takeIf { it.isNotBlank() }
                     ?.let { emitControl(GeminiEvent.InputTranscript(it, interim = false)) }
@@ -1417,25 +1578,27 @@ class GeminiProtobufLiveClient @Inject constructor(
                                     val aggregate = perSession.get() + bytes
                                     if (aggregate <= MAX_AI_AUDIO_BACKLOG_BYTES) {
                                         perSession.addAndGet(bytes)
-                                        // УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Передача sequenceNumber и наносекундной метки
+                                        // УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49, 67, 79: Пул объектов AudioFrame и проверка TTL
                                         val frameSeq = audioFrameSeqGen.incrementAndGet()
                                         val frameNanoTime = SystemClock.elapsedRealtimeNanos()
-                                        accepted = _audio.trySend(
-                                            AudioFrame(
-                                                pcm = pcm,
-                                                sessionId = mySessionId,
-                                                epoch = myEpoch,
-                                                generation = generation,
-                                                frameId = frameId,
-                                                timestampMs = SystemClock.elapsedRealtime(),
-                                                sequenceNumber = frameSeq,
-                                                timestampNs = frameNanoTime
-                                            )
-                                        ).isSuccess
+                                        val audioFrame = obtainAudioFrame(
+                                            pcm = pcm,
+                                            sessionId = mySessionId,
+                                            epoch = myEpoch,
+                                            generation = generation,
+                                            frameId = frameId,
+                                            timestampMs = SystemClock.elapsedRealtime(),
+                                            sequenceNumber = frameSeq,
+                                            timestampNs = frameNanoTime,
+                                            ttlMs = AUDIO_FRAME_DEFAULT_TTL_MS
+                                        )
+
+                                        if (!audioFrame.isExpired()) {
+                                            accepted = _audio.trySend(audioFrame).isSuccess
+                                        }
+
                                         if (!accepted) {
-                                            audioBudgetBySession[key]?.let { c ->
-                                                if (c.addAndGet(-bytes) <= 0L) audioBudgetBySession.remove(key, c)
-                                            }
+                                            releaseAudio(audioFrame)
                                         }
                                     }
                                 }
@@ -1495,10 +1658,8 @@ class GeminiProtobufLiveClient @Inject constructor(
             dataEventsDroppedCounter.set(0L)
             audioFrameSeqGen.set(0L)
 
-            while (true) {
-                val frame = _audio.tryReceive().getOrNull() ?: break
-                releaseAudio(frame)
-            }
+            // УСТРАНЕНИЕ ДЕФЕКТОВ 68 и 69: Полная очистка очереди при закрытии
+            purgeAudioQueue(-1L)
 
             while (true) {
                 val queued = _events.tryReceive().getOrNull() ?: break
@@ -1517,6 +1678,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         synchronized(batchLock) {
             isAudioStreamEnded = true
             audioBatchBuffer.reset()
+            audioBatchFirstWriteMs = 0L
         }
 
         stopAudioWriter()
