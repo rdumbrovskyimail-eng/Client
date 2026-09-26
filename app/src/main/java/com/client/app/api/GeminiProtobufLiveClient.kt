@@ -1,11 +1,12 @@
-// >>> FILE: app/src/main/java/com/client/app/api/GeminiProtobufLiveClient.kt
 package com.client.app.api
 
+import android.os.SystemClock
 import android.util.Base64
 import kotlinx.coroutines.*
 import com.client.app.audio.NativeAudioBridge
 import com.client.app.audio.NativeAudioEngine
 import com.client.app.logging.AppLogManager
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.channels.ReceiveChannel
@@ -42,224 +43,100 @@ class GeminiProtobufLiveClient @Inject constructor(
     private val nativeBridge: NativeAudioBridge
 ) {
     companion object {
-        const val WS_HOST =
-            "generativelanguage.googleapis.com"
+        const val WS_HOST = "generativelanguage.googleapis.com"
+        const val WS_PATH = "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
-        const val WS_PATH =
-            "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-
-        // Application-level watermark.
-        // This is intentionally below OkHttp's own terminal queue limit.
-        private const val MAX_QUEUE_BYTES =
-            256L * 1024L
-
-        // 40 ms @ 16 kHz PCM16 mono:
-        // 16000 * 0.040 * 2 = 1280 bytes.
-        private const val AUDIO_BATCH_THRESHOLD_BYTES =
-            1280
-
+        private const val MAX_QUEUE_BYTES = 256L * 1024L
+        private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280
         private const val WS_QUEUE_POLL_MS = 5L
-
-        // Bounded command queue means network backpressure eventually
-        // propagates to the capture producer instead of dropping PCM.
         private const val AUDIO_COMMAND_CHANNEL_CAPACITY = 32
-
         private const val MAX_INITIAL_HISTORY_TURNS = 20
 
-        // Физически обоснованный лимит бэклога входящего аудио (~174 секунды 24 кГц PCM16).
-        // Устраняет ложное переполнение памяти при быстрых сетевых всплесках генератора Gemini.
-        private const val MAX_AI_AUDIO_BACKLOG_BYTES =
-            8L * 1024L * 1024L
+        // УСТРАНЕНИЕ ДЕФЕКТА 31: Рациональный предел бэклога (~8 секунд звука 24 кГц вместо 3 минут)
+        private const val MAX_AI_AUDIO_BACKLOG_BYTES = 384L * 1024L
 
         private const val MAX_DATA_EVENTS_IN_FLIGHT = 256
     }
 
-    private val json =
-        Json {
-            ignoreUnknownKeys = true
-            isLenient = true
-        }
-
-    // AUD-067:
-    // One ordered producer pipeline for realtime audio/activity commands.
-    // Crucially:
-    //   - PCM uses suspend/send(), not trySend()
-    //   - AudioStreamEnd uses the same queue
-    //   - ActivityStart/End use the same queue
-    //   - DirectJson (ToolResponse, RealtimeText, ClientContent) uses the same queue
-    // Therefore stream markers and tool responses cannot overtake PCM.
-    private sealed interface AudioOutboundCommand {
-
-        data class Pcm(
-            val payload: ByteArray
-        ) : AudioOutboundCommand
-
-        data object ActivityStart :
-            AudioOutboundCommand
-
-        data object ActivityEnd :
-            AudioOutboundCommand
-
-        data object AudioStreamEnd :
-            AudioOutboundCommand
-
-        /**
-         * Arbitrary realtime JSON that must preserve FIFO ordering with audio
-         * and activity markers. All realtime producers therefore share one
-         * ordered command stream rather than using a mutex around a network wait.
-         */
-        data class DirectJson(
-            val jsonMessage: String
-        ) : AudioOutboundCommand
+    private val json = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
     }
 
-    private val loggingEventListener =
-        object : EventListener() {
+    private sealed interface AudioOutboundCommand {
+        data class Pcm(val payload: ByteArray) : AudioOutboundCommand
+        data object ActivityStart : AudioOutboundCommand
+        data object ActivityEnd : AudioOutboundCommand
+        data object AudioStreamEnd : AudioOutboundCommand
+        data class DirectJson(val jsonMessage: String) : AudioOutboundCommand
+    }
 
-            override fun dnsStart(
-                call: Call,
-                domainName: String
-            ) {
-                logManager.net(
-                    "OkHttp:DNS",
-                    "Старт DNS-резолва: $domainName"
-                )
-            }
-
-            override fun dnsEnd(
-                call: Call,
-                domainName: String,
-                inetAddressList: List<InetAddress>
-            ) {
-                logManager.net(
-                    "OkHttp:DNS",
-                    "DNS успешен: $domainName -> $inetAddressList"
-                )
-            }
-
-            override fun connectStart(
-                call: Call,
-                inetSocketAddress: InetSocketAddress,
-                proxy: Proxy
-            ) {
-                logManager.net(
-                    "OkHttp:TCP",
-                    "Подключение к $inetSocketAddress..."
-                )
-            }
-
-            override fun connectEnd(
-                call: Call,
-                inetSocketAddress: InetSocketAddress,
-                proxy: Proxy,
-                protocol: Protocol?
-            ) {
-                logManager.net(
-                    "OkHttp:TCP",
-                    "TCP соединение установлено ($protocol)"
-                )
-            }
-
-            override fun secureConnectStart(
-                call: Call
-            ) {
-                logManager.net(
-                    "OkHttp:TLS",
-                    "Старт TLS 1.3 хендшейка..."
-                )
-            }
-
-            override fun secureConnectEnd(
-                call: Call,
-                handshake: Handshake?
-            ) {
-                val tls = handshake?.tlsVersion
-                val cipher = handshake?.cipherSuite
-
-                logManager.net(
-                    "OkHttp:TLS",
-                    "TLS успешен: $tls [$cipher]"
-                )
-            }
-
-            override fun connectFailed(
-                call: Call,
-                inetSocketAddress: InetSocketAddress,
-                proxy: Proxy,
-                protocol: Protocol?,
-                ioe: IOException
-            ) {
-                logManager.e(
-                    "OkHttp:Connect",
-                    "Сбой подключения к $inetSocketAddress: ${ioe.message}",
-                    ioe
-                )
-            }
+    private val loggingEventListener = object : EventListener() {
+        override fun dnsStart(call: Call, domainName: String) {
+            logManager.net("OkHttp:DNS", "Старт DNS-резолва: $domainName")
         }
 
-    private val httpClient =
-        OkHttpClient.Builder()
-            .socketFactory(
-                TunedSocketFactory(
-                    delegate = SocketFactory.getDefault(),
-                    nativeBridge = nativeBridge,
-                    logManager = logManager
-                )
-            )
-            .eventListener(loggingEventListener)
-            .connectTimeout(
-                10,
-                TimeUnit.SECONDS
-            )
-            .readTimeout(
-                0,
-                TimeUnit.MILLISECONDS
-            )
-            .writeTimeout(
-                0,
-                TimeUnit.MILLISECONDS
-            )
-            .pingInterval(
-                12,
-                TimeUnit.SECONDS
-            )
-            .retryOnConnectionFailure(false)
-            .build()
+        override fun dnsEnd(call: Call, domainName: String, inetAddressList: List<InetAddress>) {
+            logManager.net("OkHttp:DNS", "DNS успешен: $domainName -> $inetAddressList")
+        }
 
-    private val wsMutex =
-        Mutex()
+        override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) {
+            logManager.net("OkHttp:TCP", "Подключение к $inetSocketAddress...")
+        }
+
+        override fun connectEnd(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy, protocol: Protocol?) {
+            logManager.net("OkHttp:TCP", "TCP соединение установлено ($protocol)")
+        }
+
+        override fun secureConnectStart(call: Call) {
+            logManager.net("OkHttp:TLS", "Старт TLS 1.3 хендшейка...")
+        }
+
+        override fun secureConnectEnd(call: Call, handshake: Handshake?) {
+            val tls = handshake?.tlsVersion
+            val cipher = handshake?.cipherSuite
+            logManager.net("OkHttp:TLS", "TLS успешен: $tls [$cipher]")
+        }
+
+        override fun connectFailed(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy, protocol: Protocol?, ioe: IOException) {
+            logManager.e("OkHttp:Connect", "Сбой подключения к $inetSocketAddress: ${ioe.message}", ioe)
+        }
+    }
+
+    private val httpClient = OkHttpClient.Builder()
+        .socketFactory(
+            TunedSocketFactory(
+                delegate = SocketFactory.getDefault(),
+                nativeBridge = nativeBridge,
+                logManager = logManager
+            )
+        )
+        .eventListener(loggingEventListener)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .writeTimeout(0, TimeUnit.MILLISECONDS)
+        .pingInterval(12, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(false)
+        .build()
+
+    private val wsMutex = Mutex()
 
     @Volatile
     private var webSocket: WebSocket? = null
 
-    private val epochGen =
-        AtomicLong(0)
+    private val epochGen = AtomicLong(0)
 
     @Volatile
     var epoch: Long = 0L
         private set
 
-    // Serializes transport identity changes with parser-side destructive
-    // state transitions. A WebSocket callback can arrive concurrently with
-    // reconnect/close, so epoch + socket identity must be checked atomically
-    // for side effects that touch global transport state.
     private val sessionStateLock = Any()
 
-    // AUD-005.3:
-    // The playback-generation authority lives outside the transport so there
-    // is exactly one generation domain shared by all invalidation sources.
     val audioGeneration: Long
         get() = audioEngine.currentPlaybackGeneration
 
-    private val audioBudgetBySession =
-        ConcurrentHashMap<DataBudgetKey, AtomicLong>()
+    private val audioBudgetBySession = ConcurrentHashMap<DataBudgetKey, AtomicLong>()
 
-    // AUD-006:
-    // One FIFO event ingress preserves the actual server delivery order.
-    // Control events are never rejected. High-frequency telemetry/data events are
-    // bounded by count and are dropped newest when the data budget is full.
-    // Critical conversation content (ModelText, Final Transcripts) is delivered via
-    // the Control Plane to guarantee zero drops.
     private data class DataBudgetKey(
         val sessionId: Long,
         val epoch: Long
@@ -291,29 +168,15 @@ class GeminiProtobufLiveClient @Inject constructor(
         private set
 
     private val frameIdGen = AtomicLong(0L)
-
     private var protocolPhase = ProtocolPhase.IDLE
-
     private val cancelledToolCallIds = mutableSetOf<String>()
-
-    private val pendingDataBySession =
-        ConcurrentHashMap<DataBudgetKey, AtomicLong>()
-
+    private val pendingDataBySession = ConcurrentHashMap<DataBudgetKey, AtomicLong>()
     private val dataEventsDroppedCounter = AtomicLong(0L)
-
     private val generationIdGen = AtomicLong(0L)
     private var activeServerGenerationId = 0L
     private var serverGenerationOpen = false
 
-    // One FIFO preserves control/data ordering. The physical event queue is
-    // unlimited; Data Plane admission remains bounded separately by
-    // MAX_DATA_EVENTS_IN_FLIGHT so high-rate telemetry cannot consume
-    // unbounded application memory. Control events (including ModelText) must
-    // never be dropped because of a fixed queue capacity.
-    private val _events =
-        Channel<QueuedEvent>(
-            Channel.UNLIMITED
-        )
+    private val _events = Channel<QueuedEvent>(Channel.UNLIMITED)
 
     val events: Flow<GeminiEventEnvelope> =
         _events
@@ -330,13 +193,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                 }
             }
             .filter { queued ->
-                // Old callbacks can still be physically present in the FIFO
-                // after a reconnect. Filter by epoch at consumption so stale
-                // events are not normally delivered to SessionManager. The
-                // explicit envelope keeps the source epoch available for a
-                // second validation at the consumer boundary.
-                queued.epoch == epoch &&
-                    queued.sessionId == sessionId
+                queued.epoch == epoch && queued.sessionId == sessionId
             }
             .map {
                 GeminiEventEnvelope(
@@ -348,20 +205,15 @@ class GeminiProtobufLiveClient @Inject constructor(
                 )
             }
 
-    // AI output audio is independently bounded by byte accounting. The channel
-    // itself is unlimited so capacity cannot cause an otherwise budget-admitted
-    // PCM frame to be silently discarded. MAX_AI_AUDIO_BACKLOG_BYTES remains the
-    // hard memory ceiling enforced at ingress.
-    private val _audio =
-        Channel<AudioFrame>(Channel.UNLIMITED)
+    // УСТРАНЕНИЕ ДЕФЕКТА 32: Bounded channel с автоматическим возвратом бюджета при вытеснении
+    private val _audio = Channel<AudioFrame>(
+        capacity = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        onUndeliveredElement = { frame -> releaseAudio(frame) }
+    )
 
-    val audio: ReceiveChannel<AudioFrame> =
-        _audio
+    val audio: ReceiveChannel<AudioFrame> = _audio
 
-    /**
-     * Позволяет SessionManager проверить, остались ли в транспортном канале
-     * невычитанные кадры входящего аудио перед началом аппаратного дренажа.
-     */
     val hasPendingAudioFrames: Boolean
         get() = !_audio.isEmpty
 
@@ -372,26 +224,18 @@ class GeminiProtobufLiveClient @Inject constructor(
     @Volatile
     private var activeConfig: LiveConfig? = null
 
-    private val audioBatchBuffer =
-        ByteArrayOutputStream(
-            AUDIO_BATCH_THRESHOLD_BYTES * 2
-        )
-
-    private val batchLock =
-        Any()
-
-    // batchLock protects only the mutable PCM batch state. It is never held
-    // across a suspending Channel.send() or a network operation.
-    private var isAudioStreamEnded =
-        true
+    private val audioBatchBuffer = ByteArrayOutputStream(AUDIO_BATCH_THRESHOLD_BYTES * 2)
+    private val batchLock = Any()
+    private var isAudioStreamEnded = true
 
     @Volatile
-    private var audioWriterScope:
-        CoroutineScope? = null
+    private var audioWriterScope: CoroutineScope? = null
 
     @Volatile
-    private var audioWriterChannel:
-        Channel<AudioOutboundCommand>? = null
+    private var audioWriterChannel: Channel<AudioOutboundCommand>? = null
+
+    private val outboundSendLock = Any()
+    private val outboundCommandMutex = Mutex()
 
     private fun emitControlEvent(
         event: GeminiEvent,
@@ -489,7 +333,6 @@ class GeminiProtobufLiveClient @Inject constructor(
     ) = wsMutex.withLock {
 
         validateCompressionConfig(cfg)
-
         closeInternal()
 
         val newSessionId = sessionIdGen.incrementAndGet()
@@ -518,285 +361,148 @@ class GeminiProtobufLiveClient @Inject constructor(
         val myEpoch = epoch
         val mySessionId = synchronized(sessionStateLock) { sessionId }
 
-        val rawKey =
-            cfg.apiKey.trim()
-        val encodedKey =
-            URLEncoder.encode(
-                rawKey,
-                "UTF-8"
-            )
-
-        val url =
-            "wss://$WS_HOST/$WS_PATH?key=$encodedKey"
+        val rawKey = cfg.apiKey.trim()
+        val encodedKey = URLEncoder.encode(rawKey, "UTF-8")
+        val url = "wss://$WS_HOST/$WS_PATH?key=$encodedKey"
 
         logManager.net(
             "WebSocket",
             "Инициализация Bidi сессии Gemini 3.8 Live (epoch=$myEpoch, key=[REDACTED])"
         )
 
-        val req =
-            Request.Builder()
-                .url(url)
-                .header(
-                    "X-Accel-Buffering",
-                    "no"
-                )
-                .header(
-                    "Cache-Control",
-                    "no-cache"
-                )
-                .build()
+        val req = Request.Builder()
+            .url(url)
+            .header("X-Accel-Buffering", "no")
+            .header("Cache-Control", "no-cache")
+            .build()
 
-        val ws =
-            httpClient.newWebSocket(
-                req,
-                object : WebSocketListener() {
-
-                    override fun onOpen(
-                        ws: WebSocket,
-                        response: Response
-                    ) {
-
-                        synchronized(sessionStateLock) {
-                            if (myEpoch != epoch) {
-                                ws.close(
-                                    1000,
-                                    "stale"
-                                )
-                                return
-                            }
-
-                            webSocket = ws
-                            protocolPhase = ProtocolPhase.CONNECTING
-                        }
-
-                        startAudioWriter(
-                            ws,
-                            myEpoch
-                        )
-
-                        logManager.net(
-                            "WebSocket:Open",
-                            "Соединение открыто! HTTP ${response.code} ${response.message}"
-                        )
-
-                        emitControlEvent(
-                            GeminiEvent.Connected,
-                            myEpoch
-                        )
-
-                        val setupMsg =
-                            buildSetupMessage(cfg)
-
-                        logManager.net(
-                            "WebSocket:Tx",
-                            "Отправка setup сообщения (payload redacted)"
-                        )
-
-                        val setupAccepted =
-                            synchronized(sessionStateLock) {
-                                if (myEpoch != epoch || webSocket !== ws) {
-                                    false
-                                } else {
-                                    synchronized(outboundSendLock) {
-                                        ws.send(setupMsg)
-                                    }
-                                }
-                            }
-
-                        if (!setupAccepted) {
-                            logManager.e(
-                                "WebSocket:Setup",
-                                "OkHttp отверг setup-сообщение; закрываем сессию"
-                            )
-                            ws.cancel()
-                        }
-                    }
-
-                    override fun onMessage(
-                        ws: WebSocket,
-                        text: String
-                    ) {
-
-                        if (synchronized(sessionStateLock) {
-                                myEpoch == epoch &&
-                                    sessionId == mySessionId &&
-                                    webSocket === ws
-                            }) {
-
-                            val logSummary =
-                                if (text.contains("\"audio/pcm")) {
-                                    "[Аудиофрейм получен; размер=${text.length}]"
-                                } else {
-                                    "[WebSocket text frame; размер=${text.length}]"
-                                }
-
-                            logManager.net(
-                                "WebSocket:Rx",
-                                logSummary
-                            )
-
-                            parseServerJsonMessage(
-                                text,
-                                myEpoch,
-                                ws
-                            )
-                        }
-                    }
-
-                    override fun onMessage(
-                        ws: WebSocket,
-                        bytes: ByteString
-                    ) {
-
-                        if (myEpoch == epoch) {
-
-                            logManager.net(
-                                "WebSocket:RxBinary",
-                                "Получено ${bytes.size} байт"
-                            )
-
-                            parseServerJsonMessage(
-                                bytes.utf8(),
-                                myEpoch,
-                                ws
-                            )
-                        }
-                    }
-
-                    override fun onClosing(
-                        ws: WebSocket,
-                        code: Int,
-                        reason: String
-                    ) {
-
-                        logManager.w(
-                            "WebSocket:Closing",
-                            "Сервер инициировал закрытие: $code / '$reason'"
-                        )
-
-                        ws.close(
-                            1000,
-                            null
-                        )
-                    }
-
-                    override fun onClosed(
-                        ws: WebSocket,
-                        code: Int,
-                        reason: String
-                    ) {
-
-                        logManager.w(
-                            "WebSocket:Closed",
-                            "Соединение закрыто (code=$code, reason='$reason', epoch=$myEpoch)"
-                        )
-
+        val ws = httpClient.newWebSocket(
+            req,
+            object : WebSocketListener() {
+                override fun onOpen(ws: WebSocket, response: Response) {
+                    synchronized(sessionStateLock) {
                         if (myEpoch != epoch) {
+                            ws.close(1000, "stale")
                             return
                         }
-
-                        synchronized(sessionStateLock) {
-                            if (myEpoch != epoch || webSocket !== ws) {
-                                return
-                            }
-                            isReady = false
-                        }
-                        stopAudioWriter(
-                            expectedWs = ws,
-                            expectedEpoch = myEpoch
-                        )
-
-                        emitControlEvent(
-                            GeminiEvent.Disconnected(
-                                code,
-                                reason,
-                                mySessionId,
-                                myEpoch
-                            ),
-                            myEpoch
-                        )
+                        webSocket = ws
+                        protocolPhase = ProtocolPhase.CONNECTING
                     }
 
-                    override fun onFailure(
-                        ws: WebSocket,
-                        t: Throwable,
-                        response: Response?
-                    ) {
+                    startAudioWriter(ws, myEpoch)
+                    logManager.net(
+                        "WebSocket:Open",
+                        "Соединение открыто! HTTP ${response.code} ${response.message}"
+                    )
 
-                        val httpCode =
-                            response?.code
+                    emitControlEvent(GeminiEvent.Connected, myEpoch)
+                    val setupMsg = buildSetupMessage(cfg)
 
-                        val errBody =
-                            runCatching {
-                                response?.body?.string()
-                            }.getOrNull()
+                    logManager.net("WebSocket:Tx", "Отправка setup сообщения (payload redacted)")
 
+                    val setupAccepted = synchronized(sessionStateLock) {
+                        if (myEpoch != epoch || webSocket !== ws) {
+                            false
+                        } else {
+                            synchronized(outboundSendLock) {
+                                ws.send(setupMsg)
+                            }
+                        }
+                    }
+
+                    if (!setupAccepted) {
                         logManager.e(
-                            "WebSocket:Failure",
-                            "Сбой сокета (HTTP $httpCode): ${t.localizedMessage}. Ответ: $errBody",
-                            t
+                            "WebSocket:Setup",
+                            "OkHttp отверг setup-сообщение; закрываем сессию"
                         )
-
-                        if (myEpoch != epoch) {
-                            return
-                        }
-
-                        synchronized(sessionStateLock) {
-                            if (myEpoch != epoch || webSocket !== ws) {
-                                return
-                            }
-                            isReady = false
-                        }
-                        stopAudioWriter(
-                            expectedWs = ws,
-                            expectedEpoch = myEpoch
-                        )
-
-                        val fatal =
-                            httpCode == 401 ||
-                            httpCode == 403
-
-                        emitControlEvent(
-                            GeminiEvent.Error(
-                                "Сетевой сбой ($httpCode): ${t.localizedMessage}",
-                                fatal
-                            ),
-                            myEpoch
-                        )
-
-                        emitControlEvent(
-                            GeminiEvent.Disconnected(
-                                httpCode ?: 1006,
-                                t.message.orEmpty(),
-                                mySessionId,
-                                myEpoch
-                            ),
-                            myEpoch
-                        )
+                        ws.cancel()
                     }
                 }
-            )
+
+                override fun onMessage(ws: WebSocket, text: String) {
+                    if (synchronized(sessionStateLock) {
+                            myEpoch == epoch &&
+                                sessionId == mySessionId &&
+                                webSocket === ws
+                        }) {
+                        val logSummary = if (text.contains("\"audio/pcm")) {
+                            "[Аудиофрейм получен; размер=${text.length}]"
+                        } else {
+                            "[WebSocket text frame; размер=${text.length}]"
+                        }
+
+                        logManager.net("WebSocket:Rx", logSummary)
+                        parseServerJsonMessage(text, myEpoch, ws)
+                    }
+                }
+
+                override fun onMessage(ws: WebSocket, bytes: ByteString) {
+                    if (myEpoch == epoch) {
+                        logManager.net("WebSocket:RxBinary", "Получено ${bytes.size} байт")
+                        parseServerJsonMessage(bytes.utf8(), myEpoch, ws)
+                    }
+                }
+
+                override fun onClosing(ws: WebSocket, code: Int, reason: String) {
+                    logManager.w("WebSocket:Closing", "Сервер инициировал закрытие: $code / '$reason'")
+                    ws.close(1000, null)
+                }
+
+                override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+                    logManager.w("WebSocket:Closed", "Соединение закрыто (code=$code, reason='$reason', epoch=$myEpoch)")
+                    if (myEpoch != epoch) return
+
+                    synchronized(sessionStateLock) {
+                        if (myEpoch != epoch || webSocket !== ws) return
+                        isReady = false
+                    }
+                    stopAudioWriter(expectedWs = ws, expectedEpoch = myEpoch)
+
+                    emitControlEvent(
+                        GeminiEvent.Disconnected(code, reason, mySessionId, myEpoch),
+                        myEpoch
+                    )
+                }
+
+                override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                    val httpCode = response?.code
+                    val errBody = runCatching { response?.body?.string() }.getOrNull()
+
+                    logManager.e(
+                        "WebSocket:Failure",
+                        "Сбой сокета (HTTP $httpCode): ${t.localizedMessage}. Ответ: $errBody",
+                        t
+                    )
+
+                    if (myEpoch != epoch) return
+
+                    synchronized(sessionStateLock) {
+                        if (myEpoch != epoch || webSocket !== ws) return
+                        isReady = false
+                    }
+                    stopAudioWriter(expectedWs = ws, expectedEpoch = myEpoch)
+
+                    val fatal = httpCode == 401 || httpCode == 403
+
+                    emitControlEvent(
+                        GeminiEvent.Error("Сетевой сбой ($httpCode): ${t.localizedMessage}", fatal),
+                        myEpoch
+                    )
+
+                    emitControlEvent(
+                        GeminiEvent.Disconnected(httpCode ?: 1006, t.message.orEmpty(), mySessionId, myEpoch),
+                        myEpoch
+                    )
+                }
+            }
+        )
     }
 
-    private fun startAudioWriter(
-        ws: WebSocket,
-        writerEpoch: Long
-    ) {
-
+    private fun startAudioWriter(ws: WebSocket, writerEpoch: Long) {
         stopAudioWriter()
 
-        val scope =
-            CoroutineScope(
-                SupervisorJob() +
-                    Dispatchers.IO
-            )
-
-        val channel =
-            Channel<AudioOutboundCommand>(
-                capacity =
-                    AUDIO_COMMAND_CHANNEL_CAPACITY
-            )
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val channel = Channel<AudioOutboundCommand>(capacity = AUDIO_COMMAND_CHANNEL_CAPACITY)
 
         synchronized(sessionStateLock) {
             if (writerEpoch != epoch || webSocket !== ws) {
@@ -811,120 +517,65 @@ class GeminiProtobufLiveClient @Inject constructor(
         scope.launch {
             try {
                 while (true) {
-                    if (!awaitWriterReady(ws, writerEpoch)) {
-                        break
-                    }
+                    if (!awaitWriterReady(ws, writerEpoch)) break
+                    if (writerEpoch != epoch || webSocket !== ws) break
 
-                    if (writerEpoch != epoch || webSocket !== ws) {
-                        break
-                    }
+                    val command = channel.receiveCatching().getOrNull() ?: break
+                    if (!awaitWebSocketQueueCapacity(ws, writerEpoch)) break
 
-                    val command = channel.receiveCatching().getOrNull()
-                        ?: break
+                    if (writerEpoch != epoch || !isReady || webSocket !== ws) break
 
-                    if (!awaitWebSocketQueueCapacity(ws, writerEpoch)) {
-                        break
-                    }
-
-                    if (
-                        writerEpoch != epoch ||
-                        !isReady ||
-                        webSocket !== ws
-                    ) {
-                        break
-                    }
-
-                    val jsonMessage =
-                        when (command) {
-                            is AudioOutboundCommand.Pcm -> {
-                                val base64Data =
-                                    Base64.encodeToString(
-                                        command.payload,
-                                        Base64.NO_WRAP
-                                    )
-
-                                buildJsonObject {
-                                    putJsonObject(
-                                        "realtimeInput"
-                                    ) {
-                                        putJsonObject(
-                                            "audio"
-                                        ) {
-                                            put(
-                                                "mimeType",
-                                                GEMINI_INPUT_AUDIO_MIME_TYPE
-                                            )
-                                            put(
-                                                "data",
-                                                base64Data
-                                            )
-                                        }
+                    val jsonMessage = when (command) {
+                        is AudioOutboundCommand.Pcm -> {
+                            val base64Data = Base64.encodeToString(command.payload, Base64.NO_WRAP)
+                            buildJsonObject {
+                                putJsonObject("realtimeInput") {
+                                    putJsonObject("audio") {
+                                        put("mimeType", GEMINI_INPUT_AUDIO_MIME_TYPE)
+                                        put("data", base64Data)
                                     }
-                                }.toString()
-                            }
-
-                            AudioOutboundCommand.ActivityStart ->
-                                buildJsonObject {
-                                    putJsonObject(
-                                        "realtimeInput"
-                                    ) {
-                                        putJsonObject(
-                                            "activityStart"
-                                        ) {}
-                                    }
-                                }.toString()
-
-                            AudioOutboundCommand.ActivityEnd ->
-                                buildJsonObject {
-                                    putJsonObject(
-                                        "realtimeInput"
-                                    ) {
-                                        putJsonObject(
-                                            "activityEnd"
-                                        ) {}
-                                    }
-                                }.toString()
-
-                            AudioOutboundCommand.AudioStreamEnd ->
-                                buildJsonObject {
-                                    putJsonObject(
-                                        "realtimeInput"
-                                    ) {
-                                        put(
-                                            "audioStreamEnd",
-                                            true
-                                        )
-                                    }
-                                }.toString()
-
-                            is AudioOutboundCommand.DirectJson ->
-                                command.jsonMessage
-                        }
-
-                    val sendAccepted =
-                        synchronized(sessionStateLock) {
-                            if (
-                                writerEpoch != epoch ||
-                                !isReady ||
-                                webSocket !== ws
-                            ) {
-                                false
-                            } else {
-                                synchronized(outboundSendLock) {
-                                    ws.send(jsonMessage)
                                 }
+                            }.toString()
+                        }
+
+                        AudioOutboundCommand.ActivityStart ->
+                            buildJsonObject {
+                                putJsonObject("realtimeInput") {
+                                    putJsonObject("activityStart") {}
+                                }
+                            }.toString()
+
+                        AudioOutboundCommand.ActivityEnd ->
+                            buildJsonObject {
+                                putJsonObject("realtimeInput") {
+                                    putJsonObject("activityEnd") {}
+                                }
+                            }.toString()
+
+                        AudioOutboundCommand.AudioStreamEnd ->
+                            buildJsonObject {
+                                putJsonObject("realtimeInput") {
+                                    put("audioStreamEnd", true)
+                                }
+                            }.toString()
+
+                        is AudioOutboundCommand.DirectJson ->
+                            command.jsonMessage
+                    }
+
+                    val sendAccepted = synchronized(sessionStateLock) {
+                        if (writerEpoch != epoch || !isReady || webSocket !== ws) {
+                            false
+                        } else {
+                            synchronized(outboundSendLock) {
+                                ws.send(jsonMessage)
                             }
                         }
+                    }
 
                     if (!sendAccepted) {
-                        logManager.w(
-                            "WebSocket:AudioWriter",
-                            "OkHttp отверг outbound audio/control command"
-                        )
-
-                        if (writerEpoch == epoch &&
-                            webSocket === ws
-                        ) {
+                        logManager.w("WebSocket:AudioWriter", "OkHttp отверг outbound audio/control command")
+                        if (writerEpoch == epoch && webSocket === ws) {
                             isReady = false
                         }
                         break
@@ -933,11 +584,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (t: Throwable) {
-                logManager.e(
-                    "WebSocket:AudioWriter",
-                    "Ошибка realtime audio writer",
-                    t
-                )
+                logManager.e("WebSocket:AudioWriter", "Ошибка realtime audio writer", t)
                 val current = synchronized(sessionStateLock) {
                     writerEpoch == epoch && webSocket === ws
                 }
@@ -950,73 +597,36 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                     val failedSessionId = synchronized(sessionStateLock) { sessionId }
                     emitControlEvent(
-                        GeminiEvent.Disconnected(
-                            1011,
-                            "realtime audio writer failed",
-                            failedSessionId,
-                            writerEpoch
-                        ),
+                        GeminiEvent.Disconnected(1011, "realtime audio writer failed", failedSessionId, writerEpoch),
                         writerEpoch
                     )
                     runCatching { ws.close(1011, "realtime audio writer failed") }
                 }
             } finally {
                 channel.close()
-
                 synchronized(sessionStateLock) {
-                    if (audioWriterChannel === channel) {
-                        audioWriterChannel = null
-                    }
-                    if (audioWriterScope === scope) {
-                        audioWriterScope = null
-                    }
+                    if (audioWriterChannel === channel) audioWriterChannel = null
+                    if (audioWriterScope === scope) audioWriterScope = null
                 }
             }
         }
     }
 
-    private suspend fun awaitWriterReady(
-        ws: WebSocket,
-        writerEpoch: Long
-    ): Boolean {
+    private suspend fun awaitWriterReady(ws: WebSocket, writerEpoch: Long): Boolean {
         while (!isReady) {
-            if (
-                writerEpoch != epoch ||
-                webSocket !== ws
-            ) {
-                return false
-            }
+            if (writerEpoch != epoch || webSocket !== ws) return false
             delay(WS_QUEUE_POLL_MS)
         }
-        return (
-            writerEpoch == epoch &&
-            webSocket === ws
-        )
+        return (writerEpoch == epoch && webSocket === ws)
     }
 
-    private suspend fun awaitWebSocketQueueCapacity(
-        ws: WebSocket,
-        writerEpoch: Long
-    ): Boolean {
+    private suspend fun awaitWebSocketQueueCapacity(ws: WebSocket, writerEpoch: Long): Boolean {
         while (ws.queueSize() > MAX_QUEUE_BYTES) {
-            if (
-                writerEpoch != epoch ||
-                webSocket !== ws
-            ) {
-                return false
-            }
+            if (writerEpoch != epoch || webSocket !== ws) return false
             delay(WS_QUEUE_POLL_MS)
         }
-        return (
-            writerEpoch == epoch &&
-            isReady &&
-            webSocket === ws
-        )
+        return (writerEpoch == epoch && isReady && webSocket === ws)
     }
-
-    private val outboundSendLock = Any()
-
-    private val outboundCommandMutex = Mutex()
 
     private fun stopAudioWriter(
         expectedWs: WebSocket? = null,
@@ -1024,10 +634,7 @@ class GeminiProtobufLiveClient @Inject constructor(
     ) {
         synchronized(sessionStateLock) {
             if (expectedWs != null) {
-                if (expectedEpoch == null ||
-                    expectedEpoch != epoch ||
-                    webSocket !== expectedWs
-                ) {
+                if (expectedEpoch == null || expectedEpoch != epoch || webSocket !== expectedWs) {
                     return
                 }
             }
@@ -1042,28 +649,23 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
     }
 
-    suspend fun sendAudioPcm(
-        pcm: ByteArray
-    ) {
+    suspend fun sendAudioPcm(pcm: ByteArray) {
         if (pcm.isEmpty()) return
 
         outboundCommandMutex.withLock {
             val target = synchronized(batchLock) {
                 val writerEpoch = synchronized(sessionStateLock) { epoch }
-                val ws = synchronized(sessionStateLock) { webSocket }
-                    ?: return@synchronized null
-                val channel = synchronized(sessionStateLock) { audioWriterChannel }
-                    ?: return@synchronized null
+                val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
+                val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
 
                 isAudioStreamEnded = false
                 audioBatchBuffer.write(pcm)
 
-                val payload =
-                    if (audioBatchBuffer.size() >= AUDIO_BATCH_THRESHOLD_BYTES) {
-                        audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
-                    } else {
-                        null
-                    }
+                val payload = if (audioBatchBuffer.size() >= AUDIO_BATCH_THRESHOLD_BYTES) {
+                    audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
+                } else {
+                    null
+                }
 
                 if (payload == null || !isWriterCurrent(writerEpoch, ws, channel)) {
                     null
@@ -1105,17 +707,14 @@ class GeminiProtobufLiveClient @Inject constructor(
                 if (isAudioStreamEnded) return@synchronized null
 
                 val writerEpoch = synchronized(sessionStateLock) { epoch }
-                val ws = synchronized(sessionStateLock) { webSocket }
-                    ?: return@synchronized null
-                val channel = synchronized(sessionStateLock) { audioWriterChannel }
-                    ?: return@synchronized null
+                val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
+                val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
 
-                val tailPayload =
-                    if (audioBatchBuffer.size() == 0) {
-                        null
-                    } else {
-                        audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
-                    }
+                val tailPayload = if (audioBatchBuffer.size() == 0) {
+                    null
+                } else {
+                    audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
+                }
 
                 isAudioStreamEnded = true
 
@@ -1140,12 +739,9 @@ class GeminiProtobufLiveClient @Inject constructor(
         writerEpoch: Long,
         ws: WebSocket,
         channel: SendChannel<AudioOutboundCommand>
-    ): Boolean =
-        synchronized(sessionStateLock) {
-            writerEpoch == epoch &&
-                webSocket === ws &&
-                audioWriterChannel === channel
-        }
+    ): Boolean = synchronized(sessionStateLock) {
+        writerEpoch == epoch && webSocket === ws && audioWriterChannel === channel
+    }
 
     private suspend fun sendOrderedJson(
         jsonMessage: String,
@@ -1164,9 +760,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
     }
 
-    suspend fun sendRealtimeText(
-        text: String
-    ) {
+    suspend fun sendRealtimeText(text: String) {
         if (text.isBlank()) return
 
         val target = synchronized(sessionStateLock) {
@@ -1183,22 +777,11 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
         }.toString()
 
-        logManager.net(
-            "WebSocket:TxText",
-            "Отправка realtimeInput.text (payload redacted; length=${cleanText.length})"
-        )
-
-        sendOrderedJson(
-            jsonMessage,
-            target.first,
-            target.second,
-            target.third
-        )
+        logManager.net("WebSocket:TxText", "Отправка realtimeInput.text (length=${cleanText.length})")
+        sendOrderedJson(jsonMessage, target.first, target.second, target.third)
     }
 
-    suspend fun sendRealtimeImage(
-        jpegBytes: ByteArray
-    ) {
+    suspend fun sendRealtimeImage(jpegBytes: ByteArray) {
         if (jpegBytes.isEmpty()) return
 
         val target = synchronized(sessionStateLock) {
@@ -1209,10 +792,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         } ?: return
 
         if (target.second.queueSize() > MAX_QUEUE_BYTES) {
-            logManager.w(
-                "WebSocket:TxImage",
-                "Очередь WebSocket перегружена; realtime image пропущен"
-            )
+            logManager.w("WebSocket:TxImage", "Очередь WebSocket перегружена; realtime image пропущен")
             return
         }
 
@@ -1226,34 +806,22 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
         }.toString()
 
-        logManager.net(
-            "WebSocket:TxImage",
-            "Отправка изображения (${jpegBytes.size} байт)"
-        )
-
-        sendOrderedJson(
-            jsonMessage,
-            target.first,
-            target.second,
-            target.third
-        )
+        logManager.net("WebSocket:TxImage", "Отправка изображения (${jpegBytes.size} байт)")
+        sendOrderedJson(jsonMessage, target.first, target.second, target.third)
     }
 
     suspend fun sendActivityStart() {
         outboundCommandMutex.withLock {
             val pending = synchronized(batchLock) {
                 val writerEpoch = synchronized(sessionStateLock) { epoch }
-                val ws = synchronized(sessionStateLock) { webSocket }
-                    ?: return@synchronized null
-                val channel = synchronized(sessionStateLock) { audioWriterChannel }
-                    ?: return@synchronized null
+                val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
+                val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
 
-                val preRoll =
-                    if (audioBatchBuffer.size() == 0) {
-                        null
-                    } else {
-                        audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
-                    }
+                val preRoll = if (audioBatchBuffer.size() == 0) {
+                    null
+                } else {
+                    audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
+                }
 
                 isAudioStreamEnded = false
 
@@ -1278,17 +846,14 @@ class GeminiProtobufLiveClient @Inject constructor(
         outboundCommandMutex.withLock {
             val pending = synchronized(batchLock) {
                 val writerEpoch = synchronized(sessionStateLock) { epoch }
-                val ws = synchronized(sessionStateLock) { webSocket }
-                    ?: return@synchronized null
-                val channel = synchronized(sessionStateLock) { audioWriterChannel }
-                    ?: return@synchronized null
+                val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
+                val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
 
-                val tailPayload =
-                    if (audioBatchBuffer.size() == 0) {
-                        null
-                    } else {
-                        audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
-                    }
+                val tailPayload = if (audioBatchBuffer.size() == 0) {
+                    null
+                } else {
+                    audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
+                }
 
                 isAudioStreamEnded = true
 
@@ -1338,17 +903,8 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
         }.toString()
 
-        logManager.net(
-            "WebSocket:TxClientContent",
-            "Отправка clientContent (${turns.size} ходов, turnComplete=$turnComplete) [payload redacted]"
-        )
-
-        sendOrderedJson(
-            jsonMessage,
-            target.first,
-            target.second,
-            target.third
-        )
+        logManager.net("WebSocket:TxClientContent", "Отправка clientContent (${turns.size} ходов, turnComplete=$turnComplete)")
+        sendOrderedJson(jsonMessage, target.first, target.second, target.third)
     }
 
     private fun sendClientContentInternal(
@@ -1357,74 +913,39 @@ class GeminiProtobufLiveClient @Inject constructor(
         targetWebSocket: WebSocket? = null,
         expectedEpoch: Long = epoch
     ): Boolean {
+        val ws = targetWebSocket ?: webSocket ?: return false
 
-        val ws =
-            targetWebSocket ?: webSocket ?: return false
-
-        val jsonMessage =
-            buildJsonObject {
-
-                putJsonObject(
-                    "clientContent"
-                ) {
-
-                    putJsonArray(
-                        "turns"
-                    ) {
-
-                        turns.forEach { turn ->
-
-                            addJsonObject {
-
-                                put(
-                                    "role",
-                                    turn.role.value
-                                )
-
-                                putJsonArray(
-                                    "parts"
-                                ) {
-
-                                    addJsonObject {
-                                        put(
-                                            "text",
-                                            turn.text
-                                        )
-                                    }
-                                }
+        val jsonMessage = buildJsonObject {
+            putJsonObject("clientContent") {
+                putJsonArray("turns") {
+                    turns.forEach { turn ->
+                        addJsonObject {
+                            put("role", turn.role.value)
+                            putJsonArray("parts") {
+                                addJsonObject { put("text", turn.text) }
                             }
                         }
                     }
-
-                    put(
-                        "turnComplete",
-                        turnComplete
-                    )
                 }
+                put("turnComplete", turnComplete)
+            }
+        }.toString()
 
-            }.toString()
+        logManager.net("WebSocket:TxClientContent", "Отправка clientContent (${turns.size} ходов, turnComplete=$turnComplete)")
 
-        logManager.net(
-            "WebSocket:TxClientContent",
-            "Отправка clientContent (${turns.size} ходов, turnComplete=$turnComplete) [payload redacted]"
-        )
+        return synchronized(sessionStateLock) {
+            val allowed = expectedEpoch == epoch &&
+                webSocket === ws &&
+                (targetWebSocket != null || isReady)
 
-        val accepted: Boolean =
-            synchronized(sessionStateLock) {
-                val allowed = expectedEpoch == epoch &&
-                    webSocket === ws &&
-                    (targetWebSocket != null || isReady)
-
-                if (!allowed) {
-                    false
-                } else {
-                    synchronized(outboundSendLock) {
-                        ws.send(jsonMessage)
-                    }
+            if (!allowed) {
+                false
+            } else {
+                synchronized(outboundSendLock) {
+                    ws.send(jsonMessage)
                 }
             }
-
-        return accepted
+        }
     }
 
     suspend fun sendToolResponses(
@@ -1441,59 +962,40 @@ class GeminiProtobufLiveClient @Inject constructor(
 
             if (!isReady) return@synchronized null
 
-            val activeResponses =
-                responses.filter { response ->
-                    val id = response.id
-                    !id.isNullOrBlank() &&
-                        !cancelledToolCallIds.contains(id)
-                }
+            val activeResponses = responses.filter { response ->
+                val id = response.id
+                !id.isNullOrBlank() && !cancelledToolCallIds.contains(id)
+            }
 
             if (activeResponses.isEmpty()) {
-                logManager.w(
-                    "GeminiLive:ToolResp",
-                    "Все FunctionResponse относятся к отменённым tool calls; ответ не отправляется"
-                )
+                logManager.w("GeminiLive:ToolResp", "Все FunctionResponse относятся к отменённым tool calls")
                 return@synchronized null
             }
 
-            val jsonMsg =
-                buildJsonObject {
-                    putJsonObject("toolResponse") {
-                        putJsonArray("functionResponses") {
-                            activeResponses.forEach { resp ->
-                                addJsonObject {
-                                    put("id", resp.id!!.trim())
-                                    put("name", resp.name)
-                                    put("response", resp.response)
+            val jsonMsg = buildJsonObject {
+                putJsonObject("toolResponse") {
+                    putJsonArray("functionResponses") {
+                        activeResponses.forEach { resp ->
+                            addJsonObject {
+                                put("id", resp.id!!.trim())
+                                put("name", resp.name)
+                                put("response", resp.response)
 
-                                    if (
-                                        caps.supportsFunctionScheduling &&
-                                        resp.scheduling != null
-                                    ) {
-                                        put(
-                                            "scheduling",
-                                            resp.scheduling.name
-                                        )
-                                    }
+                                if (caps.supportsFunctionScheduling && resp.scheduling != null) {
+                                    put("scheduling", resp.scheduling.name)
+                                }
 
-                                    if (resp.willContinue) {
-                                        put("willContinue", true)
-                                    }
+                                if (resp.willContinue) {
+                                    put("willContinue", true)
+                                }
 
-                                    if (resp.parts.isNotEmpty()) {
-                                        putJsonArray("parts") {
-                                            resp.parts.forEach { part ->
-                                                addJsonObject {
-                                                    putJsonObject("inlineData") {
-                                                        put(
-                                                            "mimeType",
-                                                            part.mimeType
-                                                        )
-                                                        put(
-                                                            "data",
-                                                            part.base64Data
-                                                        )
-                                                    }
+                                if (resp.parts.isNotEmpty()) {
+                                    putJsonArray("parts") {
+                                        resp.parts.forEach { part ->
+                                            addJsonObject {
+                                                putJsonObject("inlineData") {
+                                                    put("mimeType", part.mimeType)
+                                                    put("data", part.base64Data)
                                                 }
                                             }
                                         }
@@ -1502,56 +1004,26 @@ class GeminiProtobufLiveClient @Inject constructor(
                             }
                         }
                     }
-                }.toString()
-
-            val dbgLog =
-                activeResponses.joinToString {
-                    "${it.name}(id=${it.id}, sched=${it.scheduling?.name ?: "NONE"})"
                 }
+            }.toString()
 
+            val dbgLog = activeResponses.joinToString { "${it.name}(id=${it.id}, sched=${it.scheduling?.name ?: "NONE"})" }
             Triple(Triple(sendEpoch, ws, channel), jsonMsg, dbgLog)
         } ?: return false
 
         val (target, jsonMessage, debugLog) = targetData
-
-        // P1 Fix (Проблема №14): Ответ инструмента отправляется строго через FIFO-очередь
-        // audioWriterChannel, исключая обгон звуковых данных и ошибку протокола 1002.
-        val accepted = sendOrderedJson(
-            jsonMessage,
-            target.first,
-            target.second,
-            target.third
-        )
-
-        logManager.net(
-            "WebSocket:ToolResp",
-            "Ответы функций enqueued=$accepted: [$debugLog]"
-        )
-
-        if (!accepted) {
-            logManager.w(
-                "GeminiLive:ToolResp",
-                "Не удалось поставить FunctionResponse в очередь WebSocket"
-            )
-        }
-
+        val accepted = sendOrderedJson(jsonMessage, target.first, target.second, target.third)
+        logManager.net("WebSocket:ToolResp", "Ответы функций enqueued=$accepted: [$debugLog]")
         return accepted
     }
 
-    private fun validateCompressionConfig(
-        cfg: LiveConfig
-    ) {
+    private fun validateCompressionConfig(cfg: LiveConfig) {
         LiveModelCapabilitiesRegistry.forModel(cfg.model)
-
         val trigger = cfg.compression.triggerTokens
         val target = cfg.compression.targetTokens
 
-        require(trigger >= 0) {
-            "contextWindowCompression.triggerTokens must be >= 0"
-        }
-        require(target >= 0) {
-            "contextWindowCompression.slidingWindow.targetTokens must be >= 0"
-        }
+        require(trigger >= 0) { "contextWindowCompression.triggerTokens must be >= 0" }
+        require(target >= 0) { "contextWindowCompression.slidingWindow.targetTokens must be >= 0" }
     }
 
     private fun normalizeToolsForModel(
@@ -1587,10 +1059,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                                 add(
                                     buildJsonObject {
                                         declaration.forEach { (key, value) ->
-                                            if (!(
-                                                key == "behavior" &&
-                                                !capabilities.supportsAsyncFunctionCalling
-                                            )) {
+                                            if (!(key == "behavior" && !capabilities.supportsAsyncFunctionCalling)) {
                                                 put(key, value)
                                             }
                                         }
@@ -1607,346 +1076,156 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
     }
 
-    private fun buildSetupMessage(
-        cfg: LiveConfig
-    ): String {
+    private fun buildSetupMessage(cfg: LiveConfig): String {
         val capabilities = LiveModelCapabilitiesRegistry.forModel(cfg.model)
+        val rawModelName = cfg.model.trim().removePrefix("publishers/google/models/").removePrefix("models/")
+        val cleanModel = "models/$rawModelName"
 
-        val rawModelName =
-            cfg.model
-                .trim()
-                .removePrefix(
-                    "publishers/google/models/"
-                )
-                .removePrefix(
-                    "models/"
-                )
-
-        val cleanModel =
-            "models/$rawModelName"
-
-        val setupObj =
-            buildJsonObject {
-
-                putJsonObject(
-                    "setup"
-                ) {
-
-                    put(
-                        "model",
-                        cleanModel
-                    )
-
-                    putJsonObject(
-                        "generationConfig"
-                    ) {
-
-                        if (capabilities.supportsThinkingConfig &&
-                            !cfg.thinkingLevel.isNullOrBlank()
-                        ) {
-                            putJsonObject("thinkingConfig") {
-                                put("thinkingLevel", cfg.thinkingLevel.lowercase())
-                            }
-                        }
-
-                        putJsonArray(
-                            "responseModalities"
-                        ) {
-
-                            add("AUDIO")
-                        }
-
-                        put(
-                            "temperature",
-                            cfg.temperature
-                        )
-
-                        put(
-                            "mediaResolution",
-                            cfg.mediaResolution
-                        )
-
-                        putJsonObject(
-                            "speechConfig"
-                        ) {
-
-                            putJsonObject(
-                                "voiceConfig"
-                            ) {
-
-                                putJsonObject(
-                                    "prebuiltVoiceConfig"
-                                ) {
-
-                                    put(
-                                        "voiceName",
-                                        cfg.voiceName
-                                    )
-                                }
-                            }
-
-                            val targetLang = cfg.speechLanguage?.ifBlank { "ru-RU" } ?: "ru-RU"
-                            put("languageCode", targetLang)
+        val setupObj = buildJsonObject {
+            putJsonObject("setup") {
+                put("model", cleanModel)
+                putJsonObject("generationConfig") {
+                    if (capabilities.supportsThinkingConfig && !cfg.thinkingLevel.isNullOrBlank()) {
+                        putJsonObject("thinkingConfig") {
+                            put("thinkingLevel", cfg.thinkingLevel.lowercase())
                         }
                     }
 
-                    if (
-                        cfg.inputTranscription.enabled
-                    ) {
-
-                        putJsonObject(
-                            "inputAudioTranscription"
-                        ) {
-
-                            val inputLangs = if (cfg.inputTranscription.languageCodes.isNotEmpty()) {
-                                cfg.inputTranscription.languageCodes
-                            } else {
-                                listOf(cfg.speechLanguage?.ifBlank { "ru-RU" } ?: "ru-RU")
-                            }
-
-                            putJsonArray(
-                                "languageCodes"
-                            ) {
-                                inputLangs.forEach { add(it) }
-                            }
-
-                            if (
-                                cfg.inputTranscription
-                                    .customVocabulary
-                                    .isNotEmpty()
-                            ) {
-
-                                putJsonArray(
-                                    "customVocabulary"
-                                ) {
-
-                                    cfg.inputTranscription
-                                        .customVocabulary
-                                        .forEach {
-                                            add(it)
-                                        }
-                                }
-                            }
-
-                            put(
-                                "mode",
-                                cfg.inputTranscription
-                                    .mode
-                            )
-                        }
+                    putJsonArray("responseModalities") {
+                        add("AUDIO")
                     }
 
-                    if (
-                        cfg.outputTranscription.enabled
-                    ) {
+                    put("temperature", cfg.temperature)
+                    put("mediaResolution", cfg.mediaResolution)
 
-                        putJsonObject(
-                            "outputAudioTranscription"
-                        ) {
-
-                            val outputLangs = if (cfg.outputTranscription.languageCodes.isNotEmpty()) {
-                                cfg.outputTranscription.languageCodes
-                            } else {
-                                listOf(cfg.speechLanguage?.ifBlank { "ru-RU" } ?: "ru-RU")
-                            }
-
-                            putJsonArray(
-                                "languageCodes"
-                            ) {
-                                outputLangs.forEach { add(it) }
-                            }
-
-                            if (
-                                cfg.outputTranscription
-                                    .customVocabulary
-                                    .isNotEmpty()
-                            ) {
-
-                                putJsonArray(
-                                    "customVocabulary"
-                                ) {
-
-                                    cfg.outputTranscription
-                                        .customVocabulary
-                                        .forEach {
-                                            add(it)
-                                        }
-                                }
-                            }
-
-                            put(
-                                "mode",
-                                cfg.outputTranscription
-                                    .mode
-                            )
-                        }
-                    }
-
-                    if (cfg.compression.enabled) {
-                        val trigger = cfg.compression.triggerTokens
-                        val target = cfg.compression.targetTokens
-
-                        putJsonObject("contextWindowCompression") {
-                            when {
-                                target > 0 -> {
-                                    putJsonObject("slidingWindow") {
-                                        put("targetTokens", target)
-                                    }
-                                }
-                                trigger > 0 -> {
-                                    put("triggerTokens", trigger)
-                                }
-                                else -> {
-                                    putJsonObject("slidingWindow") {}
-                                }
-                            }
-                        }
-                    }
-
-                    putJsonObject(
-                        "realtimeInputConfig"
-                    ) {
-
-                        putJsonObject(
-                            "automaticActivityDetection"
-                        ) {
-
-                            put(
-                                "disabled",
-                                !cfg.realtimeInput
-                                    .aadEnabled
-                            )
-
-                            if (
-                                cfg.realtimeInput
-                                    .aadEnabled
-                            ) {
-
-                                put(
-                                    "startOfSpeechSensitivity",
-                                    cfg.realtimeInput
-                                        .startSensitivity
-                                )
-
-                                put(
-                                    "endOfSpeechSensitivity",
-                                    cfg.realtimeInput
-                                        .endSensitivity
-                                )
-
-                                put(
-                                    "prefixPaddingMs",
-                                    cfg.realtimeInput
-                                        .prefixPaddingMs
-                                )
-
-                                put(
-                                    "silenceDurationMs",
-                                    cfg.realtimeInput
-                                        .silenceDurationMs
-                                )
+                    putJsonObject("speechConfig") {
+                        putJsonObject("voiceConfig") {
+                            putJsonObject("prebuiltVoiceConfig") {
+                                put("voiceName", cfg.voiceName)
                             }
                         }
 
-                        put(
-                            "activityHandling",
-                            cfg.realtimeInput
-                                .activityHandling
-                        )
-
-                        put(
-                            "turnCoverage",
-                            cfg.realtimeInput
-                                .turnCoverage
-                        )
+                        val targetLang = cfg.speechLanguage?.ifBlank { "ru-RU" } ?: "ru-RU"
+                        put("languageCode", targetLang)
                     }
+                }
 
-                    if (
-                        cfg.systemInstruction.isNotBlank()
-                    ) {
-
-                        putJsonObject(
-                            "systemInstruction"
-                        ) {
-
-                            putJsonArray(
-                                "parts"
-                            ) {
-
-                                addJsonObject {
-
-                                    put(
-                                        "text",
-                                        cfg.systemInstruction
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    val allTools =
-                        buildJsonArray {
-
-                            normalizeToolsForModel(
-                                cfg.toolsJson,
-                                capabilities
-                            )?.forEach {
-                                add(it)
-                            }
-
-                            if (
-                                cfg.enableGoogleSearch
-                            ) {
-
-                                addJsonObject {
-
-                                    putJsonObject(
-                                        "googleSearch"
-                                    ) {}
-                                }
-                            }
+                if (cfg.inputTranscription.enabled) {
+                    putJsonObject("inputAudioTranscription") {
+                        val inputLangs = if (cfg.inputTranscription.languageCodes.isNotEmpty()) {
+                            cfg.inputTranscription.languageCodes
+                        } else {
+                            listOf(cfg.speechLanguage?.ifBlank { "ru-RU" } ?: "ru-RU")
                         }
 
-                    if (
-                        allTools.isNotEmpty()
-                    ) {
-
-                        put(
-                            "tools",
-                            allTools
-                        )
-                    }
-
-                    if (
-                        cfg.sessionResumptionEnabled
-                    ) {
-                        putJsonObject(
-                            "sessionResumption"
-                        ) {
-                            cfg.resumptionHandle
-                                ?.takeIf { it.isNotBlank() }
-                                ?.let { handle ->
-                                    put("handle", handle)
-                                }
+                        putJsonArray("languageCodes") {
+                            inputLangs.forEach { add(it) }
                         }
+
+                        if (cfg.inputTranscription.customVocabulary.isNotEmpty()) {
+                            putJsonArray("customVocabulary") {
+                                cfg.inputTranscription.customVocabulary.forEach { add(it) }
+                            }
+                        }
+                        put("mode", cfg.inputTranscription.mode)
                     }
+                }
 
-                    if (
-                        cfg.initialHistory.isNotEmpty()
-                    ) {
+                if (cfg.outputTranscription.enabled) {
+                    putJsonObject("outputAudioTranscription") {
+                        val outputLangs = if (cfg.outputTranscription.languageCodes.isNotEmpty()) {
+                            cfg.outputTranscription.languageCodes
+                        } else {
+                            listOf(cfg.speechLanguage?.ifBlank { "ru-RU" } ?: "ru-RU")
+                        }
 
-                        putJsonObject(
-                            "historyConfig"
-                        ) {
+                        putJsonArray("languageCodes") {
+                            outputLangs.forEach { add(it) }
+                        }
 
-                            put(
-                                "initialHistoryInClientContent",
-                                true
-                            )
+                        if (cfg.outputTranscription.customVocabulary.isNotEmpty()) {
+                            putJsonArray("customVocabulary") {
+                                cfg.outputTranscription.customVocabulary.forEach { add(it) }
+                            }
+                        }
+                        put("mode", cfg.outputTranscription.mode)
+                    }
+                }
+
+                if (cfg.compression.enabled) {
+                    val trigger = cfg.compression.triggerTokens
+                    val target = cfg.compression.targetTokens
+
+                    putJsonObject("contextWindowCompression") {
+                        when {
+                            target > 0 -> {
+                                putJsonObject("slidingWindow") {
+                                    put("targetTokens", target)
+                                }
+                            }
+                            trigger > 0 -> {
+                                put("triggerTokens", trigger)
+                            }
+                            else -> {
+                                putJsonObject("slidingWindow") {}
+                            }
                         }
                     }
                 }
+
+                putJsonObject("realtimeInputConfig") {
+                    putJsonObject("automaticActivityDetection") {
+                        put("disabled", !cfg.realtimeInput.aadEnabled)
+
+                        if (cfg.realtimeInput.aadEnabled) {
+                            put("startOfSpeechSensitivity", cfg.realtimeInput.startSensitivity)
+                            put("endOfSpeechSensitivity", cfg.realtimeInput.endSensitivity)
+                            put("prefixPaddingMs", cfg.realtimeInput.prefixPaddingMs)
+                            put("silenceDurationMs", cfg.realtimeInput.silenceDurationMs)
+                        }
+                    }
+                    put("activityHandling", cfg.realtimeInput.activityHandling)
+                    put("turnCoverage", cfg.realtimeInput.turnCoverage)
+                }
+
+                if (cfg.systemInstruction.isNotBlank()) {
+                    putJsonObject("systemInstruction") {
+                        putJsonArray("parts") {
+                            addJsonObject {
+                                put("text", cfg.systemInstruction)
+                            }
+                        }
+                    }
+                }
+
+                val allTools = buildJsonArray {
+                    normalizeToolsForModel(cfg.toolsJson, capabilities)?.forEach { add(it) }
+                    if (cfg.enableGoogleSearch) {
+                        addJsonObject {
+                            putJsonObject("googleSearch") {}
+                        }
+                    }
+                }
+
+                if (allTools.isNotEmpty()) {
+                    put("tools", allTools)
+                }
+
+                if (cfg.sessionResumptionEnabled) {
+                    putJsonObject("sessionResumption") {
+                        cfg.resumptionHandle?.takeIf { it.isNotBlank() }?.let { handle ->
+                            put("handle", handle)
+                        }
+                    }
+                }
+
+                if (cfg.initialHistory.isNotEmpty()) {
+                    putJsonObject("historyConfig") {
+                        put("initialHistoryInClientContent", true)
+                    }
+                }
             }
+        }
 
         return setupObj.toString()
     }
@@ -1976,8 +1255,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             ?.jsonArray
 
         val decodedPcmParts = modelParts?.map { partEl ->
-            val inline = partEl.jsonObject["inlineData"]?.jsonObject
-                ?: return@map null
+            val inline = partEl.jsonObject["inlineData"]?.jsonObject ?: return@map null
             val mime = inline["mimeType"]?.jsonPrimitive?.contentOrNull.orEmpty()
             val data = inline["data"]?.jsonPrimitive?.contentOrNull.orEmpty()
             if (!mime.startsWith("audio/pcm") || data.isEmpty()) return@map null
@@ -2003,26 +1281,17 @@ class GeminiProtobufLiveClient @Inject constructor(
             root["usageMetadata"]?.jsonObject?.get("totalTokenCount")
                 ?.jsonPrimitive?.intOrNull?.let { emitData(GeminiEvent.Usage(it)) }
 
-            val setupHistory =
-                if (root.containsKey("setupComplete")) {
-                    synchronized(sessionStateLock) {
-                        if (
-                            myEpoch == epoch &&
-                            webSocket === sourceWebSocket &&
-                            !isReady
-                        ) {
-                            activeConfig?.initialHistory
-                                .orEmpty()
-                                .takeLast(
-                                    MAX_INITIAL_HISTORY_TURNS
-                                )
-                        } else {
-                            null
-                        }
+            val setupHistory = if (root.containsKey("setupComplete")) {
+                synchronized(sessionStateLock) {
+                    if (myEpoch == epoch && webSocket === sourceWebSocket && !isReady) {
+                        activeConfig?.initialHistory.orEmpty().takeLast(MAX_INITIAL_HISTORY_TURNS)
+                    } else {
+                        null
                     }
-                } else {
-                    null
                 }
+            } else {
+                null
+            }
 
             if (setupHistory != null) {
                 if (setupHistory.isNotEmpty()) {
@@ -2033,25 +1302,16 @@ class GeminiProtobufLiveClient @Inject constructor(
                         expectedEpoch = myEpoch
                     )
                     if (!accepted) {
-                        sourceWebSocket.close(
-                            1011,
-                            "initial history send failed"
-                        )
+                        sourceWebSocket.close(1011, "initial history send failed")
                         return
                     }
                 }
 
                 synchronized(sessionStateLock) {
-                    if (
-                        myEpoch == epoch &&
-                        webSocket === sourceWebSocket &&
-                        !isReady
-                    ) {
+                    if (myEpoch == epoch && webSocket === sourceWebSocket && !isReady) {
                         isReady = true
                         protocolPhase = ProtocolPhase.READY
-                        emitControl(
-                            GeminiEvent.SetupComplete
-                        )
+                        emitControl(GeminiEvent.SetupComplete)
                     } else {
                         return
                     }
@@ -2059,8 +1319,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
 
             root["sessionResumptionUpdate"]?.jsonObject?.let { sru ->
-                val handle = sru["newHandle"]?.jsonPrimitive?.contentOrNull
-                    ?.takeIf { it.isNotBlank() }
+                val handle = sru["newHandle"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
                 val resumable = sru["resumable"]?.jsonPrimitive?.booleanOrNull ?: false
                 emitControl(GeminiEvent.ResumptionHandle(handle, resumable))
             }
@@ -2082,12 +1341,10 @@ class GeminiProtobufLiveClient @Inject constructor(
                 }
 
             val sc = root["serverContent"]?.jsonObject
-
-            val interactionStatusElement =
-                sc?.get("interactionStatus")
-                    ?: sc?.get("interaction_status")
-                    ?: root["interactionStatus"]
-                    ?: root["interaction_status"]
+            val interactionStatusElement = sc?.get("interactionStatus")
+                ?: sc?.get("interaction_status")
+                ?: root["interactionStatus"]
+                ?: root["interaction_status"]
 
             interactionStatusElement
                 ?.jsonPrimitive?.contentOrNull
@@ -2105,12 +1362,8 @@ class GeminiProtobufLiveClient @Inject constructor(
             root["toolCall"]?.jsonObject?.get("functionCalls")?.jsonArray
                 ?.mapNotNull { fcEl ->
                     val fc = fcEl.jsonObject
-                    val name = fc["name"]?.jsonPrimitive?.contentOrNull
-                        ?.takeIf { it.isNotBlank() }
-                        ?: return@mapNotNull null
-                    val id = fc["id"]?.jsonPrimitive?.contentOrNull
-                        ?.takeIf { it.isNotBlank() }
-                        ?: return@mapNotNull null
+                    val name = fc["name"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    val id = fc["id"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
                     val args = fc["args"]?.jsonObject ?: buildJsonObject {}
                     FunctionCall(name, id, args)
                 }
@@ -2142,8 +1395,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                             part["text"]?.jsonPrimitive?.contentOrNull
                                 ?.takeIf { it.isNotBlank() }
                                 ?.let {
-                                    // P1 Fix (Проблема №13): Текст модели переведён в Control Plane (гарантированная доставка).
-                                    // Полностью исключается молчаливый отброс при исчерпании квоты в 256 сообщений.
                                     emitControl(GeminiEvent.ModelText(it))
                                 }
                         }
@@ -2161,8 +1412,9 @@ class GeminiProtobufLiveClient @Inject constructor(
                                     val aggregate = perSession.get() + bytes
                                     if (aggregate <= MAX_AI_AUDIO_BACKLOG_BYTES) {
                                         perSession.addAndGet(bytes)
+                                        // УСТРАНЕНИЕ ДЕФЕКТА 33: Передаём точную временную метку получения фрейма
                                         accepted = _audio.trySend(
-                                            AudioFrame(pcm, mySessionId, myEpoch, generation, frameId)
+                                            AudioFrame(pcm, mySessionId, myEpoch, generation, frameId, SystemClock.elapsedRealtime())
                                         ).isSuccess
                                         if (!accepted) {
                                             audioBudgetBySession[key]?.let { c ->
@@ -2176,7 +1428,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                                 val backlog = audioBudgetBySession[key]?.get() ?: 0L
                                 logManager.w(
                                     "GeminiLive:AudioBacklog",
-                                    "Входящий аудиочанк отклонён защитным лимитом (backlog=${backlog / 1024} КБ, лимит=${MAX_AI_AUDIO_BACKLOG_BYTES / 1024} КБ)"
+                                    "Входящий аудиочанк отклонён (backlog=${backlog / 1024} КБ, лимит=${MAX_AI_AUDIO_BACKLOG_BYTES / 1024} КБ)"
                                 )
                             }
                         }
@@ -2198,19 +1450,14 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 sc["turnComplete"]?.jsonPrimitive?.booleanOrNull?.takeIf { it }
                     ?.let { emitControl(GeminiEvent.TurnComplete) }
-
             }
         }
     }
 
     private fun extractTranscriptText(element: JsonElement?): String? {
         return when (element) {
-            is JsonObject ->
-                element["text"]
-                    ?.jsonPrimitive
-                    ?.contentOrNull
-            is JsonPrimitive ->
-                element.contentOrNull
+            is JsonObject -> element["text"]?.jsonPrimitive?.contentOrNull
+            is JsonPrimitive -> element.contentOrNull
             else -> null
         }
     }
@@ -2257,16 +1504,8 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         stopAudioWriter()
 
-        runCatching {
-            ws?.close(
-                1000,
-                "close"
-            )
-        }
-
-        runCatching {
-            ws?.cancel()
-        }
+        runCatching { ws?.close(1000, "close") }
+        runCatching { ws?.cancel() }
 
         synchronized(sessionStateLock) {
             if (webSocket == null && epoch == newEpoch) {
@@ -2274,18 +1513,11 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
         }
 
-        logManager.w(
-            "WebSocket",
-            "Старая сессия закрыта (новая эпоха=$newEpoch)"
-        )
+        logManager.w("WebSocket", "Старая сессия закрыта (новая эпоха=$newEpoch)")
     }
 
-    suspend fun disconnect() =
-        wsMutex.withLock {
-            logManager.w(
-                "WebSocket",
-                "Отключение сессии (эпоха будет сменена атомарно)"
-            )
-            closeInternal()
-        }
+    suspend fun disconnect() = wsMutex.withLock {
+        logManager.w("WebSocket", "Отключение сессии (эпоха будет сменена атомарно)")
+        closeInternal()
+    }
 }
