@@ -18,7 +18,6 @@
 
 namespace client::audio {
 
-constexpr size_t PLAYBACK_DSP_INPUT_CHUNK_FRAMES = 1024;
 constexpr size_t PLAYBACK_DSP_MAX_OUTPUT_FRAMES = 8192;
 constexpr size_t EARCON_SCRATCH_MAX_FRAMES = 2048;
 constexpr size_t CAPTURE_RAW_SCRATCH_FRAMES = 2048;
