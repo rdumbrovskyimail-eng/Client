@@ -38,10 +38,7 @@ class NativeAudioBridge @Inject constructor() {
     external fun getActiveOutputDeviceId(): Int
     external fun getPendingPlaybackFrames(): Long
 
-    /** Мгновенный атомарный RMS ЦАП (без задержек UI-рендеринга) для Geigel DTD */
     external fun getOutRms(): Float
-
-    /** Мгновенный атомарный RMS АЦП микрофона */
     external fun getMicRms(): Float
 
     external fun isMmapActive(): Boolean
@@ -49,7 +46,6 @@ class NativeAudioBridge @Inject constructor() {
     external fun setVolume(volume: Float)
     external fun setMicGain(gain: Float)
 
-    // AUD-005.6: generation строго обязателен для отсечения устаревших чанков
     external fun writePlaybackByteArray(
         pcmArray: ByteArray,
         offsetBytes: Int,
