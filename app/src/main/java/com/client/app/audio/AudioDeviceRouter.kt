@@ -114,13 +114,40 @@ class AudioDeviceRouter @Inject constructor(
 
     @Volatile private var activeFingerprint: RouteFingerprint? = null
 
+    /**
+     * УСТРАНЕНИЕ ДЕФЕКТОВ 9 и 10: Строгий фильтр релевантности аудиоустройств.
+     * Игнорирует подключение зарядных устройств USB-PD, BLE-маячков, мышей и внешних аксессуаров,
+     * предотвращая паразитный сброс и перезапуск аудиопайплайна.
+     */
+    private fun isRelevantAudioDevice(device: AudioDeviceInfo): Boolean {
+        return when (device.type) {
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            AudioDeviceInfo.TYPE_BLE_HEADSET,
+            AudioDeviceInfo.TYPE_BLE_SPEAKER,
+            AudioDeviceInfo.TYPE_WIRED_HEADSET,
+            AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+            AudioDeviceInfo.TYPE_USB_HEADSET,
+            AudioDeviceInfo.TYPE_USB_DEVICE,
+            AudioDeviceInfo.TYPE_HEARING_AID -> true
+            else -> false
+        }
+    }
+
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
-            debounceTrigger.tryEmit(Unit)
+            val hasRelevant = addedDevices?.any { isRelevantAudioDevice(it) } ?: false
+            if (hasRelevant) {
+                logger.d("AudioDeviceRouter: onAudioDevicesAdded с релевантным аудиоустройством -> дебаунс")
+                debounceTrigger.tryEmit(Unit)
+            }
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
-            debounceTrigger.tryEmit(Unit)
+            val hasRelevant = removedDevices?.any { isRelevantAudioDevice(it) } ?: false
+            if (hasRelevant) {
+                logger.d("AudioDeviceRouter: onAudioDevicesRemoved с релевантным аудиоустройством -> дебаунс")
+                debounceTrigger.tryEmit(Unit)
+            }
         }
     }
 
@@ -245,66 +272,81 @@ class AudioDeviceRouter @Inject constructor(
                 val target = targetBtCandidate!!
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    val confirmation = CompletableDeferred<AudioDeviceInfo?>()
+                    // УСТРАНЕНИЕ ДЕФЕКТА 12: Если целевое Bluetooth-устройство уже активно, пропускаем повторный биндинг
+                    val alreadyActive = runCatching {
+                        audioManager.communicationDevice?.id == target.id
+                    }.getOrDefault(false)
 
-                    synchronized(routeLock) {
-                        communicationDeviceConfirmation = confirmation
-                        pendingCommunicationDeviceId = target.id
-                        pendingCommunicationAcceptSpeakerDefault = false
-                    }
+                    val activated = if (alreadyActive) {
+                        logger.d("AudioDeviceRouter: Устройство связи ${target.id} уже активно в системе, пропуск повторной привязки")
+                        true
+                    } else {
+                        val confirmation = CompletableDeferred<AudioDeviceInfo?>()
 
-                    val accepted = synchronized(routeLock) {
-                        bindBluetoothCommunication(target)
-                    }
+                        synchronized(routeLock) {
+                            communicationDeviceConfirmation = confirmation
+                            pendingCommunicationDeviceId = target.id
+                            pendingCommunicationAcceptSpeakerDefault = false
+                        }
 
-                    val activated =
-                        accepted &&
-                            awaitCommunicationDeviceActivation(
-                                target,
-                                confirmation,
-                                COMMUNICATION_ROUTE_CONFIRM_TIMEOUT_MS
-                            )
+                        val accepted = synchronized(routeLock) {
+                            bindBluetoothCommunication(target)
+                        }
 
-                    synchronized(routeLock) {
-                        pendingCommunicationDeviceId = null
-                        pendingCommunicationAcceptSpeakerDefault = false
-                        communicationDeviceConfirmation = null
+                        val isConfirmed = accepted && awaitCommunicationDeviceActivation(
+                            target,
+                            confirmation,
+                            COMMUNICATION_ROUTE_CONFIRM_TIMEOUT_MS
+                        )
+
+                        synchronized(routeLock) {
+                            pendingCommunicationDeviceId = null
+                            pendingCommunicationAcceptSpeakerDefault = false
+                            communicationDeviceConfirmation = null
+                        }
+                        isConfirmed
                     }
 
                     if (!activated) {
                         logger.w(
-                            "AudioDeviceRouter: Bluetooth communication route ${target.id} " +
-                                "was not confirmed within ${COMMUNICATION_ROUTE_CONFIRM_TIMEOUT_MS} ms; " +
-                                "falling back to speaker"
+                            "AudioDeviceRouter: Bluetooth-маршрут связи ${target.id} " +
+                                "не подтвержден за ${COMMUNICATION_ROUTE_CONFIRM_TIMEOUT_MS} мс; " +
+                                "откат на встроенный динамик"
                         )
                         awaitSpeakerFallback()
                     }
                 } else {
-                    val confirmation = CompletableDeferred<Unit>()
+                    val alreadyActive = legacyScoConnected && audioManager.isBluetoothScoOn
 
-                    synchronized(routeLock) {
-                        legacyScoConfirmation = confirmation
-                    }
+                    val activated = if (alreadyActive) {
+                        logger.d("AudioDeviceRouter: Legacy Bluetooth SCO уже активен, пропуск повторного старта")
+                        true
+                    } else {
+                        val confirmation = CompletableDeferred<Unit>()
 
-                    val requested = synchronized(routeLock) {
-                        bindBluetoothCommunication(target)
-                    }
+                        synchronized(routeLock) {
+                            legacyScoConfirmation = confirmation
+                        }
 
-                    val activated =
-                        requested &&
-                            awaitLegacyScoActivation(
-                                confirmation,
-                                COMMUNICATION_ROUTE_CONFIRM_TIMEOUT_MS
-                            )
+                        val requested = synchronized(routeLock) {
+                            bindBluetoothCommunication(target)
+                        }
 
-                    synchronized(routeLock) {
-                        legacyScoConfirmation = null
+                        val isConfirmed = requested && awaitLegacyScoActivation(
+                            confirmation,
+                            COMMUNICATION_ROUTE_CONFIRM_TIMEOUT_MS
+                        )
+
+                        synchronized(routeLock) {
+                            legacyScoConfirmation = null
+                        }
+                        isConfirmed
                     }
 
                     if (!activated) {
                         logger.w(
-                            "AudioDeviceRouter: Bluetooth SCO was not confirmed within " +
-                                "${COMMUNICATION_ROUTE_CONFIRM_TIMEOUT_MS} ms; falling back to speaker"
+                            "AudioDeviceRouter: Bluetooth SCO не подтвержден за " +
+                                "${COMMUNICATION_ROUTE_CONFIRM_TIMEOUT_MS} мс; откат на динамик"
                         )
                         synchronized(routeLock) {
                             bindSpeakerCommunication()
@@ -380,11 +422,10 @@ class AudioDeviceRouter @Inject constructor(
 
         if (alreadyActive) return true
 
-        val signaled =
-            withTimeoutOrNull(timeoutMs) {
-                confirmation.await()
-                true
-            } ?: false
+        val signaled = withTimeoutOrNull(timeoutMs) {
+            confirmation.await()
+            true
+        } ?: false
 
         if (!signaled) return false
 
@@ -404,11 +445,10 @@ class AudioDeviceRouter @Inject constructor(
             return true
         }
 
-        val signaled =
-            withTimeoutOrNull(timeoutMs) {
-                confirmation.await()
-                true
-            } ?: false
+        val signaled = withTimeoutOrNull(timeoutMs) {
+            confirmation.await()
+            true
+        } ?: false
 
         return signaled && legacyScoConnected && audioManager.isBluetoothScoOn
     }
@@ -581,17 +621,21 @@ class AudioDeviceRouter @Inject constructor(
             onRouteChangedListener == null ||
             routeStartInProgress
 
+    /**
+     * УСТРАНЕНИЕ ДЕФЕКТОВ 6 и 7: Если поддерживаемые частоты не объявлены Bluetooth-драйвером,
+     * возвращается 0 (AAUDIO_UNSPECIFIED), позволяя аппаратному слою AAudio выбрать оптимальный рейт.
+     */
     private fun selectOptimalBluetoothSampleRate(device: AudioDeviceInfo): Int {
         val supportedRates = device.sampleRates
         if (supportedRates.isEmpty()) {
-            return 24000
+            return 0 // AAUDIO_UNSPECIFIED: нативный драйвер выбирает аппаратную сетку
         }
 
         return supportedRates
             .filter { it in 16000..48000 }
             .minByOrNull { kotlin.math.abs(it - 24000) }
             ?: supportedRates.minByOrNull { kotlin.math.abs(it - 24000) }
-            ?: 24000
+            ?: 0
     }
 
     private fun evaluateActiveRouteInternal() = synchronized(routeLock) {
@@ -607,11 +651,14 @@ class AudioDeviceRouter @Inject constructor(
                 sampleRate = newProfile.sampleRateOut
             )
 
+            // УСТРАНЕНИЕ ДЕФЕКТА 11: Проверка на фактическое изменение отпечатка маршрута перед нотификацией
             if (activeFingerprint != newFingerprint) {
                 activeFingerprint = newFingerprint
                 _currentProfile.value = newProfile
                 logger.d("AudioDeviceRouter: Аппаратный маршрут переключён -> ${newProfile.path} [InId=${newProfile.inputDeviceId}, OutId=${newProfile.outputDeviceId}, Rate=${newProfile.sampleRateOut}Hz, Name='${newProfile.deviceName}']")
                 onRouteChangedListener?.invoke(newProfile)
+            } else {
+                logger.d("AudioDeviceRouter: Отпечаток маршрута не изменился, перезапуск стрима опущен")
             }
         }.onFailure {
             logger.w("AudioDeviceRouter: Ошибка пересчёта маршрута: ${it.message}")
@@ -624,27 +671,15 @@ class AudioDeviceRouter @Inject constructor(
     }
 
     /**
-     * Валидация фактического входного порта, открытого драйвером AAudio.
+     * УСТРАНЕНИЕ ДЕФЕКТА 8: Валидация фактического входного порта без аварийного сброса
+     * из-за внутренних HAL ALSA Device ID на Samsung One UI.
      */
     fun isInputDeviceMatchingRoute(
         profile: RouteProfile,
         actualInputDeviceId: Int
     ): Boolean {
         if (actualInputDeviceId <= 0) {
-            logger.e("AudioDeviceRouter: invalid actual input device ID=$actualInputDeviceId")
-            return false
-        }
-
-        val inputs = runCatching {
-            audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
-        }.getOrElse {
-            logger.e("AudioDeviceRouter: failed to enumerate input devices", it)
-            return false
-        }
-
-        val actualInput = inputs.firstOrNull { it.id == actualInputDeviceId }
-        if (actualInput == null) {
-            logger.e("AudioDeviceRouter: actual input device $actualInputDeviceId is not present in AudioManager")
+            logger.e("AudioDeviceRouter: Невалидный фактический ID входного устройства=$actualInputDeviceId")
             return false
         }
 
@@ -653,29 +688,19 @@ class AudioDeviceRouter @Inject constructor(
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     val communicationDevice = runCatching { audioManager.communicationDevice }.getOrNull()
                     if (communicationDevice == null) {
-                        logger.w("AudioDeviceRouter: Bluetooth capture validation failed: communicationDevice == null")
-                        return false
-                    }
-
-                    if (communicationDevice.id != profile.outputDeviceId) {
-                        logger.w("AudioDeviceRouter: communication sink mismatch: expected=${profile.outputDeviceId}, actual=${communicationDevice.id}")
+                        logger.w("AudioDeviceRouter: Валидация Bluetooth отклонена: communicationDevice == null")
                         return false
                     }
 
                     if (!isBluetoothDeviceType(communicationDevice.type)) {
-                        logger.w("AudioDeviceRouter: communication sink is not Bluetooth")
+                        logger.w("AudioDeviceRouter: Устройство связи не является Bluetooth: тип=${communicationDevice.type}")
                         return false
                     }
 
-                    if (!isBluetoothDeviceType(actualInput.type)) {
-                        logger.e("AudioDeviceRouter: Bluetooth route resolved to non-BT input: id=${actualInput.id}, type=${actualInput.type}")
-                        return false
-                    }
-
-                    if (profile.inputDeviceId > 0 && actualInputDeviceId != profile.inputDeviceId) {
-                        logger.e("AudioDeviceRouter: explicit BT input mismatch: expected=${profile.inputDeviceId}, actual=$actualInputDeviceId")
-                        return false
-                    }
+                    // AudioPolicy управляет маршрутизацией на Android 12+.
+                    // На Samsung One UI actualInputDeviceId является внутренним HAL-портом,
+                    // не совпадающим с номерами из AudioManager.getDevices().
+                    logger.d("AudioDeviceRouter: Bluetooth вход подтверждён AudioPolicy (sinkId=${communicationDevice.id}, halInputId=$actualInputDeviceId)")
                     true
                 } else {
                     val scoActive = synchronized(routeLock) {
@@ -683,31 +708,25 @@ class AudioDeviceRouter @Inject constructor(
                         legacyScoConnected && audioManager.isBluetoothScoOn
                     }
                     if (!scoActive) {
-                        logger.w("AudioDeviceRouter: legacy Bluetooth SCO is not active")
+                        logger.w("AudioDeviceRouter: Legacy Bluetooth SCO не активен")
                         return false
                     }
-
-                    if (actualInput.type != AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
-                        logger.e("AudioDeviceRouter: legacy SCO route resolved to non-SCO input")
-                        return false
-                    }
-
-                    if (profile.inputDeviceId > 0 && actualInputDeviceId != profile.inputDeviceId) {
-                        logger.e("AudioDeviceRouter: legacy SCO input mismatch: expected=${profile.inputDeviceId}, actual=$actualInputDeviceId")
-                        return false
-                    }
+                    logger.d("AudioDeviceRouter: Legacy Bluetooth SCO подтверждён (halInputId=$actualInputDeviceId)")
                     true
                 }
             }
 
             AudioRoutePath.SPEAKER_SHARED -> {
-                if (actualInput.type != AudioDeviceInfo.TYPE_BUILTIN_MIC) {
-                    logger.e("AudioDeviceRouter: SPEAKER_SHARED resolved to non-built-in input: id=${actualInput.id}, type=${actualInput.type}")
+                val inputs = runCatching {
+                    audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
+                }.getOrElse {
+                    logger.e("AudioDeviceRouter: Не удалось перечислить входные аудиоустройства", it)
                     return false
                 }
 
-                if (profile.inputDeviceId > 0 && actualInputDeviceId != profile.inputDeviceId) {
-                    logger.e("AudioDeviceRouter: built-in microphone mismatch: expected=${profile.inputDeviceId}, actual=$actualInputDeviceId")
+                val actualInput = inputs.firstOrNull { it.id == actualInputDeviceId }
+                if (actualInput != null && actualInput.type != AudioDeviceInfo.TYPE_BUILTIN_MIC) {
+                    logger.e("AudioDeviceRouter: SPEAKER_SHARED разрешился в не-встроенный микрофон: id=${actualInput.id}, тип=${actualInput.type}")
                     return false
                 }
                 true
@@ -771,7 +790,7 @@ class AudioDeviceRouter @Inject constructor(
                 vadThresholdStart = 0.40f,
                 vadThresholdEnd = 0.20f,
                 deviceName = btOutputDevice.productName.toString().ifBlank { "Bluetooth communication device" },
-                inputDeviceId = 0, // AudioPolicy автоматически привязывает source к communication sink
+                inputDeviceId = 0, // AudioPolicy автоматически привязывает capture к communication sink
                 outputDeviceId = btOutputDevice.id
             )
         } else {
@@ -806,7 +825,7 @@ class AudioDeviceRouter @Inject constructor(
             )
 
             when {
-                currentIsBt -> return
+                currentIsBt -> return // Уже привязано к Bluetooth: не вызывать лишний IPC
                 candidates.isNotEmpty() -> {
                     val targetDevice = candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
                         ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
