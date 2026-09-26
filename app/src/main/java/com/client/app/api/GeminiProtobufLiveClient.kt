@@ -37,6 +37,20 @@ import javax.net.SocketFactory
 
 private const val GEMINI_INPUT_AUDIO_MIME_TYPE = "audio/pcm;rate=16000"
 
+/**
+ * Структурированная телеметрия качества и потерь аудиоданных сетевого транспорта.
+ * УСТРАНЕНИЕ ДЕФЕКТОВ 119, 120, 121.
+ */
+data class TransportAudioStats(
+    val serverAudioFramesReceived: Long,
+    val serverAudioBytesReceived: Long,
+    val transportAudioDroppedBytes: Long,
+    val transportAudioDroppedFrames: Long,
+    val transportBacklogDropEvents: Long,
+    val outboundMicFramesDelivered: Long,
+    val outboundMicBytesDelivered: Long
+)
+
 @Singleton
 class GeminiProtobufLiveClient @Inject constructor(
     private val audioEngine: NativeAudioEngine,
@@ -49,12 +63,11 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         private const val MAX_QUEUE_BYTES = 256L * 1024L
 
-        // УСТРАНЕНИЕ ДЕФЕКТОВ 61 и 62: Адаптивные пределы пакетизации (RFC 3551 / 3GPP TS 26.114)
         private const val DEFAULT_AUDIO_BATCH_THRESHOLD_BYTES = 640 // 20 мс @ 16 кГц
         private const val MIN_AUDIO_BATCH_THRESHOLD_BYTES = 320     // 10 мс @ 16 кГц (низкий RTT)
         private const val MAX_AUDIO_BATCH_THRESHOLD_BYTES = 1280    // 40 мс @ 16 кГц (высокий RTT)
-        private const val DEFAULT_BATCH_DEADLINE_MS = 20L           // Предельный тайм-аут удержания хвоста
-        private const val AUDIO_FRAME_DEFAULT_TTL_MS = 500L         // RFC 5481 / RFC 3550 Playout TTL
+        private const val DEFAULT_BATCH_DEADLINE_MS = 20L
+        private const val AUDIO_FRAME_DEFAULT_TTL_MS = 500L
 
         private const val AUDIO_PCM_CHANNEL_CAPACITY = 24
         private const val CONTROL_COMMAND_CHANNEL_CAPACITY = 32
@@ -69,7 +82,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         isLenient = true
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 84 и 85: Разделение команд Control Plane от непрерывного Data Plane
     private sealed interface ControlOutboundCommand {
         data object ActivityStart : ControlOutboundCommand
         data object ActivityEnd : ControlOutboundCommand
@@ -84,6 +96,16 @@ class GeminiProtobufLiveClient @Inject constructor(
     @Volatile private var lastOutboundAudioSendMs: Long = 0L
 
     @Volatile private var writerReadySignal: CompletableDeferred<Unit>? = null
+
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 119, 120, 121: Атомарные числовые счетчики баланса консервации фреймов
+    private val totalServerAudioFramesReceived = AtomicLong(0L)
+    private val totalServerAudioBytesReceived = AtomicLong(0L)
+    private val transportAudioDroppedBytes = AtomicLong(0L)
+    private val transportAudioDroppedFrames = AtomicLong(0L)
+    private val transportBacklogDropEvents = AtomicLong(0L)
+
+    private val totalOutboundMicFramesDelivered = AtomicLong(0L)
+    private val totalOutboundMicBytesDelivered = AtomicLong(0L)
 
     private val audioFramePool = ArrayDeque<AudioFrame>(64)
     private val audioFramePoolLock = Any()
@@ -115,6 +137,16 @@ class GeminiProtobufLiveClient @Inject constructor(
             AudioFrame(pcm, sessionId, epoch, generation, frameId, timestampMs, sequenceNumber, timestampNs, ttlMs)
         }
     }
+
+    fun getTransportAudioStats(): TransportAudioStats = TransportAudioStats(
+        serverAudioFramesReceived = totalServerAudioFramesReceived.get(),
+        serverAudioBytesReceived = totalServerAudioBytesReceived.get(),
+        transportAudioDroppedBytes = transportAudioDroppedBytes.get(),
+        transportAudioDroppedFrames = transportAudioDroppedFrames.get(),
+        transportBacklogDropEvents = transportBacklogDropEvents.get(),
+        outboundMicFramesDelivered = totalOutboundMicFramesDelivered.get(),
+        outboundMicBytesDelivered = totalOutboundMicBytesDelivered.get()
+    )
 
     fun updateNetworkRtt(rttMs: Long) {
         if (rttMs <= 0L || rttMs > 2000L) return
@@ -301,11 +333,9 @@ class GeminiProtobufLiveClient @Inject constructor(
     @Volatile
     private var outboundWorkersScope: CoroutineScope? = null
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 84: Физически изолированный канал для PCM-данных (Data Plane)
     @Volatile
     private var audioPcmChannel: Channel<ByteArray>? = null
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 84: Физически изолированный канал для сигналов управления (Control Plane)
     @Volatile
     private var controlCommandChannel: Channel<ControlOutboundCommand>? = null
 
@@ -602,7 +632,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         )
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 84 и 85: Разделение диспетчеризации Data Plane и Control Plane на независимые корутины
     private fun startOutboundWorkers(ws: WebSocket, writerEpoch: Long) {
         stopOutboundWorkers()
 
@@ -656,7 +685,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
         }
 
-        // Воркер 2 (Data Plane): Монопольная высокоприоритетная передача PCM без блокировки командами
+        // Воркер 2 (Data Plane): Монопольная передача PCM с подсчетом сквозного баланса фреймов
         scope.launch {
             try {
                 while (true) {
@@ -689,7 +718,11 @@ class GeminiProtobufLiveClient @Inject constructor(
                         }
                     }
 
-                    if (!sendAccepted) {
+                    if (sendAccepted) {
+                        // УСТРАНЕНИЕ ДЕФЕКТА 120: Сквозная фиксация доставленных в сокет фреймов
+                        totalOutboundMicBytesDelivered.addAndGet(pcmBytes.size.toLong())
+                        totalOutboundMicFramesDelivered.addAndGet(pcmBytes.size / 2L)
+                    } else {
                         logManager.w("WebSocket:AudioWriter", "OkHttp отверг outbound audio frame")
                         if (writerEpoch == epoch && webSocket === ws) {
                             isReady = false
@@ -704,7 +737,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
         }
 
-        // Воркер 3 (Control Plane): Изолированная отправка управляющих сигналов, ответов функций и текста
+        // Воркер 3 (Control Plane): Отправка управляющих сигналов
         scope.launch {
             try {
                 while (true) {
@@ -917,7 +950,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         writerEpoch == epoch && webSocket === ws && controlCommandChannel === channel
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 84: Отправка JSON напрямую в Control Plane без блокировки аудиотракта
     private suspend fun sendOrderedControlJson(
         jsonMessage: String,
         tag: String = "ControlJson"
@@ -1563,10 +1595,15 @@ class GeminiProtobufLiveClient @Inject constructor(
                         val mime = inline?.get("mimeType")?.jsonPrimitive?.contentOrNull.orEmpty()
                         if (mime.startsWith("audio/pcm")) {
                             val pcm = decodedPcmParts.getOrNull(partIndex) ?: return@forEachIndexed
+                            val bytes = pcm.size.toLong()
+
+                            // УСТРАНЕНИЕ ДЕФЕКТА 121: Учет общего числа полученных аудиофреймов модели
+                            totalServerAudioBytesReceived.addAndGet(bytes)
+                            totalServerAudioFramesReceived.addAndGet(bytes / 2L)
+
                             val generation = audioEngine.currentPlaybackGeneration
                             val key = DataBudgetKey(mySessionId, myEpoch)
                             var accepted = false
-                            val bytes = pcm.size.toLong()
                             synchronized(sessionStateLock) {
                                 if (myEpoch == epoch && webSocket === sourceWebSocket) {
                                     val perSession = audioBudgetBySession.computeIfAbsent(key) { AtomicLong(0L) }
@@ -1597,11 +1634,17 @@ class GeminiProtobufLiveClient @Inject constructor(
                                     }
                                 }
                             }
+
                             if (!accepted) {
+                                // УСТРАНЕНИЕ ДЕФЕКТА 119: Числовая фиксация потерь транспорта вместо текстового лога
+                                transportAudioDroppedBytes.addAndGet(bytes)
+                                transportAudioDroppedFrames.addAndGet(bytes / 2L)
+                                val dropEvents = transportBacklogDropEvents.incrementAndGet()
+
                                 val backlog = audioBudgetBySession[key]?.get() ?: 0L
                                 logManager.w(
                                     "GeminiLive:AudioBacklog",
-                                    "Входящий аудиочанк отклонён (backlog=${backlog / 1024} КБ, лимит=${MAX_AI_AUDIO_BACKLOG_BYTES / 1024} КБ)"
+                                    "Входящий аудиочанк отклонён (backlog=${backlog / 1024} КБ, лимит=${MAX_AI_AUDIO_BACKLOG_BYTES / 1024} КБ, droppedBytes=${transportAudioDroppedBytes.get()}, events=$dropEvents)"
                                 )
                             }
                         }
