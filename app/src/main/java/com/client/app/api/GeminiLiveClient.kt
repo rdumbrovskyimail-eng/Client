@@ -1,6 +1,6 @@
-// >>> FILE: app/src/main/java/com/client/app/api/GeminiLiveClient.kt
 package com.client.app.api
 
+import android.os.SystemClock
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.serialization.json.*
@@ -127,7 +127,6 @@ data class ToolResponse(
     val id: String?,
     val response: JsonObject,
     val parts: List<FunctionResponsePart> = emptyList(),
-    // Null means the field must be omitted from the wire message.
     val scheduling: FunctionResponseScheduling? = null,
     val willContinue: Boolean = false
 )
@@ -137,13 +136,14 @@ data class ClientTurn(
     val text: String
 )
 
-// AUD-005.2
+// УСТРАНЕНИЕ ДЕФЕКТА 33: Временная метка для контроля актуальности (Playout Deadline TTL)
 class AudioFrame(
     val pcm: ByteArray,
     val sessionId: Long,
     val epoch: Long,
     val generation: Long,
-    val frameId: Long
+    val frameId: Long,
+    val timestampMs: Long = SystemClock.elapsedRealtime()
 )
 
 data class GeminiEventEnvelope(
@@ -163,16 +163,12 @@ data class TranscriptionSettings(
 
 data class RealtimeInputSettings(
     val aadEnabled: Boolean = true,
-    val startSensitivity: String =
-        "START_SENSITIVITY_HIGH",
-    val endSensitivity: String =
-        "END_SENSITIVITY_LOW",
+    val startSensitivity: String = "START_SENSITIVITY_HIGH",
+    val endSensitivity: String = "END_SENSITIVITY_LOW",
     val prefixPaddingMs: Int = 60,
     val silenceDurationMs: Int = 600,
-    val activityHandling: String =
-        "START_OF_ACTIVITY_INTERRUPTS",
-    val turnCoverage: String =
-        "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
+    val activityHandling: String = "START_OF_ACTIVITY_INTERRUPTS",
+    val turnCoverage: String = "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
 )
 
 data class CompressionSettings(
@@ -181,11 +177,6 @@ data class CompressionSettings(
     val targetTokens: Int = 0
 )
 
-/**
- * Model-specific Live API contract. The model string alone is not enough to
- * safely serialize setup/tool responses because Gemini Live models expose
- * different thinking, tool-scheduling and interaction-lifecycle semantics.
- */
 data class GroundingMetadata(
     val raw: JsonObject
 )
@@ -296,36 +287,23 @@ data class LiveConfig(
     val voiceName: String = "Charon",
     val speechLanguage: String? = null,
     val temperature: Float = 0.5f,
-    val mediaResolution: String =
-        "MEDIA_RESOLUTION_HIGH",
-    val inputTranscription:
-        TranscriptionSettings =
-        TranscriptionSettings(),
-    val outputTranscription:
-        TranscriptionSettings =
-        TranscriptionSettings(),
-    val realtimeInput:
-        RealtimeInputSettings =
-        RealtimeInputSettings(),
-    val compression:
-        CompressionSettings =
-        CompressionSettings(),
-    val sessionResumptionEnabled: Boolean =
-        true,
+    val mediaResolution: String = "MEDIA_RESOLUTION_HIGH",
+    val inputTranscription: TranscriptionSettings = TranscriptionSettings(),
+    val outputTranscription: TranscriptionSettings = TranscriptionSettings(),
+    val realtimeInput: RealtimeInputSettings = RealtimeInputSettings(),
+    val compression: CompressionSettings = CompressionSettings(),
+    val sessionResumptionEnabled: Boolean = true,
     val resumptionHandle: String? = null,
     val thinkingLevel: String? = null,
     val toolsJson: JsonArray? = null,
     val enableGoogleSearch: Boolean = false,
-    val initialHistory: List<ClientTurn> =
-        emptyList()
+    val initialHistory: List<ClientTurn> = emptyList()
 )
 
 @Singleton
 class GeminiLiveClient @Inject constructor(
-    private val protobufClient:
-        GeminiProtobufLiveClient
+    private val protobufClient: GeminiProtobufLiveClient
 ) {
-
     val events: Flow<GeminiEventEnvelope>
         get() = protobufClient.events
 
@@ -347,60 +325,38 @@ class GeminiLiveClient @Inject constructor(
     suspend fun connect(
         cfg: LiveConfig,
         beforeOpen: (suspend () -> Unit)? = null
-    ) =
-        protobufClient.connect(
-            cfg,
-            beforeOpen
-        )
+    ) = protobufClient.connect(cfg, beforeOpen)
 
-    // AUD-067
-    suspend fun sendAudio(
-        pcm: ByteArray
-    ) =
+    suspend fun sendAudio(pcm: ByteArray) =
         protobufClient.sendAudioPcm(pcm)
 
     suspend fun flushAudio() =
         protobufClient.flushAudio()
 
-    suspend fun sendRealtimeText(
-        text: String
-    ) =
+    suspend fun sendRealtimeText(text: String) =
         protobufClient.sendRealtimeText(text)
 
-    suspend fun sendRealtimeImage(
-        jpegBytes: ByteArray
-    ) =
+    suspend fun sendRealtimeImage(jpegBytes: ByteArray) =
         protobufClient.sendRealtimeImage(jpegBytes)
 
-    // AUD-067
     suspend fun sendActivityStart() =
         protobufClient.sendActivityStart()
 
-    // AUD-067
     suspend fun sendActivityEnd() =
         protobufClient.sendActivityEnd()
 
     suspend fun sendClientContent(
         turns: List<ClientTurn>,
         turnComplete: Boolean = true
-    ) =
-        protobufClient.sendClientContent(
-            turns,
-            turnComplete
-        )
+    ) = protobufClient.sendClientContent(turns, turnComplete)
 
-    // AUD-067
     suspend fun sendAudioStreamEnd() =
         protobufClient.sendAudioStreamEnd()
 
     suspend fun sendToolResponses(
         responses: List<ToolResponse>
-    ): Boolean =
-        protobufClient.sendToolResponses(
-            responses
-        )
+    ): Boolean = protobufClient.sendToolResponses(responses)
 
-    // AUD-005.3
     fun invalidateAudio(): Long =
         protobufClient.invalidateAudio()
 
