@@ -136,14 +136,18 @@ data class ClientTurn(
     val text: String
 )
 
-// УСТРАНЕНИЕ ДЕФЕКТА 33: Временная метка для контроля актуальности (Playout Deadline TTL)
+/**
+ * УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Сквозная привязка аппаратного монотонного таймстемпа и sequence-номера
+ */
 class AudioFrame(
     val pcm: ByteArray,
     val sessionId: Long,
     val epoch: Long,
     val generation: Long,
     val frameId: Long,
-    val timestampMs: Long = SystemClock.elapsedRealtime()
+    val timestampMs: Long = SystemClock.elapsedRealtime(),
+    val sequenceNumber: Long = 0L,
+    val timestampNs: Long = SystemClock.elapsedRealtimeNanos()
 )
 
 data class GeminiEventEnvelope(
