@@ -1,4 +1,3 @@
-
 package com.client.app.session
 
 import android.content.Context
@@ -1514,6 +1513,7 @@ class SessionManager @Inject constructor(
         }
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 21, 22: Мгновенная реакция на barge-in без блокировок
     private fun observeBargeIn() = scope.launch {
         audioEngine.bargeInEvents.collect {
             if (!_state.value.isAiSpeaking) return@collect
