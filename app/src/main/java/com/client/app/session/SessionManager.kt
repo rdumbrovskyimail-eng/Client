@@ -202,6 +202,9 @@ class SessionManager @Inject constructor(
 
     private val isManualActivityActive = AtomicBoolean(false)
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 3: Транзакционный барьер текстового хода для предотвращения коллизий с микрофоном
+    private val isTextTurnInProgress = AtomicBoolean(false)
+
     private val activeToolJobs = ConcurrentHashMap<ToolCallKey, Job>()
     private val cancelledToolCallKeys = ConcurrentHashMap.newKeySet<ToolCallKey>()
 
@@ -342,6 +345,7 @@ class SessionManager @Inject constructor(
             audioEngine.invalidateAndFlushPlayback(reason)
         }
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 1 И 3: Использование realtimeInput.text во время активной сессии и транзакционный барьер
     fun sendText(text: String, uris: List<Uri> = emptyList()) = scope.launch {
         commandMutex.withLock {
             userTurnMutex.withLock {
@@ -368,10 +372,14 @@ class SessionManager @Inject constructor(
                     return@withLock
                 }
 
-                client.sendClientContent(
-                    turns = listOf(ClientTurn(role = ClientRole.USER, text = trimmed)),
-                    turnComplete = true
-                )
+                // Транзакционная приостановка передачи микрофона во избежание коллизии аудио и текста
+                isTextTurnInProgress.set(true)
+                try {
+                    client.sendRealtimeText(trimmed)
+                } finally {
+                    delay(300L)
+                    isTextTurnInProgress.set(false)
+                }
             }
         }
     }
@@ -445,6 +453,7 @@ class SessionManager @Inject constructor(
         }
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 1: Передача извлечённого OCR-текста документа через realtimeInput.text
     private suspend fun handleAttachments(text: String, uris: List<Uri>) {
         _state.update { it.copy(isAnalyzing = true, error = null) }
         try {
@@ -498,15 +507,15 @@ class SessionManager @Inject constructor(
                         scope.launch { resolveForvo(a.vocabulary, a.language) }
                     }
                     if (!ensureLive()) return
-                    client.sendClientContent(
-                        turns = listOf(
-                            ClientTurn(
-                                role = ClientRole.USER,
-                                text = a.fullText.take(15000)
-                            )
-                        ),
-                        turnComplete = true
-                    )
+
+                    // Отправка через realtimeInput.text вместо недопустимого во время сессии clientContent
+                    isTextTurnInProgress.set(true)
+                    try {
+                        client.sendRealtimeText(a.fullText.take(15000))
+                    } finally {
+                        delay(300L)
+                        isTextTurnInProgress.set(false)
+                    }
                 }
 
                 is AnalysisResult.Failure -> {
@@ -609,6 +618,7 @@ class SessionManager @Inject constructor(
         }
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 4: Начальная история обязана заканчиваться ходом MODEL
     private fun recentHistory(maxTurns: Int): List<ClientTurn> {
         val raw = _state.value.messages
             .filter { !it.interim && it.text.isNotBlank() }
@@ -625,11 +635,18 @@ class SessionManager @Inject constructor(
         val firstUser = candidates.indexOfFirst { it.role == ClientRole.USER }
         if (firstUser < 0) return emptyList()
 
+        var candidateList = candidates.drop(firstUser)
+        // Отсекаем висящие незавершённые реплики USER, чтобы сервер не начинал говорить сразу при старте
+        while (candidateList.isNotEmpty() && candidateList.last().role == ClientRole.USER) {
+            candidateList = candidateList.dropLast(1)
+        }
+        if (candidateList.isEmpty()) return emptyList()
+
         val maxHistoryChars = (131_072 * 3).coerceAtMost(240_000)
         val out = ArrayDeque<ClientTurn>()
         var chars = 0
 
-        for (turn in candidates.drop(firstUser).asReversed()) {
+        for (turn in candidateList.asReversed()) {
             val cost = turn.text.length
             if (out.isNotEmpty() && chars + cost > maxHistoryChars) break
             if (out.isEmpty() && cost > maxHistoryChars) {
@@ -665,6 +682,7 @@ class SessionManager @Inject constructor(
         pendingGoAway = false
         resetTranscriptRuntime()
         isManualActivityActive.set(false)
+        isTextTurnInProgress.set(false)
 
         val prefs = dataStore.data.first()
         val encryptedApiKey = prefs[KEY_API]?.trim().orEmpty()
@@ -974,6 +992,7 @@ class SessionManager @Inject constructor(
             }
 
             isManualActivityActive.set(false)
+            isTextTurnInProgress.set(false)
 
             if (full) {
                 reconnectAttempts = 0
@@ -1257,7 +1276,7 @@ class SessionManager @Inject constructor(
         micAudioJob?.cancel()
         micControlJob?.cancel()
 
-        // 1. Data Plane: Передача PCM сэмплов без задержек в общей очереди
+        // Data Plane: передача PCM-сэмплов с шлюзованием во время текстового хода
         micAudioJob = scope.launch {
             try {
                 for (audio in audioEngine.micAudioOutput) {
@@ -1265,6 +1284,7 @@ class SessionManager @Inject constructor(
                     try {
                         if (
                             !forvoPlayer.isPlaying.value &&
+                            !isTextTurnInProgress.get() &&
                             (currentAadEnabled || isManualActivityActive.get()) &&
                             connectionDesired &&
                             client.isReady
@@ -1283,7 +1303,7 @@ class SessionManager @Inject constructor(
             }
         }
 
-        // 2. Control Plane: События VAD и жизненного цикла
+        // Control Plane: гарантированная отправка activityStart без гонок CAS
         micControlJob = scope.launch {
             try {
                 for (control in audioEngine.micControlOutput) {
@@ -1291,20 +1311,17 @@ class SessionManager @Inject constructor(
                     when (control) {
                         is AudioStreamControlEvent.SpeechStart -> {
                             if (!currentAadEnabled && client.isReady) {
-                                if (isManualActivityActive.compareAndSet(false, true)) {
-                                    logger.d("SessionManager: VAD SpeechStart -> sendActivityStart")
-                                    client.sendActivityStart()
-                                }
+                                isManualActivityActive.set(true)
+                                logger.d("SessionManager: VAD SpeechStart -> sendActivityStart")
+                                client.sendActivityStart()
                             }
                         }
 
                         is AudioStreamControlEvent.SpeechEnd -> {
                             if (currentAadEnabled && client.isReady) {
                                 client.flushAudio()
-                            } else if (!currentAadEnabled &&
-                                isManualActivityActive.compareAndSet(true, false) &&
-                                client.isReady
-                            ) {
+                            } else if (!currentAadEnabled && client.isReady) {
+                                isManualActivityActive.set(false)
                                 withTimeoutOrNull(500L) {
                                     client.sendActivityEnd()
                                 } ?: logger.w("SessionManager: SpeechEnd activityEnd timed out")
@@ -1776,7 +1793,7 @@ class SessionManager @Inject constructor(
 
                                         if (resumeRejected) {
                                             logger.w(
-                                                "SessionManager: Сервер отклонил сессионный токен (${event.code}). Сбрасываем хэндл и переключаемся на чистую сессию."
+                                                "SessionManager: Сервер отклонил токен resumption (${event.code}). Сброс кэша и перезапуск чистой сессии."
                                             )
                                             resumptionHandle = null
                                             activeConnectUsedResumption = false
@@ -1823,7 +1840,7 @@ class SessionManager @Inject constructor(
                                             scheduleReconnect(
                                                 reason =
                                                     if (resumeRejected) {
-                                                        "resumption отклонён сервером (код ${event.code}), запуск чистой сессии"
+                                                        "resumption отклонён сервером (${event.code}), запуск чистой сессии"
                                                     } else {
                                                         "код ${event.code}"
                                                     },
@@ -1835,10 +1852,8 @@ class SessionManager @Inject constructor(
                                     }
 
                                     is GeminiEvent.Connected -> Unit
-
                                     is GeminiEvent.GroundingMetadata,
                                     is GeminiEvent.UrlContextMetadata -> Unit
-
                                     else -> Unit
                                 }
                             }
