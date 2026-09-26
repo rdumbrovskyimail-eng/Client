@@ -30,8 +30,16 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.sqrt
 
+/**
+ * УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Передача сквозного sequence-номера и монотонного таймстемпа АЦП
+ */
 sealed interface AudioStreamEvent {
-    class Audio(val pcm: ByteArray) : AudioStreamEvent
+    class Audio(
+        val pcm: ByteArray,
+        val sequenceNumber: Long = 0L,
+        val captureTimestampNs: Long = 0L
+    ) : AudioStreamEvent
+
     data object SpeechStart : AudioStreamEvent
     data object SpeechEnd : AudioStreamEvent
     data object StreamStop : AudioStreamEvent
@@ -46,6 +54,17 @@ sealed interface AudioFocusEvent {
     data object LossPermanent : AudioFocusEvent
     data object LossTransient : AudioFocusEvent
     data object Gain : AudioFocusEvent
+}
+
+/**
+ * УСТРАНЕНИЕ ДЕФЕКТА 45: Строгий детерминированный конечный автомат движка в JVM
+ */
+enum class AudioEngineState {
+    IDLE,
+    STARTING,
+    RUNNING,
+    RECOVERING,
+    STOPPING
 }
 
 private data class RouteTransitionRequest(
@@ -77,6 +96,10 @@ class NativeAudioEngine @Inject constructor(
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var focusRequest: AudioFocusRequest? = null
+
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 45 и 46: Консолидация жизненного цикла в единый FSM StateFlow
+    private val _engineState = MutableStateFlow(AudioEngineState.IDLE)
+    val engineState: StateFlow<AudioEngineState> = _engineState.asStateFlow()
 
     private val _isCapturing = MutableStateFlow(false)
     val isCapturing: StateFlow<Boolean> = _isCapturing.asStateFlow()
@@ -134,9 +157,6 @@ class NativeAudioEngine @Inject constructor(
     private val captureEventLock = Any()
     private val captureDirectMutex = Mutex()
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 37 и 38: playbackOperationLock полностью ликвидирован,
-    // исключая инверсию блокировок (Deadlock) с captureDirectMutex и C++ lifecycleMutex_.
-
     private val routeTransitionChannel = Channel<RouteTransitionRequest>(Channel.CONFLATED)
 
     private val engineGeneration = AtomicLong(0)
@@ -145,6 +165,9 @@ class NativeAudioEngine @Inject constructor(
 
     private val playbackDesired = AtomicBoolean(false)
     private val captureDesired = AtomicBoolean(false)
+
+    // Буфер для извлечения ошибок из C++ ядра без аллокаций
+    private val errorMetadataBuffer = LongArray(4)
 
     val currentPlaybackGeneration: Long
         get() = playbackGeneration.get()
@@ -277,8 +300,11 @@ class NativeAudioEngine @Inject constructor(
                     return@withContext true
                 }
 
+                _engineState.value = AudioEngineState.STARTING
+
                 if (!requestAudioFocus()) {
                     playbackDesired.set(false)
+                    _engineState.value = AudioEngineState.IDLE
                     logger.e("NativeAudioEngine: Сбой запроса AudioFocus")
                     return@withContext false
                 }
@@ -296,6 +322,7 @@ class NativeAudioEngine @Inject constructor(
                 } catch (t: Throwable) {
                     logger.e("NativeAudioEngine: AudioDeviceRouter startup failed", t)
                     abandonAudioFocus()
+                    _engineState.value = AudioEngineState.IDLE
                     return@withContext false
                 }
 
@@ -314,6 +341,7 @@ class NativeAudioEngine @Inject constructor(
                     logger.e("NativeAudioEngine: Сбой инициализации playback route")
                     router.stop()
                     abandonAudioFocus()
+                    _engineState.value = AudioEngineState.IDLE
                     return@withContext false
                 }
 
@@ -340,11 +368,13 @@ class NativeAudioEngine @Inject constructor(
                     }
                     router.stop()
                     abandonAudioFocus()
+                    _engineState.value = AudioEngineState.IDLE
                     return@withContext false
                 }
 
                 _isPlaying.value = true
                 playbackDesired.set(true)
+                _engineState.value = AudioEngineState.RUNNING
                 startLoops()
                 true
             }
@@ -482,6 +512,7 @@ class NativeAudioEngine @Inject constructor(
 
                 _isCapturing.value = true
                 captureDesired.set(true)
+                _engineState.value = AudioEngineState.RUNNING
                 synchronized(captureEventLock) {
                     captureInstanceId.incrementAndGet()
                 }
@@ -489,6 +520,109 @@ class NativeAudioEngine @Inject constructor(
                 true
             }
         }
+
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 44: Изолированное восстановление микрофона без сброса ЦАП
+    private suspend fun recoverCaptureStreamIsolated() {
+        audioLifecycleMutex.withLock {
+            withContext(Dispatchers.IO) {
+                if (!captureDesired.get()) return@withContext
+                logger.w("NativeAudioEngine: Performing targeted capture stream recovery")
+
+                _engineState.value = AudioEngineState.RECOVERING
+                _isCapturing.value = false
+
+                synchronized(captureEventLock) {
+                    captureInstanceId.incrementAndGet()
+                }
+
+                val oldJob = captureJob
+                oldJob?.cancel()
+                if (oldJob != null) {
+                    withTimeoutOrNull(500L) { oldJob.join() }
+                }
+                captureJob = null
+
+                val recovered = captureDirectMutex.withLock {
+                    bridge.restartCaptureStream()
+                }
+
+                if (recovered) {
+                    _isCapturing.value = true
+                    _engineState.value = AudioEngineState.RUNNING
+                    synchronized(captureEventLock) {
+                        captureInstanceId.incrementAndGet()
+                    }
+                    startLoops()
+                    logger.i("NativeAudioEngine: Targeted capture recovery completed successfully")
+                } else {
+                    logger.e("NativeAudioEngine: Targeted capture recovery failed, falling back to full route recovery")
+                    applyRouteInternal(RouteTransitionRequest(router.currentProfile.value, engineGeneration.get()))
+                }
+            }
+        }
+    }
+
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 44: Изолированное восстановление воспроизведения без сброса АЦП
+    private suspend fun recoverPlaybackStreamIsolated() {
+        audioLifecycleMutex.withLock {
+            withContext(Dispatchers.IO) {
+                if (!playbackDesired.get()) return@withContext
+                logger.w("NativeAudioEngine: Performing targeted playback stream recovery")
+
+                _engineState.value = AudioEngineState.RECOVERING
+                _isPlaying.value = false
+
+                invalidateAndFlushPlayback("playback stream recovery")
+
+                val recovered = captureDirectMutex.withLock {
+                    bridge.restartPlaybackStream()
+                }
+
+                if (recovered) {
+                    _isPlaying.value = true
+                    _engineState.value = AudioEngineState.RUNNING
+                    logger.i("NativeAudioEngine: Targeted playback recovery completed successfully")
+                } else {
+                    logger.e("NativeAudioEngine: Targeted playback recovery failed, falling back to full route recovery")
+                    applyRouteInternal(RouteTransitionRequest(router.currentProfile.value, engineGeneration.get()))
+                }
+            }
+        }
+    }
+
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 41, 42, 43: Реактивная обработка ошибок AAudio без ожидания 100 мс
+    private suspend fun drainAndDispatchNativeErrors() {
+        while (bridge.hasPendingError()) {
+            val hasEvent = synchronized(errorMetadataBuffer) {
+                bridge.pollAudioError(errorMetadataBuffer)
+            }
+            if (!hasEvent) break
+
+            val direction = errorMetadataBuffer[0].toInt()
+            val errorCode = errorMetadataBuffer[1].toInt()
+            val faultType = errorMetadataBuffer[2].toInt()
+            val timestampNs = errorMetadataBuffer[3]
+
+            logger.w("NativeAudioEngine: Dispatching native audio error: dir=$direction, code=$errorCode, faultType=$faultType, ts=$timestampNs")
+
+            when (faultType) {
+                1 -> {
+                    // Soft timeout / xrun: не разрушаем стрим, логируем инцидент
+                    logger.w("NativeAudioEngine: Soft audio fault handled (XRun/timeout)")
+                }
+                2, 3 -> {
+                    // Hard disconnect / system error: точечный перезапуск
+                    if (direction == 1) {
+                        recoverCaptureStreamIsolated()
+                    } else if (direction == 2) {
+                        recoverPlaybackStreamIsolated()
+                    } else {
+                        applyRouteInternal(RouteTransitionRequest(router.currentProfile.value, engineGeneration.get()))
+                    }
+                }
+            }
+        }
+    }
 
     private fun calculatePcm16Rms(pcm: ByteArray, bytesCount: Int): Float {
         val sampleCount = bytesCount / 2
@@ -516,6 +650,11 @@ class NativeAudioEngine @Inject constructor(
 
                 try {
                     while (isActive && _isCapturing.value && captureDesired.get() && captureInstanceId.get() == instanceId) {
+                        // Реактивная проверка аппаратных сбоев на каждом шаге цикла
+                        if (bridge.hasPendingError()) {
+                            drainAndDispatchNativeErrors()
+                        }
+
                         captureDirectBuffer.clear()
 
                         val bytesRead = captureDirectMutex.withLock {
@@ -530,6 +669,10 @@ class NativeAudioEngine @Inject constructor(
                             if (captureInstanceId.get() != instanceId || !captureDesired.get() || !_isCapturing.value) {
                                 continue
                             }
+
+                            // УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Снятие аппаратного таймстемпа и sequence number
+                            val seqNum = bridge.getCaptureSequenceNumber()
+                            val captureTimestampNs = bridge.getCaptureTimestampNs()
 
                             val frame = obtainBuffer()
                             captureDirectBuffer.position(0)
@@ -619,12 +762,12 @@ class NativeAudioEngine @Inject constructor(
                                         }
                                     }
                                     for (pf in preRoll) {
-                                        sendMicEvent(AudioStreamEvent.Audio(pf), instanceId)
+                                        sendMicEvent(AudioStreamEvent.Audio(pf, seqNum, captureTimestampNs), instanceId)
                                     }
                                 }
 
                                 if (isBargeInActive || !isAiRendering) {
-                                    sendMicEvent(AudioStreamEvent.Audio(currentAudioBytes), instanceId)
+                                    sendMicEvent(AudioStreamEvent.Audio(currentAudioBytes, seqNum, captureTimestampNs), instanceId)
                                 } else {
                                     synchronized(poolLock) {
                                         leadInBuffer.addLast(currentAudioBytes)
@@ -649,12 +792,12 @@ class NativeAudioEngine @Inject constructor(
 
                                     sendMicEvent(AudioStreamEvent.SpeechStart, instanceId)
                                     for (pf in preRoll) {
-                                        sendMicEvent(AudioStreamEvent.Audio(pf), instanceId)
+                                        sendMicEvent(AudioStreamEvent.Audio(pf, seqNum, captureTimestampNs), instanceId)
                                     }
-                                    sendMicEvent(AudioStreamEvent.Audio(currentAudioBytes), instanceId)
+                                    sendMicEvent(AudioStreamEvent.Audio(currentAudioBytes, seqNum, captureTimestampNs), instanceId)
                                     isSpeechActiveManual = true
                                 } else if (isSpeechActiveManual) {
-                                    sendMicEvent(AudioStreamEvent.Audio(currentAudioBytes), instanceId)
+                                    sendMicEvent(AudioStreamEvent.Audio(currentAudioBytes, seqNum, captureTimestampNs), instanceId)
                                 } else {
                                     synchronized(poolLock) {
                                         leadInBuffer.addLast(currentAudioBytes)
@@ -714,6 +857,7 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 
+        // УСТРАНЕНИЕ ДЕФЕКТА 42: Быстрый реактивный опрос без задержки 100 мс
         if (_isPlaying.value && healthJob?.isActive != true) {
             healthJob = engineScope.launch {
                 while (isActive && (playbackDesired.get() || captureDesired.get())) {
@@ -721,18 +865,15 @@ class NativeAudioEngine @Inject constructor(
                         if (!vadDetector.isNeuralActive) {
                             vadDetector.prepare()
                         }
-                        if (bridge.isAudioDisconnected()) {
-                            logger.w("NativeAudioEngine: AAudio health fault detected; restarting active streams")
-                            applyRouteInternal(
-                                RouteTransitionRequest(router.currentProfile.value, engineGeneration.get())
-                            )
+                        if (bridge.hasPendingError() || bridge.isAudioDisconnected()) {
+                            drainAndDispatchNativeErrors()
                         }
                     } catch (t: Throwable) {
                         if (t !is CancellationException) {
-                            logger.e("NativeAudioEngine: audio recovery attempt failed", t)
+                            logger.e("NativeAudioEngine: audio recovery check failed", t)
                         }
                     }
-                    delay(100)
+                    delay(25) // Снижено со 100 мс до 25 мс для быстрой реакции
                 }
             }
         }
@@ -748,6 +889,8 @@ class NativeAudioEngine @Inject constructor(
             val keepPlaying = playbackDesired.get()
             val keepCapturing = captureDesired.get()
             if (!keepPlaying && !keepCapturing) return@withContext
+
+            _engineState.value = AudioEngineState.RECOVERING
 
             if (keepCapturing) {
                 _isCapturing.value = false
@@ -811,6 +954,7 @@ class NativeAudioEngine @Inject constructor(
             if (!routeInited || (!playbackRecovered && keepPlaying)) {
                 _isPlaying.value = false
                 _isCapturing.value = false
+                _engineState.value = AudioEngineState.IDLE
                 logger.e("NativeAudioEngine: route recovery playback initialization failed")
                 return@withContext
             }
@@ -830,9 +974,11 @@ class NativeAudioEngine @Inject constructor(
                 synchronized(captureEventLock) {
                     captureInstanceId.incrementAndGet()
                 }
+                _engineState.value = AudioEngineState.RUNNING
                 startLoops()
             } else if (keepCapturing) {
                 captureDesired.set(false)
+                _engineState.value = if (playbackRecovered && keepPlaying) AudioEngineState.RUNNING else AudioEngineState.IDLE
                 logger.e("NativeAudioEngine: capture route recovery rejected by verifier")
             }
         }
@@ -907,6 +1053,10 @@ class NativeAudioEngine @Inject constructor(
                         shutdownStatus = CaptureShutdownResult.FORCED_TIMEOUT
                     }
 
+                    if (!_isPlaying.value) {
+                        _engineState.value = AudioEngineState.IDLE
+                    }
+
                     return@withContext shutdownStatus
                 }
             }
@@ -916,6 +1066,7 @@ class NativeAudioEngine @Inject constructor(
         withContext(NonCancellable) {
             audioLifecycleMutex.withLock {
                 withContext(Dispatchers.IO) {
+                    _engineState.value = AudioEngineState.STOPPING
                     captureDesired.set(false)
                     playbackDesired.set(false)
                     _isCapturing.value = false
@@ -983,6 +1134,8 @@ class NativeAudioEngine @Inject constructor(
                     drainMicOutput()
 
                     while (routeTransitionChannel.tryReceive().isSuccess) {}
+
+                    _engineState.value = AudioEngineState.IDLE
                 }
             }
         }
@@ -1055,7 +1208,6 @@ class NativeAudioEngine @Inject constructor(
     fun setMicGain(gain: Float) =
         bridge.setMicGain(gain.coerceIn(0.5f, 2.0f))
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 37 и 38: Быстрый атомарный сброс без захвата playbackOperationLock
     fun invalidateAndFlushPlayback(reason: String = ""): Long {
         val next = playbackGeneration.incrementAndGet().let { if (it <= 0L) 1L else it }
         bridge.flushPlayback(next)
