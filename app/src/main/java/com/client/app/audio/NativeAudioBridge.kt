@@ -21,7 +21,6 @@ class NativeAudioBridge @Inject constructor() {
         outputDeviceId: Int = 0
     ): Boolean
 
-    /** Legacy all-duplex start; new lifecycle code uses explicit methods. */
     external fun startAudio(): Boolean
     external fun startPlaybackAudio(): Boolean
     external fun startCaptureAudio(): Boolean
@@ -38,7 +37,6 @@ class NativeAudioBridge @Inject constructor() {
     external fun getActiveInputDeviceId(): Int
     external fun getActiveOutputDeviceId(): Int
     external fun getPendingPlaybackFrames(): Long
-    external fun getNativeAudioState(): Int
 
     /** Мгновенный атомарный RMS ЦАП (без задержек UI-рендеринга) для Geigel DTD */
     external fun getOutRms(): Float
@@ -51,7 +49,7 @@ class NativeAudioBridge @Inject constructor() {
     external fun setVolume(volume: Float)
     external fun setMicGain(gain: Float)
 
-    // AUD-005.6: generation строго обязателен
+    // AUD-005.6: generation строго обязателен для отсечения устаревших чанков
     external fun writePlaybackByteArray(
         pcmArray: ByteArray,
         offsetBytes: Int,
