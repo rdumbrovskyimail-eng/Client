@@ -22,7 +22,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * УСТРАНЕНИЕ ДЕФЕКТА 102:
+ * УСТРАНЕНИЕ ДЕФЕКТОВ 102, 103:
  * Дифференцированные аппаратные пути связи:
  * - SPEAKER_SHARED: встроенный громкоговоритель (48 кГц, нулевая задержка радиоканала).
  * - BLUETOOTH_SCO: Classic Bluetooth BR/EDR (HFP 1.8 mSBC 16 кГц, задержка 40–80 мс).
@@ -100,10 +100,10 @@ data class DeviceQuirks(
         val CMF_BUDS_2 = DeviceQuirks(
             deviceModel = "CMF Buds 2 (Bestechnic BES2600)",
             encLatencyMs = 35, // Алгоритмическая задержка двухмикрофонного фильтра Clear Voice ENC
-            acousticErleRatio = 0.60f, // Повышенное подавление эха из-за близости микрофонов
+            acousticErleRatio = 0.60f,
             echoThreshold = 0.035f,
             bargeInRequiredStreak = 3,
-            micGainCompensation = 1.15f, // Компенсация затухания тихих согласных в шумоподавителе
+            micGainCompensation = 1.15f,
             preferredSampleRate = 16000
         )
     }
@@ -128,7 +128,8 @@ object DeviceProfileRegistry {
 }
 
 /**
- * Очищенный от сторонней бизнес-логики DTO топологии звукового маршрута.
+ * УСТРАНЕНИЕ ДЕФЕКТОВ 96, 97, 98:
+ * Очищенный от сторонней бизнес-логики DTO топологии звукового маршрута (Single Responsibility).
  */
 data class RouteProfile(
     val path: AudioRoutePath,
@@ -230,6 +231,7 @@ class AudioDeviceRouter @Inject constructor(
 
     @Volatile private var activeFingerprint: RouteFingerprint? = null
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 10, 93: Фильтрация посторонней периферии
     private fun isRelevantAudioDevice(device: AudioDeviceInfo): Boolean {
         return when (device.type) {
             AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
@@ -656,7 +658,7 @@ class AudioDeviceRouter @Inject constructor(
         else if (device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) score += 50
 
         if (isTargetHeadset) score += 40
-        if (isWatch) score -= 80 // Понижаем приоритет смарт-часов при наличии гарнитуры
+        if (isWatch) score -= 80
 
         return score
     }
@@ -825,6 +827,7 @@ class AudioDeviceRouter @Inject constructor(
             type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 8, 13: Проверка коммуникационного узла без жесткого ID на One UI
     fun isInputDeviceMatchingRoute(
         profile: RouteProfile,
         actualInputDeviceId: Int
