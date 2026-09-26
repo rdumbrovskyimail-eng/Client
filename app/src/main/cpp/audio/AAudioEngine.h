@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <queue>
+#include <array>
 #include "AudioConstants.h"
 #include "LockFreeRingBuffer.h"
 #include "PolyphaseResampler.h"
@@ -23,7 +24,7 @@ constexpr size_t EARCON_SCRATCH_MAX_FRAMES = 2048;
 constexpr size_t CAPTURE_RAW_SCRATCH_FRAMES = 2048;
 
 /**
- * УСТРАНЕНИЕ ДЕФЕКТА 45: Строгий детерминированный конечный автомат движка.
+ * Строгий конечный автомат жизненного цикла движка.
  */
 enum class EngineState : int32_t {
     IDLE = 0,
@@ -34,20 +35,66 @@ enum class EngineState : int32_t {
 };
 
 /**
- * УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 43: Таксономия аппаратных сбоев и событий.
+ * Таксономия аппаратных сбоев AAudio.
  */
 enum class StreamFaultType : int32_t {
     NONE = 0,
     SOFT_TIMEOUT = 1,
     HARD_DISCONNECTED = 2,
-    SYSTEM_ERROR = 3
+    INVALID_STATE = 3,
+    SYSTEM_ERROR = 4
 };
 
+/**
+ * Структурированное событие аппаратного сбоя.
+ */
 struct StreamErrorEvent {
     int32_t direction{0}; // 1 = Input (Capture), 2 = Output (Playback)
     int32_t errorCode{0}; // Код AAUDIO_ERROR_*
     StreamFaultType faultType{StreamFaultType::NONE};
     uint64_t timestampNs{0};
+};
+
+/**
+ * Разделение физических возможностей оборудования (Capabilities)
+ * и применённой действующей конфигурации дескриптора (Active Configuration).
+ */
+struct HardwareAudioCapabilities {
+    bool supports16k{false};
+    bool supports24k{false};
+    bool supports32k{false};
+    bool supports48k{false};
+    int32_t minBurstFrames{0};
+    int32_t maxBurstFrames{0};
+};
+
+struct HardwareAudioActiveConfig {
+    int32_t sampleRate{0};
+    int32_t channelCount{0};
+    int32_t format{0};
+    int32_t burstFrames{0};
+    int32_t bufferSizeFrames{0};
+    int32_t bufferCapacityFrames{0};
+    int32_t deviceId{0};
+    bool isMmap{false};
+    bool isExclusive{false};
+};
+
+/**
+ * Сквозная телеметрия баланса фреймов и качества тракта (E2E Accounting).
+ */
+struct AudioPipelineDiagnostics {
+    uint64_t totalHardwareCapturedFrames{0};
+    uint64_t totalDspProcessedFrames{0};
+    uint64_t captureDroppedFrames{0};
+    uint64_t totalHardwarePlaybackFrames{0};
+    uint64_t playbackUnderrunFrames{0};
+    uint64_t playbackUnderrunCount{0};
+    uint64_t playbackDroppedFrames{0};
+    uint32_t streamDisconnectCount{0};
+    uint32_t captureErrorCount{0};
+    uint32_t playbackErrorCount{0};
+    int32_t lastXRunCount{0};
 };
 
 struct Biquad {
@@ -98,20 +145,19 @@ public:
 
     bool startPlayback();
 
-    // Трёхфазный барьер захвата
+    // Трёхфазный барьер безопасного старта микрофона
     bool startCapture();
     bool activateCaptureDsp();
     bool commitCaptureAdmission();
     void stopCapture();
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 44: Изолированный целевой перезапуск конкретных стримов
+    // Изолированный целевой перезапуск конкретных стримов
     bool restartCaptureStream();
     bool restartPlaybackStream();
 
     size_t writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation);
     size_t readCapturePcm(int16_t* pcm, size_t maxFrames);
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 21 и 22: Мгновенный неблокирующий сброс без остановки ЦАП
     void flushPlayback(uint64_t generation);
     void triggerBargeInEarcon();
     void resetEarcon();
@@ -121,10 +167,10 @@ public:
 
     float getMicRms() const { return micRms_.load(std::memory_order_relaxed); }
     float getOutRms() const { return outRms_.load(std::memory_order_relaxed); }
+    float getMicNoiseFloorRms() const { return micNoiseFloorRms_.load(std::memory_order_relaxed); }
     bool isMmapActive() const { return isMmapActive_.load(std::memory_order_relaxed); }
     bool isExclusiveSharingActive() const { return isExclusiveSharingActive_.load(std::memory_order_relaxed); }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 46: Состояние вычисляется непосредственно из инвариантов FSM
     bool isRunning() const {
         return engineState_.load(std::memory_order_acquire) == EngineState::RUNNING;
     }
@@ -136,13 +182,12 @@ public:
         return engineState_.load(std::memory_order_acquire);
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 42: Реактивное извлечение событий аппаратных сбоев
     bool pollErrorEvent(StreamErrorEvent& outEvent);
     bool hasPendingError() const {
         return errorEventPending_.load(std::memory_order_acquire);
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Метрология аппаратных таймстемпов и номеров пакетов
+    // Метрология аппаратных таймстемпов и последовательности
     uint64_t getCaptureSequenceNumber() const {
         return captureSequenceNumber_.load(std::memory_order_relaxed);
     }
@@ -181,13 +226,40 @@ public:
         return actualOutputDeviceId_.load(std::memory_order_relaxed);
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 126, 127, 128: Раздельные очереди и физическая задержка в миллисекундах
+    size_t getPendingPlaybackInputFrames() const;
+    size_t getPendingPlaybackOutputFrames() const;
     size_t getPendingPlaybackFrames() const;
+    float getPendingPlaybackDurationMs() const;
+    float getTotalEstimatedPlaybackLatencyMs() const;
 
+    // Метрики потерь и качества звукового тракта
     uint64_t getCaptureDroppedFrames() const {
         return captureDroppedFrames_.load(std::memory_order_relaxed);
     }
+    uint64_t getPlaybackUnderrunFrames() const {
+        return playbackUnderrunFrames_.load(std::memory_order_relaxed);
+    }
+    uint64_t getPlaybackUnderrunCount() const {
+        return playbackUnderrunCount_.load(std::memory_order_relaxed);
+    }
+    uint64_t getPlaybackDroppedFrames() const {
+        return playbackDroppedFrames_.load(std::memory_order_relaxed);
+    }
+    uint32_t getStreamDisconnectCount() const {
+        return streamDisconnectCount_.load(std::memory_order_relaxed);
+    }
+    int32_t getLastXRunCount() const {
+        return lastXRunCount_.load(std::memory_order_relaxed);
+    }
+
+    void getAudioDiagnostics(AudioPipelineDiagnostics& outDiagnostics);
+    void getErrorHistogram(uint32_t* outArray, size_t arraySize);
 
     void getSpectrumData(dsp::SpectrumSnapshot& outSnapshot);
+
+    // УСТРАНЕНИЕ ДЕФЕКТА 125: Управление состоянием активности воспроизведения фразы
+    void setPlaybackActiveState(bool isActive);
 
 private:
     AAudioEngine();
@@ -236,6 +308,8 @@ private:
         aaudio_result_t error);
 
     void pushErrorEvent(int32_t direction, aaudio_result_t errorCode);
+    StreamFaultType classifyAaudioError(aaudio_result_t errorCode);
+    void recordErrorHistogram(aaudio_result_t errorCode);
 
     AAudioStream* captureStream_{nullptr};
     AAudioStream* playbackStream_{nullptr};
@@ -251,7 +325,6 @@ private:
 
     std::mutex lifecycleMutex_;
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 45 и 46: Консолидация жизненного цикла в конечный автомат FSM
     alignas(64) std::atomic<EngineState> engineState_{EngineState::IDLE};
     std::atomic<bool> isBluetoothMode_{false};
     std::atomic<bool> isMmapActive_{false};
@@ -263,13 +336,13 @@ private:
     std::queue<StreamErrorEvent> errorEventQueue_;
     std::atomic<bool> errorEventPending_{false};
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Аппаратные счетчики последовательности и таймстемпы
+    // Метрология аппаратных счетчиков последовательности и таймстемпов
     alignas(64) std::atomic<uint64_t> captureSequenceNumber_{0};
     alignas(64) std::atomic<uint64_t> lastCaptureTimestampNs_{0};
     alignas(64) std::atomic<uint64_t> playbackSequenceNumber_{0};
     alignas(64) std::atomic<uint64_t> lastPlaybackPresentationTimestampNs_{0};
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 64 и 65: Адаптивный джиттер-буфер (AJB) и контроллер скорости воспроизведения (TSM)
+    // Адаптивный джиттер-буфер (AJB) и контроллер скорости вывода (TSM)
     alignas(64) std::atomic<size_t> playbackTargetBufferMs_{PLAYBACK_TARGET_BUFFER_MS};
     alignas(64) std::atomic<uint64_t> lastPlaybackWriteNs_{0};
     alignas(64) std::atomic<int64_t> interArrivalJitterNs_{0};
@@ -296,7 +369,29 @@ private:
     std::atomic<float> micRms_{0.0f};
     std::atomic<float> outRms_{0.0f};
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 140: Потоковый статистический оценщик минимального фонового шума
+    alignas(64) std::atomic<float> micNoiseFloorRms_{0.015f};
+
+    // УСТРАНЕНИЕ ДЕФЕКТА 125: Различение штатного DRAIN и аварийного UNDERRUN
+    std::atomic<bool> isPlaybackRenderingActive_{false};
+
+    // Сквозные счетчики потерь данных (E2E Loss & Glitch Tracking)
+    alignas(64) std::atomic<uint64_t> totalHardwareCapturedFrames_{0};
+    alignas(64) std::atomic<uint64_t> totalDspProcessedFrames_{0};
     alignas(64) std::atomic<uint64_t> captureDroppedFrames_{0};
+
+    alignas(64) std::atomic<uint64_t> totalHardwarePlaybackFrames_{0};
+    alignas(64) std::atomic<uint64_t> playbackUnderrunFrames_{0};
+    alignas(64) std::atomic<uint64_t> playbackUnderrunCount_{0};
+    alignas(64) std::atomic<uint64_t> playbackDroppedFrames_{0};
+
+    alignas(64) std::atomic<uint32_t> streamDisconnectCount_{0};
+    alignas(64) std::atomic<uint32_t> captureErrorCount_{0};
+    alignas(64) std::atomic<uint32_t> playbackErrorCount_{0};
+    alignas(64) std::atomic<int32_t> lastXRunCount_{0};
+
+    // Гистограмма кодов ошибок (RFC 7004)
+    alignas(64) std::array<std::atomic<uint32_t>, ERROR_HISTOGRAM_BUCKETS> errorHistogram_{};
 
     std::thread playbackDspThread_;
     std::atomic<bool> playbackDspRunning_{false};
