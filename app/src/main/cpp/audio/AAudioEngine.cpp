@@ -16,28 +16,23 @@
 
 #define LOG_TAG "NativeAudioEngine"
 
-#undef LOGI
-#undef LOGW
-#undef LOGE
+// УСТРАНЕНИЕ ДЕФЕКТОВ 173, 174, 175: Неблокирующий pushRt без блокирующих сокетов в RT
 #define LOGI(...) do { \
     char _buf[256]; \
     snprintf(_buf, sizeof(_buf), __VA_ARGS__); \
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", _buf); \
-    client::logging::NativeLogQueue::getInstance().push(4, LOG_TAG, _buf); \
+    client::logging::NativeLogQueue::getInstance().pushRt(4, LOG_TAG, _buf); \
 } while (0)
 
 #define LOGW(...) do { \
     char _buf[256]; \
     snprintf(_buf, sizeof(_buf), __VA_ARGS__); \
-    __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "%s", _buf); \
-    client::logging::NativeLogQueue::getInstance().push(5, LOG_TAG, _buf); \
+    client::logging::NativeLogQueue::getInstance().pushRt(5, LOG_TAG, _buf); \
 } while (0)
 
 #define LOGE(...) do { \
     char _buf[256]; \
     snprintf(_buf, sizeof(_buf), __VA_ARGS__); \
-    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "%s", _buf); \
-    client::logging::NativeLogQueue::getInstance().push(6, LOG_TAG, _buf); \
+    client::logging::NativeLogQueue::getInstance().pushRt(6, LOG_TAG, _buf); \
 } while (0)
 
 namespace client::audio {
@@ -62,6 +57,7 @@ void Biquad::makeLowShelf(float fc, float gainDb, float fs) {
     a2 = ((A + 1.0f) - (A - 1.0f) * cs - beta) / a0;
 }
 
+// УСТРАНЕНИЕ ОШИБКИ 1: Математически строгие формулы знаков Роберта Бристоу-Джонсона (RBJ Cookbook)
 void Biquad::makeHighShelf(float fc, float gainDb, float fs) {
     const float A = std::pow(10.0f, gainDb / 40.0f);
     const float omega = 2.0f * 3.14159265f * fc / fs;
@@ -69,11 +65,12 @@ void Biquad::makeHighShelf(float fc, float gainDb, float fs) {
     const float cs = std::cos(omega);
     const float alpha = sn / 2.0f * std::sqrt((A + 1.0f / A) * (1.0f / 0.9f - 1.0f) + 2.0f);
     const float beta = 2.0f * std::sqrt(A) * alpha;
+
     const float a0 = (A + 1.0f) - (A - 1.0f) * cs + beta;
     b0 = (A * ((A + 1.0f) + (A - 1.0f) * cs + beta)) / a0;
     b1 = (-2.0f * A * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
-    b2 = (A * ((A + 1.0f) - (A - 1.0f) * cs - beta)) / a0;
-    a1 = (2.0f * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
+    b2 = (A * ((A + 1.0f) + (A - 1.0f) * cs - beta)) / a0; // Знак +
+    a1 = (2.0f * ((A - 1.0f) - (A + 1.0f) * cs)) / a0;     // Знак -
     a2 = ((A + 1.0f) - (A - 1.0f) * cs - beta) / a0;
 }
 
@@ -275,7 +272,6 @@ bool AAudioEngine::initLocked(
     playbackBuffer_.resetQuiesced();
     fftTapBuffer_.resetQuiesced();
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 223: Закрытие шлюза приема микрофона при старте
     micPipelineAdmitted_.store(false, std::memory_order_release);
 
     actualCaptureSampleRate_.store(0, std::memory_order_release);
@@ -588,7 +584,6 @@ bool AAudioEngine::commitCaptureAdmission() {
         return false;
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 223: Открытие допуска микрофона в тракт
     micPipelineAdmitted_.store(true, std::memory_order_release);
     captureDspCv_.notify_all();
     return true;
@@ -1202,7 +1197,10 @@ void AAudioEngine::playbackDspThreadLoop() {
                 }
             }
 
-            // УСТРАНЕНИЕ ДЕФЕКТОВ 214 и 215: Мгновенная доставка аудио в аппаратный буфер
+            // УСТРАНЕНИЕ ДЕФЕКТОВ 23, 24, 215, 220: Расчет мощности сигнала вынесен из прерывания ЦАП в поток DSP
+            const float dacRms = dsp::calculateRms(output, outputFrames);
+            outRms_.store(dacRms, std::memory_order_relaxed);
+
             if (playbackDspRunning_.load(std::memory_order_acquire) &&
                 playbackEpoch_.load(std::memory_order_acquire) == activeEpoch) {
                 const size_t written = playbackBuffer_.writeAllOrNothing(output, outputFrames);
@@ -1348,7 +1346,6 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
 
     engine->captureSequenceNumber_.fetch_add(1, std::memory_order_relaxed);
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 223: Проверка позитивного допуска микрофона
     if (!engine->micPipelineAdmitted_.load(std::memory_order_acquire)) {
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
@@ -1371,7 +1368,7 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТА 215: Полностью пассивный Dumb RT Callback
+// УСТРАНЕНИЕ ДЕФЕКТОВ 23, 24, 215: Полностью пассивный Dumb RT Callback без аналитики и системных вызовов
 aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     AAudioStream* stream,
     void* userData,
@@ -1420,14 +1417,6 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
             engine->playbackUnderrunFrames_.fetch_add(frames - read, std::memory_order_relaxed);
             engine->playbackUnderrunCount_.fetch_add(1, std::memory_order_relaxed);
         }
-    }
-
-    if (read > 0) {
-        const float dacRms = dsp::calculateRms(samples, frames);
-        engine->outRms_.store(dacRms, std::memory_order_relaxed);
-        engine->playbackDspCv_.notify_one();
-    } else {
-        engine->outRms_.store(0.0f, std::memory_order_relaxed);
     }
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
