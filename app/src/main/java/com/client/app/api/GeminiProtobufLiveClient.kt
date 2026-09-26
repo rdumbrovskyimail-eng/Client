@@ -47,7 +47,8 @@ class GeminiProtobufLiveClient @Inject constructor(
         const val WS_PATH = "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
         private const val MAX_QUEUE_BYTES = 256L * 1024L
-        private const val AUDIO_BATCH_THRESHOLD_BYTES = 1280
+        // УСТРАНЕНИЕ ДЕФЕКТА 60: Снижение порога пакетизации микрофона с 40 мс (1280 байт) до 20 мс (640 байт)
+        private const val AUDIO_BATCH_THRESHOLD_BYTES = 640
         private const val WS_QUEUE_POLL_MS = 5L
         private const val AUDIO_COMMAND_CHANNEL_CAPACITY = 32
         private const val MAX_INITIAL_HISTORY_TURNS = 20
@@ -168,6 +169,9 @@ class GeminiProtobufLiveClient @Inject constructor(
         private set
 
     private val frameIdGen = AtomicLong(0L)
+    // УСТРАНЕНИЕ ДЕФЕКТА 48: Монотонный счетчик входящих аудиокадров
+    private val audioFrameSeqGen = AtomicLong(0L)
+
     private var protocolPhase = ProtocolPhase.IDLE
     private val cancelledToolCallIds = mutableSetOf<String>()
     private val pendingDataBySession = ConcurrentHashMap<DataBudgetKey, AtomicLong>()
@@ -339,6 +343,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         synchronized(sessionStateLock) {
             sessionId = newSessionId
             frameIdGen.set(0L)
+            audioFrameSeqGen.set(0L)
             protocolPhase = ProtocolPhase.CONNECTING
             cancelledToolCallIds.clear()
             serverGenerationOpen = false
@@ -1412,9 +1417,20 @@ class GeminiProtobufLiveClient @Inject constructor(
                                     val aggregate = perSession.get() + bytes
                                     if (aggregate <= MAX_AI_AUDIO_BACKLOG_BYTES) {
                                         perSession.addAndGet(bytes)
-                                        // УСТРАНЕНИЕ ДЕФЕКТА 33: Передаём точную временную метку получения фрейма
+                                        // УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Передача sequenceNumber и наносекундной метки
+                                        val frameSeq = audioFrameSeqGen.incrementAndGet()
+                                        val frameNanoTime = SystemClock.elapsedRealtimeNanos()
                                         accepted = _audio.trySend(
-                                            AudioFrame(pcm, mySessionId, myEpoch, generation, frameId, SystemClock.elapsedRealtime())
+                                            AudioFrame(
+                                                pcm = pcm,
+                                                sessionId = mySessionId,
+                                                epoch = myEpoch,
+                                                generation = generation,
+                                                frameId = frameId,
+                                                timestampMs = SystemClock.elapsedRealtime(),
+                                                sequenceNumber = frameSeq,
+                                                timestampNs = frameNanoTime
+                                            )
                                         ).isSuccess
                                         if (!accepted) {
                                             audioBudgetBySession[key]?.let { c ->
@@ -1477,6 +1493,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             activeConfig = null
             cancelledToolCallIds.clear()
             dataEventsDroppedCounter.set(0L)
+            audioFrameSeqGen.set(0L)
 
             while (true) {
                 val frame = _audio.tryReceive().getOrNull() ?: break
