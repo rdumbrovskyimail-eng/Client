@@ -10,12 +10,14 @@ import kotlin.test.*
 
 /**
  * Отражение констант AudioConstants.h для валидации архитектурных требований ядра в JVM-тестах.
+ * Обновлено в соответствии с ITU-T G.114 и RFC 3550 (пороги джиттер-буфера).
  */
 internal object AudioConstants {
-    const val PLAYBACK_TARGET_BUFFER_BT_MIN_MS = 30L
-    const val PLAYBACK_TARGET_BUFFER_BT_MAX_MS = 60L
-    const val PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS = 20L
-    const val PLAYBACK_TARGET_BUFFER_SPEAKER_MAX_MS = 40L
+    const val PLAYBACK_TARGET_BUFFER_MS = 45L
+    const val PLAYBACK_TARGET_BUFFER_BT_MIN_MS = 45L
+    const val PLAYBACK_TARGET_BUFFER_BT_MAX_MS = 90L
+    const val PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS = 30L
+    const val PLAYBACK_TARGET_BUFFER_SPEAKER_MAX_MS = 50L
     const val PLAYBACK_MAX_QUEUE_HORIZON_MS = 150L
 
     const val KPI_MAX_CALLBACK_LATENCY_US = 800
@@ -27,15 +29,9 @@ internal object AudioConstants {
 /**
  * Комплекс многопоточного стресс-тестирования, фаззинга поколений и валидации
  * аппаратных инвариантов Audio Core 2.0 под Samsung Galaxy S23 Ultra и CMF Buds 2.
- * УСТРАНЕНИЕ ДЕФЕКТОВ 186–225.
  */
 class AudioCoreStressAndConcurrencyTest {
 
-    /**
-     * ДЕФЕКТ 202, 203: Стресс-тест одновременной многопоточной конкуренции (Simultaneous flush + write + route change + callback).
-     * 8 параллельных рабочих потоков непрерывно дергают операции ядра.
-     * Проверяет отсутствие взаимных блокировок (Deadlock-Free Invariant) и корректность иерархии блокировок.
-     */
     @Test
     fun testHighContentionConcurrencyAndDeadlockFreedom() {
         runBlocking {
@@ -53,7 +49,6 @@ class AudioCoreStressAndConcurrencyTest {
             val routeLock = Any()
             val playoutLock = Any()
 
-            // Потоки 1-2: Интенсивная неблокирующая запись Try-Write (JNI Simulation)
             val writerJobs = List(2) {
                 launch(Dispatchers.Default) {
                     var localGen = activeGeneration.get()
@@ -73,13 +68,12 @@ class AudioCoreStressAndConcurrencyTest {
                 }
             }
 
-            // Потоки 3-4: Аппаратный колбэк ЦАП (Dumb RT Callback Simulation)
             val callbackJobs = List(2) {
                 launch(Dispatchers.Default) {
                     while (isRunning.get()) {
                         synchronized(playoutLock) {
                             val current = availableFrames.get()
-                            val toRead = minOf(current, 192) // 4 мс бёрст @ 48 кГц
+                            val toRead = minOf(current, 192)
                             availableFrames.addAndGet(-toRead)
                             callbacksExecuted.incrementAndGet()
                         }
@@ -88,19 +82,17 @@ class AudioCoreStressAndConcurrencyTest {
                 }
             }
 
-            // Поток 5: Мгновенный Soft-Flush (0 мс Barge-in)
             val flushJob = launch(Dispatchers.Default) {
                 while (isRunning.get()) {
                     delay(35)
                     synchronized(playoutLock) {
                         activeGeneration.incrementAndGet()
-                        availableFrames.set(0) // 0-мс сброс без остановки генератора
+                        availableFrames.set(0)
                         flushCount.incrementAndGet()
                     }
                 }
             }
 
-            // Поток 6: Резкие смены аппаратного маршрута (Route Transitions)
             val routeJob = launch(Dispatchers.Default) {
                 while (isRunning.get()) {
                     delay(50)
@@ -114,7 +106,6 @@ class AudioCoreStressAndConcurrencyTest {
                 }
             }
 
-            // Выполняем стресс-тест в течение 1.5 секунд высокой многопоточной нагрузки
             withTimeoutOrNull(2500) {
                 delay(1500)
                 isRunning.set(false)
@@ -132,10 +123,6 @@ class AudioCoreStressAndConcurrencyTest {
         }
     }
 
-    /**
-     * ДЕФЕКТ 201: Фаззинг-тестирование системы поколений (Stale-Generation Fuzzing).
-     * Проверка отсева отрицательных, нулевых, устаревших и переполненных номеров поколений.
-     */
     @Test
     fun testGenerationFuzzingAndStaleRejection() {
         val currentPlaybackGeneration = AtomicLong(100L)
@@ -151,7 +138,6 @@ class AudioCoreStressAndConcurrencyTest {
             return true
         }
 
-        // Набор фаззинг-значений
         val fuzzGenerations = listOf(
             0L, -1L, -100L, Long.MIN_VALUE, 1L, 50L, 99L,
             101L, 1000L, Long.MAX_VALUE, 100L, 100L, 99L, 100L
@@ -165,10 +151,6 @@ class AudioCoreStressAndConcurrencyTest {
         assertEquals(fuzzGenerations.size - 3, rejectedFrames.get(), "Все невалидные/устаревшие/будущие поколения обязаны отсекаться")
     }
 
-    /**
-     * ДЕФЕКТ 218: Проверка неблокирующего Try-Write контракта.
-     * Запись не имеет права засыпать или входить в spin-loop при заполненном буфере.
-     */
     @Test
     fun testTryWriteNonBlockingContract() {
         val ringCapacity = 1000
@@ -177,7 +159,7 @@ class AudioCoreStressAndConcurrencyTest {
         fun tryWrite(requestedFrames: Int): Int {
             if (requestedFrames <= 0) return 0
             if (availableWrite < requestedFrames) {
-                return 0 // Строгий мгновенный отказ без ожидания
+                return 0
             }
             availableWrite -= requestedFrames
             return requestedFrames
@@ -185,7 +167,7 @@ class AudioCoreStressAndConcurrencyTest {
 
         val startNs = System.nanoTime()
         val written1 = tryWrite(200)
-        val written2 = tryWrite(200) // Места только 100, должно вернуть 0 немедленно
+        val written2 = tryWrite(200)
         val elapsedUs = (System.nanoTime() - startNs) / 1000
 
         assertEquals(200, written1, "Первая пачка должна успешно записаться")
@@ -193,10 +175,6 @@ class AudioCoreStressAndConcurrencyTest {
         assertTrue(elapsedUs < 500, "Время выполнения неблокирующей проверки должно быть < 500 мкс (без sleep)")
     }
 
-    /**
-     * ДЕФЕКТ 214: Аппаратный Soft-Flush без остановки потока ЦАП.
-     * Проверка того, что физический стрим сохраняет состояние STARTED, а латентность сброса = 0 мс.
-     */
     @Test
     fun testHardwareSoftFlushLatencyAndStreamContinuity() {
         val physicalStreamState = "STARTED"
@@ -206,7 +184,7 @@ class AudioCoreStressAndConcurrencyTest {
         fun softFlush(newGeneration: Long) {
             val startNs = System.nanoTime()
             playbackEpoch.set(newGeneration)
-            bufferOccupancy.set(0) // Зануление буфера
+            bufferOccupancy.set(0)
             val durationUs = (System.nanoTime() - startNs) / 1000
 
             assertTrue(durationUs < 200, "Soft-flush обязан выполняться быстрее 200 мкс (0 мс на практике)")
@@ -218,20 +196,17 @@ class AudioCoreStressAndConcurrencyTest {
         assertEquals(0, bufferOccupancy.get())
     }
 
-    /**
-     * ДЕФЕКТ 216, 217: Проверка диапазона адаптивного сетевого горизонта воспроизведения (Jitter Buffer).
-     * Bluetooth (CMF Buds 2): 30–60 мс; Динамик (S23 Ultra): 20–40 мс; абсолютный лимит: 150 мс.
-     */
+    // УСТРАНЕНИЕ ДЕФЕКТА 12: Валидация обновлённых порогов джиттер-буфера (45-90 мс для BT, 30-50 мс для динамика)
     @Test
     fun testAdaptivePlayoutBufferRangeBounds() {
         fun calculateTargetBufferMs(jitterMs: Long, isBluetooth: Boolean): Long {
             val base = if (isBluetooth) {
-                (jitterMs * 2 + 20).coerceIn(
+                (jitterMs * 2 + 25).coerceIn(
                     AudioConstants.PLAYBACK_TARGET_BUFFER_BT_MIN_MS,
                     AudioConstants.PLAYBACK_TARGET_BUFFER_BT_MAX_MS
                 )
             } else {
-                (jitterMs * 2 + 15).coerceIn(
+                (jitterMs * 2 + 25).coerceIn(
                     AudioConstants.PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS,
                     AudioConstants.PLAYBACK_TARGET_BUFFER_SPEAKER_MAX_MS
                 )
@@ -239,20 +214,16 @@ class AudioCoreStressAndConcurrencyTest {
             return minOf(base, AudioConstants.PLAYBACK_MAX_QUEUE_HORIZON_MS)
         }
 
-        // Проверка для CMF Buds 2 (Bluetooth)
-        assertEquals(30L, calculateTargetBufferMs(2L, isBluetooth = true))
-        assertEquals(40L, calculateTargetBufferMs(10L, isBluetooth = true))
-        assertEquals(60L, calculateTargetBufferMs(100L, isBluetooth = true)) // Ограничение максимумом 60 мс
+        assertEquals(45L, calculateTargetBufferMs(2L, isBluetooth = true))
+        assertEquals(45L, calculateTargetBufferMs(10L, isBluetooth = true))
+        assertEquals(65L, calculateTargetBufferMs(20L, isBluetooth = true))
+        assertEquals(90L, calculateTargetBufferMs(100L, isBluetooth = true))
 
-        // Проверка для встроенного динамика S23 Ultra
-        assertEquals(20L, calculateTargetBufferMs(1L, isBluetooth = false))
-        assertEquals(35L, calculateTargetBufferMs(10L, isBluetooth = false))
-        assertEquals(40L, calculateTargetBufferMs(80L, isBluetooth = false)) // Ограничение максимумом 40 мс
+        assertEquals(30L, calculateTargetBufferMs(1L, isBluetooth = false))
+        assertEquals(45L, calculateTargetBufferMs(10L, isBluetooth = false))
+        assertEquals(50L, calculateTargetBufferMs(80L, isBluetooth = false))
     }
 
-    /**
-     * ДЕФЕКТ 188: Проверка профиля и калиброванных констант наушников CMF Buds 2 (Bestechnic BES2600).
-     */
     @Test
     fun testCmfBuds2ProfileQuirks() {
         val quirks = DeviceQuirks.CMF_BUDS_2
@@ -263,9 +234,6 @@ class AudioCoreStressAndConcurrencyTest {
         assertEquals(16000, quirks.preferredSampleRate, "Нативная частота mSBC речи гарнитуры равна 16000 Гц")
     }
 
-    /**
-     * ДЕФЕКТ 210: Расчет сетевого межпакетного джиттера по стандарту RFC 3550 (Appendix A.8).
-     */
     @Test
     fun testRfc3550InterArrivalJitterCalculation() {
         var interArrivalJitterNs = 0L
@@ -275,28 +243,20 @@ class AudioCoreStressAndConcurrencyTest {
             interArrivalJitterNs += (diffNs - interArrivalJitterNs) / 16L
         }
 
-        // Симуляция стабильной доставки (джиттер ~0)
         repeat(20) { updateJitter(0L) }
         assertEquals(0L, interArrivalJitterNs)
 
-        // Сетевой скачок задержки в 32 мс (32_000_000 нс)
         updateJitter(32_000_000L)
         assertTrue(interArrivalJitterNs > 0, "Джиттер обязан отреагировать на скачок")
         assertEquals(2_000_000L, interArrivalJitterNs, "Фильтр первого порядка 1/16 дает ровно 2 мс после первого скачка")
 
-        // Сглаживание последующими пакетами
         repeat(15) { updateJitter(0L) }
         assertTrue(interArrivalJitterNs < 1_000_000L, "Джиттер обязан экспоненциально затухать при стабильной сети")
     }
 
-    /**
-     * ДЕФЕКТ 189: Долговременный стресс-тест стабильности (Soak Test Simulation).
-     * Симуляция 180 000 фреймов непрерывного дуплекса (30 минут чистого аудио по 10 мс).
-     * Проверяет отсутствие переполнения монотонных счетчиков и сохранение целостности сэмплов.
-     */
     @Test
     fun testLongDurationDuplexStreamIntegrity30Minutes() {
-        val totalFrames = 180_000 // 30 минут @ 10 мс кванты
+        val totalFrames = 180_000
         var capturedFramesCount = 0L
         var playbackFramesCount = 0L
         var sequenceNum = 0L
@@ -310,7 +270,6 @@ class AudioCoreStressAndConcurrencyTest {
             capturedFramesCount += 160
             playbackFramesCount += 240
 
-            // Кольцевой буфер не должен переполняться при балансе поставщик-потребитель
             bufferTail += 160
             val used = bufferTail - bufferHead
             assertTrue(used <= ringCapacity * 2, "Индексы кольцевого буфера не должны расходиться")
@@ -323,22 +282,16 @@ class AudioCoreStressAndConcurrencyTest {
         assertEquals(bufferTail, bufferHead, "В установившемся режиме буфер обязан полностью освобождаться")
     }
 
-    /**
-     * ДЕФЕКТ 194: Тестирование внедрения искусственного сбоя (Fault Injection XRun).
-     * При внезапном опустошении буфера колбэк обязан выдать нули без срыва тактирования.
-     */
     @Test
     fun testFaultInjectionXRunZeroPadding() {
         val requestedFrames = 192
-        val availableFrames = 50 // Недогрузка: доступно меньше, чем просит ЦАП
+        val availableFrames = 50
         val outputBuffer = ShortArray(requestedFrames) { 1234 }
 
-        // Симуляция логики playbackCallback
         val readFrames = minOf(availableFrames, requestedFrames)
         for (i in 0 until readFrames) {
-            outputBuffer[i] = 5000 // Полезный сигнал
+            outputBuffer[i] = 5000
         }
-        // Зануление остатка кванта для исключения щелчка
         if (readFrames < requestedFrames) {
             for (i in readFrames until requestedFrames) {
                 outputBuffer[i] = 0
@@ -351,10 +304,6 @@ class AudioCoreStressAndConcurrencyTest {
         assertEquals(0.toShort(), outputBuffer[191], "Последний сэмпл кванта обязан быть нулем")
     }
 
-    /**
-     * ДЕФЕКТ 190: Стресс-тест частых переключений маршрута (100 быстрых переключений).
-     * Проверяет отсутствие рассинхронизации состояний и зависаний корутин.
-     */
     @Test
     fun testRapidRouteTransitionsStress() {
         runBlocking {
@@ -368,7 +317,8 @@ class AudioCoreStressAndConcurrencyTest {
             val profiles = listOf(
                 RouteProfile(AudioRoutePath.SPEAKER_SHARED, 48000, deviceName = "Speaker"),
                 RouteProfile(AudioRoutePath.BLUETOOTH_SCO, 16000, deviceName = "CMF Buds 2 (mSBC)"),
-                RouteProfile(AudioRoutePath.BLUETOOTH_BLE_HEADSET, 24000, deviceName = "CMF Buds 2 (LC3)")
+                RouteProfile(AudioRoutePath.BLUETOOTH_BLE_HEADSET, 24000, deviceName = "CMF Buds 2 (LC3)"),
+                RouteProfile(AudioRoutePath.USB_HEADSET, 48000, deviceName = "USB-C Headset")
             )
 
             val switchJob = launch(Dispatchers.Default) {
@@ -391,12 +341,9 @@ class AudioCoreStressAndConcurrencyTest {
         }
     }
 
-    /**
-     * ДЕФЕКТ 219: Проверка работы пакетного накопителя микрофона с двумя триггерами (квант 20 мс и дедлайн 20 мс).
-     */
     @Test
     fun testDualTriggerAudioBatchPacing() {
-        val targetBatchBytes = 640 // 20 мс @ 16 кГц
+        val targetBatchBytes = 640
         val deadlineMs = 20L
         val accumulatedBuffer = mutableListOf<Byte>()
         var firstWriteMs = 0L
@@ -408,7 +355,6 @@ class AudioCoreStressAndConcurrencyTest {
             }
             accumulatedBuffer.addAll(chunk.toList())
 
-            // Триггер 1: заполнение целевого объема 20 мс
             if (accumulatedBuffer.size >= targetBatchBytes) {
                 dispatchedBatches++
                 accumulatedBuffer.clear()
@@ -417,7 +363,6 @@ class AudioCoreStressAndConcurrencyTest {
         }
 
         fun onWatchdogTimer(nowMs: Long) {
-            // Триггер 2: истечение предельного дедлайна 20 мс
             if (accumulatedBuffer.isNotEmpty() && firstWriteMs > 0L && (nowMs - firstWriteMs) >= deadlineMs) {
                 dispatchedBatches++
                 accumulatedBuffer.clear()
@@ -425,24 +370,18 @@ class AudioCoreStressAndConcurrencyTest {
             }
         }
 
-        // Подача половины кванта (10 мс = 320 байт)
         val pcm10ms = ByteArray(320) { 1 }
         onAudioInput(pcm10ms, nowMs = 1000L)
         assertEquals(0, dispatchedBatches, "Неполный квант не должен отправляться немедленно")
 
-        // Проверка через 10 мс (дедлайн еще не вышел)
         onWatchdogTimer(nowMs = 1010L)
         assertEquals(0, dispatchedBatches)
 
-        // Истечение дедлайна 20 мс (1020 мс)
         onWatchdogTimer(nowMs = 1020L)
         assertEquals(1, dispatchedBatches, "Неполная пачка обязана сброситься по дедлайну 20 мс")
         assertEquals(0, accumulatedBuffer.size)
     }
 
-    /**
-     * ДЕФЕКТ 225: Проверка соответствия формальным инженерным критериям приемки (Engineering KPIs).
-     */
     @Test
     fun testEngineeringKpiThresholds() {
         assertTrue(AudioConstants.KPI_MAX_CALLBACK_LATENCY_US <= 800, "KPI колбэка ЦАП обязан быть <= 800 мкс")
