@@ -66,8 +66,8 @@ class NativeAudioEngine @Inject constructor(
 
     companion object {
         private const val BURST_BYTES = 160 * 2
-        private const val PLAYBACK_GRACE_PERIOD_MS = 350L
-        private const val BARGE_IN_DEBOUNCE_MS = 500L
+        private const val PLAYBACK_GRACE_PERIOD_MS = 250L
+        private const val BARGE_IN_DEBOUNCE_MS = 400L
         private const val BARGE_IN_MIN_HOLD_MS = 250L
         private const val BARGE_IN_HARD_RECOVERY_MS = 3000L
         private const val BARGE_IN_RECOVERY_POLL_MS = 50L
@@ -568,6 +568,7 @@ class NativeAudioEngine @Inject constructor(
                             val isBluetooth = router.currentProfile.value.path == AudioRoutePath.BLUETOOTH_COMMUNICATION
                             val pendingFrames = bridge.getPendingPlaybackFrames()
 
+                            // УСТРАНЕНИЕ ДЕФЕКТА 18: outputEnergyHangover не задерживает систему после окончания речи
                             if (instantaneousOut > 0.02f && outputEnergyHangover <= 0.005f) {
                                 lastPlaybackStartMs = now
                             }
@@ -575,7 +576,7 @@ class NativeAudioEngine @Inject constructor(
                             outputEnergyHangover = if (!_isPlaying.value || (pendingFrames == 0L && instantaneousOut <= 0.001f)) {
                                 0f
                             } else {
-                                maxOf(instantaneousOut, outputEnergyHangover * 0.96f)
+                                maxOf(instantaneousOut, outputEnergyHangover * 0.92f)
                             }
 
                             val isAiRendering = _isPlaying.value && (outputEnergyHangover > 0.015f || pendingFrames > 160L)
@@ -598,62 +599,63 @@ class NativeAudioEngine @Inject constructor(
                             if (isAadMode) {
                                 val isVocalized = speechStartedOnFrame || vadDetector.isSpeechDetected.value
 
-                                if (isVocalized && isAiRendering) {
-                                    val canBargeInTimers = (now - lastPlaybackStartMs > PLAYBACK_GRACE_PERIOD_MS) &&
+                                // УСТРАНЕНИЕ ДЕФЕКТОВ 14, 15, 16, 17: Разделение акустических моделей TWS и спикерфона
+                                val isConfirmedUserInterruption = if (isBluetooth) {
+                                    // TWS (CMF Buds 2): полная изоляция динамика в ушном канале.
+                                    // Чистый VAD с чувствительным порогом (RMS >= 0.012f) без подавления эха.
+                                    val canBargeInTimers = (now - lastPlaybackStartMs > 180L) &&
                                                            (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
 
-                                    val dynamicErleRatio = 0.72f + (0.15f * currentPlaybackVolume)
-                                    val nonLinearOffset = if (outputEnergyHangover > 0.45f) {
-                                        (outputEnergyHangover - 0.45f) * 0.40f
-                                    } else {
-                                        0.0f
-                                    }
-                                    val echoThreshold = maxOf(0.18f, (outputEnergyHangover * dynamicErleRatio) + nonLinearOffset)
-                                    val effectiveThreshold = if (isBluetooth) 0.035f else echoThreshold
-
-                                    if (instantaneousMic > effectiveThreshold) {
+                                    if (isVocalized && instantaneousMic >= 0.012f) {
                                         bargeInCandidateStreak++
                                     } else {
                                         bargeInCandidateStreak = maxOf(0, bargeInCandidateStreak - 1)
                                     }
 
-                                    val requiredStreak = if (isBluetooth) 3 else 5
-                                    val isConfirmedUserInterruption = (bargeInCandidateStreak >= requiredStreak) && canBargeInTimers
-
-                                    if (isConfirmedUserInterruption) {
-                                        lastBargeInMs = now
-                                        bargeInCandidateStreak = 0
-                                        outputEnergyHangover = 0f
-
-                                        activateBargeIn(now)
-                                        hapticManager.triggerBargeIn()
-                                        _bargeInEvents.tryEmit(Unit)
-
-                                        if (isBluetooth) {
-                                            val preRoll = mutableListOf<ByteArray>()
-                                            synchronized(poolLock) {
-                                                while (leadInBuffer.isNotEmpty()) {
-                                                    preRoll.add(leadInBuffer.removeFirst())
-                                                }
-                                            }
-                                            for (pf in preRoll) {
-                                                sendMicEvent(AudioStreamEvent.Audio(pf), instanceId)
-                                            }
-                                        } else {
-                                            synchronized(poolLock) {
-                                                while (leadInBuffer.isNotEmpty()) {
-                                                    recycleBuffer(leadInBuffer.removeFirst())
-                                                }
-                                            }
-                                        }
-                                    }
+                                    (bargeInCandidateStreak >= 2) && canBargeInTimers && isAiRendering
                                 } else {
-                                    bargeInCandidateStreak = 0
+                                    // Спикерфон: открытый акустический канал в воздухе.
+                                    // DTD на базе физического порога утечки звука без вымышленного ERLE.
+                                    val canBargeInTimers = (now - lastPlaybackStartMs > PLAYBACK_GRACE_PERIOD_MS) &&
+                                                           (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
+
+                                    val physicalEchoCouplingThreshold = maxOf(0.12f, outputEnergyHangover * 0.82f)
+
+                                    if (isVocalized && instantaneousMic > physicalEchoCouplingThreshold) {
+                                        bargeInCandidateStreak++
+                                    } else {
+                                        bargeInCandidateStreak = maxOf(0, bargeInCandidateStreak - 1)
+                                    }
+
+                                    (bargeInCandidateStreak >= 4) && canBargeInTimers && isAiRendering
                                 }
 
-                                if (isBluetooth || !isAiRendering || isBargeInActive) {
+                                if (isConfirmedUserInterruption) {
+                                    lastBargeInMs = now
+                                    bargeInCandidateStreak = 0
+                                    outputEnergyHangover = 0f
+
+                                    activateBargeIn(now)
+                                    hapticManager.triggerBargeIn()
+                                    _bargeInEvents.tryEmit(Unit)
+
+                                    // УСТРАНЕНИЕ ДЕФЕКТА 19: Полное сохранение и передача pre-roll буфера
+                                    // в ОБОИХ режимах. Исключает стирание первых фонем («Стой», «Подожди»).
+                                    val preRoll = mutableListOf<ByteArray>()
+                                    synchronized(poolLock) {
+                                        while (leadInBuffer.isNotEmpty()) {
+                                            preRoll.add(leadInBuffer.removeFirst())
+                                        }
+                                    }
+                                    for (pf in preRoll) {
+                                        sendMicEvent(AudioStreamEvent.Audio(pf), instanceId)
+                                    }
+                                }
+
+                                if (isBargeInActive || !isAiRendering) {
                                     sendMicEvent(AudioStreamEvent.Audio(currentAudioBytes), instanceId)
                                 } else {
+                                    // Накопление скользящего предзаписанного буфера во время речи модели
                                     synchronized(poolLock) {
                                         leadInBuffer.addLast(currentAudioBytes)
                                         val maxPreRoll = router.currentProfile.value.leadInBufferSizeFrames / 160
@@ -667,6 +669,7 @@ class NativeAudioEngine @Inject constructor(
                                     sendMicEvent(AudioStreamEvent.SpeechEnd, instanceId)
                                 }
                             } else {
+                                // Ручной режим VAD
                                 if (speechStartedOnFrame) {
                                     val preRoll = mutableListOf<ByteArray>()
                                     synchronized(poolLock) {
