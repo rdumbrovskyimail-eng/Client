@@ -22,6 +22,7 @@ namespace client::audio {
 constexpr size_t PLAYBACK_DSP_MAX_OUTPUT_FRAMES = 8192;
 constexpr size_t EARCON_SCRATCH_MAX_FRAMES = 2048;
 constexpr size_t CAPTURE_RAW_SCRATCH_FRAMES = 2048;
+constexpr size_t FFT_TAP_BUFFER_CAPACITY = 4096;
 
 /**
  * Строгий конечный автомат жизненного цикла движка.
@@ -155,9 +156,11 @@ public:
     bool restartCaptureStream();
     bool restartPlaybackStream();
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 218: Неблокирующий Try-Write контракт
     size_t writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation);
     size_t readCapturePcm(int16_t* pcm, size_t maxFrames);
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 214: Аппаратный Soft-Flush без остановки потока ЦАП
     void flushPlayback(uint64_t generation);
     void triggerBargeInEarcon();
     void resetEarcon();
@@ -226,7 +229,7 @@ public:
         return actualOutputDeviceId_.load(std::memory_order_relaxed);
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 126, 127, 128: Раздельные очереди и физическая задержка в миллисекундах
+    // Раздельные очереди и физическая задержка в миллисекундах
     size_t getPendingPlaybackInputFrames() const;
     size_t getPendingPlaybackOutputFrames() const;
     size_t getPendingPlaybackFrames() const;
@@ -257,8 +260,6 @@ public:
     void getErrorHistogram(uint32_t* outArray, size_t arraySize);
 
     void getSpectrumData(dsp::SpectrumSnapshot& outSnapshot);
-
-    // УСТРАНЕНИЕ ДЕФЕКТА 125: Управление состоянием активности воспроизведения фразы
     void setPlaybackActiveState(bool isActive);
 
 private:
@@ -275,6 +276,7 @@ private:
     void stopPlaybackLocked();
     void joinPlaybackDspThreadLocked();
     void joinCaptureDspThreadLocked();
+    void joinFftTapThreadLocked();
     void closeCaptureStreamLocked();
     void closePlaybackStreamLocked();
     bool openCaptureStreamLocked(int32_t inputDeviceId);
@@ -289,7 +291,9 @@ private:
 
     void playbackDspThreadLoop();
     void captureDspThreadLoop();
+    void fftTapThreadLoop();
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 215: Пассивный Dumb RT Callback
     static aaudio_data_callback_result_t captureCallback(
         AAudioStream* stream,
         void* userData,
@@ -322,6 +326,7 @@ private:
 
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_PLAYBACK> playbackDspInputBuffer_;
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_PLAYBACK> playbackBuffer_;
+    LockFreeRingBuffer<int16_t, FFT_TAP_BUFFER_CAPACITY> fftTapBuffer_;
 
     std::mutex lifecycleMutex_;
 
@@ -369,10 +374,7 @@ private:
     std::atomic<float> micRms_{0.0f};
     std::atomic<float> outRms_{0.0f};
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 140: Потоковый статистический оценщик минимального фонового шума
     alignas(64) std::atomic<float> micNoiseFloorRms_{0.015f};
-
-    // УСТРАНЕНИЕ ДЕФЕКТА 125: Различение штатного DRAIN и аварийного UNDERRUN
     std::atomic<bool> isPlaybackRenderingActive_{false};
 
     // Сквозные счетчики потерь данных (E2E Loss & Glitch Tracking)
@@ -403,13 +405,18 @@ private:
     std::mutex captureDspWaitMutex_;
     std::condition_variable captureDspCv_;
 
-    std::atomic<bool> captureIngressBlocked_{true};
+    std::thread fftTapThread_;
+    std::atomic<bool> fftTapRunning_{false};
+    std::mutex fftTapWaitMutex_;
+    std::condition_variable fftTapCv_;
+
+    // УСТРАНЕНИЕ ДЕФЕКТА 223: Однозначный позитивный флаг допуска микрофона
+    std::atomic<bool> micPipelineAdmitted_{false};
 
     alignas(64) std::atomic<uint64_t> playbackEpoch_{0};
     alignas(64) std::atomic<uint64_t> playbackDspResetAcknowledgedEpoch_{0};
 
     std::mutex playbackControlMutex_;
-
     std::atomic<bool> earconRequested_{false};
 
     std::unique_ptr<dsp::FastFft> fftProcessor_;
@@ -417,9 +424,6 @@ private:
     std::vector<int16_t> playbackDspInputScratch_;
     std::vector<int16_t> playbackDspOutputScratch_;
     std::vector<int16_t> earconScratch_;
-
-    std::vector<float> fftBuffer_;
-    size_t fftPos_{0};
 
     std::vector<int16_t> captureRawScratchBuffer_;
     std::vector<int16_t> captureDecimateBuffer_;
@@ -431,11 +435,8 @@ private:
     PolyphaseResampler24To32 resampler24To32_;
     HalfbandResampler24To48 halfbandResampler24To48_;
     StreamingLinearResampler genericResampler_;
-    Decimator48To16 captureDecimator48To16_;
-    Decimator32To16 captureDecimator32To16_;
-    PolyphaseResampler24To16 captureResampler24To16_;
-    Resampler44100To16000 captureResampler44100To16000_;
-    Upsampler8000To16000 captureUpsampler8To16_;
+
+    UnifiedCaptureResampler unifiedCaptureResampler_;
 };
 
 } // namespace client::audio
