@@ -31,8 +31,7 @@ import javax.inject.Singleton
 import kotlin.math.sqrt
 
 /**
- * УСТРАНЕНИЕ ДЕФЕКТА 83: Полное физическое разделение Data Plane и Control Plane.
- * AudioStreamDataEvent содержит только PCM-данные высокой частоты (100 фреймов/с).
+ * Data Plane: События PCM-потока микрофона высокой частоты (100 фреймов/с).
  */
 class AudioStreamDataEvent(
     var pcm: ByteArray,
@@ -61,9 +60,6 @@ sealed interface AudioFocusEvent {
     data object Gain : AudioFocusEvent
 }
 
-/**
- * УСТРАНЕНИЕ ДЕФЕКТА 45: Строгий детерминированный конечный автомат движка в JVM.
- */
 enum class AudioEngineState {
     IDLE,
     STARTING,
@@ -88,7 +84,7 @@ class NativeAudioEngine @Inject constructor(
 ) {
 
     companion object {
-        private const val BURST_BYTES = 160 * 2
+        private const val BURST_BYTES = 160 * 2 // 10 мс @ 16 кГц 16-бит моно
         private const val PLAYBACK_GRACE_PERIOD_MS = 250L
         private const val BARGE_IN_DEBOUNCE_MS = 400L
         private const val BARGE_IN_MIN_HOLD_MS = 250L
@@ -96,8 +92,7 @@ class NativeAudioEngine @Inject constructor(
         private const val BARGE_IN_RECOVERY_POLL_MS = 50L
         private const val PRE_ROLL_FRAMES_CAPACITY = 20
 
-        // УСТРАНЕНИЕ ДЕФЕКТА 81: Рациональный предел бэклога ~250 мс звука (8 КБ) вместо 16 секунд (512 КБ)
-        private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 8L * 1024L
+        private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 8L * 1024L // ~250 мс звука
         private const val PLAYBACK_WRITE_STALL_TIMEOUT_MS = 250L
     }
 
@@ -129,7 +124,6 @@ class NativeAudioEngine @Inject constructor(
     private val _focusEvents = MutableStateFlow<AudioFocusEvent>(AudioFocusEvent.Gain)
     val focusEvents: StateFlow<AudioFocusEvent> = _focusEvents.asStateFlow()
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 80, 82, 83: Раздельные каналы Data Plane и Control Plane
     private val _micAudioOutput = Channel<AudioStreamDataEvent>(
         capacity = 24,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
@@ -175,7 +169,6 @@ class NativeAudioEngine @Inject constructor(
     private val captureEventLock = Any()
     private val captureDirectMutex = Mutex()
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 86: Буферизованный канал транзакций вместо затирающего Channel.CONFLATED
     private val routeTransitionChannel = Channel<RouteTransitionRequest>(capacity = 16)
 
     private val engineGeneration = AtomicLong(0)
@@ -259,18 +252,20 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 97: Акустические пороги VAD инкапсулированы в аудиодвижке
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 105 и 106: Применение калиброванных параметров гарнитуры CMF Buds 2
     private fun applyAcousticProfileForRoute(profile: RouteProfile) {
-        if (profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION) {
-            vadDetector.setThresholds(0.40f, 0.20f)
-        } else {
-            vadDetector.setThresholds(0.50f, 0.25f)
-        }
+        val quirks = profile.quirks
+        vadDetector.setThresholds(
+            start = if (profile.isBluetooth) 0.40f else 0.50f,
+            end = if (profile.isBluetooth) 0.20f else 0.25f
+        )
+        bridge.setMicGain(quirks.micGainCompensation)
+        logger.d("NativeAudioEngine: Акустический профиль применен: ${quirks.deviceModel} (ENC Delay=${quirks.encLatencyMs}ms, ERLE=${quirks.acousticErleRatio})")
     }
 
     private fun getLeadInCapacityForRoute(profile: RouteProfile): Int {
-        return if (profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION) {
-            (260 * 16) / 160 // ~26 пакетов
+        return if (profile.isBluetooth) {
+            (260 * 16) / 160 // ~26 пакетов с учетом задержки ENC 35 мс
         } else {
             (160 * 16) / 160 // ~16 пакетов
         }
@@ -347,7 +342,7 @@ class NativeAudioEngine @Inject constructor(
         val mmap = bridge.isMmapActive()
         val exclusive = bridge.isExclusiveSharingActive()
 
-        logger.d("NativeAudioEngine: actual native route ($context): in=$actualIn out=$actualOut playRate=${actualPlayRate}Hz ch=$actualPlayChannels fmt=$actualPlayFormat exclusive=$exclusive mmap=$mmap")
+        logger.d("NativeAudioEngine: actual native route ($context): in=$actualIn out=$actualOut playRate=${actualPlayRate}Hz ch=$actualPlayChannels fmt=$actualPlayFormat exclusive=$exclusive mmap=$mmap quirks=${profile.quirks.deviceModel}")
     }
 
     suspend fun start(): Boolean {
@@ -395,7 +390,7 @@ class NativeAudioEngine @Inject constructor(
 
                 val inited = captureDirectMutex.withLock {
                     bridge.initAudioRoute(
-                        isBluetooth = profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION,
+                        isBluetooth = profile.isBluetooth,
                         sampleRate = profile.targetSampleRate,
                         inputDeviceId = profile.inputDeviceId,
                         outputDeviceId = profile.outputDeviceId
@@ -445,7 +440,7 @@ class NativeAudioEngine @Inject constructor(
         profile: RouteProfile,
         context: String
     ): Boolean {
-        val maxAttempts = if (profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION) 3 else 1
+        val maxAttempts = if (profile.isBluetooth) 3 else 1
         var captureOpened = false
         var dspActivated = false
         var admissionCommitted = false
@@ -664,7 +659,7 @@ class NativeAudioEngine @Inject constructor(
                 1 -> {
                     logger.w("NativeAudioEngine: Soft audio fault handled (XRun/timeout)")
                 }
-                2, 3 -> {
+                2, 3, 4 -> {
                     if (direction == 1) {
                         recoverCaptureStreamIsolated()
                     } else if (direction == 2) {
@@ -738,20 +733,25 @@ class NativeAudioEngine @Inject constructor(
                             )
                             val instantaneousOut = bridge.getOutRms()
 
-                            val isBluetooth = router.currentProfile.value.path == AudioRoutePath.BLUETOOTH_COMMUNICATION
-                            val pendingFrames = bridge.getPendingPlaybackFrames()
+                            val profile = router.currentProfile.value
+                            val quirks = profile.quirks
+                            val isBluetooth = profile.isBluetooth
+
+                            // УСТРАНЕНИЕ ДЕФЕКТОВ 126, 127, 128: Опрос точной физической задержки в миллисекундах
+                            val pendingDurationMs = bridge.getPendingPlaybackDurationMs()
 
                             if (instantaneousOut > 0.02f && outputEnergyHangover <= 0.005f) {
                                 lastPlaybackStartMs = now
                             }
 
-                            outputEnergyHangover = if (!_isPlaying.value || (pendingFrames == 0L && instantaneousOut <= 0.001f)) {
+                            outputEnergyHangover = if (!_isPlaying.value || (pendingDurationMs <= 0.5f && instantaneousOut <= 0.001f)) {
                                 0f
                             } else {
                                 maxOf(instantaneousOut, outputEnergyHangover * 0.96f)
                             }
 
-                            val isAiRendering = _isPlaying.value && (outputEnergyHangover > 0.015f || pendingFrames > 160L)
+                            // Инвариант: воспроизведение активно, если в тракте есть звук (> 15 мс)
+                            val isAiRendering = _isPlaying.value && (outputEnergyHangover > 0.015f || pendingDurationMs > 15.0f)
 
                             var speechStartedOnFrame = false
                             var speechEndedOnFrame = false
@@ -772,19 +772,24 @@ class NativeAudioEngine @Inject constructor(
 
                                 if (isVocalized && isAiRendering) {
                                     val canBargeInTimers = if (isBluetooth) {
-                                        (now - lastPlaybackStartMs > 180L) && (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
+                                        (now - lastPlaybackStartMs > (180L + quirks.encLatencyMs)) && (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
                                     } else {
                                         (now - lastPlaybackStartMs > PLAYBACK_GRACE_PERIOD_MS) && (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
                                     }
 
-                                    val dynamicErleRatio = 0.72f + (0.15f * currentPlaybackVolume)
+                                    // УСТРАНЕНИЕ ДЕФЕКТА 140: Адаптация порога эха под реальный фоновый шум комнаты
+                                    val ambientNoiseFloor = bridge.getMicNoiseFloorRms()
+                                    val dynamicErleRatio = quirks.acousticErleRatio + (0.15f * currentPlaybackVolume)
                                     val nonLinearOffset = if (outputEnergyHangover > 0.45f) {
                                         (outputEnergyHangover - 0.45f) * 0.40f
                                     } else {
                                         0.0f
                                     }
-                                    val echoThreshold = maxOf(0.18f, (outputEnergyHangover * dynamicErleRatio) + nonLinearOffset)
-                                    val effectiveThreshold = if (isBluetooth) 0.035f else echoThreshold
+                                    val echoThreshold = maxOf(
+                                        ambientNoiseFloor * 2.2f,
+                                        maxOf(quirks.echoThreshold, (outputEnergyHangover * dynamicErleRatio) + nonLinearOffset)
+                                    )
+                                    val effectiveThreshold = if (isBluetooth) quirks.echoThreshold else echoThreshold
 
                                     if (instantaneousMic > effectiveThreshold) {
                                         bargeInCandidateStreak++
@@ -792,7 +797,7 @@ class NativeAudioEngine @Inject constructor(
                                         bargeInCandidateStreak = maxOf(0, bargeInCandidateStreak - 1)
                                     }
 
-                                    val requiredStreak = if (isBluetooth) 3 else 5
+                                    val requiredStreak = quirks.bargeInRequiredStreak
                                     val isConfirmedUserInterruption = (bargeInCandidateStreak >= requiredStreak) && canBargeInTimers
 
                                     if (isConfirmedUserInterruption) {
@@ -914,7 +919,7 @@ class NativeAudioEngine @Inject constructor(
             healthJob = engineScope.launch {
                 while (isActive && (playbackDesired.get() || captureDesired.get())) {
                     try {
-                        if (!vadDetector.isNeuralActive) {
+                        if (!vadDetector.isNeuralActive.value) {
                             vadDetector.prepare()
                         }
                         if (bridge.hasPendingError() || bridge.isAudioDisconnected()) {
@@ -931,7 +936,6 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 95: Политика «Same Route — No Restart»
     private suspend fun applyRouteInternal(
         req: RouteTransitionRequest
     ) = audioLifecycleMutex.withLock {
@@ -993,7 +997,7 @@ class NativeAudioEngine @Inject constructor(
             captureDirectMutex.withLock {
                 bridge.stopAudio()
                 routeInited = bridge.initAudioRoute(
-                    isBluetooth = req.profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION,
+                    isBluetooth = req.profile.isBluetooth,
                     sampleRate = req.profile.targetSampleRate,
                     inputDeviceId = req.profile.inputDeviceId,
                     outputDeviceId = req.profile.outputDeviceId
@@ -1197,50 +1201,51 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 126, 127, 128: Ожидание опустошения очередей по реальному времени звучания
     suspend fun awaitPlaybackDrained(
         generation: Long,
         stallTimeoutMs: Long = 1800L
     ): Boolean = withContext(Dispatchers.IO) {
-        val sampleRate = bridge.getActualPlaybackSampleRate().let { if (it > 0) it else 48000 }
-        var lastPending = bridge.getPendingPlaybackFrames()
+        var lastPendingMs = bridge.getPendingPlaybackDurationMs()
         var lastProgressTime = SystemClock.elapsedRealtime()
         val startTime = lastProgressTime
 
-        var maxAllowedDurationMs = (lastPending * 1000L / sampleRate) + 1200L
+        var maxAllowedDurationMs = lastPendingMs + 1200L
 
         while (isActive) {
             if (generation != currentPlaybackGeneration) {
                 return@withContext true
             }
 
-            val currentPending = bridge.getPendingPlaybackFrames()
+            val currentPendingMs = bridge.getPendingPlaybackDurationMs()
             val now = SystemClock.elapsedRealtime()
 
-            if (currentPending == 0L) {
+            if (currentPendingMs <= 0.5f) {
                 delay(5L)
-                if (generation == currentPlaybackGeneration && bridge.getPendingPlaybackFrames() == 0L) {
+                if (generation == currentPlaybackGeneration && bridge.getPendingPlaybackDurationMs() <= 0.5f) {
+                    bridge.setPlaybackActiveState(false)
                     return@withContext true
                 }
                 continue
             }
 
-            if (currentPending < lastPending) {
-                lastPending = currentPending
+            if (currentPendingMs < lastPendingMs) {
+                lastPendingMs = currentPendingMs
                 lastProgressTime = now
 
-                val remainingMs = (currentPending * 1000L / sampleRate) + 800L
+                val remainingMs = currentPendingMs + 800L
                 val projectedTotal = (now - startTime) + remainingMs
                 if (projectedTotal > maxAllowedDurationMs) {
                     maxAllowedDurationMs = projectedTotal
                 }
-            } else if (currentPending > lastPending) {
-                val deltaGrowth = currentPending - lastPending
-                lastPending = currentPending
+            } else if (currentPendingMs > lastPendingMs) {
+                val deltaGrowth = currentPendingMs - lastPendingMs
+                lastPendingMs = currentPendingMs
                 lastProgressTime = now
-                maxAllowedDurationMs += ((deltaGrowth * 1000L / sampleRate) + 300L)
+                maxAllowedDurationMs += (deltaGrowth + 300L)
             } else {
                 if (now - lastProgressTime >= stallTimeoutMs) {
-                    logger.w("NativeAudioEngine: playback stalled for ${now - lastProgressTime} ms with $currentPending pending frames")
+                    logger.w("NativeAudioEngine: playback stalled for ${now - lastProgressTime} ms with $currentPendingMs ms pending duration")
                     return@withContext false
                 }
             }
@@ -1253,7 +1258,7 @@ class NativeAudioEngine @Inject constructor(
             delay(5L)
         }
 
-        generation != currentPlaybackGeneration || bridge.getPendingPlaybackFrames() == 0L
+        generation != currentPlaybackGeneration || bridge.getPendingPlaybackDurationMs() <= 0.5f
     }
 
     fun setVolume(volume: Float) {
@@ -1419,7 +1424,6 @@ class NativeAudioEngine @Inject constructor(
         drainMicOutput()
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 82: Переполнение очереди приводит к сбросу кадра, а не к смерти захвата
     private fun sendMicDataEvent(
         event: AudioStreamDataEvent,
         expectedCaptureInstanceId: Long? = null
