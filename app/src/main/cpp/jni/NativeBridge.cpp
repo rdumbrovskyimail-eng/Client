@@ -42,13 +42,19 @@ Java_com_client_app_audio_NativeAudioBridge_getHardwareCoreInfo(JNIEnv *env, job
     const int32_t outRate = engine.getActualPlaybackSampleRate();
     const int32_t inDevId = engine.getActiveInputDeviceId();
     const int32_t outDevId = engine.getActiveOutputDeviceId();
+    const uint64_t underruns = engine.getPlaybackUnderrunCount();
+    const uint64_t drops = engine.getPlaybackDroppedFrames();
+    const float noiseFloor = engine.getMicNoiseFloorRms();
 
     char infoBuf[256];
     snprintf(infoBuf, sizeof(infoBuf),
-             "Qualcomm SD8 Gen2 - [In:%dHz/ID:%d -> Out:%dHz/ID:%d, Exclusive:%s, MMAP:%s]",
+             "Qualcomm SD8 Gen2 - [In:%dHz/ID:%d -> Out:%dHz/ID:%d, Excl:%s, MMAP:%s, XRuns:%llu, Drops:%llu, Noise:%.4f]",
              inRate, inDevId, outRate, outDevId,
              isExclusive ? "yes" : "no",
-             isMmap ? "yes" : "no");
+             isMmap ? "yes" : "no",
+             static_cast<unsigned long long>(underruns),
+             static_cast<unsigned long long>(drops),
+             noiseFloor);
 
     return env->NewStringUTF(infoBuf);
 }
@@ -96,7 +102,6 @@ Java_com_client_app_audio_NativeAudioBridge_commitCaptureAdmission(JNIEnv * /* e
     return static_cast<jboolean>(AAudioEngine::getInstance().commitCaptureAdmission());
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 44: Изолированный перезапуск только пострадавшего стрима
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_client_app_audio_NativeAudioBridge_restartCaptureStream(JNIEnv * /* env */, jobject /* this */) {
     LOGI("restartCaptureStream called");
@@ -114,7 +119,6 @@ Java_com_client_app_audio_NativeAudioBridge_getEngineState(JNIEnv * /* env */, j
     return static_cast<jint>(AAudioEngine::getInstance().getEngineState());
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 42: Немедленное чтение структурированной ошибки без ожидания 100 мс
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_client_app_audio_NativeAudioBridge_pollAudioError(
     JNIEnv *env, jobject /* this */, jlongArray outData) {
@@ -142,7 +146,6 @@ Java_com_client_app_audio_NativeAudioBridge_hasPendingError(JNIEnv * /* env */, 
     return static_cast<jboolean>(AAudioEngine::getInstance().hasPendingError());
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Наносекундный тайминг и счетчики кадров
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_client_app_audio_NativeAudioBridge_getCaptureSequenceNumber(JNIEnv * /* env */, jobject /* this */) {
     return static_cast<jlong>(AAudioEngine::getInstance().getCaptureSequenceNumber());
@@ -176,6 +179,11 @@ Java_com_client_app_audio_NativeAudioBridge_getActualPlaybackChannels(JNIEnv * /
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_getActualPlaybackFormat(JNIEnv * /* env */, jobject /* this */) {
     return AAudioEngine::getInstance().getActualPlaybackFormat();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getActualPlaybackBurst(JNIEnv * /* env */, jobject /* this */) {
+    return AAudioEngine::getInstance().getActualPlaybackBurst();
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -255,7 +263,6 @@ Java_com_client_app_audio_NativeAudioBridge_setMicGain(
     AAudioEngine::getInstance().setMicGain(static_cast<float>(gain));
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 72, 73, 74: Исключение промежуточного вектора, realloc и shrink_to_fit через GetPrimitiveArrayCritical
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     JNIEnv *env, jobject /* this */, jbyteArray byteArray, jint offset, jint length, jlong generation) {
@@ -292,7 +299,6 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     return static_cast<jint>(writtenFrames * sizeof(int16_t));
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТА 75: Полноценная поддержка прямого Zero-Copy DirectBuffer
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackDirect(
     JNIEnv *env, jobject /* this */, jobject byteBuffer, jint offsetBytes, jint lengthBytes, jlong generation) {
@@ -433,4 +439,134 @@ Java_com_client_app_audio_NativeAudioBridge_drainNativeLogs(JNIEnv *env, jobject
 
     env->DeleteLocalRef(stringClass);
     return resultArray;
+}
+
+// --- УСТРАНЕНИЕ ДЕФЕКТОВ 116–120, 126–128: Новые диагностические и временные точки входа ---
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getCaptureDroppedFrames(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jlong>(AAudioEngine::getInstance().getCaptureDroppedFrames());
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getPlaybackUnderrunFrames(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jlong>(AAudioEngine::getInstance().getPlaybackUnderrunFrames());
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getPlaybackUnderrunCount(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jlong>(AAudioEngine::getInstance().getPlaybackUnderrunCount());
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getPlaybackDroppedFrames(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jlong>(AAudioEngine::getInstance().getPlaybackDroppedFrames());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getStreamDisconnectCount(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jint>(AAudioEngine::getInstance().getStreamDisconnectCount());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getLastXRunCount(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jint>(AAudioEngine::getInstance().getLastXRunCount());
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getPendingPlaybackInputFrames(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jlong>(AAudioEngine::getInstance().getPendingPlaybackInputFrames());
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getPendingPlaybackOutputFrames(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jlong>(AAudioEngine::getInstance().getPendingPlaybackOutputFrames());
+}
+
+extern "C" JNIEXPORT jfloat JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getPendingPlaybackDurationMs(JNIEnv * /* env */, jobject /* this */) {
+    return AAudioEngine::getInstance().getPendingPlaybackDurationMs();
+}
+
+extern "C" JNIEXPORT jfloat JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getTotalEstimatedPlaybackLatencyMs(JNIEnv * /* env */, jobject /* this */) {
+    return AAudioEngine::getInstance().getTotalEstimatedPlaybackLatencyMs();
+}
+
+extern "C" JNIEXPORT jfloat JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getMicNoiseFloorRms(JNIEnv * /* env */, jobject /* this */) {
+    return AAudioEngine::getInstance().getMicNoiseFloorRms();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_client_app_audio_NativeAudioBridge_setPlaybackActiveState(JNIEnv * /* env */, jobject /* this */, jboolean isActive) {
+    AAudioEngine::getInstance().setPlaybackActiveState(isActive == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getAudioPipelineDiagnostics(
+    JNIEnv *env, jobject /* this */, jlongArray outArray) {
+
+    if (!outArray || env->GetArrayLength(outArray) < 11) return JNI_FALSE;
+
+    client::audio::AudioPipelineDiagnostics diag{};
+    AAudioEngine::getInstance().getAudioDiagnostics(diag);
+
+    jlong data[11] = {
+        static_cast<jlong>(diag.totalHardwareCapturedFrames),
+        static_cast<jlong>(diag.totalDspProcessedFrames),
+        static_cast<jlong>(diag.captureDroppedFrames),
+        static_cast<jlong>(diag.totalHardwarePlaybackFrames),
+        static_cast<jlong>(diag.playbackUnderrunFrames),
+        static_cast<jlong>(diag.playbackUnderrunCount),
+        static_cast<jlong>(diag.playbackDroppedFrames),
+        static_cast<jlong>(diag.streamDisconnectCount),
+        static_cast<jlong>(diag.captureErrorCount),
+        static_cast<jlong>(diag.playbackErrorCount),
+        static_cast<jlong>(diag.lastXRunCount)
+    };
+
+    env->SetLongArrayRegion(outArray, 0, 11, data);
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getErrorHistogram(
+    JNIEnv *env, jobject /* this */, jintArray outArray) {
+
+    if (!outArray) return JNI_FALSE;
+    const jsize len = env->GetArrayLength(outArray);
+    if (len < static_cast<jsize>(client::audio::ERROR_HISTOGRAM_BUCKETS)) return JNI_FALSE;
+
+    uint32_t buf[client::audio::ERROR_HISTOGRAM_BUCKETS] = {0};
+    AAudioEngine::getInstance().getErrorHistogram(buf, client::audio::ERROR_HISTOGRAM_BUCKETS);
+
+    jint jbuf[client::audio::ERROR_HISTOGRAM_BUCKETS];
+    for (size_t i = 0; i < client::audio::ERROR_HISTOGRAM_BUCKETS; ++i) {
+        jbuf[i] = static_cast<jint>(buf[i]);
+    }
+
+    env->SetIntArrayRegion(outArray, 0, client::audio::ERROR_HISTOGRAM_BUCKETS, jbuf);
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getHardwareActiveConfig(
+    JNIEnv *env, jobject /* this */, jintArray outArray) {
+
+    if (!outArray || env->GetArrayLength(outArray) < 7) return JNI_FALSE;
+
+    auto& engine = AAudioEngine::getInstance();
+    jint data[7] = {
+        engine.getActualPlaybackSampleRate(),
+        engine.getActualPlaybackChannels(),
+        engine.getActualPlaybackFormat(),
+        engine.getActualPlaybackBurst(),
+        engine.getActiveOutputDeviceId(),
+        engine.isMmapActive() ? 1 : 0,
+        engine.isExclusiveSharingActive() ? 1 : 0
+    };
+
+    env->SetIntArrayRegion(outArray, 0, 7, data);
+    return JNI_TRUE;
 }
