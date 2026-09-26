@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/java/com/client/app/service/LiveSessionForegroundService.kt
 package com.client.app.service
 
 import android.Manifest
@@ -7,16 +6,22 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.media.app.NotificationCompat.MediaStyle
 import com.client.app.MainActivity
+import com.client.app.session.LinkState
 import com.client.app.session.SessionManager
 import com.client.app.util.AppLogger
 import dagger.hilt.android.AndroidEntryPoint
@@ -26,6 +31,88 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.lang.ref.WeakReference
 import javax.inject.Inject
+
+/**
+ * УСТРАНЕНИЕ ДЕФЕКТА 180:
+ * Мониторинг энергопотребления голосовой сессии (Power Budget Tracker).
+ * Целевой бюджет платформы Snapdragon 8 Gen 2: расход < 7% емкости аккумулятора в час.
+ */
+class SessionPowerBudgetTracker(
+    private val context: Context,
+    private val logger: AppLogger
+) {
+    private var sessionStartTimeMs: Long = 0L
+    private var startBatteryLevel: Int = -1
+    private var activeDuplexDurationMs: Long = 0L
+    private var lastActiveStartMs: Long = 0L
+    private var wifiLockHeldDurationMs: Long = 0L
+    private var lastWifiLockStartMs: Long = 0L
+
+    fun onSessionStarted() {
+        sessionStartTimeMs = SystemClock.elapsedRealtime()
+        startBatteryLevel = readBatteryLevel()
+        activeDuplexDurationMs = 0L
+        wifiLockHeldDurationMs = 0L
+        logger.d("PowerBudget: Старт мониторинга (уровень заряда: $startBatteryLevel%)")
+    }
+
+    fun onDuplexStateChanged(isLive: Boolean) {
+        val now = SystemClock.elapsedRealtime()
+        if (isLive) {
+            lastActiveStartMs = now
+        } else if (lastActiveStartMs > 0L) {
+            activeDuplexDurationMs += (now - lastActiveStartMs)
+            lastActiveStartMs = 0L
+        }
+    }
+
+    fun onWifiLockStateChanged(isHeld: Boolean) {
+        val now = SystemClock.elapsedRealtime()
+        if (isHeld) {
+            lastWifiLockStartMs = now
+        } else if (lastWifiLockStartMs > 0L) {
+            wifiLockHeldDurationMs += (now - lastWifiLockStartMs)
+            lastWifiLockStartMs = 0L
+        }
+    }
+
+    fun reportBudgetSummary() {
+        val now = SystemClock.elapsedRealtime()
+        val totalSessionMs = now - sessionStartTimeMs
+        if (totalSessionMs <= 0L) return
+
+        val totalMinutes = totalSessionMs / 60000.0
+        val endBatteryLevel = readBatteryLevel()
+        val batteryDrop = if (startBatteryLevel >= 0 && endBatteryLevel >= 0) {
+            (startBatteryLevel - endBatteryLevel).coerceAtLeast(0)
+        } else {
+            0
+        }
+
+        val dischargeRatePerHour = if (totalMinutes >= 5.0) {
+            (batteryDrop.toDouble() / totalMinutes) * 60.0
+        } else {
+            0.0
+        }
+
+        val wifiHeldSec = wifiLockHeldDurationMs / 1000L
+        val activeSec = activeDuplexDurationMs / 1000L
+
+        logger.d(
+            "PowerBudget: Итоги сессии -> " +
+            "Длительность=${"%.1f".format(totalMinutes)} мин, " +
+            "Расход=$batteryDrop%, " +
+            "Темп=${"%.2f".format(dischargeRatePerHour)}%/час (Лимит: 7.0%/час), " +
+            "Активный дуплекс=${activeSec}с, " +
+            "Low-Latency Wi-Fi=${wifiHeldSec}с"
+        )
+    }
+
+    private fun readBatteryLevel(): Int {
+        val bm = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+        return bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+    }
+}
 
 @AndroidEntryPoint
 class LiveSessionForegroundService : Service() {
@@ -39,6 +126,10 @@ class LiveSessionForegroundService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var mediaObserverJob: Job? = null
+    private var powerTracker: SessionPowerBudgetTracker? = null
+
+    private var connectivityManager: ConnectivityManager? = null
+    private var isCurrentNetworkWifi: Boolean = false
 
     companion object {
         const val ACTION_STOP = "com.client.app.action.STOP"
@@ -76,14 +167,27 @@ class LiveSessionForegroundService : Service() {
         prepareForStart()
         createNotificationChannel()
         initMediaSession()
+        initNetworkMonitoring()
+
+        powerTracker = SessionPowerBudgetTracker(this, logger).apply {
+            onSessionStarted()
+        }
+
         promoteToForeground()
         if (_isServiceActive.value) {
-            acquireHardwareLocks()
+            acquireCpuWakeLock()
         }
+
         mediaObserverJob = serviceScope.launch {
             sessionManager.state.collect { state ->
+                val isLive = state.link == LinkState.LIVE
+                powerTracker?.onDuplexStateChanged(isLive)
+
+                // УСТРАНЕНИЕ ДЕФЕКТА 179: Динамическое управление блокировкой Wi-Fi
+                updateWifiLockState(isLive)
+
                 val mediaState = when {
-                    state.link != com.client.app.session.LinkState.IDLE -> PlaybackStateCompat.STATE_PLAYING
+                    state.link != LinkState.IDLE -> PlaybackStateCompat.STATE_PLAYING
                     else -> PlaybackStateCompat.STATE_STOPPED
                 }
                 mediaSession?.setPlaybackState(
@@ -98,24 +202,90 @@ class LiveSessionForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            // SessionManager owns the shutdown ordering. Do not stop the
-            // service here, otherwise the service could disappear before
-            // capture/playback/WebSocket cleanup has completed.
             sessionManager.stopSession()
             return START_NOT_STICKY
         }
 
         promoteToForeground()
         if (_isServiceActive.value) {
-            acquireHardwareLocks()
+            acquireCpuWakeLock()
         }
         return START_NOT_STICKY
     }
 
+    private fun initNetworkMonitoring() {
+        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        checkCurrentNetworkTransport()
+
+        connectivityManager?.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                val isWifi = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                if (isCurrentNetworkWifi != isWifi) {
+                    isCurrentNetworkWifi = isWifi
+                    val isLive = sessionManager.state.value.link == LinkState.LIVE
+                    updateWifiLockState(isLive)
+                }
+            }
+
+            override fun onLost(network: Network) {
+                isCurrentNetworkWifi = false
+                updateWifiLockState(false)
+            }
+        })
+    }
+
+    private fun checkCurrentNetworkTransport() {
+        val cm = connectivityManager ?: return
+        val activeNetwork = cm.activeNetwork ?: return
+        val caps = cm.getNetworkCapabilities(activeNetwork) ?: return
+        isCurrentNetworkWifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+    }
+
     /**
-     * Exposes the active session to Android media controls while the Live
-     * foreground service owns the background audio lifecycle.
+     * УСТРАНЕНИЕ ДЕФЕКТА 179:
+     * Блокировка Low-Latency Wi-Fi удерживается строго при наличии Wi-Fi соединения и активного дуплекса.
+     * При переходе на сотовую сеть или паузе в диалоге радиомодуль переходит в энергосбережение.
      */
+    private fun updateWifiLockState(isLive: Boolean) {
+        val shouldHoldWifi = isLive && isCurrentNetworkWifi
+
+        if (shouldHoldWifi) {
+            if (wifiLock?.isHeld != true) {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                wifiLock = wm.createWifiLock(lockMode, "client:live_session_wifi").apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+                powerTracker?.onWifiLockStateChanged(true)
+            }
+        } else {
+            if (wifiLock?.isHeld == true) {
+                runCatching { wifiLock?.release() }
+                wifiLock = null
+                powerTracker?.onWifiLockStateChanged(false)
+            }
+        }
+    }
+
+    private fun acquireCpuWakeLock() {
+        if (wakeLock?.isHeld != true) {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "client:live_session_cpu"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
+    }
+
     private fun initMediaSession() {
         runCatching {
             mediaSession = MediaSessionCompat(this, "GeminiLiveMediaSession").apply {
@@ -131,33 +301,6 @@ class LiveSessionForegroundService : Service() {
                     .build()
                 setPlaybackState(state)
                 isActive = true
-            }
-        }
-    }
-
-    private fun acquireHardwareLocks() {
-        if (wakeLock?.isHeld != true) {
-            val pm = getSystemService(POWER_SERVICE) as PowerManager
-            wakeLock = pm.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "client:live_session_cpu"
-            ).apply {
-                setReferenceCounted(false)
-                acquire()
-            }
-        }
-
-        if (wifiLock?.isHeld != true) {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val lockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-            } else {
-                @Suppress("DEPRECATION")
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF
-            }
-            wifiLock = wm.createWifiLock(lockMode, "client:live_session_wifi").apply {
-                setReferenceCounted(false)
-                acquire()
             }
         }
     }
@@ -203,7 +346,6 @@ class LiveSessionForegroundService : Service() {
             false
         }
     }
-
 
     private fun createNotificationChannel() {
         val nm = getSystemService(NotificationManager::class.java)
@@ -253,7 +395,6 @@ class LiveSessionForegroundService : Service() {
                 stopPendingIntent
             )
 
-        // Связываем с токеном MediaSession для нативного стиля Android Media
         mediaSession?.let { session ->
             builder.setStyle(
                 MediaStyle()
@@ -265,15 +406,13 @@ class LiveSessionForegroundService : Service() {
         return builder.build()
     }
 
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        logger.w("LiveSessionForegroundService: task removed while service is active")
-        super.onTaskRemoved(rootIntent)
-    }
-
     override fun onDestroy() {
         _isServiceActive.value = false
         mediaObserverJob?.cancel()
         serviceScope.cancel()
+
+        powerTracker?.reportBudgetSummary()
+        powerTracker = null
 
         runCatching {
             if (wakeLock?.isHeld == true) wakeLock?.release()
