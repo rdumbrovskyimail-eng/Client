@@ -207,12 +207,15 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
         return false;
     }
 
-    // ИСПРАВЛЕНИЕ ДЕФЕКТА: Явно запрошенное устройство обязано совпадать с открытым.
+    // УСТРАНЕНИЕ ДЕФЕКТА 8: Не закрывать поток из-за несовпадения ID устройства на Samsung One UI
     if (inputDeviceId > 0 && actualInDeviceId != inputDeviceId) {
-        LOGE("AAudio capture device mismatch rejected: requested=%d, actual=%d",
-             inputDeviceId, actualInDeviceId);
-        closeCaptureStreamLocked();
-        return false;
+        if (!isBt) {
+            LOGW("AAudio capture device ID mismatch: requested=%d, actual=%d (AudioPolicy routing active)",
+                 inputDeviceId, actualInDeviceId);
+        } else {
+            LOGI("AAudio capture device routed via AudioPolicy: requested=%d, actual=%d",
+                 inputDeviceId, actualInDeviceId);
+        }
     }
 
     actualCaptureSampleRate_.store(actualInRate, std::memory_order_release);
@@ -250,6 +253,7 @@ bool AAudioEngine::initLocked(
     {
         std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
         resampler24To16_.reset();
+        resampler24To32_.reset();
         halfbandResampler24To48_.reset();
         genericResampler_.reset();
         captureDecimator48To16_.reset();
@@ -269,7 +273,6 @@ bool AAudioEngine::initLocked(
     playbackDspInputBuffer_.resetQuiesced();
     playbackBuffer_.resetQuiesced();
 
-    // Шлюз входящих сэмплов закрыт по умолчанию
     captureIngressBlocked_.store(true, std::memory_order_release);
 
     actualCaptureSampleRate_.store(0, std::memory_order_release);
@@ -324,7 +327,7 @@ aaudio_result_t AAudioEngine::openPlaybackStreamWithFallback(
     const aaudio_sharing_mode_t desiredSharing =
         isBluetooth ? AAUDIO_SHARING_MODE_SHARED : AAUDIO_SHARING_MODE_EXCLUSIVE;
 
-    auto buildAndOpen = [this, targetPlaybackSampleRate, outputDeviceId](aaudio_sharing_mode_t sharingMode) -> aaudio_result_t {
+    auto buildAndOpen = [this, targetPlaybackSampleRate, outputDeviceId, isBluetooth](aaudio_sharing_mode_t sharingMode) -> aaudio_result_t {
         AAudioStreamBuilder* outBuilder = nullptr;
         if (AAudio_createStreamBuilder(&outBuilder) != AAUDIO_OK) return AAUDIO_ERROR_INTERNAL;
 
@@ -332,9 +335,18 @@ aaudio_result_t AAudioEngine::openPlaybackStreamWithFallback(
         AAudioStreamBuilder_setPerformanceMode(outBuilder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
         AAudioStreamBuilder_setChannelCount(outBuilder, CHANNEL_COUNT_MONO);
         AAudioStreamBuilder_setFormat(outBuilder, AAUDIO_FORMAT_PCM_I16);
-        AAudioStreamBuilder_setSampleRate(outBuilder, targetPlaybackSampleRate);
+        
+        // УСТРАНЕНИЕ ДЕФЕКТОВ 6 и 7: В Bluetooth-режиме избегать навязывания жесткого битрейта, если драйвер согласовал иной
+        if (isBluetooth && targetPlaybackSampleRate <= 0) {
+            AAudioStreamBuilder_setSampleRate(outBuilder, AAUDIO_UNSPECIFIED);
+        } else {
+            AAudioStreamBuilder_setSampleRate(outBuilder, targetPlaybackSampleRate);
+        }
 
-        if (outputDeviceId > 0) AAudioStreamBuilder_setDeviceId(outBuilder, outputDeviceId);
+        if (outputDeviceId > 0 && !isBluetooth) {
+            AAudioStreamBuilder_setDeviceId(outBuilder, outputDeviceId);
+        }
+        
         AAudioStreamBuilder_setSharingMode(outBuilder, sharingMode);
         AAudioStreamBuilder_setUsage(outBuilder, AAUDIO_USAGE_VOICE_COMMUNICATION);
         AAudioStreamBuilder_setDataCallback(outBuilder, playbackCallback, this);
@@ -450,6 +462,7 @@ bool AAudioEngine::startPlayback() {
         std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
         halfbandResampler24To48_.reset();
         resampler24To16_.reset();
+        resampler24To32_.reset();
         genericResampler_.reset();
     }
 
@@ -488,9 +501,6 @@ bool AAudioEngine::startPlayback() {
     return true;
 }
 
-// -----------------------------------------------------------------------------
-// ФАЗА 1: Физический старт потока. PCM НЕ допускается в буферы.
-// -----------------------------------------------------------------------------
 bool AAudioEngine::startCapture() {
     std::lock_guard<std::mutex> lock(lifecycleMutex_);
 
@@ -550,7 +560,6 @@ bool AAudioEngine::startCapture() {
         return false;
     }
 
-    // Обновляем реальный ID устройства ПОСЛЕ физического запуска
     const int32_t actualDeviceId = AAudioStream_getDeviceId(captureStream_);
     actualInputDeviceId_.store(actualDeviceId, std::memory_order_release);
 
@@ -558,9 +567,6 @@ bool AAudioEngine::startCapture() {
     return true;
 }
 
-// -----------------------------------------------------------------------------
-// ФАЗА 2: Запуск DSP-потребителя. PCM по-прежнему заблокирован.
-// -----------------------------------------------------------------------------
 bool AAudioEngine::activateCaptureDsp() {
     std::lock_guard<std::mutex> lock(lifecycleMutex_);
 
@@ -606,9 +612,6 @@ bool AAudioEngine::activateCaptureDsp() {
     return true;
 }
 
-// -----------------------------------------------------------------------------
-// ФАЗА 3: Финальный коммит. Открытие шлюза для поступления PCM в пайплайн.
-// -----------------------------------------------------------------------------
 bool AAudioEngine::commitCaptureAdmission() {
     std::lock_guard<std::mutex> lock(lifecycleMutex_);
 
@@ -753,6 +756,7 @@ void AAudioEngine::stopLocked() {
     {
         std::scoped_lock lock(playbackControlMutex_, playbackJniWriteMutex_);
         resampler24To16_.reset();
+        resampler24To32_.reset();
         halfbandResampler24To48_.reset();
         genericResampler_.reset();
         captureDecimator48To16_.reset();
@@ -894,6 +898,7 @@ void AAudioEngine::playbackDspThreadLoop() {
                 voiceEnhancer_.reset(currentRate);
                 halfbandResampler24To48_.reset();
                 resampler24To16_.reset();
+                resampler24To32_.reset();
                 genericResampler_.reset();
                 genericResampler_.configure(SAMPLE_RATE_GEMINI_OUT, currentRate);
                 fftPos_ = 0;
@@ -975,6 +980,9 @@ void AAudioEngine::playbackDspThreadLoop() {
                 outputFrames = halfbandResampler24To48_.process(input, inputFrames, output);
             } else if (actualRate == SAMPLE_RATE_BT_HFP) {
                 outputFrames = resampler24To16_.process(input, inputFrames, output);
+            } else if (actualRate == 32000) {
+                // УСТРАНЕНИЕ ДЕФЕКТА 3: Выделенный полифазный ресемплер для 32 кГц LE Audio LC3
+                outputFrames = resampler24To32_.process(input, inputFrames, output);
             } else {
                 genericResampler_.configure(SAMPLE_RATE_GEMINI_OUT, actualRate);
                 outputFrames = genericResampler_.process(input, inputFrames, output, playbackDspOutputScratch_.size());
@@ -1204,7 +1212,6 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
 
     auto* engine = static_cast<AAudioEngine*>(userData);
 
-    // БАРЬЕР ДОПУСКА: пока маршрут не проверен и не подтверждён, данные отбрасываются
     if (engine->captureIngressBlocked_.load(std::memory_order_acquire)) {
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
