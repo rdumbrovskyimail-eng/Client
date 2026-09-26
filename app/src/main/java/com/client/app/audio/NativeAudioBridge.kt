@@ -63,6 +63,7 @@ class NativeAudioBridge @Inject constructor() {
     external fun setVolume(volume: Float)
     external fun setMicGain(gain: Float)
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 71, 72: Zero-Copy pinned JNI передача с корректным контрактом возврата
     external fun writePlaybackByteArray(
         pcmArray: ByteArray,
         offsetBytes: Int,
@@ -70,6 +71,7 @@ class NativeAudioBridge @Inject constructor() {
         generation: Long
     ): Int
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 75: Прямой доступ к DirectBuffer без аллокаций памяти
     external fun writePlaybackDirect(
         byteBuffer: ByteBuffer,
         offsetBytes: Int,
