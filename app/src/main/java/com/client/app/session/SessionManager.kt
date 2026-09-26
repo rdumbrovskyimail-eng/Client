@@ -336,7 +336,6 @@ class SessionManager @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 68 и 69: Мгновенный сброс очереди аудиокадров перед инвалидацией
     private suspend fun invalidateAndFlushAudio(reason: String): Long =
         withContext(Dispatchers.IO) {
             client.purgeAudioQueue()
@@ -1220,7 +1219,6 @@ class SessionManager @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 83: Раздельная параллельная обработка Data Plane и Control Plane
     private suspend fun startMicLocked() {
         if (
             !userMicDesired ||
@@ -1259,7 +1257,7 @@ class SessionManager @Inject constructor(
         micAudioJob?.cancel()
         micControlJob?.cancel()
 
-        // 1. Data Plane: Непрерывная передача PCM аудио
+        // 1. Data Plane: Передача PCM сэмплов без задержек в общей очереди
         micAudioJob = scope.launch {
             try {
                 for (audio in audioEngine.micAudioOutput) {
@@ -1285,7 +1283,7 @@ class SessionManager @Inject constructor(
             }
         }
 
-        // 2. Control Plane: Мгновенная доставка сигналов VAD и остановки без задержек в очереди PCM
+        // 2. Control Plane: События VAD и жизненного цикла
         micControlJob = scope.launch {
             try {
                 for (control in audioEngine.micControlOutput) {
@@ -1358,7 +1356,6 @@ class SessionManager @Inject constructor(
         _state.update { it.copy(isMicActive = false) }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 67, 68, 70: Валидация поколений и отсев просроченных аудиокадров
     private fun observeAudio() = scope.launch {
         while (isActive) {
             try {
