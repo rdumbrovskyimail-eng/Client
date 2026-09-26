@@ -96,6 +96,73 @@ Java_com_client_app_audio_NativeAudioBridge_commitCaptureAdmission(JNIEnv * /* e
     return static_cast<jboolean>(AAudioEngine::getInstance().commitCaptureAdmission());
 }
 
+// УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 44: Изолированный перезапуск только пострадавшего стрима
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_restartCaptureStream(JNIEnv * /* env */, jobject /* this */) {
+    LOGI("restartCaptureStream called");
+    return static_cast<jboolean>(AAudioEngine::getInstance().restartCaptureStream());
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_restartPlaybackStream(JNIEnv * /* env */, jobject /* this */) {
+    LOGI("restartPlaybackStream called");
+    return static_cast<jboolean>(AAudioEngine::getInstance().restartPlaybackStream());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getEngineState(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jint>(AAudioEngine::getInstance().getEngineState());
+}
+
+// УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 42: Немедленное чтение структурированной ошибки без ожидания 100 мс
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_pollAudioError(
+    JNIEnv *env, jobject /* this */, jlongArray outData) {
+
+    if (!outData || env->GetArrayLength(outData) < 4) return JNI_FALSE;
+
+    client::audio::StreamErrorEvent event{};
+    if (!AAudioEngine::getInstance().pollErrorEvent(event)) {
+        return JNI_FALSE;
+    }
+
+    jlong data[4] = {
+        static_cast<jlong>(event.direction),
+        static_cast<jlong>(event.errorCode),
+        static_cast<jlong>(event.faultType),
+        static_cast<jlong>(event.timestampNs)
+    };
+
+    env->SetLongArrayRegion(outData, 0, 4, data);
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_hasPendingError(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jboolean>(AAudioEngine::getInstance().hasPendingError());
+}
+
+// УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Наносекундный тайминг и счетчики кадров
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getCaptureSequenceNumber(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jlong>(AAudioEngine::getInstance().getCaptureSequenceNumber());
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getCaptureTimestampNs(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jlong>(AAudioEngine::getInstance().getCaptureTimestampNs());
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getPlaybackSequenceNumber(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jlong>(AAudioEngine::getInstance().getPlaybackSequenceNumber());
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getPlaybackPresentationTimestampNs(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jlong>(AAudioEngine::getInstance().getPlaybackPresentationTimestampNs());
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_getActualPlaybackSampleRate(JNIEnv * /* env */, jobject /* this */) {
     return AAudioEngine::getInstance().getActualPlaybackSampleRate();
