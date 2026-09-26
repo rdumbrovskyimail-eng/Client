@@ -26,7 +26,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
-import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.sqrt
@@ -73,13 +72,10 @@ class NativeAudioEngine @Inject constructor(
         private const val BARGE_IN_RECOVERY_POLL_MS = 50L
         private const val PRE_ROLL_FRAMES_CAPACITY = 20
         private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 512L * 1024L
-        // УСТРАНЕНИЕ ДЕФЕКТА 36: Снижение таймаута зависания записи с 1800 до 150 мс
         private const val PLAYBACK_WRITE_STALL_TIMEOUT_MS = 150L
     }
 
-    private val audioManager =
-        context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var focusRequest: AudioFocusRequest? = null
 
     private val _isCapturing = MutableStateFlow(false)
@@ -137,7 +133,9 @@ class NativeAudioEngine @Inject constructor(
     private val audioLifecycleMutex = Mutex()
     private val captureEventLock = Any()
     private val captureDirectMutex = Mutex()
-    private val playbackOperationLock = ReentrantLock()
+
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 37 и 38: playbackOperationLock полностью ликвидирован,
+    // исключая инверсию блокировок (Deadlock) с captureDirectMutex и C++ lifecycleMutex_.
 
     private val routeTransitionChannel = Channel<RouteTransitionRequest>(Channel.CONFLATED)
 
@@ -304,17 +302,12 @@ class NativeAudioEngine @Inject constructor(
                 val profile = router.currentProfile.value
 
                 val inited = captureDirectMutex.withLock {
-                    playbackOperationLock.lock()
-                    try {
-                        bridge.initAudioRoute(
-                            isBluetooth = profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION,
-                            sampleRate = profile.sampleRateOut,
-                            inputDeviceId = profile.inputDeviceId,
-                            outputDeviceId = profile.outputDeviceId
-                        )
-                    } finally {
-                        playbackOperationLock.unlock()
-                    }
+                    bridge.initAudioRoute(
+                        isBluetooth = profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION,
+                        sampleRate = profile.sampleRateOut,
+                        inputDeviceId = profile.inputDeviceId,
+                        outputDeviceId = profile.outputDeviceId
+                    )
                 }
 
                 if (!inited) {
@@ -332,33 +325,18 @@ class NativeAudioEngine @Inject constructor(
                 )
 
                 captureDirectMutex.withLock {
-                    playbackOperationLock.lock()
-                    try {
-                        bridge.flushPlayback(currentPlaybackGeneration)
-                    } finally {
-                        playbackOperationLock.unlock()
-                    }
+                    bridge.flushPlayback(currentPlaybackGeneration)
                 }
 
                 val started = captureDirectMutex.withLock {
-                    playbackOperationLock.lock()
-                    try {
-                        bridge.startPlaybackAudio()
-                    } finally {
-                        playbackOperationLock.unlock()
-                    }
+                    bridge.startPlaybackAudio()
                 }
 
                 if (!started) {
                     playbackDesired.set(false)
                     logger.e("NativeAudioEngine: Сбой запуска playback AAudio")
                     captureDirectMutex.withLock {
-                        playbackOperationLock.lock()
-                        try {
-                            bridge.stopAudio()
-                        } finally {
-                            playbackOperationLock.unlock()
-                        }
+                        bridge.stopAudio()
                     }
                     router.stop()
                     abandonAudioFocus()
@@ -599,7 +577,6 @@ class NativeAudioEngine @Inject constructor(
                             if (isAadMode) {
                                 val isVocalized = speechStartedOnFrame || vadDetector.isSpeechDetected.value
 
-                                // УСТРАНЕНИЕ ДЕФЕКТОВ 14, 15, 16, 17: Разделение акустических моделей TWS и спикерфона
                                 val isConfirmedUserInterruption = if (isBluetooth) {
                                     val canBargeInTimers = (now - lastPlaybackStartMs > 180L) &&
                                                            (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
@@ -635,7 +612,6 @@ class NativeAudioEngine @Inject constructor(
                                     hapticManager.triggerBargeIn()
                                     _bargeInEvents.tryEmit(Unit)
 
-                                    // УСТРАНЕНИЕ ДЕФЕКТА 19: Полное сохранение pre-roll буфера в ОБОИХ режимах
                                     val preRoll = mutableListOf<ByteArray>()
                                     synchronized(poolLock) {
                                         while (leadInBuffer.isNotEmpty()) {
@@ -808,32 +784,27 @@ class NativeAudioEngine @Inject constructor(
             var playbackRecovered = false
 
             captureDirectMutex.withLock {
-                playbackOperationLock.lock()
-                try {
-                    bridge.stopAudio()
-                    routeInited = bridge.initAudioRoute(
-                        isBluetooth = req.profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION,
-                        sampleRate = req.profile.sampleRateOut,
-                        inputDeviceId = req.profile.inputDeviceId,
-                        outputDeviceId = req.profile.outputDeviceId
+                bridge.stopAudio()
+                routeInited = bridge.initAudioRoute(
+                    isBluetooth = req.profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION,
+                    sampleRate = req.profile.sampleRateOut,
+                    inputDeviceId = req.profile.inputDeviceId,
+                    outputDeviceId = req.profile.outputDeviceId
+                )
+
+                if (routeInited) {
+                    logActualNativeRoute(req.profile, "routeRecovery")
+                    vadDetector.resetState()
+                    synchronized(poolLock) {
+                        recycleLeadInBuffersLocked()
+                    }
+                    vadDetector.setThresholds(
+                        req.profile.vadThresholdStart,
+                        req.profile.vadThresholdEnd
                     )
 
-                    if (routeInited) {
-                        logActualNativeRoute(req.profile, "routeRecovery")
-                        vadDetector.resetState()
-                        synchronized(poolLock) {
-                            recycleLeadInBuffersLocked()
-                        }
-                        vadDetector.setThresholds(
-                            req.profile.vadThresholdStart,
-                            req.profile.vadThresholdEnd
-                        )
-
-                        playbackRecovered = !keepPlaying || bridge.startPlaybackAudio()
-                        _isPlaying.value = playbackRecovered && keepPlaying
-                    }
-                } finally {
-                    playbackOperationLock.unlock()
+                    playbackRecovered = !keepPlaying || bridge.startPlaybackAudio()
+                    _isPlaying.value = playbackRecovered && keepPlaying
                 }
             }
 
@@ -979,12 +950,7 @@ class NativeAudioEngine @Inject constructor(
                     healthJob = null
 
                     captureDirectMutex.withLock {
-                        playbackOperationLock.lock()
-                        try {
-                            bridge.stopAudio()
-                        } finally {
-                            playbackOperationLock.unlock()
-                        }
+                        bridge.stopAudio()
                     }
 
                     if (captureToStop != null) {
@@ -1021,7 +987,6 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 34: Исправление порядка операций при вычислении дельты прироста
     suspend fun awaitPlaybackDrained(
         generation: Long,
         stallTimeoutMs: Long = 1800L
@@ -1090,24 +1055,15 @@ class NativeAudioEngine @Inject constructor(
     fun setMicGain(gain: Float) =
         bridge.setMicGain(gain.coerceIn(0.5f, 2.0f))
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 37 и 38: Быстрый атомарный сброс без захвата playbackOperationLock
     fun invalidateAndFlushPlayback(reason: String = ""): Long {
-        playbackOperationLock.lock()
-        try {
-            val current = playbackGeneration.get()
-            val next = if (current == Long.MAX_VALUE) 1L else current + 1L
-
-            bridge.flushPlayback(next)
-            playbackGeneration.set(next)
-
-            _outLevel.value = 0f
-            logger.d("NativeAudioEngine: playback generation committed [Gen=$next, Reason='$reason']")
-            return next
-        } finally {
-            playbackOperationLock.unlock()
-        }
+        val next = playbackGeneration.incrementAndGet().let { if (it <= 0L) 1L else it }
+        bridge.flushPlayback(next)
+        _outLevel.value = 0f
+        logger.d("NativeAudioEngine: playback generation committed [Gen=$next, Reason='$reason']")
+        return next
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 36: Снижение таймаута зависания с 1800 до 150 мс и мгновенный выход
     suspend fun enqueuePlayback(
         pcm: ByteArray,
         generation: Long
