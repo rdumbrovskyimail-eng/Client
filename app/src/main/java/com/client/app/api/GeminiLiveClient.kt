@@ -151,9 +151,6 @@ class AudioFrame(
     var timestampNs: Long = SystemClock.elapsedRealtimeNanos(),
     var ttlMs: Long = 500L
 ) {
-    /**
-     * Проверка срока жизни пакета: отсеивает пакеты, задержавшиеся в сети или очереди воспроизведения.
-     */
     fun isExpired(nowMs: Long = SystemClock.elapsedRealtime()): Boolean =
         (nowMs - timestampMs) > ttlMs
 }
