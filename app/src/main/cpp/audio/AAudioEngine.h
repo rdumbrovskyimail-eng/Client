@@ -79,6 +79,7 @@ public:
     size_t writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation);
     size_t readCapturePcm(int16_t* pcm, size_t maxFrames);
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 21 и 22: Мгновенный неблокирующий сброс без остановки ЦАП
     void flushPlayback(uint64_t generation);
     void triggerBargeInEarcon();
     void resetEarcon();
@@ -152,7 +153,6 @@ private:
 
     bool waitForStreamState(AAudioStream* stream, aaudio_stream_state_t desired, int timeoutMs);
     bool validateAndPublishPlaybackConfigLocked(int32_t requestedOutputDeviceId);
-    bool flushOutputStreamLocked(bool resumeAfterFlush);
 
     aaudio_result_t openPlaybackStreamWithFallback(
         int32_t targetPlaybackSampleRate,
@@ -168,6 +168,7 @@ private:
         void* audioData,
         int32_t numFrames);
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 23, 24, 25: Wait-free RT колбэк без математики и спин-локов
     static aaudio_data_callback_result_t playbackCallback(
         AAudioStream* stream,
         void* userData,
@@ -178,14 +179,6 @@ private:
         AAudioStream* stream,
         void* userData,
         aaudio_result_t error);
-
-    static constexpr uint32_t PLAYBACK_CALLBACK_BLOCKED = 0x80000000u;
-    static constexpr uint32_t PLAYBACK_CALLBACK_COUNT_MASK = 0x7fffffffu;
-
-    bool tryEnterPlaybackCallback();
-    void leavePlaybackCallback();
-    void blockPlaybackCallbackAndWait();
-    void unblockPlaybackCallback();
 
     AAudioStream* captureStream_{nullptr};
     AAudioStream* playbackStream_{nullptr};
@@ -246,15 +239,7 @@ private:
     alignas(64) std::atomic<uint64_t> playbackEpoch_{0};
     alignas(64) std::atomic<uint64_t> playbackDspResetAcknowledgedEpoch_{0};
 
-    alignas(64)
-    std::atomic<uint32_t> playbackCallbackState_{PLAYBACK_CALLBACK_BLOCKED};
-
     std::mutex playbackControlMutex_;
-    std::mutex playbackJniWriteMutex_;
-
-    std::mutex playbackIngressMutex_;
-    std::condition_variable playbackIngressCv_;
-    std::atomic<bool> inputIngressBlocked_{false};
 
     std::atomic<bool> earconRequested_{false};
 
