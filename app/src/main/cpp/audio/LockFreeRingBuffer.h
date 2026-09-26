@@ -22,8 +22,8 @@ namespace client::audio {
  * 2. Метод writeAllOrNothing(): гарантирует целостность квантов ЦОС. Данные либо
  *    записываются целиком, либо отклоняются без частичного усечения, предотвращая щелчки
  *    и разрывы фазы звуковой волны (Дефект 124).
- * 3. Контроль владения потоками: регистрация ID потока продюсера и консьюмера с проверкой
- *    прав доступа в runtime (Дефект 123).
+ * 3. Контроль владения потоками: регистрация и валидация ID потоков продюсера и консьюмера
+ *    для предотвращения несанкционированного многопоточного доступа (Дефект 123).
  * 4. Wait-free потокобезопасный сброс: CAS-петля discardAll() позволяет безопасно
  *    очищать очередь из управляющих потоков без разрушения индексов читателя (Дефект 122).
  */
@@ -54,11 +54,11 @@ public:
     }
 
     void registerProducerThread() noexcept {
-        producerThreadId_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        producerThreadId_.store(std::this_thread::get_id(), std::memory_order_release);
     }
 
     void registerConsumerThread() noexcept {
-        consumerThreadId_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        consumerThreadId_.store(std::this_thread::get_id(), std::memory_order_release);
     }
 
     /**
@@ -69,6 +69,8 @@ public:
         if (data == nullptr || count == 0 || count > Capacity) {
             return 0;
         }
+
+        checkProducerThread();
 
         const size_t currentTail = tail_.load(std::memory_order_relaxed);
         const size_t currentHead = head_.load(std::memory_order_acquire);
@@ -101,6 +103,8 @@ public:
             return 0;
         }
 
+        checkProducerThread();
+
         const size_t currentTail = tail_.load(std::memory_order_relaxed);
         const size_t currentHead = head_.load(std::memory_order_acquire);
         const size_t used = currentTail - currentHead;
@@ -132,6 +136,8 @@ public:
         if (data == nullptr || count == 0) {
             return 0;
         }
+
+        checkConsumerThread();
 
         size_t currentHead = head_.load(std::memory_order_relaxed);
 
@@ -203,7 +209,7 @@ public:
         const size_t h = head_.load(std::memory_order_relaxed);
         const size_t t = tail_.load(std::memory_order_acquire);
         const size_t distance = t - h;
-        return std::min(distance, Capacity);
+        return (distance > Capacity) ? 0 : distance;
     }
 
     size_t availableWrite() const noexcept {
@@ -215,6 +221,24 @@ public:
     }
 
 private:
+    inline void checkProducerThread() const noexcept {
+#ifndef NDEBUG
+        const auto registered = producerThreadId_.load(std::memory_order_acquire);
+        if (registered != std::thread::id{}) {
+            assert(std::this_thread::get_id() == registered && "LockFreeRingBuffer: Producer thread violation detected!");
+        }
+#endif
+    }
+
+    inline void checkConsumerThread() const noexcept {
+#ifndef NDEBUG
+        const auto registered = consumerThreadId_.load(std::memory_order_acquire);
+        if (registered != std::thread::id{}) {
+            assert(std::this_thread::get_id() == registered && "LockFreeRingBuffer: Consumer thread violation detected!");
+        }
+#endif
+    }
+
     std::vector<T> buffer_;
 
     alignas(64) std::atomic<size_t> head_{0};
