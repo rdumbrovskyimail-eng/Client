@@ -56,12 +56,11 @@ class GeminiProtobufLiveClient @Inject constructor(
         private const val DEFAULT_BATCH_DEADLINE_MS = 20L           // Предельный тайм-аут удержания хвоста
         private const val AUDIO_FRAME_DEFAULT_TTL_MS = 500L         // RFC 5481 / RFC 3550 Playout TTL
 
-        private const val AUDIO_COMMAND_CHANNEL_CAPACITY = 32
+        private const val AUDIO_PCM_CHANNEL_CAPACITY = 24
+        private const val CONTROL_COMMAND_CHANNEL_CAPACITY = 32
         private const val MAX_INITIAL_HISTORY_TURNS = 20
 
-        // УСТРАНЕНИЕ ДЕФЕКТА 31: Рациональный предел бэклога (~8 секунд звука 24 кГц вместо 3 минут)
         private const val MAX_AI_AUDIO_BACKLOG_BYTES = 384L * 1024L
-
         private const val MAX_DATA_EVENTS_IN_FLIGHT = 256
     }
 
@@ -70,25 +69,22 @@ class GeminiProtobufLiveClient @Inject constructor(
         isLenient = true
     }
 
-    private sealed interface AudioOutboundCommand {
-        data class Pcm(val payload: ByteArray) : AudioOutboundCommand
-        data object ActivityStart : AudioOutboundCommand
-        data object ActivityEnd : AudioOutboundCommand
-        data object AudioStreamEnd : AudioOutboundCommand
-        data class DirectJson(val jsonMessage: String) : AudioOutboundCommand
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 84 и 85: Разделение команд Control Plane от непрерывного Data Plane
+    private sealed interface ControlOutboundCommand {
+        data object ActivityStart : ControlOutboundCommand
+        data object ActivityEnd : ControlOutboundCommand
+        data object AudioStreamEnd : ControlOutboundCommand
+        data class DirectJson(val jsonMessage: String, val tag: String = "ControlJson") : ControlOutboundCommand
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 62: Отслеживание RTT и характеристик транспортного уровня
     @Volatile private var dynamicBatchThresholdBytes: Int = DEFAULT_AUDIO_BATCH_THRESHOLD_BYTES
     @Volatile private var dynamicBatchDeadlineMs: Long = DEFAULT_BATCH_DEADLINE_MS
     @Volatile private var smoothedRttMs: Float = 40.0f
     @Volatile private var audioBatchFirstWriteMs: Long = 0L
     @Volatile private var lastOutboundAudioSendMs: Long = 0L
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 63: Событийная синхронизация готовности без таймерного поллинга
     @Volatile private var writerReadySignal: CompletableDeferred<Unit>? = null
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 79: Пул объектов AudioFrame для полного исключения GC Pressure
     private val audioFramePool = ArrayDeque<AudioFrame>(64)
     private val audioFramePoolLock = Any()
 
@@ -127,9 +123,9 @@ class GeminiProtobufLiveClient @Inject constructor(
         smoothedRttMs = next
 
         val (threshold, deadline) = when {
-            next < 35.0f -> MIN_AUDIO_BATCH_THRESHOLD_BYTES to 15L // 10 мс @ 16 кГц
-            next < 90.0f -> DEFAULT_AUDIO_BATCH_THRESHOLD_BYTES to 20L // 20 мс @ 16 кГц
-            else -> MAX_AUDIO_BATCH_THRESHOLD_BYTES to 35L // 40 мс @ 16 кГц
+            next < 35.0f -> MIN_AUDIO_BATCH_THRESHOLD_BYTES to 15L
+            next < 90.0f -> DEFAULT_AUDIO_BATCH_THRESHOLD_BYTES to 20L
+            else -> MAX_AUDIO_BATCH_THRESHOLD_BYTES to 35L
         }
         dynamicBatchThresholdBytes = threshold
         dynamicBatchDeadlineMs = deadline
@@ -241,7 +237,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         private set
 
     private val frameIdGen = AtomicLong(0L)
-    // УСТРАНЕНИЕ ДЕФЕКТА 48: Монотонный счетчик входящих аудиокадров
     private val audioFrameSeqGen = AtomicLong(0L)
 
     private var protocolPhase = ProtocolPhase.IDLE
@@ -281,7 +276,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                 )
             }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 32: Bounded channel с автоматическим возвратом бюджета при вытеснении
     private val _audio = Channel<AudioFrame>(
         capacity = 64,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
@@ -305,10 +299,15 @@ class GeminiProtobufLiveClient @Inject constructor(
     private var isAudioStreamEnded = true
 
     @Volatile
-    private var audioWriterScope: CoroutineScope? = null
+    private var outboundWorkersScope: CoroutineScope? = null
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 84: Физически изолированный канал для PCM-данных (Data Plane)
     @Volatile
-    private var audioWriterChannel: Channel<AudioOutboundCommand>? = null
+    private var audioPcmChannel: Channel<ByteArray>? = null
+
+    // УСТРАНЕНИЕ ДЕФЕКТА 84: Физически изолированный канал для сигналов управления (Control Plane)
+    @Volatile
+    private var controlCommandChannel: Channel<ControlOutboundCommand>? = null
 
     private val outboundSendLock = Any()
     private val outboundCommandMutex = Mutex()
@@ -389,7 +388,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 68 и 69: Мгновенная атомарная очистка очереди аудиокадров при смене поколения
     fun purgeAudioQueue(targetGeneration: Long = -1L): Int {
         var purgedCount = 0
         synchronized(sessionStateLock) {
@@ -412,7 +410,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         return audioEngine.invalidateAndFlushPlayback("transport invalidate")
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 79: Возврат отработанного объекта AudioFrame в пул
     fun releaseAudio(frame: AudioFrame) {
         val bytes = frame.pcm.size
         if (bytes > 0) {
@@ -496,7 +493,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                         protocolPhase = ProtocolPhase.CONNECTING
                     }
 
-                    startAudioWriter(ws, myEpoch)
+                    startOutboundWorkers(ws, myEpoch)
                     logManager.net(
                         "WebSocket:Open",
                         "Соединение открыто! HTTP ${response.code} ${response.message}"
@@ -563,7 +560,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                         if (myEpoch != epoch || webSocket !== ws) return
                         isReady = false
                     }
-                    stopAudioWriter(expectedWs = ws, expectedEpoch = myEpoch)
+                    stopOutboundWorkers(expectedWs = ws, expectedEpoch = myEpoch)
 
                     emitControlEvent(
                         GeminiEvent.Disconnected(code, reason, mySessionId, myEpoch),
@@ -587,7 +584,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                         if (myEpoch != epoch || webSocket !== ws) return
                         isReady = false
                     }
-                    stopAudioWriter(expectedWs = ws, expectedEpoch = myEpoch)
+                    stopOutboundWorkers(expectedWs = ws, expectedEpoch = myEpoch)
 
                     val fatal = httpCode == 401 || httpCode == 403
 
@@ -605,25 +602,29 @@ class GeminiProtobufLiveClient @Inject constructor(
         )
     }
 
-    private fun startAudioWriter(ws: WebSocket, writerEpoch: Long) {
-        stopAudioWriter()
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 84 и 85: Разделение диспетчеризации Data Plane и Control Plane на независимые корутины
+    private fun startOutboundWorkers(ws: WebSocket, writerEpoch: Long) {
+        stopOutboundWorkers()
 
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val channel = Channel<AudioOutboundCommand>(capacity = AUDIO_COMMAND_CHANNEL_CAPACITY)
+        val pcmChannel = Channel<ByteArray>(capacity = AUDIO_PCM_CHANNEL_CAPACITY, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+        val ctrlChannel = Channel<ControlOutboundCommand>(capacity = CONTROL_COMMAND_CHANNEL_CAPACITY)
         val readySignal = CompletableDeferred<Unit>()
 
         synchronized(sessionStateLock) {
             if (writerEpoch != epoch || webSocket !== ws) {
-                channel.close()
+                pcmChannel.close()
+                ctrlChannel.close()
                 scope.cancel()
                 return
             }
-            audioWriterScope = scope
-            audioWriterChannel = channel
+            outboundWorkersScope = scope
+            audioPcmChannel = pcmChannel
+            controlCommandChannel = ctrlChannel
             writerReadySignal = readySignal
         }
 
-        // УСТРАНЕНИЕ ДЕФЕКТА 61: Сторожевой таймер сброса частичного аудиобуфера по ограниченному дедлайну
+        // Воркер 1: Сторожевой таймер сброса частичного аудиобуфера по дедлайну
         scope.launch {
             while (isActive) {
                 delay(10L)
@@ -644,10 +645,10 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 if (pendingPayload != null) {
                     val ch = synchronized(sessionStateLock) {
-                        if (writerEpoch == epoch && webSocket === ws) audioWriterChannel else null
+                        if (writerEpoch == epoch && webSocket === ws) audioPcmChannel else null
                     } ?: break
                     try {
-                        ch.send(AudioOutboundCommand.Pcm(pendingPayload))
+                        ch.send(pendingPayload)
                     } catch (_: ClosedSendChannelException) {
                         break
                     }
@@ -655,53 +656,87 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
         }
 
+        // Воркер 2 (Data Plane): Монопольная высокоприоритетная передача PCM без блокировки командами
         scope.launch {
             try {
                 while (true) {
                     if (!awaitWriterReady(ws, writerEpoch)) break
                     if (writerEpoch != epoch || webSocket !== ws) break
 
-                    val command = channel.receiveCatching().getOrNull() ?: break
+                    val pcmBytes = pcmChannel.receiveCatching().getOrNull() ?: break
                     if (!awaitWebSocketQueueCapacity(ws, writerEpoch)) break
 
                     if (writerEpoch != epoch || !isReady || webSocket !== ws) break
 
-                    val jsonMessage = when (command) {
-                        is AudioOutboundCommand.Pcm -> {
-                            lastOutboundAudioSendMs = SystemClock.elapsedRealtime()
-                            val base64Data = Base64.encodeToString(command.payload, Base64.NO_WRAP)
-                            buildJsonObject {
-                                putJsonObject("realtimeInput") {
-                                    putJsonObject("audio") {
-                                        put("mimeType", GEMINI_INPUT_AUDIO_MIME_TYPE)
-                                        put("data", base64Data)
-                                    }
-                                }
-                            }.toString()
+                    lastOutboundAudioSendMs = SystemClock.elapsedRealtime()
+                    val base64Data = Base64.encodeToString(pcmBytes, Base64.NO_WRAP)
+                    val jsonMessage = buildJsonObject {
+                        putJsonObject("realtimeInput") {
+                            putJsonObject("audio") {
+                                put("mimeType", GEMINI_INPUT_AUDIO_MIME_TYPE)
+                                put("data", base64Data)
+                            }
                         }
+                    }.toString()
 
-                        AudioOutboundCommand.ActivityStart ->
+                    val sendAccepted = synchronized(sessionStateLock) {
+                        if (writerEpoch != epoch || !isReady || webSocket !== ws) {
+                            false
+                        } else {
+                            synchronized(outboundSendLock) {
+                                ws.send(jsonMessage)
+                            }
+                        }
+                    }
+
+                    if (!sendAccepted) {
+                        logManager.w("WebSocket:AudioWriter", "OkHttp отверг outbound audio frame")
+                        if (writerEpoch == epoch && webSocket === ws) {
+                            isReady = false
+                        }
+                        break
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (t: Throwable) {
+                logManager.e("WebSocket:AudioWriter", "Сбой воркера отправки аудио", t)
+            }
+        }
+
+        // Воркер 3 (Control Plane): Изолированная отправка управляющих сигналов, ответов функций и текста
+        scope.launch {
+            try {
+                while (true) {
+                    if (!awaitWriterReady(ws, writerEpoch)) break
+                    if (writerEpoch != epoch || webSocket !== ws) break
+
+                    val command = ctrlChannel.receiveCatching().getOrNull() ?: break
+                    if (writerEpoch != epoch || !isReady || webSocket !== ws) break
+
+                    val jsonMessage = when (command) {
+                        ControlOutboundCommand.ActivityStart ->
                             buildJsonObject {
                                 putJsonObject("realtimeInput") {
                                     putJsonObject("activityStart") {}
                                 }
                             }.toString()
 
-                        AudioOutboundCommand.ActivityEnd ->
+                        ControlOutboundCommand.ActivityEnd ->
                             buildJsonObject {
                                 putJsonObject("realtimeInput") {
                                     putJsonObject("activityEnd") {}
                                 }
                             }.toString()
 
-                        AudioOutboundCommand.AudioStreamEnd ->
+                        ControlOutboundCommand.AudioStreamEnd ->
                             buildJsonObject {
                                 putJsonObject("realtimeInput") {
                                     put("audioStreamEnd", true)
                                 }
                             }.toString()
 
-                        is AudioOutboundCommand.DirectJson ->
+                        is ControlOutboundCommand.DirectJson ->
                             command.jsonMessage
                     }
 
@@ -716,46 +751,17 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
 
                     if (!sendAccepted) {
-                        logManager.w("WebSocket:AudioWriter", "OkHttp отверг outbound audio/control command")
-                        if (writerEpoch == epoch && webSocket === ws) {
-                            isReady = false
-                        }
-                        break
+                        logManager.w("WebSocket:ControlWriter", "OkHttp отверг outbound control command")
                     }
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (t: Throwable) {
-                logManager.e("WebSocket:AudioWriter", "Ошибка realtime audio writer", t)
-                val current = synchronized(sessionStateLock) {
-                    writerEpoch == epoch && webSocket === ws
-                }
-                if (current) {
-                    synchronized(sessionStateLock) {
-                        if (writerEpoch == epoch && webSocket === ws) {
-                            isReady = false
-                            protocolPhase = ProtocolPhase.CLOSING
-                        }
-                    }
-                    val failedSessionId = synchronized(sessionStateLock) { sessionId }
-                    emitControlEvent(
-                        GeminiEvent.Disconnected(1011, "realtime audio writer failed", failedSessionId, writerEpoch),
-                        writerEpoch
-                    )
-                    runCatching { ws.close(1011, "realtime audio writer failed") }
-                }
-            } finally {
-                channel.close()
-                synchronized(sessionStateLock) {
-                    if (audioWriterChannel === channel) audioWriterChannel = null
-                    if (audioWriterScope === scope) audioWriterScope = null
-                    writerReadySignal = null
-                }
+                logManager.e("WebSocket:ControlWriter", "Сбой воркера управляющих команд", t)
             }
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 63: Ожидание сигнала готовности без циклического polling delay(5L)
     private suspend fun awaitWriterReady(ws: WebSocket, writerEpoch: Long): Boolean {
         if (isReady && writerEpoch == epoch && webSocket === ws) return true
         val signal = synchronized(sessionStateLock) { writerReadySignal } ?: return false
@@ -765,7 +771,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         } ?: false
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 63: Адаптивный экспоненциальный backoff при насыщении очереди сокета
     private suspend fun awaitWebSocketQueueCapacity(ws: WebSocket, writerEpoch: Long): Boolean {
         var backoffMs = 2L
         while (ws.queueSize() > MAX_QUEUE_BYTES) {
@@ -776,7 +781,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         return (writerEpoch == epoch && isReady && webSocket === ws)
     }
 
-    private fun stopAudioWriter(
+    private fun stopOutboundWorkers(
         expectedWs: WebSocket? = null,
         expectedEpoch: Long? = null
     ) {
@@ -787,18 +792,21 @@ class GeminiProtobufLiveClient @Inject constructor(
                 }
             }
 
-            val channel = audioWriterChannel
-            val scope = audioWriterScope
-            audioWriterChannel = null
-            audioWriterScope = null
+            val pcmCh = audioPcmChannel
+            val ctrlCh = controlCommandChannel
+            val scope = outboundWorkersScope
+
+            audioPcmChannel = null
+            controlCommandChannel = null
+            outboundWorkersScope = null
             writerReadySignal = null
 
-            channel?.close()
+            pcmCh?.close()
+            ctrlCh?.close()
             scope?.cancel()
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 61, 62, 77: Адаптивная пакетизация PCM с фиксацией длины без аллокаций
     suspend fun sendAudioPcm(pcm: ByteArray, length: Int = pcm.size) {
         if (pcm.isEmpty() || length <= 0) return
         val safeLen = minOf(length, pcm.size)
@@ -807,7 +815,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             val target = synchronized(batchLock) {
                 val writerEpoch = synchronized(sessionStateLock) { epoch }
                 val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
-                val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
+                val channel = synchronized(sessionStateLock) { audioPcmChannel } ?: return@synchronized null
 
                 isAudioStreamEnded = false
                 if (audioBatchBuffer.size() == 0) {
@@ -822,7 +830,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                     null
                 }
 
-                if (payload == null || !isWriterCurrent(writerEpoch, ws, channel)) {
+                if (payload == null || !isPcmWriterCurrent(writerEpoch, ws, channel)) {
                     null
                 } else {
                     channel to payload
@@ -830,7 +838,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             } ?: return@withLock
 
             try {
-                target.first.send(AudioOutboundCommand.Pcm(target.second))
+                target.first.send(target.second)
             } catch (_: ClosedSendChannelException) {
             }
         }
@@ -841,17 +849,17 @@ class GeminiProtobufLiveClient @Inject constructor(
             val pending = synchronized(batchLock) {
                 val writerEpoch = synchronized(sessionStateLock) { epoch }
                 val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
-                val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
+                val channel = synchronized(sessionStateLock) { audioPcmChannel } ?: return@synchronized null
 
                 if (audioBatchBuffer.size() == 0) return@synchronized null
 
                 audioBatchFirstWriteMs = 0L
                 val payload = audioBatchBuffer.toByteArray().also { audioBatchBuffer.reset() }
-                if (!isWriterCurrent(writerEpoch, ws, channel)) null else channel to payload
+                if (!isPcmWriterCurrent(writerEpoch, ws, channel)) null else channel to payload
             } ?: return@withLock
 
             try {
-                pending.first.send(AudioOutboundCommand.Pcm(pending.second))
+                pending.first.send(pending.second)
             } catch (_: ClosedSendChannelException) {
             }
         }
@@ -859,12 +867,13 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     suspend fun sendAudioStreamEnd() {
         outboundCommandMutex.withLock {
-            val pending = synchronized(batchLock) {
+            val pendingPcm = synchronized(batchLock) {
                 if (isAudioStreamEnded) return@synchronized null
 
                 val writerEpoch = synchronized(sessionStateLock) { epoch }
                 val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
-                val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
+                val pcmCh = synchronized(sessionStateLock) { audioPcmChannel } ?: return@synchronized null
+                val ctrlCh = synchronized(sessionStateLock) { controlCommandChannel } ?: return@synchronized null
 
                 audioBatchFirstWriteMs = 0L
                 val tailPayload = if (audioBatchBuffer.size() == 0) {
@@ -875,41 +884,55 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 isAudioStreamEnded = true
 
-                if (!isWriterCurrent(writerEpoch, ws, channel)) {
+                if (!isPcmWriterCurrent(writerEpoch, ws, pcmCh)) {
                     null
                 } else {
-                    Triple(channel, tailPayload, Unit)
+                    Triple(pcmCh, ctrlCh, tailPayload)
                 }
             } ?: return@withLock
 
             try {
-                pending.second?.let {
-                    pending.first.send(AudioOutboundCommand.Pcm(it))
+                pendingPcm.third?.let {
+                    pendingPcm.first.send(it)
                 }
-                pending.first.send(AudioOutboundCommand.AudioStreamEnd)
+                pendingPcm.second.send(ControlOutboundCommand.AudioStreamEnd)
             } catch (_: ClosedSendChannelException) {
             }
         }
     }
 
-    private fun isWriterCurrent(
+    private fun isPcmWriterCurrent(
         writerEpoch: Long,
         ws: WebSocket,
-        channel: SendChannel<AudioOutboundCommand>
+        channel: SendChannel<ByteArray>
     ): Boolean = synchronized(sessionStateLock) {
-        writerEpoch == epoch && webSocket === ws && audioWriterChannel === channel
+        writerEpoch == epoch && webSocket === ws && audioPcmChannel === channel
     }
 
-    private suspend fun sendOrderedJson(
-        jsonMessage: String,
+    private fun isCtrlWriterCurrent(
         writerEpoch: Long,
         ws: WebSocket,
-        channel: Channel<AudioOutboundCommand>
+        channel: SendChannel<ControlOutboundCommand>
+    ): Boolean = synchronized(sessionStateLock) {
+        writerEpoch == epoch && webSocket === ws && controlCommandChannel === channel
+    }
+
+    // УСТРАНЕНИЕ ДЕФЕКТА 84: Отправка JSON напрямую в Control Plane без блокировки аудиотракта
+    private suspend fun sendOrderedControlJson(
+        jsonMessage: String,
+        tag: String = "ControlJson"
     ): Boolean {
+        val target = synchronized(sessionStateLock) {
+            if (!isReady) return@synchronized null
+            val ws = webSocket ?: return@synchronized null
+            val channel = controlCommandChannel ?: return@synchronized null
+            Triple(epoch, ws, channel)
+        } ?: return false
+
         return outboundCommandMutex.withLock {
-            if (!isWriterCurrent(writerEpoch, ws, channel)) return@withLock false
+            if (!isCtrlWriterCurrent(target.first, target.second, target.third)) return@withLock false
             try {
-                channel.send(AudioOutboundCommand.DirectJson(jsonMessage))
+                target.third.send(ControlOutboundCommand.DirectJson(jsonMessage, tag))
                 true
             } catch (_: ClosedSendChannelException) {
                 false
@@ -919,14 +942,6 @@ class GeminiProtobufLiveClient @Inject constructor(
 
     suspend fun sendRealtimeText(text: String) {
         if (text.isBlank()) return
-
-        val target = synchronized(sessionStateLock) {
-            if (!isReady) return@synchronized null
-            val currentWs = webSocket ?: return@synchronized null
-            val currentChannel = audioWriterChannel ?: return@synchronized null
-            Triple(epoch, currentWs, currentChannel)
-        } ?: return
-
         val cleanText = text.trim()
         val jsonMessage = buildJsonObject {
             putJsonObject("realtimeInput") {
@@ -935,23 +950,11 @@ class GeminiProtobufLiveClient @Inject constructor(
         }.toString()
 
         logManager.net("WebSocket:TxText", "Отправка realtimeInput.text (length=${cleanText.length})")
-        sendOrderedJson(jsonMessage, target.first, target.second, target.third)
+        sendOrderedControlJson(jsonMessage, "RealtimeText")
     }
 
     suspend fun sendRealtimeImage(jpegBytes: ByteArray) {
         if (jpegBytes.isEmpty()) return
-
-        val target = synchronized(sessionStateLock) {
-            if (!isReady) return@synchronized null
-            val currentWs = webSocket ?: return@synchronized null
-            val currentChannel = audioWriterChannel ?: return@synchronized null
-            Triple(epoch, currentWs, currentChannel)
-        } ?: return
-
-        if (target.second.queueSize() > MAX_QUEUE_BYTES) {
-            logManager.w("WebSocket:TxImage", "Очередь WebSocket перегружена; realtime image пропущен")
-            return
-        }
 
         val base64Data = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
         val jsonMessage = buildJsonObject {
@@ -963,8 +966,8 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
         }.toString()
 
-        logManager.net("WebSocket:TxImage", "Отправка изображения (${jpegBytes.size} байт)")
-        sendOrderedJson(jsonMessage, target.first, target.second, target.third)
+        logManager.net("WebSocket:TxImage", "Отправка изображения (${jpegBytes.size} байт) в Control Plane")
+        sendOrderedControlJson(jsonMessage, "RealtimeImage")
     }
 
     suspend fun sendActivityStart() {
@@ -972,7 +975,8 @@ class GeminiProtobufLiveClient @Inject constructor(
             val pending = synchronized(batchLock) {
                 val writerEpoch = synchronized(sessionStateLock) { epoch }
                 val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
-                val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
+                val pcmCh = synchronized(sessionStateLock) { audioPcmChannel } ?: return@synchronized null
+                val ctrlCh = synchronized(sessionStateLock) { controlCommandChannel } ?: return@synchronized null
 
                 audioBatchFirstWriteMs = 0L
                 val preRoll = if (audioBatchBuffer.size() == 0) {
@@ -983,17 +987,17 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 isAudioStreamEnded = false
 
-                if (isWriterCurrent(writerEpoch, ws, channel)) {
-                    Triple(channel, preRoll, Unit)
+                if (isPcmWriterCurrent(writerEpoch, ws, pcmCh) && isCtrlWriterCurrent(writerEpoch, ws, ctrlCh)) {
+                    Triple(pcmCh, ctrlCh, preRoll)
                 } else {
                     null
                 }
             } ?: return@withLock
 
             try {
-                pending.first.send(AudioOutboundCommand.ActivityStart)
-                pending.second?.let {
-                    pending.first.send(AudioOutboundCommand.Pcm(it))
+                pending.second.send(ControlOutboundCommand.ActivityStart)
+                pending.third?.let {
+                    pending.first.send(it)
                 }
             } catch (_: ClosedSendChannelException) {
             }
@@ -1005,7 +1009,8 @@ class GeminiProtobufLiveClient @Inject constructor(
             val pending = synchronized(batchLock) {
                 val writerEpoch = synchronized(sessionStateLock) { epoch }
                 val ws = synchronized(sessionStateLock) { webSocket } ?: return@synchronized null
-                val channel = synchronized(sessionStateLock) { audioWriterChannel } ?: return@synchronized null
+                val pcmCh = synchronized(sessionStateLock) { audioPcmChannel } ?: return@synchronized null
+                val ctrlCh = synchronized(sessionStateLock) { controlCommandChannel } ?: return@synchronized null
 
                 audioBatchFirstWriteMs = 0L
                 val tailPayload = if (audioBatchBuffer.size() == 0) {
@@ -1016,18 +1021,18 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 isAudioStreamEnded = true
 
-                if (!isWriterCurrent(writerEpoch, ws, channel)) {
-                    null
+                if (isPcmWriterCurrent(writerEpoch, ws, pcmCh) && isCtrlWriterCurrent(writerEpoch, ws, ctrlCh)) {
+                    Triple(pcmCh, ctrlCh, tailPayload)
                 } else {
-                    Triple(channel, tailPayload, Unit)
+                    null
                 }
             } ?: return@withLock
 
             try {
-                pending.second?.let {
-                    pending.first.send(AudioOutboundCommand.Pcm(it))
+                pending.third?.let {
+                    pending.first.send(it)
                 }
-                pending.first.send(AudioOutboundCommand.ActivityEnd)
+                pending.second.send(ControlOutboundCommand.ActivityEnd)
             } catch (_: ClosedSendChannelException) {
             }
         }
@@ -1038,13 +1043,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         turnComplete: Boolean = true
     ) {
         if (turns.isEmpty()) return
-
-        val target = synchronized(sessionStateLock) {
-            if (!isReady) return@synchronized null
-            val currentWs = webSocket ?: return@synchronized null
-            val currentChannel = audioWriterChannel ?: return@synchronized null
-            Triple(epoch, currentWs, currentChannel)
-        } ?: return
 
         val jsonMessage = buildJsonObject {
             putJsonObject("clientContent") {
@@ -1063,7 +1061,7 @@ class GeminiProtobufLiveClient @Inject constructor(
         }.toString()
 
         logManager.net("WebSocket:TxClientContent", "Отправка clientContent (${turns.size} ходов, turnComplete=$turnComplete)")
-        sendOrderedJson(jsonMessage, target.first, target.second, target.third)
+        sendOrderedControlJson(jsonMessage, "ClientContent")
     }
 
     private fun sendClientContentInternal(
@@ -1115,9 +1113,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         val targetData = synchronized(sessionStateLock) {
             val cfg = activeConfig ?: return@synchronized null
             val caps = LiveModelCapabilitiesRegistry.forModel(cfg.model)
-            val ws = webSocket ?: return@synchronized null
-            val channel = audioWriterChannel ?: return@synchronized null
-            val sendEpoch = epoch
 
             if (!isReady) return@synchronized null
 
@@ -1167,11 +1162,11 @@ class GeminiProtobufLiveClient @Inject constructor(
             }.toString()
 
             val dbgLog = activeResponses.joinToString { "${it.name}(id=${it.id}, sched=${it.scheduling?.name ?: "NONE"})" }
-            Triple(Triple(sendEpoch, ws, channel), jsonMsg, dbgLog)
+            jsonMsg to dbgLog
         } ?: return false
 
-        val (target, jsonMessage, debugLog) = targetData
-        val accepted = sendOrderedJson(jsonMessage, target.first, target.second, target.third)
+        val (jsonMessage, debugLog) = targetData
+        val accepted = sendOrderedControlJson(jsonMessage, "ToolResponse")
         logManager.net("WebSocket:ToolResp", "Ответы функций enqueued=$accepted: [$debugLog]")
         return accepted
     }
@@ -1578,7 +1573,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                                     val aggregate = perSession.get() + bytes
                                     if (aggregate <= MAX_AI_AUDIO_BACKLOG_BYTES) {
                                         perSession.addAndGet(bytes)
-                                        // УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49, 67, 79: Пул объектов AudioFrame и проверка TTL
                                         val frameSeq = audioFrameSeqGen.incrementAndGet()
                                         val frameNanoTime = SystemClock.elapsedRealtimeNanos()
                                         val audioFrame = obtainAudioFrame(
@@ -1658,7 +1652,6 @@ class GeminiProtobufLiveClient @Inject constructor(
             dataEventsDroppedCounter.set(0L)
             audioFrameSeqGen.set(0L)
 
-            // УСТРАНЕНИЕ ДЕФЕКТОВ 68 и 69: Полная очистка очереди при закрытии
             purgeAudioQueue(-1L)
 
             while (true) {
@@ -1681,7 +1674,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             audioBatchFirstWriteMs = 0L
         }
 
-        stopAudioWriter()
+        stopOutboundWorkers()
 
         runCatching { ws?.close(1000, "close") }
         runCatching { ws?.cancel() }
