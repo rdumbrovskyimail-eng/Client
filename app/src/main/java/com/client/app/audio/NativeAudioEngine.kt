@@ -73,6 +73,155 @@ private data class RouteTransitionRequest(
     val generation: Long
 )
 
+/**
+ * УСТРАНЕНИЕ ДЕФЕКТА 141:
+ * Монолитный изолированный DSP-контроллер акустического эхоподавления (AEC)
+ * и детекции пользовательского перебивания (Barge-In) по стандартам WebRTC APM и ITU-T G.168.
+ *
+ * Инкапсулирует:
+ * - Моделирование акустической огибающей звука динамика (hangover decay).
+ * - Адаптацию порога подавления эха под реальный минимальный фоновый шум комнаты (ITU-T G.160).
+ * - Расчет динамического коэффициента подавления эха (ERLE) с учетом громкости ЦАП.
+ * - Детекцию перебивания с гистерезисом по числу подтвержденных кадров (streak).
+ * - Управление временными окнами подавления ложных срабатываний (debounce / grace period).
+ */
+data class BargeInDecision(
+    val isAiRendering: Boolean,
+    val isConfirmedInterruption: Boolean,
+    val shouldStreamMicData: Boolean,
+    val effectiveThreshold: Float
+)
+
+class AcousticEchoBargeInProcessor(
+    private val debounceMs: Long = 400L,
+    private val playbackGracePeriodMs: Long = 250L
+) {
+    @Volatile var outputEnergyHangover: Float = 0f
+        private set
+
+    @Volatile var lastPlaybackStartMs: Long = 0L
+        private set
+
+    @Volatile var lastBargeInMs: Long = 0L
+        private set
+
+    @Volatile var bargeInCandidateStreak: Int = 0
+        private set
+
+    fun onPlaybackStarted(nowMs: Long) {
+        lastPlaybackStartMs = nowMs
+    }
+
+    fun onBargeInTriggered(nowMs: Long) {
+        lastBargeInMs = nowMs
+        bargeInCandidateStreak = 0
+        outputEnergyHangover = 0f
+    }
+
+    fun reset() {
+        outputEnergyHangover = 0f
+        lastBargeInMs = 0L
+        lastPlaybackStartMs = 0L
+        bargeInCandidateStreak = 0
+    }
+
+    fun resetHangover() {
+        outputEnergyHangover = 0f
+        bargeInCandidateStreak = 0
+    }
+
+    fun updateHangover(
+        instantaneousOut: Float,
+        isPlaying: Boolean,
+        pendingDurationMs: Float,
+        nowMs: Long
+    ) {
+        if (instantaneousOut > 0.02f && outputEnergyHangover <= 0.005f) {
+            lastPlaybackStartMs = nowMs
+        }
+
+        outputEnergyHangover = if (!isPlaying || (pendingDurationMs <= 0.5f && instantaneousOut <= 0.001f)) {
+            0f
+        } else {
+            maxOf(instantaneousOut, outputEnergyHangover * 0.96f)
+        }
+    }
+
+    fun evaluate(
+        instantaneousMic: Float,
+        instantaneousOut: Float,
+        isPlaying: Boolean,
+        isBargeInActive: Boolean,
+        isVocalized: Boolean,
+        pendingDurationMs: Float,
+        quirks: DeviceQuirks,
+        isBluetooth: Boolean,
+        ambientNoiseFloor: Float,
+        playbackVolume: Float,
+        nowMs: Long
+    ): BargeInDecision {
+        updateHangover(instantaneousOut, isPlaying, pendingDurationMs, nowMs)
+
+        // Инвариант: воспроизведение активно, если в тракте есть звук (> 15 мс)
+        val isAiRendering = isPlaying && (outputEnergyHangover > 0.015f || pendingDurationMs > 15.0f)
+
+        if (!isAiRendering) {
+            bargeInCandidateStreak = 0
+            return BargeInDecision(
+                isAiRendering = false,
+                isConfirmedInterruption = false,
+                shouldStreamMicData = true,
+                effectiveThreshold = quirks.echoThreshold
+            )
+        }
+
+        val canBargeInTimers = if (isBluetooth) {
+            (nowMs - lastPlaybackStartMs > (180L + quirks.encLatencyMs)) &&
+                (nowMs - lastBargeInMs > debounceMs)
+        } else {
+            (nowMs - lastPlaybackStartMs > playbackGracePeriodMs) &&
+                (nowMs - lastBargeInMs > debounceMs)
+        }
+
+        // УСТРАНЕНИЕ ДЕФЕКТА 140: Адаптация порога эха под реальный фоновый шум комнаты
+        val dynamicErleRatio = quirks.acousticErleRatio + (0.15f * playbackVolume)
+        val nonLinearOffset = if (outputEnergyHangover > 0.45f) {
+            (outputEnergyHangover - 0.45f) * 0.40f
+        } else {
+            0.0f
+        }
+        val echoThreshold = maxOf(
+            ambientNoiseFloor * 2.2f,
+            maxOf(quirks.echoThreshold, (outputEnergyHangover * dynamicErleRatio) + nonLinearOffset)
+        )
+        val effectiveThreshold = if (isBluetooth) quirks.echoThreshold else echoThreshold
+
+        if (instantaneousMic > effectiveThreshold) {
+            bargeInCandidateStreak++
+        } else {
+            bargeInCandidateStreak = maxOf(0, bargeInCandidateStreak - 1)
+        }
+
+        val requiredStreak = quirks.bargeInRequiredStreak
+        val isConfirmedInterruption = isVocalized &&
+            (bargeInCandidateStreak >= requiredStreak) &&
+            canBargeInTimers
+
+        if (isConfirmedInterruption) {
+            onBargeInTriggered(nowMs)
+        }
+
+        val shouldStreamMicData = isBargeInActive || isConfirmedInterruption
+
+        return BargeInDecision(
+            isAiRendering = true,
+            isConfirmedInterruption = isConfirmedInterruption,
+            shouldStreamMicData = shouldStreamMicData,
+            effectiveThreshold = effectiveThreshold
+        )
+    }
+}
+
 @Singleton
 class NativeAudioEngine @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -209,10 +358,16 @@ class NativeAudioEngine @Inject constructor(
     private val audioEventPool = ArrayDeque<AudioStreamDataEvent>(64)
     private val audioEventPoolLock = Any()
 
-    @Volatile private var lastPlaybackStartMs = 0L
-    @Volatile private var lastBargeInMs = 0L
-    @Volatile private var outputEnergyHangover: Float = 0f
+    // УСТРАНЕНИЕ ДЕФЕКТА 141: Изолированный DSP-процессор
+    private val acousticProcessor = AcousticEchoBargeInProcessor(
+        debounceMs = BARGE_IN_DEBOUNCE_MS,
+        playbackGracePeriodMs = PLAYBACK_GRACE_PERIOD_MS
+    )
+
     @Volatile private var currentPlaybackVolume: Float = 1.0f
+
+    val outputEnergyHangover: Float
+        get() = acousticProcessor.outputEnergyHangover
 
     @Volatile var isBargeInActive = false
         private set
@@ -252,7 +407,6 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 105 и 106: Применение калиброванных параметров гарнитуры CMF Buds 2
     private fun applyAcousticProfileForRoute(profile: RouteProfile) {
         val quirks = profile.quirks
         vadDetector.setThresholds(
@@ -693,7 +847,6 @@ class NativeAudioEngine @Inject constructor(
 
             captureJob = engineScope.launch(captureDispatcher) {
                 var isSpeechActiveManual = false
-                var bargeInCandidateStreak = 0
 
                 try {
                     while (isActive && _isCapturing.value && captureDesired.get() && captureInstanceId.get() == instanceId) {
@@ -736,22 +889,8 @@ class NativeAudioEngine @Inject constructor(
                             val profile = router.currentProfile.value
                             val quirks = profile.quirks
                             val isBluetooth = profile.isBluetooth
-
-                            // УСТРАНЕНИЕ ДЕФЕКТОВ 126, 127, 128: Опрос точной физической задержки в миллисекундах
                             val pendingDurationMs = bridge.getPendingPlaybackDurationMs()
-
-                            if (instantaneousOut > 0.02f && outputEnergyHangover <= 0.005f) {
-                                lastPlaybackStartMs = now
-                            }
-
-                            outputEnergyHangover = if (!_isPlaying.value || (pendingDurationMs <= 0.5f && instantaneousOut <= 0.001f)) {
-                                0f
-                            } else {
-                                maxOf(instantaneousOut, outputEnergyHangover * 0.96f)
-                            }
-
-                            // Инвариант: воспроизведение активно, если в тракте есть звук (> 15 мс)
-                            val isAiRendering = _isPlaying.value && (outputEnergyHangover > 0.015f || pendingDurationMs > 15.0f)
+                            val ambientNoiseFloor = bridge.getMicNoiseFloorRms()
 
                             var speechStartedOnFrame = false
                             var speechEndedOnFrame = false
@@ -767,69 +906,49 @@ class NativeAudioEngine @Inject constructor(
                                 onSpeechEnd = { speechEndedOnFrame = true }
                             )
 
+                            val isVocalized = speechStartedOnFrame || vadDetector.isSpeechDetected.value
+
+                            // УСТРАНЕНИЕ ДЕФЕКТА 141: Чистый и изолированный расчет акустического решения через процессор
+                            val decision = acousticProcessor.evaluate(
+                                instantaneousMic = instantaneousMic,
+                                instantaneousOut = instantaneousOut,
+                                isPlaying = _isPlaying.value,
+                                isBargeInActive = isBargeInActive,
+                                isVocalized = isVocalized,
+                                pendingDurationMs = pendingDurationMs,
+                                quirks = quirks,
+                                isBluetooth = isBluetooth,
+                                ambientNoiseFloor = ambientNoiseFloor,
+                                playbackVolume = currentPlaybackVolume,
+                                nowMs = now
+                            )
+
                             if (isAadMode) {
-                                val isVocalized = speechStartedOnFrame || vadDetector.isSpeechDetected.value
+                                if (decision.isConfirmedInterruption) {
+                                    activateBargeIn(now)
+                                    hapticManager.triggerBargeIn()
+                                    _bargeInEvents.tryEmit(Unit)
 
-                                if (isVocalized && isAiRendering) {
-                                    val canBargeInTimers = if (isBluetooth) {
-                                        (now - lastPlaybackStartMs > (180L + quirks.encLatencyMs)) && (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
-                                    } else {
-                                        (now - lastPlaybackStartMs > PLAYBACK_GRACE_PERIOD_MS) && (now - lastBargeInMs > BARGE_IN_DEBOUNCE_MS)
-                                    }
-
-                                    // УСТРАНЕНИЕ ДЕФЕКТА 140: Адаптация порога эха под реальный фоновый шум комнаты
-                                    val ambientNoiseFloor = bridge.getMicNoiseFloorRms()
-                                    val dynamicErleRatio = quirks.acousticErleRatio + (0.15f * currentPlaybackVolume)
-                                    val nonLinearOffset = if (outputEnergyHangover > 0.45f) {
-                                        (outputEnergyHangover - 0.45f) * 0.40f
-                                    } else {
-                                        0.0f
-                                    }
-                                    val echoThreshold = maxOf(
-                                        ambientNoiseFloor * 2.2f,
-                                        maxOf(quirks.echoThreshold, (outputEnergyHangover * dynamicErleRatio) + nonLinearOffset)
-                                    )
-                                    val effectiveThreshold = if (isBluetooth) quirks.echoThreshold else echoThreshold
-
-                                    if (instantaneousMic > effectiveThreshold) {
-                                        bargeInCandidateStreak++
-                                    } else {
-                                        bargeInCandidateStreak = maxOf(0, bargeInCandidateStreak - 1)
-                                    }
-
-                                    val requiredStreak = quirks.bargeInRequiredStreak
-                                    val isConfirmedUserInterruption = (bargeInCandidateStreak >= requiredStreak) && canBargeInTimers
-
-                                    if (isConfirmedUserInterruption) {
-                                        lastBargeInMs = now
-                                        bargeInCandidateStreak = 0
-                                        outputEnergyHangover = 0f
-
-                                        activateBargeIn(now)
-                                        hapticManager.triggerBargeIn()
-                                        _bargeInEvents.tryEmit(Unit)
-
-                                        if (isBluetooth) {
-                                            val preRoll = mutableListOf<ByteArray>()
-                                            synchronized(poolLock) {
-                                                while (leadInBuffer.isNotEmpty()) {
-                                                    preRoll.add(leadInBuffer.removeFirst())
-                                                }
+                                    if (isBluetooth) {
+                                        val preRoll = mutableListOf<ByteArray>()
+                                        synchronized(poolLock) {
+                                            while (leadInBuffer.isNotEmpty()) {
+                                                preRoll.add(leadInBuffer.removeFirst())
                                             }
-                                            for (pf in preRoll) {
-                                                sendMicDataEvent(obtainAudioEvent(pf, pf.size, seqNum, captureTimestampNs), instanceId)
-                                            }
-                                        } else {
-                                            synchronized(poolLock) {
-                                                while (leadInBuffer.isNotEmpty()) {
-                                                    recycleBuffer(leadInBuffer.removeFirst())
-                                                }
+                                        }
+                                        for (pf in preRoll) {
+                                            sendMicDataEvent(obtainAudioEvent(pf, pf.size, seqNum, captureTimestampNs), instanceId)
+                                        }
+                                    } else {
+                                        synchronized(poolLock) {
+                                            while (leadInBuffer.isNotEmpty()) {
+                                                recycleBuffer(leadInBuffer.removeFirst())
                                             }
                                         }
                                     }
                                 }
 
-                                if (isBargeInActive || !isAiRendering) {
+                                if (decision.shouldStreamMicData) {
                                     sendMicDataEvent(obtainAudioEvent(frame, bytesRead, seqNum, captureTimestampNs), instanceId)
                                 } else {
                                     synchronized(poolLock) {
@@ -1201,7 +1320,6 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 126, 127, 128: Ожидание опустошения очередей по реальному времени звучания
     suspend fun awaitPlaybackDrained(
         generation: Long,
         stallTimeoutMs: Long = 1800L
@@ -1277,6 +1395,7 @@ class NativeAudioEngine @Inject constructor(
         synchronized(poolLock) {
             recycleLeadInBuffersLocked()
         }
+        acousticProcessor.resetHangover()
         logger.d("NativeAudioEngine: playback generation committed [Gen=$next, Reason='$reason']")
         return next
     }
@@ -1289,7 +1408,7 @@ class NativeAudioEngine @Inject constructor(
         if (isBargeInActive || generation != currentPlaybackGeneration) return
 
         if (playbackStartGeneration.getAndSet(generation) != generation) {
-            lastPlaybackStartMs = SystemClock.elapsedRealtime()
+            acousticProcessor.onPlaybackStarted(SystemClock.elapsedRealtime())
         }
 
         var offset = 0
@@ -1333,7 +1452,7 @@ class NativeAudioEngine @Inject constructor(
         if (isBargeInActive || generation != currentPlaybackGeneration) return
 
         if (playbackStartGeneration.getAndSet(generation) != generation) {
-            lastPlaybackStartMs = SystemClock.elapsedRealtime()
+            acousticProcessor.onPlaybackStarted(SystemClock.elapsedRealtime())
         }
 
         var offset = offsetBytes
@@ -1403,7 +1522,7 @@ class NativeAudioEngine @Inject constructor(
     fun resetBargeInState() {
         isBargeInActive = false
         bargeInTimestampMs = 0L
-        outputEnergyHangover = 0f
+        acousticProcessor.resetHangover()
         bargeInLeaseJob?.cancel()
         bargeInLeaseJob = null
     }
