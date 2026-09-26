@@ -36,7 +36,7 @@ public:
  * Математически строгая нормализация полифазных фаз H0 и H1 в формате Q15:
  * \sum H0 = 32768, \sum H1 = 32768.
  * Единичный коэффициент передачи по постоянному току (DC Gain = 1.000000, 0.00 dB).
- * Полное устранение паразитной субгармоники 8 кГц и нормализация громкости.
+ * revH0 и revH1 типизированы как int32_t для полного исключения ошибки narrowing 34124.
  */
 class PolyphaseResampler24To16 : public IStreamingResampler {
 public:
@@ -88,11 +88,11 @@ private:
             -83, 358, -901, 2114, -5883, 34124, 4321, -1921, 1002, -515, 235, -83
         };
 
-        // Предрассчитанные реверсированные коэффициенты для безызбыточного SIMD
-        static constexpr int16_t revH0[TAPS_PER_PHASE] = {
+        // ИСПРАВЛЕНИЕ: int32_t предотвращает переполнение int16_t при значении 34124
+        alignas(16) static constexpr int32_t revH0[TAPS_PER_PHASE] = {
             -83, 358, -901, 2114, -5883, 34124, 4321, -1921, 1002, -515, 235, -83
         };
-        static constexpr int16_t revH1[TAPS_PER_PHASE] = {
+        alignas(16) static constexpr int32_t revH1[TAPS_PER_PHASE] = {
             -83, 235, -515, 1002, -1921, 4321, 34124, -5883, 2114, -901, 358, -83
         };
 
@@ -107,20 +107,24 @@ private:
         while (inputIndex < totalFrames && outFrames < maxOut) {
             int64_t acc = 0;
 #if defined(__ARM_NEON) || defined(__aarch64__)
-            const int16_t* hRev = (phase_ == 0) ? revH0 : revH1;
+            const int32_t* hRev = (phase_ == 0) ? revH0 : revH1;
             const int16_t* samplePtr = &workBuf[inputIndex - (TAPS_PER_PHASE - 1)];
 
             int16x8_t s_0_7 = vld1q_s16(samplePtr);
             int16x4_t s_8_11 = vld1_s16(samplePtr + 8);
 
-            int16x8_t h_0_7 = vld1q_s16(hRev);
-            int16x4_t h_8_11 = vld1_s16(hRev + 8);
+            int32x4_t s32_0_3 = vmovl_s16(vget_low_s16(s_0_7));
+            int32x4_t s32_4_7 = vmovl_s16(vget_high_s16(s_0_7));
+            int32x4_t s32_8_11 = vmovl_s16(s_8_11);
 
-            int32x4_t vacc0 = vmull_s16(vget_low_s16(s_0_7), vget_low_s16(h_0_7));
-            int32x4_t vacc1 = vmull_s16(vget_high_s16(s_0_7), vget_high_s16(h_0_7));
-            int32x4_t vacc2 = vmull_s16(s_8_11, h_8_11);
+            int32x4_t h_0_3 = vld1q_s32(hRev);
+            int32x4_t h_4_7 = vld1q_s32(hRev + 4);
+            int32x4_t h_8_11 = vld1q_s32(hRev + 8);
 
-            int32x4_t vsum = vaddq_s32(vaddq_s32(vacc0, vacc1), vacc2);
+            int32x4_t vsum = vmulq_s32(s32_0_3, h_0_3);
+            vsum = vmlaq_s32(vsum, s32_4_7, h_4_7);
+            vsum = vmlaq_s32(vsum, s32_8_11, h_8_11);
+
             acc = static_cast<int64_t>(vgetq_lane_s32(vsum, 0)) +
                   static_cast<int64_t>(vgetq_lane_s32(vsum, 1)) +
                   static_cast<int64_t>(vgetq_lane_s32(vsum, 2)) +
@@ -248,7 +252,7 @@ private:
 /**
  * 36-таповый симметричный дециматор 3:1 (48 кГц -> 16 кГц) для микрофонного тракта.
  * Срез fc = 7.2 кГц.
- * ИСПРАВЛЕНИЕ: Точная нормализация Q16 (\sum H = 65536, Gain DC = 1.000000, 0.00 dB).
+ * Точная нормализация Q16 (\sum H = 65536, Gain DC = 1.000000, 0.00 dB).
  */
 class Decimator48To16 : public IStreamingResampler {
 public:
@@ -348,10 +352,10 @@ private:
 
 /**
  * 41-таповый полуполосный дециматор 2:1 (32 кГц -> 16 кГц) для микрофона.
- * УСТРАНЕНИЕ ДЕФЕКТОВ 152 и ОШИБКИ 2:
+ * УСТРАНЕНИЕ ДЕФЕКТОВ 152:
  * 1. Изолированная обработка центрального отсчета (16384 в Q15).
  * 2. 10 симметричных пар нечетных отсчетов без дублирования.
- * 3. Полное равенство постоянного тока: 2 * \sum COEFFS_ODD + CENTER = 32768 (1.000000).
+ * 3. Полное равенство постоянного тока: 2 * \sum ODD_COEFFS + CENTER = 32768 (1.000000).
  */
 class Decimator32To16 : public IStreamingResampler {
 public:
@@ -395,7 +399,7 @@ public:
         // 10 пар нечетных отсчетов полуполосного фильтра Кайзера (Q15).
         // 2 * \sum ODD_COEFFS = 16384. CENTER_COEFF = 16384. Итоговая сумма = 32768.
         static constexpr int32_t ODD_COEFFS[ODD_PAIRS] = {
-            10214, -2176, 1154, -612, 312, -146, 58, -16, 4, -1
+            9517, -2028, 1076, -570, 291, -136, 54, -15, 4, -1
         };
         static constexpr int32_t CENTER_COEFF = 16384;
 
@@ -462,7 +466,7 @@ private:
 
 /**
  * Высокоточный ресемплер 44.1 кГц -> 16 кГц (3GPP TS 26.445).
- * УСТРАНЕНИЕ ДЕФЕКТОВ 153 и ОШИБКИ 5:
+ * УСТРАНЕНИЕ ДЕФЕКТОВ 153:
  * 1. 21-таповый фильтр с точной нормализацией Q16 (\sum H = 65536, Gain DC = 1.000000).
  * 2. 4-точечная кубическая сплайн-интерполяция Эрмита (THD+N < -75 dB).
  */
@@ -526,9 +530,9 @@ private:
 
         if (chunkFrames == 0 || maxOut == 0) return 0;
 
-        // 21-таповый фильтр (Q16). Центр = 31210. Сумма 2 * sum(0..9) + 31210 = 65536.
+        // 21-таповый фильтр (Q16). Центр = 31216. Сумма 2 * sum(0..9) + 31216 = 65536.
         static constexpr int32_t COEFFS[11] = {
-            -54, 126, -271, 532, -974, 1731, -3113, 5956, -13229, 26456, 31210
+            -54, 126, -271, 532, -974, 1731, -3113, 5956, -13229, 26456, 31216
         };
 
         std::memcpy(firWorkBuffer_, firHistory_, FIR_HISTORY * sizeof(int16_t));
@@ -721,7 +725,7 @@ private:
 /**
  * 41-таповый полуполосный КИХ-интерполятор 24 кГц -> 48 кГц.
  *
- * УСТРАНЕНИЕ ДЕФЕКТОВ 151, 154, 155 и ОШИБКИ 3:
+ * УСТРАНЕНИЕ ДЕФЕКТОВ 151, 154, 155:
  * 1. Четный отсчет вывода $y[2m]$ является точной задержкой исходного отсчета: $x[m - 10]$.
  * 2. Нечетный отсчет $y[2m+1]$ вычисляется по 10 симметричным парам отсчетов,
  *    чей центр симметрии $(m - 10 + k + 1 + m - 10 - k) / 2 = m - 9.5$ строго совпадает
@@ -767,7 +771,7 @@ public:
         // 10 пар коэффициентов нечетной (интерполирующей) ветви (Q15).
         // 2 * \sum COEFFS = 32768 (единичный коэффициент передачи).
         static constexpr int32_t INTERP_COEFFS[ODD_INTERP_PAIRS] = {
-            10214, -2176, 1154, -612, 312, -146, 58, -16, 4, -1
+            19034, -4056, 2152, -1140, 582, -272, 108, -30, 8, -2
         };
 
         while (processed < inFrames && totalOut + 2 <= maxOutFrames) {
