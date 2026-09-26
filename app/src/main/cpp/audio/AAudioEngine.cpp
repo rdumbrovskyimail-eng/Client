@@ -73,7 +73,7 @@ void Biquad::makeHighShelf(float fc, float gainDb, float fs) {
     b0 = (A * ((A + 1.0f) + (A - 1.0f) * cs + beta)) / a0;
     b1 = (-2.0f * A * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
     b2 = (A * ((A + 1.0f) - (A - 1.0f) * cs - beta)) / a0;
-    a1 = (2.0f * ((A - 1.0f) - (A + 1.0f) * cs)) / a0;
+    a1 = (2.0f * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
     a2 = ((A + 1.0f) - (A - 1.0f) * cs - beta) / a0;
 }
 
@@ -264,6 +264,7 @@ bool AAudioEngine::initLocked(
         resetEarcon();
         voiceEnhancer_.reset(targetPlaybackSampleRate);
         fftPos_ = 0;
+        smoothedRateFactor_ = 1.0f;
     }
 
     captureDroppedFrames_.store(0, std::memory_order_relaxed);
@@ -466,6 +467,7 @@ bool AAudioEngine::startPlayback() {
         resampler24To16_.reset();
         resampler24To32_.reset();
         genericResampler_.reset();
+        smoothedRateFactor_ = 1.0f;
     }
 
     playbackDspInputBuffer_.resetQuiesced();
@@ -789,6 +791,7 @@ void AAudioEngine::stopLocked() {
         resetEarcon();
         voiceEnhancer_.reset(48000);
         fftPos_ = 0;
+        smoothedRateFactor_ = 1.0f;
     }
 
     captureRawBuffer_.resetQuiesced();
@@ -805,6 +808,9 @@ void AAudioEngine::stopLocked() {
     actualPlaybackSampleRate_.store(0, std::memory_order_relaxed);
     actualPlaybackBurst_.store(0, std::memory_order_relaxed);
     actualOutputDeviceId_.store(AAUDIO_UNSPECIFIED, std::memory_order_relaxed);
+    lastPlaybackWriteNs_.store(0, std::memory_order_relaxed);
+    interArrivalJitterNs_.store(0, std::memory_order_relaxed);
+    playbackTargetBufferMs_.store(PLAYBACK_TARGET_BUFFER_MS, std::memory_order_relaxed);
 
     engineState_.store(EngineState::IDLE, std::memory_order_release);
 }
@@ -951,7 +957,7 @@ void AAudioEngine::captureDspThreadLoop() {
     captureDspCv_.notify_all();
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТА 55: Исключение поллинга с тайм-аутом 5 мс в пользу чистого ожидания условий
+// УСТРАНЕНИЕ ДЕФЕКТОВ 64, 65, 66: Адаптивный джиттер-буфер (AJB), TSM-ресемплинг и гистерезис
 void AAudioEngine::playbackDspThreadLoop() {
     pthread_setname_np(pthread_self(), "AudioDspWorker");
     dsp::enableHardwareFtz();
@@ -974,6 +980,7 @@ void AAudioEngine::playbackDspThreadLoop() {
                 genericResampler_.configure(SAMPLE_RATE_GEMINI_OUT, currentRate);
                 fftPos_ = 0;
                 std::fill(fftBuffer_.begin(), fftBuffer_.end(), 0.0f);
+                smoothedRateFactor_ = 1.0f;
 
                 playbackDspInputBuffer_.discardAllQuiesced();
                 workerDspEpoch = activeEpoch;
@@ -985,11 +992,20 @@ void AAudioEngine::playbackDspThreadLoop() {
             const int32_t actualRate = std::max(1, actualPlaybackSampleRate_.load(std::memory_order_acquire));
             const int32_t actualBurst = actualPlaybackBurst_.load(std::memory_order_acquire);
 
+            // УСТРАНЕНИЕ ДЕФЕКТА 64: Динамический адаптивный целевой буфер
+            const size_t currentTargetMs = playbackTargetBufferMs_.load(std::memory_order_relaxed);
             const size_t timeTargetFrames = static_cast<size_t>(
-                static_cast<uint64_t>(actualRate) * PLAYBACK_TARGET_BUFFER_MS / 1000ULL);
+                static_cast<uint64_t>(actualRate) * currentTargetMs / 1000ULL);
             const size_t burstTargetFrames = (actualBurst > 0)
                 ? static_cast<size_t>(actualBurst) * PLAYBACK_BURST_MIN_MULTIPLIER : 0U;
             const size_t targetBufferFrames = std::max<size_t>(1U, std::max(timeTargetFrames, burstTargetFrames));
+
+            // УСТРАНЕНИЕ ДЕФЕКТА 66: Раздельные High Watermark и Low Watermark гистерезиса
+            const size_t hysteresisFrames = (actualBurst > 0)
+                ? static_cast<size_t>(actualBurst) * 2U : static_cast<size_t>(actualRate * 15 / 1000);
+            const size_t highWatermarkFrames = targetBufferFrames + hysteresisFrames;
+            const size_t lowWatermarkFrames = (targetBufferFrames > hysteresisFrames)
+                ? (targetBufferFrames - hysteresisFrames) : (targetBufferFrames / 2);
 
             if (earconRequested_.load(std::memory_order_acquire)) {
                 const size_t earconFrames = std::min<size_t>(
@@ -1011,18 +1027,18 @@ void AAudioEngine::playbackDspThreadLoop() {
 
             const size_t maxOutputFrames = static_cast<size_t>(
                 std::ceil(static_cast<double>(PLAYBACK_DSP_INPUT_CHUNK_FRAMES) *
-                          static_cast<double>(actualRate) / static_cast<double>(SAMPLE_RATE_GEMINI_OUT)));
+                          static_cast<double>(actualRate) / static_cast<double>(SAMPLE_RATE_GEMINI_OUT) * 1.05));
 
             const size_t buffered = playbackBuffer_.availableRead();
             const size_t freeSpace = playbackBuffer_.availableWrite();
 
-            if (buffered >= targetBufferFrames || freeSpace < maxOutputFrames) {
+            // УСТРАНЕНИЕ ДЕФЕКТА 66: Ожидание снижения до lowWatermarkFrames без дребезга переключения
+            if (buffered >= highWatermarkFrames || freeSpace < maxOutputFrames) {
                 std::unique_lock<std::mutex> waitLock(playbackDspWaitMutex_);
-                // Ожидание освобождения места в буфере без жесткого тайм-аута: пробуждается от notify_one() в ЦАП
-                playbackDspCv_.wait(waitLock, [this, activeEpoch, targetBufferFrames, maxOutputFrames]() {
+                playbackDspCv_.wait(waitLock, [this, activeEpoch, lowWatermarkFrames, maxOutputFrames]() {
                     if (!playbackDspRunning_.load(std::memory_order_acquire)) return true;
                     if (playbackEpoch_.load(std::memory_order_acquire) != activeEpoch) return true;
-                    return playbackBuffer_.availableRead() < targetBufferFrames && playbackBuffer_.availableWrite() >= maxOutputFrames;
+                    return playbackBuffer_.availableRead() <= lowWatermarkFrames && playbackBuffer_.availableWrite() >= maxOutputFrames;
                 });
                 continue;
             }
@@ -1030,7 +1046,6 @@ void AAudioEngine::playbackDspThreadLoop() {
             size_t inputFrames = playbackDspInputBuffer_.read(input, PLAYBACK_DSP_INPUT_CHUNK_FRAMES);
             if (inputFrames == 0) {
                 std::unique_lock<std::mutex> waitLock(playbackDspWaitMutex_);
-                // Ожидание поступления входящих сэмплов от Gemini без холостого спина
                 playbackDspCv_.wait(waitLock, [this, activeEpoch]() {
                     return !playbackDspRunning_.load(std::memory_order_acquire) ||
                         playbackEpoch_.load(std::memory_order_acquire) != activeEpoch ||
@@ -1041,18 +1056,29 @@ void AAudioEngine::playbackDspThreadLoop() {
 
             if (activeEpoch != playbackEpoch_.load(std::memory_order_acquire)) continue;
 
+            // УСТРАНЕНИЕ ДЕФЕКТА 65: Адаптивное управление темпом вывода (Time-Scale Modification)
+            float targetRateFactor = 1.0f;
+            if (buffered > targetBufferFrames + (hysteresisFrames / 2)) {
+                targetRateFactor = 1.035f; // Ускорение на 3.5% для незаметного сброса накопленного джиттер-буфера
+            } else if (buffered < lowWatermarkFrames && playbackDspInputBuffer_.availableRead() > 0) {
+                targetRateFactor = 0.965f; // Замедление на 3.5% для предотвращения опустошения
+            }
+            smoothedRateFactor_ = smoothedRateFactor_ * 0.90f + targetRateFactor * 0.10f;
+            const bool isNominalRate = std::abs(smoothedRateFactor_ - 1.0f) < 0.008f;
+
             size_t outputFrames = 0;
-            if (actualRate == SAMPLE_RATE_GEMINI_OUT) {
+            if (isNominalRate && actualRate == SAMPLE_RATE_GEMINI_OUT) {
                 outputFrames = inputFrames;
                 std::memcpy(output, input, outputFrames * sizeof(int16_t));
-            } else if (actualRate == SAMPLE_RATE_NATIVE_SPEAKER || actualRate == SAMPLE_RATE_BT_A2DP) {
+            } else if (isNominalRate && (actualRate == SAMPLE_RATE_NATIVE_SPEAKER || actualRate == SAMPLE_RATE_BT_A2DP)) {
                 outputFrames = halfbandResampler24To48_.process(input, inputFrames, output);
-            } else if (actualRate == SAMPLE_RATE_BT_HFP) {
+            } else if (isNominalRate && actualRate == SAMPLE_RATE_BT_HFP) {
                 outputFrames = resampler24To16_.process(input, inputFrames, output);
-            } else if (actualRate == 32000) {
+            } else if (isNominalRate && actualRate == 32000) {
                 outputFrames = resampler24To32_.process(input, inputFrames, output);
             } else {
-                genericResampler_.configure(SAMPLE_RATE_GEMINI_OUT, actualRate);
+                const int32_t effectiveInputRate = static_cast<int32_t>(std::round(SAMPLE_RATE_GEMINI_OUT * smoothedRateFactor_));
+                genericResampler_.configure(effectiveInputRate, actualRate);
                 outputFrames = genericResampler_.process(input, inputFrames, output, playbackDspOutputScratch_.size());
             }
 
@@ -1067,10 +1093,8 @@ void AAudioEngine::playbackDspThreadLoop() {
                 }
             }
 
-            const float outRms = dsp::calculateRms(output, outputFrames);
-            outRms_.store(outRms, std::memory_order_relaxed);
-
             const float micRms = micRms_.load(std::memory_order_relaxed);
+            const float outRmsVal = outRms_.load(std::memory_order_relaxed);
             const size_t requiredAccum = (actualRate >= 44100) ? (FFT_SIZE * 2) : FFT_SIZE;
             const size_t hopSize = (actualRate >= 44100) ? (FFT_HOP_SIZE * 2) : FFT_HOP_SIZE;
 
@@ -1080,7 +1104,7 @@ void AAudioEngine::playbackDspThreadLoop() {
                 }
                 if (fftPos_ >= requiredAccum) {
                     if (fftProcessor_) {
-                        fftProcessor_->process(fftBuffer_.data(), requiredAccum, micRms, outRms, actualRate);
+                        fftProcessor_->process(fftBuffer_.data(), requiredAccum, micRms, outRmsVal, actualRate);
                     }
                     std::memmove(fftBuffer_.data(), fftBuffer_.data() + hopSize, (requiredAccum - hopSize) * sizeof(float));
                     fftPos_ = requiredAccum - hopSize;
@@ -1105,12 +1129,35 @@ void AAudioEngine::playbackDspThreadLoop() {
     playbackDspCv_.notify_all();
 }
 
+// УСТРАНЕНИЕ ДЕФЕКТОВ 64, 70, 71: Корректный статус возврата и метрология межпакетного джиттера
 size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation) {
     if (pcm == nullptr || frames == 0 || generation == 0) return 0;
     if (!playbackDspRunning_.load(std::memory_order_acquire)) return 0;
 
-    if (generation < playbackEpoch_.load(std::memory_order_acquire)) {
-        return frames;
+    const uint64_t activeEpoch = playbackEpoch_.load(std::memory_order_acquire);
+    if (generation != activeEpoch) {
+        return 0; // Строгий отказ при устаревшем поколении: возвращается 0, а не фиктивный успех
+    }
+
+    // Метрология межпакетного сетевого джиттера (RFC 3550 / ITU-T G.1020)
+    timespec ts{};
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    const uint64_t nowNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+    const uint64_t lastWrite = lastPlaybackWriteNs_.exchange(nowNs, std::memory_order_relaxed);
+
+    if (lastWrite > 0 && nowNs > lastWrite) {
+        const int64_t deltaNs = static_cast<int64_t>(nowNs - lastWrite);
+        const int64_t nominalNs = static_cast<int64_t>(frames) * 1000000000LL / SAMPLE_RATE_GEMINI_OUT;
+        const int64_t diffNs = std::abs(deltaNs - nominalNs);
+
+        int64_t jitter = interArrivalJitterNs_.load(std::memory_order_relaxed);
+        jitter += (diffNs - jitter) / 16;
+        interArrivalJitterNs_.store(jitter, std::memory_order_relaxed);
+
+        const size_t dynamicTargetMs = static_cast<size_t>(
+            std::clamp<int64_t>((jitter / 1000000LL) * 2 + 15, 20LL, 75LL)
+        );
+        playbackTargetBufferMs_.store(dynamicTargetMs, std::memory_order_relaxed);
     }
 
     const size_t written = playbackDspInputBuffer_.write(pcm, frames);
@@ -1134,6 +1181,10 @@ void AAudioEngine::flushPlayback(uint64_t generation) {
     playbackEpoch_.store(generation, std::memory_order_release);
     earconRequested_.store(false, std::memory_order_release);
     outRms_.store(0.0f, std::memory_order_relaxed);
+    smoothedRateFactor_ = 1.0f;
+    lastPlaybackWriteNs_.store(0, std::memory_order_relaxed);
+    interArrivalJitterNs_.store(0, std::memory_order_relaxed);
+    playbackTargetBufferMs_.store(PLAYBACK_TARGET_BUFFER_MS, std::memory_order_relaxed);
 
     playbackDspInputBuffer_.discardAllQuiesced();
     playbackBuffer_.discardAllQuiesced();
@@ -1247,7 +1298,8 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     }
 
     if (read > 0) {
-        // Мгновенное пробуждение воркера для генерации следующей 10-мс порции
+        const float dacRms = dsp::calculateRms(samples, read);
+        engine->outRms_.store(dacRms, std::memory_order_relaxed);
         engine->playbackDspCv_.notify_one();
     } else {
         engine->outRms_.store(0.0f, std::memory_order_relaxed);
