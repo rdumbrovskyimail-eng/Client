@@ -13,6 +13,22 @@ import kotlin.math.sin
 import kotlin.test.*
 
 /**
+ * Отражение констант AudioConstants.h для валидации архитектурных требований ядра в JVM-тестах.
+ */
+internal object AudioConstants {
+    const val PLAYBACK_TARGET_BUFFER_BT_MIN_MS = 30L
+    const val PLAYBACK_TARGET_BUFFER_BT_MAX_MS = 60L
+    const val PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS = 20L
+    const val PLAYBACK_TARGET_BUFFER_SPEAKER_MAX_MS = 40L
+    const val PLAYBACK_MAX_QUEUE_HORIZON_MS = 150L
+
+    const val KPI_MAX_CALLBACK_LATENCY_US = 800
+    const val KPI_MAX_BARGE_IN_REACTION_MS = 45
+    const val KPI_MAX_ROUTE_SWITCH_MS = 80
+    const val KPI_MAX_BATTERY_DRAIN_PER_HOUR = 7.0f
+}
+
+/**
  * Комплекс многопоточного стресс-тестирования, фаззинга поколений и валидации
  * аппаратных инвариантов Audio Core 2.0 под Samsung Galaxy S23 Ultra и CMF Buds 2.
  * УСТРАНЕНИЕ ДЕФЕКТОВ 186–225.
@@ -192,7 +208,7 @@ class AudioCoreStressAndConcurrencyTest {
 
         fun softFlush(newGeneration: Long) {
             val startNs = System.nanoTime()
-            playbackEpoch.store(newGeneration)
+            playbackEpoch.set(newGeneration) // Исправлено: set вместо store
             bufferOccupancy.set(0) // Зануление буфера
             val durationUs = (System.nanoTime() - startNs) / 1000
 
@@ -214,16 +230,16 @@ class AudioCoreStressAndConcurrencyTest {
         fun calculateTargetBufferMs(jitterMs: Long, isBluetooth: Boolean): Long {
             val base = if (isBluetooth) {
                 (jitterMs * 2 + 20).coerceIn(
-                    AudioConstants.PLAYBACK_TARGET_BUFFER_BT_MIN_MS.toLong(),
-                    AudioConstants.PLAYBACK_TARGET_BUFFER_BT_MAX_MS.toLong()
+                    AudioConstants.PLAYBACK_TARGET_BUFFER_BT_MIN_MS,
+                    AudioConstants.PLAYBACK_TARGET_BUFFER_BT_MAX_MS
                 )
             } else {
                 (jitterMs * 2 + 15).coerceIn(
-                    AudioConstants.PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS.toLong(),
-                    AudioConstants.PLAYBACK_TARGET_BUFFER_SPEAKER_MAX_MS.toLong()
+                    AudioConstants.PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS,
+                    AudioConstants.PLAYBACK_TARGET_BUFFER_SPEAKER_MAX_MS
                 )
             }
-            return minOf(base, AudioConstants.PLAYBACK_MAX_QUEUE_HORIZON_MS.toLong())
+            return minOf(base, AudioConstants.PLAYBACK_MAX_QUEUE_HORIZON_MS)
         }
 
         // Проверка для CMF Buds 2 (Bluetooth)
