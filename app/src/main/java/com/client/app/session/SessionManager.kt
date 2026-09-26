@@ -153,9 +153,6 @@ class SessionManager @Inject constructor(
 
         private const val MAX_MESSAGES = 200
         private const val MAX_RECONNECT_ATTEMPTS = 5
-
-        // УСТРАНЕНИЕ ДЕФЕКТА 33: Максимально допустимый возраст фрейма до ЦАП (RFC 3550 Playout TTL)
-        private const val MAX_AUDIO_FRAME_TTL_MS = 600L
     }
 
     private val coroutineExceptionHandler = CoroutineExceptionHandler { _, throwable ->
@@ -337,8 +334,10 @@ class SessionManager @Inject constructor(
         }
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 68 и 69: Мгновенный сброс очереди аудиокадров перед инвалидацией
     private suspend fun invalidateAndFlushAudio(reason: String): Long =
         withContext(Dispatchers.IO) {
+            client.purgeAudioQueue()
             audioEngine.invalidateAndFlushPlayback(reason)
         }
 
@@ -1270,6 +1269,7 @@ class SessionManager @Inject constructor(
                             }
                         }
 
+                        // УСТРАНЕНИЕ ДЕФЕКТОВ 77, 78: Передача точной длины и возврат в пул без GC-нагрузки
                         is AudioStreamEvent.Audio -> {
                             try {
                                 if (
@@ -1278,10 +1278,11 @@ class SessionManager @Inject constructor(
                                     connectionDesired &&
                                     client.isReady
                                 ) {
-                                    client.sendAudioPcm(event.pcm)
+                                    client.sendAudioPcm(event.pcm, event.length)
                                 }
                             } finally {
                                 audioEngine.releaseCapturedBuffer(event.pcm)
+                                audioEngine.recycleAudioEvent(event)
                             }
                         }
 
@@ -1369,6 +1370,7 @@ class SessionManager @Inject constructor(
         _state.update { it.copy(isMicActive = false) }
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 67, 68, 70: Валидация поколений и отсев просроченных аудиокадров
     private fun observeAudio() = scope.launch {
         while (isActive) {
             try {
@@ -1380,10 +1382,9 @@ class SessionManager @Inject constructor(
                         if (frame.epoch != client.epoch) continue
                         if (frame.generation != audioEngine.currentPlaybackGeneration) continue
 
-                        // УСТРАНЕНИЕ ДЕФЕКТА 33: Отсев устаревших пакетов по Playout Deadline TTL
                         val now = SystemClock.elapsedRealtime()
-                        if (now - frame.timestampMs > MAX_AUDIO_FRAME_TTL_MS) {
-                            logger.w("SessionManager: Сброшен просроченный аудиофрейм (${now - frame.timestampMs} ms > TTL)")
+                        if (frame.isExpired(now)) {
+                            logger.w("SessionManager: Сброшен просроченный аудиофрейм (${now - frame.timestampMs} ms > TTL ${frame.ttlMs} ms)")
                             continue
                         }
 
@@ -1418,7 +1419,7 @@ class SessionManager @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 21, 22: Мгновенная реакция на barge-in без блокировок
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 21, 22, 68: Мгновенная реакция на barge-in с очисткой очереди
     private fun observeBargeIn() = scope.launch {
         audioEngine.bargeInEvents.collect {
             if (!_state.value.isAiSpeaking) return@collect
