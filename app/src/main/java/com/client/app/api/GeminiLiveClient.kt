@@ -137,18 +137,26 @@ data class ClientTurn(
 )
 
 /**
- * УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Сквозная привязка аппаратного монотонного таймстемпа и sequence-номера
+ * УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49, 67, 79:
+ * Поддержка переиспользования полей (var) для пулинга объектов без аллокаций в куче.
  */
 class AudioFrame(
-    val pcm: ByteArray,
-    val sessionId: Long,
-    val epoch: Long,
-    val generation: Long,
-    val frameId: Long,
-    val timestampMs: Long = SystemClock.elapsedRealtime(),
-    val sequenceNumber: Long = 0L,
-    val timestampNs: Long = SystemClock.elapsedRealtimeNanos()
-)
+    var pcm: ByteArray,
+    var sessionId: Long,
+    var epoch: Long,
+    var generation: Long,
+    var frameId: Long,
+    var timestampMs: Long = SystemClock.elapsedRealtime(),
+    var sequenceNumber: Long = 0L,
+    var timestampNs: Long = SystemClock.elapsedRealtimeNanos(),
+    var ttlMs: Long = 500L
+) {
+    /**
+     * Проверка срока жизни пакета: отсеивает пакеты, задержавшиеся в сети или очереди воспроизведения.
+     */
+    fun isExpired(nowMs: Long = SystemClock.elapsedRealtime()): Boolean =
+        (nowMs - timestampMs) > ttlMs
+}
 
 data class GeminiEventEnvelope(
     val sessionId: Long,
@@ -331,8 +339,9 @@ class GeminiLiveClient @Inject constructor(
         beforeOpen: (suspend () -> Unit)? = null
     ) = protobufClient.connect(cfg, beforeOpen)
 
-    suspend fun sendAudio(pcm: ByteArray) =
-        protobufClient.sendAudioPcm(pcm)
+    // УСТРАНЕНИЕ ДЕФЕКТА 77: Передача точной длины PCM буфера без аллокаций
+    suspend fun sendAudio(pcm: ByteArray, length: Int = pcm.size) =
+        protobufClient.sendAudioPcm(pcm, length)
 
     suspend fun flushAudio() =
         protobufClient.flushAudio()
@@ -360,6 +369,10 @@ class GeminiLiveClient @Inject constructor(
     suspend fun sendToolResponses(
         responses: List<ToolResponse>
     ): Boolean = protobufClient.sendToolResponses(responses)
+
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 68 и 69: Мгновенный сброс очереди аудиокадров
+    fun purgeAudioQueue(targetGeneration: Long = -1L): Int =
+        protobufClient.purgeAudioQueue(targetGeneration)
 
     fun invalidateAudio(): Long =
         protobufClient.invalidateAudio()
