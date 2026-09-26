@@ -160,7 +160,7 @@ public:
     size_t writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation);
     size_t readCapturePcm(int16_t* pcm, size_t maxFrames);
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 214: Аппаратный Soft-Flush без остановки потока ЦАП
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 181 и 214: Аппаратный Soft-Flush без остановки потока ЦАП
     void flushPlayback(uint64_t generation);
     void triggerBargeInEarcon();
     void resetEarcon();
@@ -293,7 +293,7 @@ private:
     void captureDspThreadLoop();
     void fftTapThreadLoop();
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 215: Пассивный Dumb RT Callback
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 23, 24, 215: Пассивный Dumb RT Callback
     static aaudio_data_callback_result_t captureCallback(
         AAudioStream* stream,
         void* userData,
