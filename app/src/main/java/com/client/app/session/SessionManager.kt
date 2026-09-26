@@ -136,8 +136,7 @@ class SessionManager @Inject constructor(
 
         val KEY_SESSION_RESUMPTION_ENABLED = booleanPreferencesKey("gemini_session_resumption_enabled")
         val KEY_SESSION_RESUMPTION_HANDLE = stringPreferencesKey("gemini_session_resumption_handle")
-        val KEY_SESSION_RESUMPTION_TIMESTAMP =
-            longPreferencesKey("gemini_resumption_timestamp")
+        val KEY_SESSION_RESUMPTION_TIMESTAMP = longPreferencesKey("gemini_resumption_timestamp")
 
         val KEY_INITIAL_HISTORY_TURNS = intPreferencesKey("gemini_initial_history_turns")
 
@@ -154,6 +153,9 @@ class SessionManager @Inject constructor(
 
         private const val MAX_MESSAGES = 200
         private const val MAX_RECONNECT_ATTEMPTS = 5
+
+        // УСТРАНЕНИЕ ДЕФЕКТА 33: Максимально допустимый возраст фрейма до ЦАП (RFC 3550 Playout TTL)
+        private const val MAX_AUDIO_FRAME_TTL_MS = 600L
     }
 
     private val coroutineExceptionHandler = CoroutineExceptionHandler { _, throwable ->
@@ -188,7 +190,6 @@ class SessionManager @Inject constructor(
     @Volatile private var activeConnectUsedResumption = false
 
     @Volatile private var connectionDesired = false
-
     @Volatile private var userMicDesired = false
     private var transcriptStreamGenerationId: Long = -1L
     @Volatile private var currentOutputTranscriptionEnabled = true
@@ -624,8 +625,7 @@ class SessionManager @Inject constructor(
         val firstUser = candidates.indexOfFirst { it.role == ClientRole.USER }
         if (firstUser < 0) return emptyList()
 
-        val maxHistoryChars = (131_072 * 3)
-            .coerceAtMost(240_000)
+        val maxHistoryChars = (131_072 * 3).coerceAtMost(240_000)
         val out = ArrayDeque<ClientTurn>()
         var chars = 0
 
@@ -710,8 +710,7 @@ class SessionManager @Inject constructor(
             ?.takeIf { it.isNotBlank() }
             ?: DEFAULT_LIVE_MODEL
 
-        val liveCapabilities =
-            LiveModelCapabilitiesRegistry.forModel(liveModel)
+        val liveCapabilities = LiveModelCapabilitiesRegistry.forModel(liveModel)
         activeLiveCapabilities = liveCapabilities
 
         val thinkingLevel =
@@ -719,19 +718,12 @@ class SessionManager @Inject constructor(
                 liveCapabilities.supportsThinkingConfig &&
                 liveModel
                     .removePrefix("models/")
-                    .equals(
-                        "gemini-3.8-live-extended-thinking",
-                        ignoreCase = true
-                    )
+                    .equals("gemini-3.8-live-extended-thinking", ignoreCase = true)
             ) {
                 prefs[KEY_THINKING_LEVEL]
                     ?.trim()
                     ?.lowercase()
-                    ?.takeIf {
-                        it == "low" ||
-                            it == "medium" ||
-                            it == "high"
-                    }
+                    ?.takeIf { it == "low" || it == "medium" || it == "high" }
                     ?: "low"
             } else {
                 null
@@ -740,8 +732,7 @@ class SessionManager @Inject constructor(
         val voice = prefs[KEY_VOICE]?.ifBlank { null } ?: "Charon"
         val speechLang = prefs[KEY_SPEECH_LANGUAGE]?.ifBlank { "ru-RU" } ?: "ru-RU"
         val temperature = prefs[KEY_TEMPERATURE] ?: 0.5f
-        val mediaResolution =
-            prefs[KEY_MEDIA_RESOLUTION] ?: "MEDIA_RESOLUTION_HIGH"
+        val mediaResolution = prefs[KEY_MEDIA_RESOLUTION] ?: "MEDIA_RESOLUTION_HIGH"
 
         val inputTx = TranscriptionSettings(
             enabled = prefs[KEY_INPUT_TRANSCRIPTION_ENABLED] ?: true,
@@ -761,8 +752,7 @@ class SessionManager @Inject constructor(
             mode = prefs[KEY_INPUT_TRANSCRIPTION_MODE] ?: "VERBATIM"
         )
 
-        currentOutputTranscriptionEnabled =
-            prefs[KEY_OUTPUT_TRANSCRIPTION_ENABLED] ?: true
+        currentOutputTranscriptionEnabled = prefs[KEY_OUTPUT_TRANSCRIPTION_ENABLED] ?: true
 
         val outputTx = TranscriptionSettings(
             enabled = currentOutputTranscriptionEnabled,
@@ -784,52 +774,31 @@ class SessionManager @Inject constructor(
 
         val aadEnabled = prefs[KEY_AAD_ENABLED] ?: true
         currentAadEnabled = aadEnabled
-
         audioEngine.isAadMode = aadEnabled
 
         val realtimeInput = RealtimeInputSettings(
             aadEnabled = aadEnabled,
-            startSensitivity =
-                prefs[KEY_AAD_START_SENSITIVITY]
-                    ?: "START_SENSITIVITY_HIGH",
-            endSensitivity =
-                prefs[KEY_AAD_END_SENSITIVITY]
-                    ?: "END_SENSITIVITY_LOW",
-            prefixPaddingMs =
-                prefs[KEY_PREFIX_PADDING_MS] ?: 60,
-            silenceDurationMs =
-                prefs[KEY_SILENCE_DURATION_MS] ?: 600,
-            activityHandling =
-                prefs[KEY_ACTIVITY_HANDLING]
-                    ?: "START_OF_ACTIVITY_INTERRUPTS",
-            turnCoverage =
-                prefs[KEY_TURN_COVERAGE]
-                    ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
+            startSensitivity = prefs[KEY_AAD_START_SENSITIVITY] ?: "START_SENSITIVITY_HIGH",
+            endSensitivity = prefs[KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_LOW",
+            prefixPaddingMs = prefs[KEY_PREFIX_PADDING_MS] ?: 60,
+            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 600,
+            activityHandling = prefs[KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
+            turnCoverage = prefs[KEY_TURN_COVERAGE] ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
         )
 
         val compression = CompressionSettings(
             enabled = prefs[KEY_COMPRESSION_ENABLED] ?: true,
-            triggerTokens =
-                prefs[KEY_COMPRESSION_TRIGGER_TOKENS] ?: 0,
-            targetTokens =
-                prefs[KEY_COMPRESSION_TARGET_TOKENS] ?: 0
+            triggerTokens = prefs[KEY_COMPRESSION_TRIGGER_TOKENS] ?: 0,
+            targetTokens = prefs[KEY_COMPRESSION_TARGET_TOKENS] ?: 0
         )
 
-        val resumptionEnabled =
-            prefs[KEY_SESSION_RESUMPTION_ENABLED] ?: true
-        val maxHistoryTurns =
-            prefs[KEY_INITIAL_HISTORY_TURNS] ?: 20
+        val resumptionEnabled = prefs[KEY_SESSION_RESUMPTION_ENABLED] ?: true
+        val maxHistoryTurns = prefs[KEY_INITIAL_HISTORY_TURNS] ?: 20
 
-        audioEngine.setVolume(
-            prefs[KEY_VOLUME] ?: 1.0f
-        )
-        audioEngine.setMicGain(
-            prefs[KEY_MIC_GAIN] ?: 1.0f
-        )
+        audioEngine.setVolume(prefs[KEY_VOLUME] ?: 1.0f)
+        audioEngine.setMicGain(prefs[KEY_MIC_GAIN] ?: 1.0f)
 
-        val startingFreshSession =
-            !resume &&
-                _state.value.link == LinkState.IDLE
+        val startingFreshSession = !resume && _state.value.link == LinkState.IDLE
 
         if (startingFreshSession) {
             val foregroundServiceError = ensureForegroundServiceActive()
@@ -882,28 +851,19 @@ class SessionManager @Inject constructor(
 
         _state.update {
             it.copy(
-                link = if (resume) {
-                    LinkState.RECONNECTING
-                } else {
-                    LinkState.CONNECTING
-                },
+                link = if (resume) LinkState.RECONNECTING else LinkState.CONNECTING,
                 error = null
             )
         }
 
-        val forvoEnabled =
-            prefs[KEY_ENABLE_FORVO] ?: false
-        val searchEnabled =
-            prefs[KEY_ENABLE_SEARCH] ?: false
+        val forvoEnabled = prefs[KEY_ENABLE_FORVO] ?: false
+        val searchEnabled = prefs[KEY_ENABLE_SEARCH] ?: false
 
-        val dynamicTools =
-            if (forvoEnabled) {
-                buildJsonArray {
-                    add(buildForvoToolDeclaration())
-                }
-            } else {
-                null
-            }
+        val dynamicTools = if (forvoEnabled) {
+            buildJsonArray { add(buildForvoToolDeclaration()) }
+        } else {
+            null
+        }
 
         try {
             client.connect(
@@ -921,20 +881,10 @@ class SessionManager @Inject constructor(
                     realtimeInput = realtimeInput,
                     compression = compression,
                     sessionResumptionEnabled = resumptionEnabled,
-                    resumptionHandle =
-                        if (resume && resumptionEnabled) {
-                            resumptionHandle
-                        } else {
-                            null
-                        },
+                    resumptionHandle = if (resume && resumptionEnabled) resumptionHandle else null,
                     toolsJson = dynamicTools,
                     enableGoogleSearch = searchEnabled,
-                    initialHistory =
-                        if (resume) {
-                            emptyList()
-                        } else {
-                            recentHistory(maxHistoryTurns)
-                        }
+                    initialHistory = if (resume) emptyList() else recentHistory(maxHistoryTurns)
                 ),
                 beforeOpen = {
                     activeSessionId = client.sessionId
@@ -964,11 +914,7 @@ class SessionManager @Inject constructor(
             }
             throw cancelled
         } catch (t: Throwable) {
-            logger.e(
-                "SessionManager: Live connection setup failed",
-                t
-            )
-
+            logger.e("SessionManager: Live connection setup failed", t)
             runCatching { client.disconnect() }
 
             if (startingFreshSession) {
@@ -1135,10 +1081,7 @@ class SessionManager @Inject constructor(
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (t: Throwable) {
-                        logger.e(
-                            "SessionManager: terminal reconnect shutdown failed",
-                            t
-                        )
+                        logger.e("SessionManager: terminal reconnect shutdown failed", t)
                     } finally {
                         synchronized(reconnectGuard) {
                             if (reconnectJob == coroutineContext[Job]) {
@@ -1155,10 +1098,7 @@ class SessionManager @Inject constructor(
             reconnectJob = scope.launch {
                 try {
                     val attempt = synchronized(reconnectGuard) {
-                        if (
-                            token != reconnectToken.get() ||
-                            !connectionDesired
-                        ) {
+                        if (token != reconnectToken.get() || !connectionDesired) {
                             return@launch
                         }
                         if (immediate) 0 else ++reconnectAttempts
@@ -1182,27 +1122,12 @@ class SessionManager @Inject constructor(
                     if (!stateAccepted) return@launch
 
                     if (!immediate) {
-                        val baseDelay =
-                            minOf(
-                                400L *
-                                    (
-                                        1L shl
-                                            (attempt - 1)
-                                                .coerceAtMost(4)
-                                    ),
-                                6000L
-                            )
+                        val baseDelay = minOf(
+                            400L * (1L shl (attempt - 1).coerceAtMost(4)),
+                            6000L
+                        )
 
-                        val jitteredDelay =
-                            (
-                                baseDelay *
-                                    (
-                                        0.8 +
-                                            Math.random() *
-                                            0.4
-                                    )
-                                ).toLong()
-
+                        val jitteredDelay = (baseDelay * (0.8 + Math.random() * 0.4)).toLong()
                         delay(jitteredDelay)
                     }
 
@@ -1222,12 +1147,8 @@ class SessionManager @Inject constructor(
                             client.epoch == sourceEpoch &&
                             _state.value.link != LinkState.IDLE
                         ) {
-                            val useResume =
-                                resumptionHandle != null
-
-                            startInternal(
-                                resume = useResume
-                            )
+                            val useResume = resumptionHandle != null
+                            startInternal(resume = useResume)
 
                             synchronized(reconnectGuard) {
                                 if (token == reconnectToken.get()) {
@@ -1239,10 +1160,7 @@ class SessionManager @Inject constructor(
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (t: Throwable) {
-                    logger.e(
-                        "SessionManager: reconnect attempt failed",
-                        t
-                    )
+                    logger.e("SessionManager: reconnect attempt failed", t)
 
                     synchronized(reconnectGuard) {
                         if (token == reconnectToken.get()) {
@@ -1260,7 +1178,6 @@ class SessionManager @Inject constructor(
                         }
 
                         activeConnectUsedResumption = false
-
                         client.epoch
                     }
 
@@ -1287,18 +1204,13 @@ class SessionManager @Inject constructor(
                 client.sendAudioStreamEnd()
             } else {
                 if (
-                    isManualActivityActive.compareAndSet(
-                        true,
-                        false
-                    ) &&
+                    isManualActivityActive.compareAndSet(true, false) &&
                     client.isReady
                 ) {
                     client.sendActivityEnd()
                 }
             }
-        } ?: logger.w(
-            "SessionManager: bounded mic activity finalization timed out"
-        )
+        } ?: logger.w("SessionManager: bounded mic activity finalization timed out")
     }
 
     private suspend fun startMic() = mutex.withLock {
@@ -1352,9 +1264,7 @@ class SessionManager @Inject constructor(
                         is AudioStreamEvent.SpeechStart -> {
                             if (!currentAadEnabled && client.isReady) {
                                 if (isManualActivityActive.compareAndSet(false, true)) {
-                                    logger.d(
-                                        "SessionManager: VAD SpeechStart (Manual VAD) -> sendActivityStart"
-                                    )
+                                    logger.d("SessionManager: VAD SpeechStart -> sendActivityStart")
                                     client.sendActivityStart()
                                 }
                             }
@@ -1384,9 +1294,7 @@ class SessionManager @Inject constructor(
                             ) {
                                 withTimeoutOrNull(500L) {
                                     client.sendActivityEnd()
-                                } ?: logger.w(
-                                    "SessionManager: SpeechEnd activityEnd timed out"
-                                )
+                                } ?: logger.w("SessionManager: SpeechEnd activityEnd timed out")
                             }
                         }
 
@@ -1411,9 +1319,7 @@ class SessionManager @Inject constructor(
         }
     }
 
-    private suspend fun stopMic(
-        userInitiated: Boolean = false
-    ) = mutex.withLock {
+    private suspend fun stopMic(userInitiated: Boolean = false) = mutex.withLock {
         micMutex.withLock {
             if (userInitiated) {
                 userMicDesired = false
@@ -1443,20 +1349,15 @@ class SessionManager @Inject constructor(
             } ?: false
 
             if (!consumerCompleted) {
-                logger.w(
-                    "SessionManager: mic consumer timeout; forcing bounded cancellation"
-                )
+                logger.w("SessionManager: mic consumer timeout; forcing bounded cancellation")
                 consumerJob.cancel()
-                consumerCompleted =
-                    withTimeoutOrNull(200L) {
-                        consumerJob.join()
-                        true
-                    } ?: false
+                consumerCompleted = withTimeoutOrNull(200L) {
+                    consumerJob.join()
+                    true
+                } ?: false
 
                 if (!consumerCompleted) {
-                    logger.e(
-                        "SessionManager: mic consumer did not terminate after cancellation"
-                    )
+                    logger.e("SessionManager: mic consumer did not terminate after cancellation")
                     finalizeMicActivityBounded()
                 }
             }
@@ -1479,6 +1380,13 @@ class SessionManager @Inject constructor(
                         if (frame.epoch != client.epoch) continue
                         if (frame.generation != audioEngine.currentPlaybackGeneration) continue
 
+                        // УСТРАНЕНИЕ ДЕФЕКТА 33: Отсев устаревших пакетов по Playout Deadline TTL
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - frame.timestampMs > MAX_AUDIO_FRAME_TTL_MS) {
+                            logger.w("SessionManager: Сброшен просроченный аудиофрейм (${now - frame.timestampMs} ms > TTL)")
+                            continue
+                        }
+
                         _state.update {
                             it.copy(isAiSpeaking = true)
                         }
@@ -1497,10 +1405,7 @@ class SessionManager @Inject constructor(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (t: Throwable) {
-                logger.e(
-                    "SessionManager: audio observer crashed; restarting consumer",
-                    t
-                )
+                logger.e("SessionManager: audio observer crashed; restarting consumer", t)
                 val shouldRecover = mutex.withLock {
                     if (connectionDesired && _state.value.link != LinkState.IDLE) {
                         _state.update { it.copy(link = LinkState.RECONNECTING, isAiSpeaking = false) }
@@ -1961,10 +1866,7 @@ class SessionManager @Inject constructor(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (t: Throwable) {
-                logger.e(
-                    "SessionManager: event observer crashed; restarting consumer",
-                    t
-                )
+                logger.e("SessionManager: event observer crashed; restarting consumer", t)
                 val shouldRecover = mutex.withLock {
                     if (connectionDesired && _state.value.link != LinkState.IDLE) {
                         _state.update {
@@ -2389,10 +2291,8 @@ class SessionManager @Inject constructor(
             return previous + incoming
         }
 
-        val noLeadingSpace = incoming.first() in
-            ".,!?;:%)]}\"»”’…-–—"
-        val noTrailingSpace = previous.last() in
-            "([{\"«“‘"
+        val noLeadingSpace = incoming.first() in ".,!?;:%)]}\"»”’…-–—"
+        val noTrailingSpace = previous.last() in "([{\"«“‘"
 
         return if (noLeadingSpace || noTrailingSpace) {
             previous + incoming
@@ -2413,15 +2313,12 @@ class SessionManager @Inject constructor(
         }
     }
 
-    private fun addMessage(
-        msg: ChatMessage
-    ) {
+    private fun addMessage(msg: ChatMessage) {
         synchronized(transcriptLock) {
             transcriptStreamGenerationId = -1L
             _state.update {
                 it.copy(
-                    messages =
-                        (it.messages + msg).takeLast(MAX_MESSAGES)
+                    messages = (it.messages + msg).takeLast(MAX_MESSAGES)
                 )
             }
         }
@@ -2447,11 +2344,8 @@ class SessionManager @Inject constructor(
             audioEngine.setVolume(prefs[KEY_VOLUME] ?: 1.0f)
             audioEngine.setMicGain(prefs[KEY_MIC_GAIN] ?: 1.0f)
             if (prefs[KEY_SESSION_RESUMPTION_ENABLED] == false) {
-                val hasStoredHandle =
-                    !prefs[KEY_SESSION_RESUMPTION_HANDLE]
-                        .isNullOrBlank()
-                val hasStoredTimestamp =
-                    prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] != null
+                val hasStoredHandle = !prefs[KEY_SESSION_RESUMPTION_HANDLE].isNullOrBlank()
+                val hasStoredTimestamp = prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] != null
 
                 if (hasStoredHandle || hasStoredTimestamp) {
                     resumptionPersistenceMutex.withLock {
@@ -2508,10 +2402,7 @@ class SessionManager @Inject constructor(
     private fun stopForegroundService() {
         runCatching {
             context.stopService(
-                Intent(
-                    context,
-                    LiveSessionForegroundService::class.java
-                )
+                Intent(context, LiveSessionForegroundService::class.java)
             )
         }
     }
