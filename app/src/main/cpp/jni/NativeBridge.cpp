@@ -13,18 +13,17 @@
 
 #undef LOGI
 #undef LOGE
+// УСТРАНЕНИЕ ДЕФЕКТОВ 173, 174, 175: Неблокирующий pushRt для исключения зависаний при логировании
 #define LOGI(...) do { \
     char _buf[256]; \
     snprintf(_buf, sizeof(_buf), __VA_ARGS__); \
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", _buf); \
-    client::logging::NativeLogQueue::getInstance().push(4, LOG_TAG, _buf); \
+    client::logging::NativeLogQueue::getInstance().pushRt(4, LOG_TAG, _buf); \
 } while(0)
 
 #define LOGE(...) do { \
     char _buf[256]; \
     snprintf(_buf, sizeof(_buf), __VA_ARGS__); \
-    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "%s", _buf); \
-    client::logging::NativeLogQueue::getInstance().push(6, LOG_TAG, _buf); \
+    client::logging::NativeLogQueue::getInstance().pushRt(6, LOG_TAG, _buf); \
 } while(0)
 
 #ifndef TCP_NOTSENT_LOWAT
@@ -263,6 +262,7 @@ Java_com_client_app_audio_NativeAudioBridge_setMicGain(
     AAudioEngine::getInstance().setMicGain(static_cast<float>(gain));
 }
 
+// УСТРАНЕНИЕ ДЕФЕКТОВ 72, 73, 74: Использование критического массива исключает копирование GetByteArrayRegion
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     JNIEnv *env, jobject /* this */, jbyteArray byteArray, jint offset, jint length, jlong generation) {
@@ -299,6 +299,7 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     return static_cast<jint>(writtenFrames * sizeof(int16_t));
 }
 
+// УСТРАНЕНИЕ ДЕФЕКТОВ 75 и 221: Zero-Copy передача через прямой буфер ByteBuffer
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackDirect(
     JNIEnv *env, jobject /* this */, jobject byteBuffer, jint offsetBytes, jint lengthBytes, jlong generation) {
@@ -441,7 +442,7 @@ Java_com_client_app_audio_NativeAudioBridge_drainNativeLogs(JNIEnv *env, jobject
     return resultArray;
 }
 
-// --- УСТРАНЕНИЕ ДЕФЕКТОВ 116–120, 126–128: Новые диагностические и временные точки входа ---
+// --- Диагностические и метрологические точки входа телеметрии E2E ---
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_client_app_audio_NativeAudioBridge_getCaptureDroppedFrames(JNIEnv * /* env */, jobject /* this */) {
