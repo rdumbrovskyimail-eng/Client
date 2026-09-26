@@ -255,6 +255,7 @@ Java_com_client_app_audio_NativeAudioBridge_setMicGain(
     AAudioEngine::getInstance().setMicGain(static_cast<float>(gain));
 }
 
+// УСТРАНЕНИЕ ДЕФЕКТОВ 72, 73, 74: Исключение промежуточного вектора, realloc и shrink_to_fit через GetPrimitiveArrayCritical
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     JNIEnv *env, jobject /* this */, jbyteArray byteArray, jint offset, jint length, jlong generation) {
@@ -272,25 +273,26 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
 
     const size_t frames = static_cast<size_t>(length) / sizeof(int16_t);
 
-    constexpr size_t MAX_PERSISTENT_FRAMES = 8192;
-    thread_local std::vector<int16_t> playbackJniBuffer;
-    if (playbackJniBuffer.size() < frames) {
-        playbackJniBuffer.resize(frames);
-    }
-    if (playbackJniBuffer.capacity() > MAX_PERSISTENT_FRAMES && frames <= MAX_PERSISTENT_FRAMES) {
-        playbackJniBuffer.shrink_to_fit();
+    jboolean isCopy = JNI_FALSE;
+    void* rawPtr = env->GetPrimitiveArrayCritical(byteArray, &isCopy);
+    if (!rawPtr) {
+        return 0;
     }
 
-    env->GetByteArrayRegion(
-        byteArray, offset, length, reinterpret_cast<jbyte*>(playbackJniBuffer.data())
+    const auto* startPtr = reinterpret_cast<const int16_t*>(
+        static_cast<const char*>(rawPtr) + offset
     );
 
     const size_t writtenFrames = AAudioEngine::getInstance().writePlaybackPcm(
-        playbackJniBuffer.data(), frames, static_cast<uint64_t>(generation)
+        startPtr, frames, static_cast<uint64_t>(generation)
     );
+
+    env->ReleasePrimitiveArrayCritical(byteArray, rawPtr, JNI_ABORT);
+
     return static_cast<jint>(writtenFrames * sizeof(int16_t));
 }
 
+// УСТРАНЕНИЕ ДЕФЕКТА 75: Полноценная поддержка прямого Zero-Copy DirectBuffer
 extern "C" JNIEXPORT jint JNICALL
 Java_com_client_app_audio_NativeAudioBridge_writePlaybackDirect(
     JNIEnv *env, jobject /* this */, jobject byteBuffer, jint offsetBytes, jint lengthBytes, jlong generation) {
