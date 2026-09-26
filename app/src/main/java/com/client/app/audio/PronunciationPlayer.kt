@@ -1,183 +1,302 @@
-// >>> FILE: app/src/main/java/com/client/app/audio/PronunciationPlayer.kt
 package com.client.app.audio
 
-import android.media.AudioAttributes
-import android.media.MediaPlayer
-import android.media.audiofx.DynamicsProcessing
-import android.os.Build
+import android.content.Context
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import com.client.app.util.AppLogger
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
-import kotlin.coroutines.resume
+import kotlin.math.roundToInt
 
-private enum class PlayerState { IDLE, PREPARING, PLAYING, RELEASED }
-
+/**
+ * УСТРАНЕНИЕ ДЕФЕКТОВ 169 и 170:
+ * Высокопроизводительный плеер произношений Forvo, интегрированный в единый тракт AAudio.
+ *
+ * Особенности:
+ * 1. Полная ликвидация android.media.MediaPlayer и AudioTrack.
+ * 2. Декодирование MP3 в линейный PCM через платформенный MediaCodec.
+ * 3. Конвертация в моно и ресемплинг в нативную частоту Gemini Live (24 кГц).
+ * 4. Прямой вывод через NativeAudioEngine::enqueuePlayback() в тот же аппаратный ЦАП WCD9385.
+ * 5. Исключение конфликтов системного AudioFocus, переконфигурации AudioPolicy и мигания микрофона.
+ * 6. Звук Forvo отображается на AGSL-визуализаторе и проходит через общий регулятор громкости.
+ */
 @Singleton
-class PronunciationPlayer @Inject constructor() {
-    private val lock = Any()
-    private var mediaPlayer: MediaPlayer? = null
-    private var dynamicsProcessing: DynamicsProcessing? = null
-    private var currentState = PlayerState.IDLE
-    private var activeContinuation: CancellableContinuation<Boolean>? = null
-
+class PronunciationPlayer @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val audioEngine: NativeAudioEngine,
+    private val logger: AppLogger
+) {
     private val playerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var activeJob: Job? = null
+    private val lock = Any()
+
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .build()
 
     private val _isPlaying = MutableStateFlow(false)
     val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
 
     suspend fun play(url: String): Boolean = withContext(Dispatchers.IO) {
-        suspendCancellableCoroutine { cont ->
-            val previousContinuation = synchronized(lock) {
-                val previous = activeContinuation
-                activeContinuation = null
-                releasePlayerInternalLocked()
-                _isPlaying.value = true
-                currentState = PlayerState.PREPARING
-                activeContinuation = cont
-                previous
-            }
-            previousContinuation?.let { previous ->
-                if (previous.isActive) previous.resume(false)
+        val job = Job(coroutineContext[Job])
+        synchronized(lock) {
+            activeJob?.cancel()
+            activeJob = job
+        }
+
+        _isPlaying.value = true
+        var tempFile: File? = null
+
+        try {
+            // 1. Скачивание аудиофайла MP3 из Forvo во временный кэш
+            val request = Request.Builder().url(url).build()
+            val mp3Bytes = httpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    logger.w("PronunciationPlayer: сбой загрузки аудио Forvo (HTTP ${response.code})")
+                    return@withContext false
+                }
+                response.body?.bytes() ?: return@withContext false
             }
 
-            val mp = MediaPlayer()
+            coroutineContext.ensureActive()
+
+            tempFile = File.createTempFile("forvo_clip_", ".mp3", context.cacheDir)
+            FileOutputStream(tempFile).use { it.write(mp3Bytes) }
+
+            // 2. Декодирование MP3 в PCM через MediaCodec
+            val decodedPcm = decodeMp3ToPcm(tempFile) ?: run {
+                logger.e("PronunciationPlayer: не удалось декодировать аудио Forvo")
+                return@withContext false
+            }
+
+            coroutineContext.ensureActive()
+
+            // 3. Ресемплинг в нативный формат Gemini (24 кГц 16-бит моно)
+            val pcm24k = convertToMono24k(
+                pcm = decodedPcm.data,
+                inSampleRate = decodedPcm.sampleRate,
+                inChannels = decodedPcm.channels
+            )
+
+            coroutineContext.ensureActive()
+
+            // 4. Подача в общий тракт AAudio
+            val generation = audioEngine.invalidateAndFlushPlayback("forvo_pronunciation")
+            audioEngine.enqueuePlayback(pcm24k, generation)
+
+            // Ожидание физического завершения вывода через динамик
+            audioEngine.awaitPlaybackDrained(generation, stallTimeoutMs = 1200L)
+            return@withContext true
+        } catch (e: CancellationException) {
+            audioEngine.invalidateAndFlushPlayback("forvo_cancel")
+            throw e
+        } catch (t: Throwable) {
+            logger.e("PronunciationPlayer: ошибка воспроизведения произношения", t)
+            audioEngine.invalidateAndFlushPlayback("forvo_error")
+            return@withContext false
+        } finally {
+            runCatching { tempFile?.delete() }
             synchronized(lock) {
-                if (activeContinuation !== cont) {
-                    playerScope.launch { runCatching { mp.release() } }
-                    return@suspendCancellableCoroutine
+                if (activeJob === job) {
+                    activeJob = null
+                    _isPlaying.value = false
                 }
-                mediaPlayer = mp
-            }
-
-            fun finish(success: Boolean) {
-                val continuationToResume = synchronized(lock) {
-                    if (activeContinuation !== cont) {
-                        return@synchronized null
-                    }
-                    activeContinuation = null
-                    releasePlayerInternalLocked()
-                    cont
-                }
-                continuationToResume?.let { continuation ->
-                    if (continuation.isActive) {
-                        continuation.resume(success)
-                    }
-                }
-            }
-
-            cont.invokeOnCancellation {
-                synchronized(lock) {
-                    if (activeContinuation === cont) {
-                        activeContinuation = null
-                        if (mediaPlayer === mp) {
-                            releasePlayerInternalLocked()
-                        }
-                    }
-                }
-            }
-
-            try {
-                mp.setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build()
-                )
-
-                mp.setOnPreparedListener { player ->
-                    val valid = synchronized(lock) {
-                        if (mediaPlayer !== player || activeContinuation !== cont || currentState == PlayerState.RELEASED) {
-                            false
-                        } else {
-                            currentState = PlayerState.PLAYING
-
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                                runCatching {
-                                    val config = DynamicsProcessing.Config.Builder(
-                                        DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
-                                        1, false, 0, false, 0, false, 0, true
-                                    ).build()
-                                    dynamicsProcessing = DynamicsProcessing(0, player.audioSessionId, config).apply {
-                                        val limiter = DynamicsProcessing.Limiter(
-                                            true, true, 0, 1.0f, 50.0f, 10.0f, -0.5f, 0.0f
-                                        )
-                                        setLimiterAllChannelsTo(limiter)
-                                        enabled = true
-                                    }
-                                }
-                            }
-                            true
-                        }
-                    }
-
-                    if (!valid) {
-                        playerScope.launch { runCatching { player.release() } }
-                        return@setOnPreparedListener
-                    }
-
-                    try {
-                        player.start()
-                    } catch (_: Exception) {
-                        finish(false)
-                    }
-                }
-
-                mp.setOnCompletionListener { finish(true) }
-                mp.setOnErrorListener { _, _, _ ->
-                    finish(false)
-                    true
-                }
-
-                // setDataSource выполняется на Dispatchers.IO для исключения блокировок сетевого стека
-                mp.setDataSource(url)
-                mp.prepareAsync()
-            } catch (_: Exception) {
-                finish(false)
             }
         }
     }
 
     fun stop() {
-        val continuationToResume = synchronized(lock) {
-            val previous = activeContinuation
-            activeContinuation = null
-            releasePlayerInternalLocked()
-            previous
+        synchronized(lock) {
+            activeJob?.cancel()
+            activeJob = null
         }
-        continuationToResume?.let { continuation ->
-            if (continuation.isActive) continuation.resume(false)
+        audioEngine.invalidateAndFlushPlayback("forvo_stop")
+        _isPlaying.value = false
+    }
+
+    private data class DecodedAudio(
+        val data: ByteArray,
+        val sampleRate: Int,
+        val channels: Int
+    )
+
+    private fun decodeMp3ToPcm(file: File): DecodedAudio? {
+        val extractor = MediaExtractor()
+        var codec: MediaCodec? = null
+
+        try {
+            extractor.setDataSource(file.absolutePath)
+            val numTracks = extractor.trackCount
+            var audioTrackIndex = -1
+            var format: MediaFormat? = null
+
+            for (i in 0 until numTracks) {
+                val trackFormat = extractor.getTrackFormat(i)
+                val mime = trackFormat.getString(MediaFormat.KEY_MIME).orEmpty()
+                if (mime.startsWith("audio/")) {
+                    audioTrackIndex = i
+                    format = trackFormat
+                    break
+                }
+            }
+
+            if (audioTrackIndex < 0 || format == null) return null
+
+            extractor.selectTrack(audioTrackIndex)
+            val mime = format.getString(MediaFormat.KEY_MIME) ?: return null
+            codec = MediaCodec.createDecoderByType(mime)
+            codec.configure(format, null, null, 0)
+            codec.start()
+
+            val pcmOut = ByteArrayOutputStream(64 * 1024)
+            val bufferInfo = MediaCodec.BufferInfo()
+            var sawInputEos = false
+            var sawOutputEos = false
+
+            var sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+            var channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+
+            val timeoutUs = 5000L
+
+            while (!sawOutputEos) {
+                if (!sawInputEos) {
+                    val inputBufIndex = codec.dequeueInputBuffer(timeoutUs)
+                    if (inputBufIndex >= 0) {
+                        val inputBuf = codec.getInputBuffer(inputBufIndex)
+                        if (inputBuf != null) {
+                            val sampleSize = extractor.readSampleData(inputBuf, 0)
+                            if (sampleSize < 0) {
+                                codec.queueInputBuffer(
+                                    inputBufIndex, 0, 0, 0L,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                )
+                                sawInputEos = true
+                            } else {
+                                val presentationTimeUs = extractor.sampleTime
+                                codec.queueInputBuffer(
+                                    inputBufIndex, 0, sampleSize, presentationTimeUs, 0
+                                )
+                                extractor.advance()
+                            }
+                        }
+                    }
+                }
+
+                val outputBufIndex = codec.dequeueOutputBuffer(bufferInfo, timeoutUs)
+                if (outputBufIndex >= 0) {
+                    if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                        sawOutputEos = true
+                    }
+
+                    val outputBuf = codec.getOutputBuffer(outputBufIndex)
+                    if (outputBuf != null && bufferInfo.size > 0) {
+                        outputBuf.position(bufferInfo.offset)
+                        outputBuf.limit(bufferInfo.offset + bufferInfo.size)
+                        val chunk = ByteArray(bufferInfo.size)
+                        outputBuf.get(chunk)
+                        pcmOut.write(chunk)
+                    }
+                    codec.releaseOutputBuffer(outputBufIndex, false)
+                } else if (outputBufIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    val newFormat = codec.outputFormat
+                    sampleRate = newFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                    channels = newFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                }
+            }
+
+            return DecodedAudio(
+                data = pcmOut.toByteArray(),
+                sampleRate = sampleRate,
+                channels = channels
+            )
+        } catch (t: Throwable) {
+            logger.e("PronunciationPlayer: ошибка декодера MediaCodec", t)
+            return null
+        } finally {
+            runCatching { codec?.stop() }
+            runCatching { codec?.release() }
+            runCatching { extractor.release() }
         }
     }
 
-    private fun releasePlayerInternalLocked() {
-        _isPlaying.value = false
-        currentState = PlayerState.RELEASED
+    /**
+     * Преобразование PCM-буфера в 16-бит моно 24 кГц с линейной интерполяцией.
+     */
+    private fun convertToMono24k(pcm: ByteArray, inSampleRate: Int, inChannels: Int): ByteArray {
+        val bytesPerSample = 2
+        val inFrameSize = bytesPerSample * inChannels
+        val totalInFrames = pcm.size / inFrameSize
+        if (totalInFrames == 0) return ByteArray(0)
 
-        val dpToRelease = dynamicsProcessing
-        dynamicsProcessing = null
+        // 1. Сведение в моно
+        val monoSamples = ShortArray(totalInFrames)
+        var byteIdx = 0
 
-        val mpToRelease = mediaPlayer
-        mediaPlayer = null
-
-        // Вызов блокирующих IPC-операций mediaserver перенесен в фоновый пул Dispatchers.IO,
-        // предотвращая задержки кадров (Jank) и ANR на главном потоке.
-        if (dpToRelease != null || mpToRelease != null) {
-            playerScope.launch {
-                runCatching { dpToRelease?.release() }
-                mpToRelease?.let { mp ->
-                    runCatching { mp.setOnPreparedListener(null) }
-                    runCatching { mp.setOnCompletionListener(null) }
-                    runCatching { mp.setOnErrorListener(null) }
-                    runCatching {
-                        if (mp.isPlaying) mp.stop()
-                    }
-                    runCatching { mp.reset() }
-                    runCatching { mp.release() }
+        if (inChannels == 1) {
+            for (i in 0 until totalInFrames) {
+                val b0 = pcm[byteIdx++].toInt() and 0xFF
+                val b1 = pcm[byteIdx++].toInt()
+                monoSamples[i] = ((b1 shl 8) or b0).toShort()
+            }
+        } else {
+            for (i in 0 until totalInFrames) {
+                var sum = 0
+                for (ch in 0 until inChannels) {
+                    val b0 = pcm[byteIdx++].toInt() and 0xFF
+                    val b1 = pcm[byteIdx++].toInt()
+                    val s = (b1 shl 8) or b0
+                    sum += s
                 }
+                monoSamples[i] = (sum / inChannels).coerceIn(-32768, 32767).toShort()
             }
         }
+
+        if (inSampleRate == 24000) {
+            val outBytes = ByteArray(totalInFrames * 2)
+            var oIdx = 0
+            for (s in monoSamples) {
+                val v = s.toInt()
+                outBytes[oIdx++] = (v and 0xFF).toByte()
+                outBytes[oIdx++] = ((v shr 8) and 0xFF).toByte()
+            }
+            return outBytes
+        }
+
+        // 2. Линейный ресемплинг из inSampleRate в 24000 Гц
+        val ratio = inSampleRate.toDouble() / 24000.0
+        val targetFrames = (totalInFrames / ratio).roundToInt().coerceAtLeast(1)
+        val outBytes = ByteArray(targetFrames * 2)
+        var outByteIdx = 0
+
+        for (i in 0 until targetFrames) {
+            val inPos = i * ratio
+            val index0 = inPos.toInt()
+            val index1 = (index0 + 1).coerceAtMost(totalInFrames - 1)
+            val frac = inPos - index0
+
+            val s0 = monoSamples[index0].toDouble()
+            val s1 = monoSamples[index1].toDouble()
+            val interpolated = (s0 + (s1 - s0) * frac).roundToInt().coerceIn(-32768, 32767)
+
+            outBytes[outByteIdx++] = (interpolated and 0xFF).toByte()
+            outBytes[outByteIdx++] = ((interpolated shr 8) and 0xFF).toByte()
+        }
+
+        return outBytes
     }
 }
