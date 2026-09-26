@@ -753,6 +753,9 @@ void AAudioEngine::stopLocked() {
     playbackTargetBufferMs_.store(PLAYBACK_TARGET_BUFFER_MS, std::memory_order_relaxed);
     isPlaybackRenderingActive_.store(false, std::memory_order_release);
 
+    // Сброс счётчика настройки буфера при остановке
+    lastTunedXRunCount_.store(0, std::memory_order_relaxed);
+
     engineState_.store(EngineState::IDLE, std::memory_order_release);
 }
 
