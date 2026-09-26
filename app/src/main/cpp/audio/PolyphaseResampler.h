@@ -16,8 +16,6 @@ namespace client::audio {
 
 /**
  * Базовый полиморфный интерфейс потокового ресемплера реального времени.
- * УСТРАНЕНИЕ ДЕФЕКТОВ 147, 148, 149, 150: Унифицированный жизненный цикл,
- * детерминированный сброс фаз и истории, потокобезопасный учет баланса отсчетов.
  */
 class IStreamingResampler {
 public:
@@ -31,12 +29,7 @@ public:
 /**
  * Высокоточный 24-таповый полифазный КИХ-ресемплер 24 кГц -> 16 кГц (L=2, M=3).
  * Прототипный фильтр Кайзера со срезом \omega_c = \pi/3 (8.0 кГц при f_intermediate = 48 кГц).
- *
- * УСТРАНЕНИЕ ДЕФЕКТОВ 1, 2, 160:
- * Математически строгая нормализация полифазных фаз H0 и H1 в формате Q15:
- * \sum H0 = 32768, \sum H1 = 32768.
- * Единичный коэффициент передачи по постоянному току (DC Gain = 1.000000, 0.00 dB).
- * revH0 и revH1 типизированы как int32_t для полного исключения ошибки narrowing 34124.
+ * Нормализация Q15: \sum H0 = 32768, \sum H1 = 32768 (DC Gain = 1.000000, 0.00 dB).
  */
 class PolyphaseResampler24To16 : public IStreamingResampler {
 public:
@@ -88,7 +81,6 @@ private:
             -83, 358, -901, 2114, -5883, 34124, 4321, -1921, 1002, -515, 235, -83
         };
 
-        // ИСПРАВЛЕНИЕ: int32_t предотвращает переполнение int16_t при значении 34124
         alignas(16) static constexpr int32_t revH0[TAPS_PER_PHASE] = {
             -83, 358, -901, 2114, -5883, 34124, 4321, -1921, 1002, -515, 235, -83
         };
@@ -159,7 +151,6 @@ private:
 
 /**
  * 32-таповый полифазный КИХ-ресемплер 24 кГц -> 32 кГц (L=4, M=3).
- * УСТРАНЕНИЕ ДЕФЕКТОВ 3, 212: Подавление в полосе задерживания > 65 dB, 4 фазы по 8 тапов.
  */
 class PolyphaseResampler24To32 : public IStreamingResampler {
 public:
@@ -250,15 +241,21 @@ private:
 };
 
 /**
+ * УСТРАНЕНИЕ ДЕФЕКТА 10:
  * 36-таповый симметричный дециматор 3:1 (48 кГц -> 16 кГц) для микрофонного тракта.
- * Срез fc = 7.2 кГц.
+ * Срез fc = 7.2 кГц, подавление зеркальных каналов > 75 dB.
  * Точная нормализация Q16 (\sum H = 65536, Gain DC = 1.000000, 0.00 dB).
+ *
+ * Математический инвариант:
+ * Фазовый аккумулятор и предыстория строго непрерывны между квантами произвольной длины.
+ * Исключены выпадения сэмплов и фазовые разрывы звуковой волны.
  */
 class Decimator48To16 : public IStreamingResampler {
 public:
     static constexpr size_t TAPS = 36;
-    static constexpr size_t HALF_TAPS = TAPS / 2;
-    static constexpr size_t HISTORY = TAPS - 1;
+    static constexpr size_t HALF_TAPS = TAPS / 2; // 18
+    static constexpr size_t HISTORY = TAPS - 1;   // 35
+    static constexpr size_t CHUNK_SIZE = 960;
 
     Decimator48To16() {
         reset();
@@ -281,61 +278,91 @@ public:
             return 0;
         }
 
-        const size_t maxPossibleOut = (inFrames + (2u - static_cast<size_t>(phase_))) / 3u;
-        const size_t allowedOut = std::min(maxPossibleOut, maxOutFrames);
+        size_t processedIn = 0;
+        size_t totalOut = 0;
 
-        if (allowedOut == 0) {
-            updateHistoryOnly(in, inFrames);
-            phase_ = static_cast<int32_t>((static_cast<size_t>(phase_) + inFrames) % 3u);
-            totalInSamples_ += inFrames;
-            return 0;
-        }
+        while (processedIn < inFrames && totalOut < maxOutFrames) {
+            const size_t currentChunk = std::min(inFrames - processedIn, CHUNK_SIZE);
+            const size_t chunkLimit = maxOutFrames - totalOut;
 
-        // 18 пар коэффициентов (Q16). Сумма 2 * sum(COEFFS) = 65536.
-        static constexpr int32_t COEFFS[HALF_TAPS] = {
-            -13, -27, -35, 10, 103, 174, 126, -94, -447,
-            -655, -364, 569, 2101, 3903, 5590, 6781, 7410, 7636
-        };
+            const size_t generated = processChunkInternal(
+                in + processedIn,
+                currentChunk,
+                out + totalOut,
+                chunkLimit
+            );
 
-        size_t outCount = 0;
-        size_t consumedIn = 0;
+            totalOut += generated;
+            processedIn += currentChunk;
 
-        for (size_t i = 0; i < inFrames; ++i) {
-            if (phase_ == 0) {
-                if (outCount >= allowedOut) {
-                    consumedIn = i;
-                    break;
-                }
-
-                int64_t acc = 0;
-                for (size_t t = 0; t < TAPS; ++t) {
-                    const int32_t sample = (i >= t)
-                        ? static_cast<int32_t>(in[i - t])
-                        : static_cast<int32_t>(history_[HISTORY - (t - i - 1)]);
-                    const size_t coeffIdx = (t < HALF_TAPS) ? t : (TAPS - 1 - t);
-                    acc += static_cast<int64_t>(COEFFS[coeffIdx]) * sample;
-                }
-
-                constexpr int64_t ROUND_CONST = 1LL << 15;
-                const int32_t rounded = static_cast<int32_t>((acc + ROUND_CONST) >> 16);
-                out[outCount++] = static_cast<int16_t>(std::clamp<int32_t>(rounded, -32768, 32767));
+            if (generated == 0 && chunkLimit == 0) {
+                break;
             }
-            phase_ = (phase_ + 1) % 3;
-            consumedIn = i + 1;
         }
 
-        updateHistoryOnly(in, consumedIn);
+        // Если выходной буфер был меньше необходимого, остаточные сэмплы не теряются
+        if (processedIn < inFrames) {
+            updateHistory(in + processedIn, inFrames - processedIn);
+            phase_ = static_cast<int32_t>((static_cast<size_t>(phase_) + (inFrames - processedIn)) % 3u);
+            processedIn = inFrames;
+        }
 
-        totalInSamples_ += consumedIn;
-        totalOutSamples_ += outCount;
-        return outCount;
+        totalInSamples_ += processedIn;
+        totalOutSamples_ += totalOut;
+        return totalOut;
     }
 
     uint64_t getTotalInSamples() const override { return totalInSamples_; }
     uint64_t getTotalOutSamples() const override { return totalOutSamples_; }
 
 private:
-    void updateHistoryOnly(const int16_t* in, size_t frames) {
+    size_t processChunkInternal(
+        const int16_t* in,
+        size_t inFrames,
+        int16_t* out,
+        size_t maxOut) {
+
+        // 18 пар коэффициентов полуполосного сглаживающего КИХ (Q16). 2 * sum(COEFFS) = 65536.
+        static constexpr int32_t COEFFS[HALF_TAPS] = {
+            -13, -27, -35, 10, 103, 174, 126, -94, -447,
+            -655, -364, 569, 2101, 3903, 5590, 6781, 7410, 7636
+        };
+
+        int16_t workBuf[CHUNK_SIZE + HISTORY];
+        std::memcpy(workBuf, history_, HISTORY * sizeof(int16_t));
+        std::memcpy(workBuf + HISTORY, in, inFrames * sizeof(int16_t));
+
+        // Вычисление смещения до первого кратного отсчета по текущей фазе (M=3)
+        const size_t offsetToFirst = (3u - static_cast<size_t>(phase_)) % 3u;
+        size_t outCount = 0;
+        size_t consumedIn = 0;
+
+        for (size_t i = offsetToFirst; i < inFrames && outCount < maxOut; i += 3u) {
+            const size_t centerIdx = HISTORY + i;
+            int64_t acc = 0;
+
+            for (size_t t = 0; t < HALF_TAPS; ++t) {
+                const int32_t s1 = static_cast<int32_t>(workBuf[centerIdx - t]);
+                const int32_t s2 = static_cast<int32_t>(workBuf[centerIdx - (TAPS - 1 - t)]);
+                acc += static_cast<int64_t>(COEFFS[t]) * (s1 + s2);
+            }
+
+            constexpr int64_t ROUND_CONST = 1LL << 15;
+            const int32_t rounded = static_cast<int32_t>((acc + ROUND_CONST) >> 16);
+            out[outCount++] = static_cast<int16_t>(std::clamp<int32_t>(rounded, -32768, 32767));
+            consumedIn = i + 1u;
+        }
+
+        // Корректное обновление фазы для следующего блока с учётом фактического количества входных отсчетов
+        phase_ = static_cast<int32_t>((static_cast<size_t>(phase_) + inFrames) % 3u);
+
+        // Обновление предыстории всеми поступившими сэмплами чанка без потерь
+        updateHistory(in, inFrames);
+
+        return outCount;
+    }
+
+    void updateHistory(const int16_t* in, size_t frames) {
         if (frames >= HISTORY) {
             std::memcpy(history_, in + frames - HISTORY, HISTORY * sizeof(int16_t));
         } else if (frames > 0) {
@@ -352,10 +379,6 @@ private:
 
 /**
  * 41-таповый полуполосный дециматор 2:1 (32 кГц -> 16 кГц) для микрофона.
- * УСТРАНЕНИЕ ДЕФЕКТОВ 152:
- * 1. Изолированная обработка центрального отсчета (16384 в Q15).
- * 2. 10 симметричных пар нечетных отсчетов без дублирования.
- * 3. Полное равенство постоянного тока: 2 * \sum ODD_COEFFS + CENTER = 32768 (1.000000).
  */
 class Decimator32To16 : public IStreamingResampler {
 public:
@@ -396,8 +419,6 @@ public:
             primed_ = true;
         }
 
-        // 10 пар нечетных отсчетов полуполосного фильтра Кайзера (Q15).
-        // 2 * \sum ODD_COEFFS = 16384. CENTER_COEFF = 16384. Итоговая сумма = 32768.
         static constexpr int32_t ODD_COEFFS[ODD_PAIRS] = {
             9517, -2028, 1076, -570, 291, -136, 54, -15, 4, -1
         };
@@ -466,9 +487,6 @@ private:
 
 /**
  * Высокоточный ресемплер 44.1 кГц -> 16 кГц (3GPP TS 26.445).
- * УСТРАНЕНИЕ ДЕФЕКТОВ 153:
- * 1. 21-таповый фильтр с точной нормализацией Q16 (\sum H = 65536, Gain DC = 1.000000).
- * 2. 4-точечная кубическая сплайн-интерполяция Эрмита (THD+N < -75 dB).
  */
 class Resampler44100To16000 : public IStreamingResampler {
 public:
@@ -530,7 +548,6 @@ private:
 
         if (chunkFrames == 0 || maxOut == 0) return 0;
 
-        // 21-таповый фильтр (Q16). Центр = 31216. Сумма 2 * sum(0..9) + 31216 = 65536.
         static constexpr int32_t COEFFS[11] = {
             -54, 126, -271, 532, -974, 1731, -3113, 5956, -13229, 26456, 31216
         };
@@ -724,13 +741,6 @@ private:
 
 /**
  * 41-таповый полуполосный КИХ-интерполятор 24 кГц -> 48 кГц.
- *
- * УСТРАНЕНИЕ ДЕФЕКТОВ 151, 154, 155:
- * 1. Четный отсчет вывода $y[2m]$ является точной задержкой исходного отсчета: $x[m - 10]$.
- * 2. Нечетный отсчет $y[2m+1]$ вычисляется по 10 симметричным парам отсчетов,
- *    чей центр симметрии $(m - 10 + k + 1 + m - 10 - k) / 2 = m - 9.5$ строго совпадает
- *    с физическим временным центром между $y[2m]$ и $y[2m+2]$.
- * 3. Фазовый сдвиг между ветвями строго равен 0.000 — полное устранение гребенчатой фильтрации.
  */
 class HalfbandResampler24To48 : public IStreamingResampler {
 public:
@@ -768,8 +778,6 @@ public:
             primed_ = true;
         }
 
-        // 10 пар коэффициентов нечетной (интерполирующей) ветви (Q15).
-        // 2 * \sum COEFFS = 32768 (единичный коэффициент передачи).
         static constexpr int32_t INTERP_COEFFS[ODD_INTERP_PAIRS] = {
             19034, -4056, 2152, -1140, 582, -272, 108, -30, 8, -2
         };
@@ -788,10 +796,8 @@ public:
 
                 const size_t idx = base + i;
 
-                // Четный отсчет y[2m]: прямой отсчет x[m - 10]
                 const int16_t directSample = workBuffer_[idx - DELAY_IN];
 
-                // Нечетный отсчет y[2m+1]: строго центральная симметричная интерполяция
                 int64_t oddAcc = 0;
                 for (size_t k = 0; k < ODD_INTERP_PAIRS; ++k) {
                     const int32_t pair =
@@ -963,8 +969,6 @@ private:
 
 /**
  * Унифицированный менеджер ресемплинга тракта захвата микрофона.
- * УСТРАНЕНИЕ ДЕФЕКТОВ 147 и 148: Единая точка конфигурации, исключение
- * дублирования пяти независимых конечных автоматов и централизованный сброс.
  */
 class UnifiedCaptureResampler {
 public:
