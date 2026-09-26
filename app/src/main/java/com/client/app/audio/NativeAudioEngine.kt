@@ -31,20 +31,23 @@ import javax.inject.Singleton
 import kotlin.math.sqrt
 
 /**
- * УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49, 77, 78:
- * Поддержка точной длины пакета (length) и переиспользуемых полей для исключения GC-нагрузки.
+ * УСТРАНЕНИЕ ДЕФЕКТА 83: Полное физическое разделение Data Plane и Control Plane.
+ * AudioStreamDataEvent содержит только PCM-данные высокой частоты (100 фреймов/с).
  */
-sealed interface AudioStreamEvent {
-    class Audio(
-        var pcm: ByteArray,
-        var length: Int = pcm.size,
-        var sequenceNumber: Long = 0L,
-        var captureTimestampNs: Long = 0L
-    ) : AudioStreamEvent
+class AudioStreamDataEvent(
+    var pcm: ByteArray,
+    var length: Int = pcm.size,
+    var sequenceNumber: Long = 0L,
+    var captureTimestampNs: Long = 0L
+)
 
-    data object SpeechStart : AudioStreamEvent
-    data object SpeechEnd : AudioStreamEvent
-    data object StreamStop : AudioStreamEvent
+/**
+ * Control Plane: События речевого взаимодействия VAD и управления жизненным циклом.
+ */
+sealed interface AudioStreamControlEvent {
+    data object SpeechStart : AudioStreamControlEvent
+    data object SpeechEnd : AudioStreamControlEvent
+    data object StreamStop : AudioStreamControlEvent
 }
 
 enum class CaptureShutdownResult {
@@ -59,7 +62,7 @@ sealed interface AudioFocusEvent {
 }
 
 /**
- * УСТРАНЕНИЕ ДЕФЕКТА 45: Строгий детерминированный конечный автомат движка в JVM
+ * УСТРАНЕНИЕ ДЕФЕКТА 45: Строгий детерминированный конечный автомат движка в JVM.
  */
 enum class AudioEngineState {
     IDLE,
@@ -92,15 +95,15 @@ class NativeAudioEngine @Inject constructor(
         private const val BARGE_IN_HARD_RECOVERY_MS = 3000L
         private const val BARGE_IN_RECOVERY_POLL_MS = 50L
         private const val PRE_ROLL_FRAMES_CAPACITY = 20
-        private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 512L * 1024L
-        // УСТРАНЕНИЕ ДЕФЕКТА 59: Быстрый порог обнаружения зависания очереди вывода
+
+        // УСТРАНЕНИЕ ДЕФЕКТА 81: Рациональный предел бэклога ~250 мс звука (8 КБ) вместо 16 секунд (512 КБ)
+        private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 8L * 1024L
         private const val PLAYBACK_WRITE_STALL_TIMEOUT_MS = 250L
     }
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var focusRequest: AudioFocusRequest? = null
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 45 и 46: Консолидация жизненного цикла в единый FSM StateFlow
     private val _engineState = MutableStateFlow(AudioEngineState.IDLE)
     val engineState: StateFlow<AudioEngineState> = _engineState.asStateFlow()
 
@@ -126,19 +129,21 @@ class NativeAudioEngine @Inject constructor(
     private val _focusEvents = MutableStateFlow<AudioFocusEvent>(AudioFocusEvent.Gain)
     val focusEvents: StateFlow<AudioFocusEvent> = _focusEvents.asStateFlow()
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 80: Ограниченная очередь микрофона с автоматическим возвратом буферов
-    private val _micOutput = Channel<AudioStreamEvent>(
-        capacity = 64,
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 80, 82, 83: Раздельные каналы Data Plane и Control Plane
+    private val _micAudioOutput = Channel<AudioStreamDataEvent>(
+        capacity = 24,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
         onUndeliveredElement = { event ->
-            if (event is AudioStreamEvent.Audio) {
-                releaseCapturedBuffer(event.pcm)
-                recycleAudioEvent(event)
-            }
+            releaseCapturedBuffer(event.pcm)
+            recycleAudioEvent(event)
         }
     )
+    val micAudioOutput: ReceiveChannel<AudioStreamDataEvent> = _micAudioOutput
+
+    private val _micControlOutput = Channel<AudioStreamControlEvent>(capacity = 16)
+    val micControlOutput: ReceiveChannel<AudioStreamControlEvent> = _micControlOutput
+
     private val queuedMicOutputBytes = AtomicLong(0L)
-    val micOutput: ReceiveChannel<AudioStreamEvent> = _micOutput
 
     private val coroutineExceptionHandler = CoroutineExceptionHandler { _, throwable ->
         logger.e("Unhandled coroutine exception in NativeAudioEngine", throwable)
@@ -170,7 +175,8 @@ class NativeAudioEngine @Inject constructor(
     private val captureEventLock = Any()
     private val captureDirectMutex = Mutex()
 
-    private val routeTransitionChannel = Channel<RouteTransitionRequest>(Channel.CONFLATED)
+    // УСТРАНЕНИЕ ДЕФЕКТА 86: Буферизованный канал транзакций вместо затирающего Channel.CONFLATED
+    private val routeTransitionChannel = Channel<RouteTransitionRequest>(capacity = 16)
 
     private val engineGeneration = AtomicLong(0)
     private val playbackGeneration = AtomicLong(1L)
@@ -179,7 +185,6 @@ class NativeAudioEngine @Inject constructor(
     private val playbackDesired = AtomicBoolean(false)
     private val captureDesired = AtomicBoolean(false)
 
-    // Буфер для извлечения ошибок из C++ ядра без аллокаций
     private val errorMetadataBuffer = LongArray(4)
 
     val currentPlaybackGeneration: Long
@@ -195,7 +200,6 @@ class NativeAudioEngine @Inject constructor(
     @Volatile var isAadMode: Boolean = true
 
     private val captureDirectBuffer = ByteBuffer.allocateDirect(BURST_BYTES * 4).order(ByteOrder.LITTLE_ENDIAN)
-    // УСТРАНЕНИЕ ДЕФЕКТА 75: Выделенный DirectBuffer для аппаратного Zero-Copy воспроизведения
     private val playbackDirectBuffer = ByteBuffer.allocateDirect(8192 * 2).order(ByteOrder.LITTLE_ENDIAN)
     private val playbackDirectMutex = Mutex()
 
@@ -209,8 +213,7 @@ class NativeAudioEngine @Inject constructor(
     private val poolLock = Any()
     private val leadInBuffer = ArrayDeque<ByteArray>(32)
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 78: Пул объектов событий аудио для устранения GC Pressure
-    private val audioEventPool = ArrayDeque<AudioStreamEvent.Audio>(64)
+    private val audioEventPool = ArrayDeque<AudioStreamDataEvent>(64)
     private val audioEventPoolLock = Any()
 
     @Volatile private var lastPlaybackStartMs = 0L
@@ -237,7 +240,7 @@ class NativeAudioEngine @Inject constructor(
         length: Int,
         seq: Long,
         tsNs: Long
-    ): AudioStreamEvent.Audio = synchronized(audioEventPoolLock) {
+    ): AudioStreamDataEvent = synchronized(audioEventPoolLock) {
         if (audioEventPool.isNotEmpty()) {
             val item = audioEventPool.removeFirst()
             item.pcm = pcm
@@ -246,13 +249,30 @@ class NativeAudioEngine @Inject constructor(
             item.captureTimestampNs = tsNs
             item
         } else {
-            AudioStreamEvent.Audio(pcm, length, seq, tsNs)
+            AudioStreamDataEvent(pcm, length, seq, tsNs)
         }
     }
 
-    fun recycleAudioEvent(event: AudioStreamEvent.Audio) = synchronized(audioEventPoolLock) {
+    fun recycleAudioEvent(event: AudioStreamDataEvent) = synchronized(audioEventPoolLock) {
         if (audioEventPool.size < 64) {
             audioEventPool.addLast(event)
+        }
+    }
+
+    // УСТРАНЕНИЕ ДЕФЕКТА 97: Акустические пороги VAD инкапсулированы в аудиодвижке
+    private fun applyAcousticProfileForRoute(profile: RouteProfile) {
+        if (profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION) {
+            vadDetector.setThresholds(0.40f, 0.20f)
+        } else {
+            vadDetector.setThresholds(0.50f, 0.25f)
+        }
+    }
+
+    private fun getLeadInCapacityForRoute(profile: RouteProfile): Int {
+        return if (profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION) {
+            (260 * 16) / 160 // ~26 пакетов
+        } else {
+            (160 * 16) / 160 // ~16 пакетов
         }
     }
 
@@ -376,7 +396,7 @@ class NativeAudioEngine @Inject constructor(
                 val inited = captureDirectMutex.withLock {
                     bridge.initAudioRoute(
                         isBluetooth = profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION,
-                        sampleRate = profile.sampleRateOut,
+                        sampleRate = profile.targetSampleRate,
                         inputDeviceId = profile.inputDeviceId,
                         outputDeviceId = profile.outputDeviceId
                     )
@@ -391,11 +411,7 @@ class NativeAudioEngine @Inject constructor(
                 }
 
                 logActualNativeRoute(profile, "startPlayback")
-
-                vadDetector.setThresholds(
-                    profile.vadThresholdStart,
-                    profile.vadThresholdEnd
-                )
+                applyAcousticProfileForRoute(profile)
 
                 captureDirectMutex.withLock {
                     bridge.flushPlayback(currentPlaybackGeneration)
@@ -534,10 +550,7 @@ class NativeAudioEngine @Inject constructor(
                 resetBargeInState()
 
                 val profile = router.currentProfile.value
-                vadDetector.setThresholds(
-                    profile.vadThresholdStart,
-                    profile.vadThresholdEnd
-                )
+                applyAcousticProfileForRoute(profile)
 
                 synchronized(captureEventLock) {
                     streamStopGeneration = -1L
@@ -566,7 +579,6 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 44: Изолированное восстановление микрофона без сброса ЦАП
     private suspend fun recoverCaptureStreamIsolated() {
         audioLifecycleMutex.withLock {
             withContext(Dispatchers.IO) {
@@ -607,7 +619,6 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 44: Изолированное восстановление воспроизведения без сброса АЦП
     private suspend fun recoverPlaybackStreamIsolated() {
         audioLifecycleMutex.withLock {
             withContext(Dispatchers.IO) {
@@ -635,7 +646,6 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 41, 42, 43: Реактивная обработка ошибок AAudio без ожидания 100 мс
     private suspend fun drainAndDispatchNativeErrors() {
         while (bridge.hasPendingError()) {
             val hasEvent = synchronized(errorMetadataBuffer) {
@@ -713,7 +723,6 @@ class NativeAudioEngine @Inject constructor(
                             val seqNum = bridge.getCaptureSequenceNumber()
                             val captureTimestampNs = bridge.getCaptureTimestampNs()
 
-                            // УСТРАНЕНИЕ ДЕФЕКТА 77: Исключение copyOf(), фрейм ВСЕГДА из пула без аллокаций
                             val frame = obtainBuffer()
                             captureDirectBuffer.position(0)
                             captureDirectBuffer.get(frame, 0, bytesRead)
@@ -803,7 +812,7 @@ class NativeAudioEngine @Inject constructor(
                                                 }
                                             }
                                             for (pf in preRoll) {
-                                                sendMicEvent(obtainAudioEvent(pf, pf.size, seqNum, captureTimestampNs), instanceId)
+                                                sendMicDataEvent(obtainAudioEvent(pf, pf.size, seqNum, captureTimestampNs), instanceId)
                                             }
                                         } else {
                                             synchronized(poolLock) {
@@ -816,11 +825,11 @@ class NativeAudioEngine @Inject constructor(
                                 }
 
                                 if (isBargeInActive || !isAiRendering) {
-                                    sendMicEvent(obtainAudioEvent(frame, bytesRead, seqNum, captureTimestampNs), instanceId)
+                                    sendMicDataEvent(obtainAudioEvent(frame, bytesRead, seqNum, captureTimestampNs), instanceId)
                                 } else {
                                     synchronized(poolLock) {
                                         leadInBuffer.addLast(frame)
-                                        val maxPreRoll = router.currentProfile.value.leadInBufferSizeFrames / 160
+                                        val maxPreRoll = getLeadInCapacityForRoute(router.currentProfile.value)
                                         while (leadInBuffer.size > maxPreRoll) {
                                             recycleBuffer(leadInBuffer.removeFirst())
                                         }
@@ -828,7 +837,7 @@ class NativeAudioEngine @Inject constructor(
                                 }
 
                                 if (speechEndedOnFrame && _isCapturing.value && captureInstanceId.get() == instanceId) {
-                                    sendMicEvent(AudioStreamEvent.SpeechEnd, instanceId)
+                                    sendMicControlEvent(AudioStreamControlEvent.SpeechEnd)
                                 }
                             } else {
                                 if (speechStartedOnFrame) {
@@ -839,14 +848,14 @@ class NativeAudioEngine @Inject constructor(
                                         }
                                     }
 
-                                    sendMicEvent(AudioStreamEvent.SpeechStart, instanceId)
+                                    sendMicControlEvent(AudioStreamControlEvent.SpeechStart)
                                     for (pf in preRoll) {
-                                        sendMicEvent(obtainAudioEvent(pf, pf.size, seqNum, captureTimestampNs), instanceId)
+                                        sendMicDataEvent(obtainAudioEvent(pf, pf.size, seqNum, captureTimestampNs), instanceId)
                                     }
-                                    sendMicEvent(obtainAudioEvent(frame, bytesRead, seqNum, captureTimestampNs), instanceId)
+                                    sendMicDataEvent(obtainAudioEvent(frame, bytesRead, seqNum, captureTimestampNs), instanceId)
                                     isSpeechActiveManual = true
                                 } else if (isSpeechActiveManual) {
-                                    sendMicEvent(obtainAudioEvent(frame, bytesRead, seqNum, captureTimestampNs), instanceId)
+                                    sendMicDataEvent(obtainAudioEvent(frame, bytesRead, seqNum, captureTimestampNs), instanceId)
                                 } else {
                                     synchronized(poolLock) {
                                         leadInBuffer.addLast(frame)
@@ -857,7 +866,7 @@ class NativeAudioEngine @Inject constructor(
                                 }
 
                                 if (speechEndedOnFrame && _isCapturing.value && captureInstanceId.get() == instanceId) {
-                                    sendMicEvent(AudioStreamEvent.SpeechEnd, instanceId)
+                                    sendMicControlEvent(AudioStreamControlEvent.SpeechEnd)
                                     isSpeechActiveManual = false
                                 }
                             }
@@ -922,16 +931,28 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 95: Политика «Same Route — No Restart»
     private suspend fun applyRouteInternal(
         req: RouteTransitionRequest
     ) = audioLifecycleMutex.withLock {
         withContext(Dispatchers.IO) {
-            val currentGeneration = engineGeneration.get()
-            if (req.generation != currentGeneration) return@withContext
-
             val keepPlaying = playbackDesired.get()
             val keepCapturing = captureDesired.get()
             if (!keepPlaying && !keepCapturing) return@withContext
+
+            val actualOutDev = bridge.getActiveOutputDeviceId()
+            val actualRate = bridge.getActualPlaybackSampleRate()
+            val actualInDev = bridge.getActiveInputDeviceId()
+
+            val isSameRoute = _isPlaying.value &&
+                actualOutDev == req.profile.outputDeviceId &&
+                actualRate == req.profile.targetSampleRate &&
+                router.isInputDeviceMatchingRoute(req.profile, actualInDev)
+
+            if (isSameRoute) {
+                logger.d("NativeAudioEngine: applyRouteInternal: Идентичный маршрут уже активен, пересоздание стримов пропущено (No-Op)")
+                return@withContext
+            }
 
             _engineState.value = AudioEngineState.RECOVERING
 
@@ -973,7 +994,7 @@ class NativeAudioEngine @Inject constructor(
                 bridge.stopAudio()
                 routeInited = bridge.initAudioRoute(
                     isBluetooth = req.profile.path == AudioRoutePath.BLUETOOTH_COMMUNICATION,
-                    sampleRate = req.profile.sampleRateOut,
+                    sampleRate = req.profile.targetSampleRate,
                     inputDeviceId = req.profile.inputDeviceId,
                     outputDeviceId = req.profile.outputDeviceId
                 )
@@ -984,10 +1005,7 @@ class NativeAudioEngine @Inject constructor(
                     synchronized(poolLock) {
                         recycleLeadInBuffersLocked()
                     }
-                    vadDetector.setThresholds(
-                        req.profile.vadThresholdStart,
-                        req.profile.vadThresholdEnd
-                    )
+                    applyAcousticProfileForRoute(req.profile)
 
                     playbackRecovered = !keepPlaying || bridge.startPlaybackAudio()
                     _isPlaying.value = playbackRecovered && keepPlaying
@@ -1036,11 +1054,7 @@ class NativeAudioEngine @Inject constructor(
                 return@synchronized true
             }
 
-            val enqueued = sendMicEventLocked(
-                AudioStreamEvent.StreamStop,
-                expectedCaptureInstanceId
-            )
-
+            val enqueued = _micControlOutput.trySend(AudioStreamControlEvent.StreamStop).isSuccess
             if (enqueued) {
                 streamStopGeneration = generation
             }
@@ -1262,7 +1276,6 @@ class NativeAudioEngine @Inject constructor(
         return next
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 71, 72, 75: Корректный возврат фреймов и Zero-Copy JNI передача
     suspend fun enqueuePlayback(
         pcm: ByteArray,
         generation: Long
@@ -1305,7 +1318,6 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 75: Прямое неблокирующее воспроизведение через DirectBuffer
     suspend fun enqueuePlaybackDirect(
         buffer: ByteBuffer,
         offsetBytes: Int,
@@ -1394,13 +1406,12 @@ class NativeAudioEngine @Inject constructor(
     private fun drainMicOutput() {
         synchronized(captureEventLock) {
             while (true) {
-                val result = _micOutput.tryReceive()
+                val result = _micAudioOutput.tryReceive()
                 val event = result.getOrNull() ?: break
-                if (event is AudioStreamEvent.Audio) {
-                    releaseCapturedBuffer(event.pcm)
-                    recycleAudioEvent(event)
-                }
+                releaseCapturedBuffer(event.pcm)
+                recycleAudioEvent(event)
             }
+            while (_micControlOutput.tryReceive().isSuccess) {}
         }
     }
 
@@ -1408,53 +1419,38 @@ class NativeAudioEngine @Inject constructor(
         drainMicOutput()
     }
 
-    private fun sendMicEvent(
-        event: AudioStreamEvent,
+    // УСТРАНЕНИЕ ДЕФЕКТА 82: Переполнение очереди приводит к сбросу кадра, а не к смерти захвата
+    private fun sendMicDataEvent(
+        event: AudioStreamDataEvent,
         expectedCaptureInstanceId: Long? = null
-    ): Boolean =
-        synchronized(captureEventLock) {
-            sendMicEventLocked(event, expectedCaptureInstanceId)
-        }
-
-    private fun sendMicEventLocked(
-        event: AudioStreamEvent,
-        expectedCaptureInstanceId: Long?
-    ): Boolean {
+    ): Boolean = synchronized(captureEventLock) {
         if (expectedCaptureInstanceId != null && captureInstanceId.get() != expectedCaptureInstanceId) {
-            if (event is AudioStreamEvent.Audio) {
-                recycleBuffer(event.pcm)
-                recycleAudioEvent(event)
-            }
+            recycleBuffer(event.pcm)
+            recycleAudioEvent(event)
             return false
         }
 
-        if (event is AudioStreamEvent.Audio) {
-            val bytes = event.length.toLong()
-            val next = queuedMicOutputBytes.addAndGet(bytes)
+        val bytes = event.length.toLong()
+        val next = queuedMicOutputBytes.addAndGet(bytes)
 
-            if (next > MAX_MIC_OUTPUT_BACKLOG_BYTES) {
-                queuedMicOutputBytes.addAndGet(-bytes)
-                recycleBuffer(event.pcm)
-                recycleAudioEvent(event)
-
-                logger.e("NativeAudioEngine: mic output backlog exceeded ${MAX_MIC_OUTPUT_BACKLOG_BYTES} bytes; stopping capture producer")
-                _isCapturing.value = false
-
-                if (streamStopGeneration != engineGeneration.get()) {
-                    if (_micOutput.trySend(AudioStreamEvent.StreamStop).isSuccess) {
-                        streamStopGeneration = engineGeneration.get()
-                    }
-                }
-                return false
-            }
+        if (next > MAX_MIC_OUTPUT_BACKLOG_BYTES) {
+            queuedMicOutputBytes.addAndGet(-bytes)
+            recycleBuffer(event.pcm)
+            recycleAudioEvent(event)
+            logger.w("NativeAudioEngine: Бэклог микрофона превысил 8 КБ (~250 мс); старый фрейм сброшен без остановки продюсера")
+            return false
         }
 
-        val result = _micOutput.trySend(event)
-        if (result.isFailure && event is AudioStreamEvent.Audio) {
+        val result = _micAudioOutput.trySend(event)
+        if (result.isFailure) {
             releaseCapturedBuffer(event.pcm)
             recycleAudioEvent(event)
         }
-        return result.isSuccess
+        result.isSuccess
+    }
+
+    private fun sendMicControlEvent(event: AudioStreamControlEvent) {
+        _micControlOutput.trySend(event)
     }
 
     private fun decrementQueuedMicOutputBytes(bytes: Long) {
