@@ -26,9 +26,26 @@ class NativeAudioBridge @Inject constructor() {
     external fun startCaptureAudio(): Boolean
     external fun activateCaptureDspAudio(): Boolean
     external fun commitCaptureAdmission(): Boolean
+
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 44: Изолированный перезапуск стримов
+    external fun restartCaptureStream(): Boolean
+    external fun restartPlaybackStream(): Boolean
+
     external fun stopCaptureAudio()
     external fun stopAudio()
     external fun isAudioDisconnected(): Boolean
+
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 45 и 46: Конечный автомат и реактивная очередь ошибок
+    external fun getEngineState(): Int
+    external fun pollAudioError(outData: LongArray): Boolean
+    external fun hasPendingError(): Boolean
+
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Аппаратные метки времени и sequence number
+    external fun getCaptureSequenceNumber(): Long
+    external fun getCaptureTimestampNs(): Long
+    external fun getPlaybackSequenceNumber(): Long
+    external fun getPlaybackPresentationTimestampNs(): Long
+
     external fun getActualPlaybackSampleRate(): Int
     external fun getActualPlaybackChannels(): Int
     external fun getActualPlaybackFormat(): Int
