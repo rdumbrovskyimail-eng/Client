@@ -18,7 +18,8 @@ import com.client.app.attach.AnalysisResult
 import com.client.app.attach.VocabItem
 import com.client.app.attach.VocabularyExtractor
 import com.client.app.audio.AudioFocusEvent
-import com.client.app.audio.AudioStreamEvent
+import com.client.app.audio.AudioStreamControlEvent
+import com.client.app.audio.AudioStreamDataEvent
 import com.client.app.audio.CaptureShutdownResult
 import com.client.app.audio.NativeAudioEngine
 import com.client.app.audio.PronunciationPlayer
@@ -174,7 +175,8 @@ class SessionManager @Inject constructor(
     ) { mic, out -> maxOf(mic, out) }
         .stateIn(scope, SharingStarted.Eagerly, 0f)
 
-    private var micJob: Job? = null
+    private var micAudioJob: Job? = null
+    private var micControlJob: Job? = null
     private var reconnectJob: Job? = null
     private var goAwayJob: Job? = null
     private val reconnectGuard = Any()
@@ -1218,6 +1220,7 @@ class SessionManager @Inject constructor(
         }
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 83: Раздельная параллельная обработка Data Plane и Control Plane
     private suspend fun startMicLocked() {
         if (
             !userMicDesired ||
@@ -1253,14 +1256,42 @@ class SessionManager @Inject constructor(
 
         _state.update { it.copy(isMicActive = true) }
 
-        micJob?.cancel()
-        micJob = scope.launch {
-            try {
-                for (event in audioEngine.micOutput) {
-                    if (!isActive) break
+        micAudioJob?.cancel()
+        micControlJob?.cancel()
 
-                    when (event) {
-                        is AudioStreamEvent.SpeechStart -> {
+        // 1. Data Plane: Непрерывная передача PCM аудио
+        micAudioJob = scope.launch {
+            try {
+                for (audio in audioEngine.micAudioOutput) {
+                    if (!isActive) break
+                    try {
+                        if (
+                            !forvoPlayer.isPlaying.value &&
+                            (currentAadEnabled || isManualActivityActive.get()) &&
+                            connectionDesired &&
+                            client.isReady
+                        ) {
+                            client.sendAudioPcm(audio.pcm, audio.length)
+                        }
+                    } finally {
+                        audioEngine.releaseCapturedBuffer(audio.pcm)
+                        audioEngine.recycleAudioEvent(audio)
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (t: Throwable) {
+                logger.e("SessionManager: mic audio consumer crashed", t)
+            }
+        }
+
+        // 2. Control Plane: Мгновенная доставка сигналов VAD и остановки без задержек в очереди PCM
+        micControlJob = scope.launch {
+            try {
+                for (control in audioEngine.micControlOutput) {
+                    if (!isActive) break
+                    when (control) {
+                        is AudioStreamControlEvent.SpeechStart -> {
                             if (!currentAadEnabled && client.isReady) {
                                 if (isManualActivityActive.compareAndSet(false, true)) {
                                     logger.d("SessionManager: VAD SpeechStart -> sendActivityStart")
@@ -1269,24 +1300,7 @@ class SessionManager @Inject constructor(
                             }
                         }
 
-                        // УСТРАНЕНИЕ ДЕФЕКТОВ 77, 78: Передача точной длины и возврат в пул без GC-нагрузки
-                        is AudioStreamEvent.Audio -> {
-                            try {
-                                if (
-                                    !forvoPlayer.isPlaying.value &&
-                                    (currentAadEnabled || isManualActivityActive.get()) &&
-                                    connectionDesired &&
-                                    client.isReady
-                                ) {
-                                    client.sendAudioPcm(event.pcm, event.length)
-                                }
-                            } finally {
-                                audioEngine.releaseCapturedBuffer(event.pcm)
-                                audioEngine.recycleAudioEvent(event)
-                            }
-                        }
-
-                        is AudioStreamEvent.SpeechEnd -> {
+                        is AudioStreamControlEvent.SpeechEnd -> {
                             if (currentAadEnabled && client.isReady) {
                                 client.flushAudio()
                             } else if (!currentAadEnabled &&
@@ -1299,7 +1313,7 @@ class SessionManager @Inject constructor(
                             }
                         }
 
-                        is AudioStreamEvent.StreamStop -> {
+                        is AudioStreamControlEvent.StreamStop -> {
                             finalizeMicActivityBounded()
                             _state.update { it.copy(isMicActive = false) }
                             break
@@ -1309,13 +1323,7 @@ class SessionManager @Inject constructor(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (t: Throwable) {
-                logger.e("SessionManager: mic consumer crashed", t)
-                _state.update {
-                    it.copy(
-                        isMicActive = false,
-                        error = "Ошибка обработки микрофона: ${t.localizedMessage}"
-                    )
-                }
+                logger.e("SessionManager: mic control consumer crashed", t)
             }
         }
     }
@@ -1340,31 +1348,11 @@ class SessionManager @Inject constructor(
             }
         }
 
-        val consumerJob = micJob
-        var consumerCompleted = true
+        micAudioJob?.cancel()
+        micControlJob?.cancel()
+        micAudioJob = null
+        micControlJob = null
 
-        if (consumerJob != null) {
-            consumerCompleted = withTimeoutOrNull(1500L) {
-                consumerJob.join()
-                true
-            } ?: false
-
-            if (!consumerCompleted) {
-                logger.w("SessionManager: mic consumer timeout; forcing bounded cancellation")
-                consumerJob.cancel()
-                consumerCompleted = withTimeoutOrNull(200L) {
-                    consumerJob.join()
-                    true
-                } ?: false
-
-                if (!consumerCompleted) {
-                    logger.e("SessionManager: mic consumer did not terminate after cancellation")
-                    finalizeMicActivityBounded()
-                }
-            }
-        }
-
-        micJob = null
         audioEngine.drainPendingMicOutput()
         isManualActivityActive.set(false)
         _state.update { it.copy(isMicActive = false) }
@@ -1419,7 +1407,6 @@ class SessionManager @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 21, 22, 68: Мгновенная реакция на barge-in с очисткой очереди
     private fun observeBargeIn() = scope.launch {
         audioEngine.bargeInEvents.collect {
             if (!_state.value.isAiSpeaking) return@collect
