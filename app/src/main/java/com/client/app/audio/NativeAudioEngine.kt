@@ -31,7 +31,7 @@ import javax.inject.Singleton
 import kotlin.math.sqrt
 
 /**
- * Data Plane: События PCM-потока микрофона высокой частоты (100 фреймов/с).
+ * Data Plane: Высокочастотные события PCM-потока микрофона (100 фреймов/с).
  */
 class AudioStreamDataEvent(
     var pcm: ByteArray,
@@ -74,16 +74,14 @@ private data class RouteTransitionRequest(
 )
 
 /**
- * УСТРАНЕНИЕ ДЕФЕКТА 141:
+ * УСТРАНЕНИЕ ДЕФЕКТОВ 14, 17, 141, 213:
  * Монолитный изолированный DSP-контроллер акустического эхоподавления (AEC)
  * и детекции пользовательского перебивания (Barge-In) по стандартам WebRTC APM и ITU-T G.168.
  *
- * Инкапсулирует:
- * - Моделирование акустической огибающей звука динамика (hangover decay).
- * - Адаптацию порога подавления эха под реальный минимальный фоновый шум комнаты (ITU-T G.160).
- * - Расчет динамического коэффициента подавления эха (ERLE) с учетом громкости ЦАП.
- * - Детекцию перебивания с гистерезисом по числу подтвержденных кадров (streak).
- * - Управление временными окнами подавления ложных срабатываний (debounce / grace period).
+ * Особенности:
+ * 1. Полное разделение акустических моделей: в режиме Bluetooth подавление микрофона динамиком
+ *    отключено (гарнитура изолирована от динамика смартфона), задержка реакции минимальна.
+ * 2. Для спикерфона адаптация порога эха опирается на фоновый шум комнаты (ITU-T G.160).
  */
 data class BargeInDecision(
     val isAiRendering: Boolean,
@@ -175,21 +173,20 @@ class AcousticEchoBargeInProcessor(
             )
         }
 
+        // УСТРАНЕНИЕ ДЕФЕКТОВ 14, 17, 213: В наушниках нет акустической связи с динамиком телефона
         val canBargeInTimers = if (isBluetooth) {
-            (nowMs - lastPlaybackStartMs > (180L + quirks.encLatencyMs)) &&
-                (nowMs - lastBargeInMs > debounceMs)
+            (nowMs - lastPlaybackStartMs > 40L) && (nowMs - lastBargeInMs > 150L)
         } else {
-            (nowMs - lastPlaybackStartMs > playbackGracePeriodMs) &&
-                (nowMs - lastBargeInMs > debounceMs)
+            (nowMs - lastPlaybackStartMs > playbackGracePeriodMs) && (nowMs - lastBargeInMs > debounceMs)
         }
 
-        // УСТРАНЕНИЕ ДЕФЕКТА 140: Адаптация порога эха под реальный фоновый шум комнаты
         val dynamicErleRatio = quirks.acousticErleRatio + (0.15f * playbackVolume)
         val nonLinearOffset = if (outputEnergyHangover > 0.45f) {
             (outputEnergyHangover - 0.45f) * 0.40f
         } else {
             0.0f
         }
+
         val echoThreshold = maxOf(
             ambientNoiseFloor * 2.2f,
             maxOf(quirks.echoThreshold, (outputEnergyHangover * dynamicErleRatio) + nonLinearOffset)
@@ -241,7 +238,7 @@ class NativeAudioEngine @Inject constructor(
         private const val BARGE_IN_RECOVERY_POLL_MS = 50L
         private const val PRE_ROLL_FRAMES_CAPACITY = 20
 
-        private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 8L * 1024L // ~250 мс звука
+        private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 8L * 1024L // ~250 мс звука (защита от bufferbloat)
         private const val PLAYBACK_WRITE_STALL_TIMEOUT_MS = 250L
     }
 
@@ -358,7 +355,6 @@ class NativeAudioEngine @Inject constructor(
     private val audioEventPool = ArrayDeque<AudioStreamDataEvent>(64)
     private val audioEventPoolLock = Any()
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 141: Изолированный DSP-процессор
     private val acousticProcessor = AcousticEchoBargeInProcessor(
         debounceMs = BARGE_IN_DEBOUNCE_MS,
         playbackGracePeriodMs = PLAYBACK_GRACE_PERIOD_MS
@@ -419,7 +415,7 @@ class NativeAudioEngine @Inject constructor(
 
     private fun getLeadInCapacityForRoute(profile: RouteProfile): Int {
         return if (profile.isBluetooth) {
-            (260 * 16) / 160 // ~26 пакетов с учетом задержки ENC 35 мс
+            (260 * 16) / 160 // ~26 пакетов с учетом аппаратной задержки ENC
         } else {
             (160 * 16) / 160 // ~16 пакетов
         }
@@ -908,7 +904,6 @@ class NativeAudioEngine @Inject constructor(
 
                             val isVocalized = speechStartedOnFrame || vadDetector.isSpeechDetected.value
 
-                            // УСТРАНЕНИЕ ДЕФЕКТА 141: Чистый и изолированный расчет акустического решения через процессор
                             val decision = acousticProcessor.evaluate(
                                 instantaneousMic = instantaneousMic,
                                 instantaneousOut = instantaneousOut,
@@ -929,22 +924,15 @@ class NativeAudioEngine @Inject constructor(
                                     hapticManager.triggerBargeIn()
                                     _bargeInEvents.tryEmit(Unit)
 
-                                    if (isBluetooth) {
-                                        val preRoll = mutableListOf<ByteArray>()
-                                        synchronized(poolLock) {
-                                            while (leadInBuffer.isNotEmpty()) {
-                                                preRoll.add(leadInBuffer.removeFirst())
-                                            }
+                                    // УСТРАНЕНИЕ ДЕФЕКТА 19: Отправка pre-roll буфера как для Bluetooth, так и для спикера!
+                                    val preRoll = mutableListOf<ByteArray>()
+                                    synchronized(poolLock) {
+                                        while (leadInBuffer.isNotEmpty()) {
+                                            preRoll.add(leadInBuffer.removeFirst())
                                         }
-                                        for (pf in preRoll) {
-                                            sendMicDataEvent(obtainAudioEvent(pf, pf.size, seqNum, captureTimestampNs), instanceId)
-                                        }
-                                    } else {
-                                        synchronized(poolLock) {
-                                            while (leadInBuffer.isNotEmpty()) {
-                                                recycleBuffer(leadInBuffer.removeFirst())
-                                            }
-                                        }
+                                    }
+                                    for (pf in preRoll) {
+                                        sendMicDataEvent(obtainAudioEvent(pf, pf.size, seqNum, captureTimestampNs), instanceId)
                                     }
                                 }
 
