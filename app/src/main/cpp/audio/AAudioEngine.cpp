@@ -171,7 +171,6 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
 
     const bool isBt = isBluetoothMode_.load(std::memory_order_relaxed);
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 13: Не навязывать жесткий deviceId при голосовой связи
     if (!isBt && inputDeviceId > 0) {
         AAudioStreamBuilder_setDeviceId(inBuilder, inputDeviceId);
     }
@@ -208,7 +207,6 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
         return false;
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 8: Не закрывать поток из-за несовпадения ID устройства на Samsung One UI
     if (inputDeviceId > 0 && actualInDeviceId != inputDeviceId) {
         if (!isBt) {
             LOGW("AAudio capture device ID mismatch: requested=%d, actual=%d (AudioPolicy routing active)",
@@ -247,7 +245,8 @@ bool AAudioEngine::initLocked(
 
     stopLocked();
 
-    isDisconnected_.store(false, std::memory_order_release);
+    engineState_.store(EngineState::STARTING, std::memory_order_release);
+    isDisconnectedExplicit_.store(false, std::memory_order_release);
     activeCaptureStream_.store(nullptr, std::memory_order_release);
     activePlaybackStream_.store(nullptr, std::memory_order_release);
 
@@ -296,10 +295,12 @@ bool AAudioEngine::initLocked(
     if (res != AAUDIO_OK || playbackStream_ == nullptr) {
         LOGE("Failed to open playback stream: %d (%s)", res, AAudio_convertResultToText(res));
         closePlaybackStreamLocked();
+        engineState_.store(EngineState::IDLE, std::memory_order_release);
         return false;
     }
 
     if (!validateAndPublishPlaybackConfigLocked(outputDeviceId)) {
+        engineState_.store(EngineState::IDLE, std::memory_order_release);
         return false;
     }
 
@@ -316,6 +317,7 @@ bool AAudioEngine::initLocked(
              targetBufSize, appliedBufSize, playBurst, playCapacity);
     }
 
+    engineState_.store(EngineState::IDLE, std::memory_order_release);
     return true;
 }
 
@@ -342,7 +344,6 @@ aaudio_result_t AAudioEngine::openPlaybackStreamWithFallback(
             AAudioStreamBuilder_setSampleRate(outBuilder, targetPlaybackSampleRate);
         }
 
-        // УСТРАНЕНИЕ ДЕФЕКТА 13: Не конфликтовать с AudioPolicy setCommunicationDevice
         if (outputDeviceId > 0 && !isBluetooth) {
             AAudioStreamBuilder_setDeviceId(outBuilder, outputDeviceId);
         }
@@ -441,6 +442,8 @@ bool AAudioEngine::startPlayback() {
     std::lock_guard<std::mutex> lock(lifecycleMutex_);
     if (playbackDspRunning_.load(std::memory_order_acquire)) return true;
 
+    engineState_.store(EngineState::STARTING, std::memory_order_release);
+
     if (!playbackStream_) {
         const aaudio_result_t reopen = openPlaybackStreamWithFallback(
             playbackSampleRate_.load(std::memory_order_acquire),
@@ -449,6 +452,7 @@ bool AAudioEngine::startPlayback() {
         if (reopen != AAUDIO_OK || playbackStream_ == nullptr ||
             !validateAndPublishPlaybackConfigLocked(requestedOutputDeviceId_.load(std::memory_order_acquire))) {
             closePlaybackStreamLocked();
+            engineState_.store(EngineState::IDLE, std::memory_order_release);
             return false;
         }
         const int32_t reopenedRate = actualPlaybackSampleRate_.load(std::memory_order_acquire);
@@ -470,12 +474,14 @@ bool AAudioEngine::startPlayback() {
     const aaudio_result_t result = AAudioStream_requestStart(playbackStream_);
     if (result != AAUDIO_OK) {
         closePlaybackStreamLocked();
-        isDisconnected_.store(true, std::memory_order_release);
+        pushErrorEvent(AAUDIO_DIRECTION_OUTPUT, result);
+        engineState_.store(EngineState::RECOVERING, std::memory_order_release);
         return false;
     }
     if (!waitForStreamState(playbackStream_, AAUDIO_STREAM_STATE_STARTED, 2000)) {
         closePlaybackStreamLocked();
-        isDisconnected_.store(true, std::memory_order_release);
+        pushErrorEvent(AAUDIO_DIRECTION_OUTPUT, AAUDIO_ERROR_TIMEOUT);
+        engineState_.store(EngineState::RECOVERING, std::memory_order_release);
         return false;
     }
 
@@ -487,11 +493,12 @@ bool AAudioEngine::startPlayback() {
         playbackDspRunning_.store(false, std::memory_order_release);
         playbackDspCv_.notify_all();
         if (playbackStream_) closePlaybackStreamLocked();
-        isDisconnected_.store(true, std::memory_order_release);
+        pushErrorEvent(AAUDIO_DIRECTION_OUTPUT, AAUDIO_ERROR_INTERNAL);
+        engineState_.store(EngineState::RECOVERING, std::memory_order_release);
         return false;
     }
 
-    isRunning_.store(true, std::memory_order_release);
+    engineState_.store(EngineState::RUNNING, std::memory_order_release);
     return true;
 }
 
@@ -502,7 +509,7 @@ bool AAudioEngine::startCapture() {
         return true;
     }
 
-    isDisconnected_.store(false, std::memory_order_release);
+    isDisconnectedExplicit_.store(false, std::memory_order_release);
     captureIngressBlocked_.store(true, std::memory_order_release);
 
     joinCaptureDspThreadLocked();
@@ -540,7 +547,7 @@ bool AAudioEngine::startCapture() {
         LOGE("AAudioStream_requestStart(capture) failed: %d (%s)", result, AAudio_convertResultToText(result));
         closeCaptureStreamLocked();
         captureIngressBlocked_.store(true, std::memory_order_release);
-        isDisconnected_.store(true, std::memory_order_release);
+        pushErrorEvent(AAUDIO_DIRECTION_INPUT, result);
         return false;
     }
 
@@ -550,14 +557,14 @@ bool AAudioEngine::startCapture() {
         waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STOPPED, 500);
         closeCaptureStreamLocked();
         captureIngressBlocked_.store(true, std::memory_order_release);
-        isDisconnected_.store(true, std::memory_order_release);
+        pushErrorEvent(AAUDIO_DIRECTION_INPUT, AAUDIO_ERROR_TIMEOUT);
         return false;
     }
 
     const int32_t actualDeviceId = AAudioStream_getDeviceId(captureStream_);
     actualInputDeviceId_.store(actualDeviceId, std::memory_order_release);
 
-    isRunning_.store(true, std::memory_order_release);
+    engineState_.store(EngineState::RUNNING, std::memory_order_release);
     return true;
 }
 
@@ -597,12 +604,11 @@ bool AAudioEngine::activateCaptureDsp() {
         closeCaptureStreamLocked();
 
         captureIngressBlocked_.store(true, std::memory_order_release);
-        isDisconnected_.store(true, std::memory_order_release);
+        pushErrorEvent(AAUDIO_DIRECTION_INPUT, AAUDIO_ERROR_INTERNAL);
         return false;
     }
 
     captureDspCv_.notify_all();
-    isRunning_.store(true, std::memory_order_release);
     return true;
 }
 
@@ -635,6 +641,83 @@ bool AAudioEngine::start() {
     if (!startCapture()) { stop(); return false; }
     if (!activateCaptureDsp()) { stop(); return false; }
     if (!commitCaptureAdmission()) { stop(); return false; }
+    return true;
+}
+
+// УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 44: Изолированный целевой перезапуск тракта захвата
+bool AAudioEngine::restartCaptureStream() {
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+    LOGI("AAudioEngine: Performing targeted capture stream restart");
+
+    stopCaptureLocked();
+
+    if (!openCaptureStreamLocked(requestedInputDeviceId_.load(std::memory_order_acquire))) {
+        LOGE("restartCaptureStream: open failed");
+        return false;
+    }
+
+    const aaudio_result_t result = AAudioStream_requestStart(captureStream_);
+    if (result != AAUDIO_OK || !waitForStreamState(captureStream_, AAUDIO_STREAM_STATE_STARTED, 2000)) {
+        LOGE("restartCaptureStream: requestStart failed");
+        closeCaptureStreamLocked();
+        return false;
+    }
+
+    captureDspRunning_.store(true, std::memory_order_release);
+    try {
+        captureDspThread_ = std::thread(&AAudioEngine::captureDspThreadLoop, this);
+    } catch (...) {
+        captureDspRunning_.store(false, std::memory_order_release);
+        closeCaptureStreamLocked();
+        return false;
+    }
+
+    captureIngressBlocked_.store(false, std::memory_order_release);
+    captureDspCv_.notify_all();
+    engineState_.store(EngineState::RUNNING, std::memory_order_release);
+    LOGI("AAudioEngine: Targeted capture restart successful");
+    return true;
+}
+
+// УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 44: Изолированный целевой перезапуск тракта воспроизведения
+bool AAudioEngine::restartPlaybackStream() {
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+    LOGI("AAudioEngine: Performing targeted playback stream restart");
+
+    stopPlaybackLocked();
+
+    const aaudio_result_t reopen = openPlaybackStreamWithFallback(
+        playbackSampleRate_.load(std::memory_order_acquire),
+        requestedOutputDeviceId_.load(std::memory_order_acquire),
+        isBluetoothMode_.load(std::memory_order_acquire));
+
+    if (reopen != AAUDIO_OK || playbackStream_ == nullptr ||
+        !validateAndPublishPlaybackConfigLocked(requestedOutputDeviceId_.load(std::memory_order_acquire))) {
+        closePlaybackStreamLocked();
+        return false;
+    }
+
+    const int32_t reopenedRate = actualPlaybackSampleRate_.load(std::memory_order_acquire);
+    voiceEnhancer_.reset(reopenedRate);
+    genericResampler_.configure(SAMPLE_RATE_GEMINI_OUT, reopenedRate);
+
+    const aaudio_result_t result = AAudioStream_requestStart(playbackStream_);
+    if (result != AAUDIO_OK || !waitForStreamState(playbackStream_, AAUDIO_STREAM_STATE_STARTED, 2000)) {
+        closePlaybackStreamLocked();
+        return false;
+    }
+
+    playbackDspRunning_.store(true, std::memory_order_release);
+    try {
+        playbackDspThread_ = std::thread(&AAudioEngine::playbackDspThreadLoop, this);
+    } catch (...) {
+        playbackDspRunning_.store(false, std::memory_order_release);
+        closePlaybackStreamLocked();
+        return false;
+    }
+
+    engineState_.store(EngineState::RUNNING, std::memory_order_release);
+    LOGI("AAudioEngine: Targeted playback restart successful");
     return true;
 }
 
@@ -687,16 +770,7 @@ void AAudioEngine::stopPlaybackLocked() {
 }
 
 void AAudioEngine::stopLocked() {
-    const bool hadState =
-        isRunning_.exchange(false, std::memory_order_acq_rel) ||
-        captureStream_ != nullptr ||
-        playbackStream_ != nullptr ||
-        captureDspRunning_.load(std::memory_order_acquire) ||
-        playbackDspRunning_.load(std::memory_order_acquire) ||
-        captureDspThread_.joinable() ||
-        playbackDspThread_.joinable();
-
-    if (!hadState) return;
+    engineState_.store(EngineState::STOPPING, std::memory_order_release);
 
     stopCaptureLocked();
     stopPlaybackLocked();
@@ -725,19 +799,69 @@ void AAudioEngine::stopLocked() {
     outRms_.store(0.0f, std::memory_order_relaxed);
     isMmapActive_.store(false, std::memory_order_relaxed);
     isExclusiveSharingActive_.store(false, std::memory_order_relaxed);
+    isDisconnectedExplicit_.store(false, std::memory_order_relaxed);
     actualPlaybackChannels_.store(0, std::memory_order_relaxed);
     actualPlaybackFormat_.store(0, std::memory_order_relaxed);
     actualPlaybackSampleRate_.store(0, std::memory_order_relaxed);
     actualPlaybackBurst_.store(0, std::memory_order_relaxed);
     actualOutputDeviceId_.store(AAUDIO_UNSPECIFIED, std::memory_order_relaxed);
+
+    engineState_.store(EngineState::IDLE, std::memory_order_release);
 }
 
 void AAudioEngine::stopCapture() {
     std::lock_guard<std::mutex> lock(lifecycleMutex_);
     stopCaptureLocked();
     if (!playbackDspRunning_.load(std::memory_order_acquire)) {
-        isRunning_.store(false, std::memory_order_release);
+        engineState_.store(EngineState::IDLE, std::memory_order_release);
     }
+}
+
+void AAudioEngine::pushErrorEvent(int32_t direction, aaudio_result_t errorCode) {
+    timespec ts{};
+    clock_gettime(CLOCK_BOOTTIME, &ts);
+    const uint64_t nowNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+
+    StreamFaultType faultType = StreamFaultType::SYSTEM_ERROR;
+    if (errorCode == AAUDIO_ERROR_DISCONNECTED || errorCode == AAUDIO_ERROR_NO_SERVICE) {
+        faultType = StreamFaultType::HARD_DISCONNECTED;
+    } else if (errorCode == AAUDIO_ERROR_TIMEOUT) {
+        faultType = StreamFaultType::SOFT_TIMEOUT;
+    }
+
+    StreamErrorEvent evt{
+        .direction = direction,
+        .errorCode = errorCode,
+        .faultType = faultType,
+        .timestampNs = nowNs
+    };
+
+    {
+        std::lock_guard<std::mutex> lock(errorQueueMutex_);
+        if (errorEventQueue_.size() >= 32) {
+            errorEventQueue_.pop();
+        }
+        errorEventQueue_.push(evt);
+        errorEventPending_.store(true, std::memory_order_release);
+    }
+
+    isDisconnectedExplicit_.store(true, std::memory_order_release);
+    engineState_.store(EngineState::RECOVERING, std::memory_order_release);
+    LOGE("AAudioEngine: Error pushed: dir=%d, code=%d (%s), faultType=%d",
+         direction, errorCode, AAudio_convertResultToText(errorCode), static_cast<int>(faultType));
+}
+
+bool AAudioEngine::pollErrorEvent(StreamErrorEvent& outEvent) {
+    std::lock_guard<std::mutex> lock(errorQueueMutex_);
+    if (errorEventQueue_.empty()) {
+        errorEventPending_.store(false, std::memory_order_release);
+        return false;
+    }
+
+    outEvent = errorEventQueue_.front();
+    errorEventQueue_.pop();
+    errorEventPending_.store(!errorEventQueue_.empty(), std::memory_order_release);
+    return true;
 }
 
 void AAudioEngine::captureDspThreadLoop() {
@@ -754,10 +878,9 @@ void AAudioEngine::captureDspThreadLoop() {
 
             if (availableSamples == 0) {
                 std::unique_lock<std::mutex> lock(captureDspWaitMutex_);
-                constexpr auto kCaptureDspWaitTimeout = std::chrono::milliseconds(100);
-                captureDspCv_.wait_for(lock, kCaptureDspWaitTimeout, [this]() {
+                captureDspCv_.wait(lock, [this]() {
                     return !captureDspRunning_.load(std::memory_order_acquire) ||
-                        captureRawBuffer_.availableRead() > 0;
+                           captureRawBuffer_.availableRead() > 0;
                 });
                 continue;
             }
@@ -817,10 +940,10 @@ void AAudioEngine::captureDspThreadLoop() {
         }
     } catch (const std::exception& e) {
         LOGE("AAudioEngine: capture DSP worker exception: %s", e.what());
-        isDisconnected_.store(true, std::memory_order_release);
+        pushErrorEvent(AAUDIO_DIRECTION_INPUT, AAUDIO_ERROR_INTERNAL);
     } catch (...) {
         LOGE("AAudioEngine: capture DSP worker unknown exception");
-        isDisconnected_.store(true, std::memory_order_release);
+        pushErrorEvent(AAUDIO_DIRECTION_INPUT, AAUDIO_ERROR_INTERNAL);
     }
 
     captureDspRunning_.store(false, std::memory_order_release);
@@ -860,7 +983,6 @@ void AAudioEngine::playbackDspThreadLoop() {
             const int32_t actualRate = std::max(1, actualPlaybackSampleRate_.load(std::memory_order_acquire));
             const int32_t actualBurst = actualPlaybackBurst_.load(std::memory_order_acquire);
 
-            // УСТРАНЕНИЕ ДЕФЕКТОВ 28 и 29: Целевой размер буфера 25 мс вместо 140 мс
             const size_t timeTargetFrames = static_cast<size_t>(
                 static_cast<uint64_t>(actualRate) * PLAYBACK_TARGET_BUFFER_MS / 1000ULL);
             const size_t burstTargetFrames = (actualBurst > 0)
@@ -905,7 +1027,7 @@ void AAudioEngine::playbackDspThreadLoop() {
             size_t inputFrames = playbackDspInputBuffer_.read(input, PLAYBACK_DSP_INPUT_CHUNK_FRAMES);
             if (inputFrames == 0) {
                 std::unique_lock<std::mutex> waitLock(playbackDspWaitMutex_);
-                playbackDspCv_.wait_for(waitLock, std::chrono::milliseconds(10), [this, activeEpoch]() {
+                playbackDspCv_.wait(waitLock, [this, activeEpoch]() {
                     return !playbackDspRunning_.load(std::memory_order_acquire) ||
                         playbackEpoch_.load(std::memory_order_acquire) != activeEpoch ||
                         playbackDspInputBuffer_.availableRead() > 0;
@@ -941,7 +1063,6 @@ void AAudioEngine::playbackDspThreadLoop() {
                 }
             }
 
-            // УСТРАНЕНИЕ ДЕФЕКТА 23: Расчёт RMS выполняется в воркере с NEON FTZ, а не в RT-колбэке
             const float outRms = dsp::calculateRms(output, outputFrames);
             outRms_.store(outRms, std::memory_order_relaxed);
 
@@ -970,22 +1091,20 @@ void AAudioEngine::playbackDspThreadLoop() {
         }
     } catch (const std::exception& e) {
         LOGE("AAudioEngine: playback DSP worker exception: %s", e.what());
-        isDisconnected_.store(true, std::memory_order_release);
+        pushErrorEvent(AAUDIO_DIRECTION_OUTPUT, AAUDIO_ERROR_INTERNAL);
     } catch (...) {
         LOGE("AAudioEngine: playback DSP worker unknown exception");
-        isDisconnected_.store(true, std::memory_order_release);
+        pushErrorEvent(AAUDIO_DIRECTION_OUTPUT, AAUDIO_ERROR_INTERNAL);
     }
 
     playbackDspRunning_.store(false, std::memory_order_release);
     playbackDspCv_.notify_all();
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТА 35: Полностью неблокирующая запись без бесконечного wait_for цикла
 size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation) {
     if (pcm == nullptr || frames == 0 || generation == 0) return 0;
     if (!playbackDspRunning_.load(std::memory_order_acquire)) return 0;
 
-    // Устаревшее поколение реплики сразу сбрасывается без блокировки JNI
     if (generation < playbackEpoch_.load(std::memory_order_acquire)) {
         return frames;
     }
@@ -1002,7 +1121,6 @@ size_t AAudioEngine::readCapturePcm(int16_t* pcm, size_t maxFrames) {
     return captureBuffer_.read(pcm, maxFrames);
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 21 и 22: Мгновенный сброс буферов за < 1 мкс без остановки ЦАП
 void AAudioEngine::flushPlayback(uint64_t generation) {
     if (generation == 0) return;
 
@@ -1044,8 +1162,9 @@ void AAudioEngine::getSpectrumData(dsp::SpectrumSnapshot& outSnapshot) {
     fftProcessor_->getLatestSnapshot(outSnapshot);
 }
 
+// УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Наносекундный таймстемпинг и счетчик последовательности в RT-колбэке
 aaudio_data_callback_result_t AAudioEngine::captureCallback(
-    AAudioStream* /*stream*/,
+    AAudioStream* stream,
     void* userData,
     void* audioData,
     int32_t numFrames) {
@@ -1055,6 +1174,20 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     }
 
     auto* engine = static_cast<AAudioEngine*>(userData);
+
+    // Замер точного аппаратного таймстемпа АЦП
+    int64_t framePosition = 0;
+    int64_t hwTimestampNs = 0;
+    if (stream != nullptr && AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &framePosition, &hwTimestampNs) == AAUDIO_OK) {
+        engine->lastCaptureTimestampNs_.store(static_cast<uint64_t>(hwTimestampNs), std::memory_order_relaxed);
+    } else {
+        timespec ts{};
+        clock_gettime(CLOCK_BOOTTIME, &ts);
+        const uint64_t nowNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+        engine->lastCaptureTimestampNs_.store(nowNs, std::memory_order_relaxed);
+    }
+
+    engine->captureSequenceNumber_.fetch_add(1, std::memory_order_relaxed);
 
     if (engine->captureIngressBlocked_.load(std::memory_order_acquire)) {
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
@@ -1083,9 +1216,9 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 23, 24, 25, 26: 100% Wait-free RT колбэк без CAS, sqrt и блокировок
+// УСТРАНЕНИЕ ДЕФЕКТОВ 47, 48, 49: Наносекундный таймстемпинг ЦАП в RT-колбэке
 aaudio_data_callback_result_t AAudioEngine::playbackCallback(
-    AAudioStream* /*stream*/,
+    AAudioStream* stream,
     void* userData,
     void* audioData,
     int32_t numFrames) {
@@ -1098,7 +1231,14 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     auto* samples = static_cast<int16_t*>(audioData);
     const size_t frames = static_cast<size_t>(numFrames);
 
-    // Wait-free чтение из SPSC-буфера
+    int64_t framePosition = 0;
+    int64_t dacTimestampNs = 0;
+    if (stream != nullptr && AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &framePosition, &dacTimestampNs) == AAUDIO_OK) {
+        engine->lastPlaybackPresentationTimestampNs_.store(static_cast<uint64_t>(dacTimestampNs), std::memory_order_relaxed);
+    }
+
+    engine->playbackSequenceNumber_.fetch_add(1, std::memory_order_relaxed);
+
     const size_t read = engine->playbackBuffer_.read(samples, frames);
     if (read < frames) {
         std::memset(samples + read, 0, (frames - read) * sizeof(int16_t));
@@ -1111,6 +1251,7 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
+// УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 43: Исчерпывающий разбор ошибок и диспетчеризация
 void AAudioEngine::errorCallback(
     AAudioStream* stream,
     void* userData,
@@ -1122,8 +1263,15 @@ void AAudioEngine::errorCallback(
     const AAudioStream* activeCapture = engine->activeCaptureStream_.load(std::memory_order_acquire);
     const AAudioStream* activePlayback = engine->activePlaybackStream_.load(std::memory_order_acquire);
 
-    if (stream == activeCapture || stream == activePlayback) {
-        engine->isDisconnected_.store(true, std::memory_order_release);
+    int32_t direction = 0;
+    if (stream == activeCapture) {
+        direction = AAUDIO_DIRECTION_INPUT;
+    } else if (stream == activePlayback) {
+        direction = AAUDIO_DIRECTION_OUTPUT;
+    }
+
+    if (direction != 0) {
+        engine->pushErrorEvent(direction, error);
     }
 }
 
