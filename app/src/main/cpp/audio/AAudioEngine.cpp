@@ -111,6 +111,9 @@ AAudioEngine::AAudioEngine()
       captureDecimateBuffer_(CAPTURE_DECIMATE_CAPACITY, 0),
       captureInputScratchBuffer_(CAPTURE_DECIMATE_CAPACITY, 0) {
     dsp::enableHardwareFtz();
+    for (auto& bucket : errorHistogram_) {
+        bucket.store(0, std::memory_order_relaxed);
+    }
 }
 
 AAudioEngine::~AAudioEngine() {
@@ -267,7 +270,6 @@ bool AAudioEngine::initLocked(
         smoothedRateFactor_ = 1.0f;
     }
 
-    captureDroppedFrames_.store(0, std::memory_order_relaxed);
     captureRawBuffer_.resetQuiesced();
     captureBuffer_.resetQuiesced();
     playbackDspInputBuffer_.resetQuiesced();
@@ -534,7 +536,6 @@ bool AAudioEngine::startCapture() {
         return false;
     }
 
-    captureDroppedFrames_.store(0, std::memory_order_relaxed);
     captureRawBuffer_.resetQuiesced();
     captureBuffer_.resetQuiesced();
 
@@ -646,7 +647,6 @@ bool AAudioEngine::start() {
     return true;
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 44: Изолированный целевой перезапуск тракта захвата
 bool AAudioEngine::restartCaptureStream() {
     std::lock_guard<std::mutex> lock(lifecycleMutex_);
     LOGI("AAudioEngine: Performing targeted capture stream restart");
@@ -681,7 +681,6 @@ bool AAudioEngine::restartCaptureStream() {
     return true;
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 41 и 44: Изолированный целевой перезапуск тракта воспроизведения
 bool AAudioEngine::restartPlaybackStream() {
     std::lock_guard<std::mutex> lock(lifecycleMutex_);
     LOGI("AAudioEngine: Performing targeted playback stream restart");
@@ -769,6 +768,7 @@ void AAudioEngine::stopPlaybackLocked() {
     playbackDspInputBuffer_.resetQuiesced();
     playbackBuffer_.resetQuiesced();
     outRms_.store(0.0f, std::memory_order_relaxed);
+    isPlaybackRenderingActive_.store(false, std::memory_order_release);
 }
 
 void AAudioEngine::stopLocked() {
@@ -811,6 +811,7 @@ void AAudioEngine::stopLocked() {
     lastPlaybackWriteNs_.store(0, std::memory_order_relaxed);
     interArrivalJitterNs_.store(0, std::memory_order_relaxed);
     playbackTargetBufferMs_.store(PLAYBACK_TARGET_BUFFER_MS, std::memory_order_relaxed);
+    isPlaybackRenderingActive_.store(false, std::memory_order_release);
 
     engineState_.store(EngineState::IDLE, std::memory_order_release);
 }
@@ -823,16 +824,55 @@ void AAudioEngine::stopCapture() {
     }
 }
 
+StreamFaultType AAudioEngine::classifyAaudioError(aaudio_result_t errorCode) {
+    switch (errorCode) {
+        case AAUDIO_ERROR_DISCONNECTED:
+        case AAUDIO_ERROR_NO_SERVICE:
+            return StreamFaultType::HARD_DISCONNECTED;
+        case AAUDIO_ERROR_TIMEOUT:
+            return StreamFaultType::SOFT_TIMEOUT;
+        case AAUDIO_ERROR_INVALID_STATE:
+            return StreamFaultType::INVALID_STATE;
+        default:
+            return StreamFaultType::SYSTEM_ERROR;
+    }
+}
+
+void AAudioEngine::recordErrorHistogram(aaudio_result_t errorCode) {
+    size_t bucketIdx = 0;
+    switch (errorCode) {
+        case AAUDIO_ERROR_DISCONNECTED: bucketIdx = 1; break;
+        case AAUDIO_ERROR_NO_SERVICE: bucketIdx = 2; break;
+        case AAUDIO_ERROR_TIMEOUT: bucketIdx = 3; break;
+        case AAUDIO_ERROR_INVALID_STATE: bucketIdx = 4; break;
+        case AAUDIO_ERROR_INTERNAL: bucketIdx = 5; break;
+        case AAUDIO_ERROR_UNAVAILABLE: bucketIdx = 6; break;
+        case AAUDIO_ERROR_UNIMPLEMENTED: bucketIdx = 7; break;
+        case AAUDIO_ERROR_OUT_OF_RANGE: bucketIdx = 8; break;
+        case AAUDIO_ERROR_INVALID_HANDLE: bucketIdx = 9; break;
+        default: bucketIdx = 10; break;
+    }
+    if (bucketIdx < ERROR_HISTOGRAM_BUCKETS) {
+        errorHistogram_[bucketIdx].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void AAudioEngine::pushErrorEvent(int32_t direction, aaudio_result_t errorCode) {
     timespec ts{};
     clock_gettime(CLOCK_BOOTTIME, &ts);
     const uint64_t nowNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
 
-    StreamFaultType faultType = StreamFaultType::SYSTEM_ERROR;
-    if (errorCode == AAUDIO_ERROR_DISCONNECTED || errorCode == AAUDIO_ERROR_NO_SERVICE) {
-        faultType = StreamFaultType::HARD_DISCONNECTED;
-    } else if (errorCode == AAUDIO_ERROR_TIMEOUT) {
-        faultType = StreamFaultType::SOFT_TIMEOUT;
+    const StreamFaultType faultType = classifyAaudioError(errorCode);
+    recordErrorHistogram(errorCode);
+
+    if (direction == AAUDIO_DIRECTION_INPUT) {
+        captureErrorCount_.fetch_add(1, std::memory_order_relaxed);
+    } else if (direction == AAUDIO_DIRECTION_OUTPUT) {
+        playbackErrorCount_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (faultType == StreamFaultType::HARD_DISCONNECTED) {
+        streamDisconnectCount_.fetch_add(1, std::memory_order_relaxed);
     }
 
     StreamErrorEvent evt{
@@ -870,7 +910,98 @@ bool AAudioEngine::pollErrorEvent(StreamErrorEvent& outEvent) {
     return true;
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТА 55: Исключение поллинга с тайм-аутом 100 мс в пользу чистого wait()
+void AAudioEngine::getAudioDiagnostics(AudioPipelineDiagnostics& outDiagnostics) {
+    outDiagnostics.totalHardwareCapturedFrames = totalHardwareCapturedFrames_.load(std::memory_order_relaxed);
+    outDiagnostics.totalDspProcessedFrames = totalDspProcessedFrames_.load(std::memory_order_relaxed);
+    outDiagnostics.captureDroppedFrames = captureDroppedFrames_.load(std::memory_order_relaxed);
+    outDiagnostics.totalHardwarePlaybackFrames = totalHardwarePlaybackFrames_.load(std::memory_order_relaxed);
+    outDiagnostics.playbackUnderrunFrames = playbackUnderrunFrames_.load(std::memory_order_relaxed);
+    outDiagnostics.playbackUnderrunCount = playbackUnderrunCount_.load(std::memory_order_relaxed);
+    outDiagnostics.playbackDroppedFrames = playbackDroppedFrames_.load(std::memory_order_relaxed);
+    outDiagnostics.streamDisconnectCount = streamDisconnectCount_.load(std::memory_order_relaxed);
+    outDiagnostics.captureErrorCount = captureErrorCount_.load(std::memory_order_relaxed);
+    outDiagnostics.playbackErrorCount = playbackErrorCount_.load(std::memory_order_relaxed);
+    outDiagnostics.lastXRunCount = lastXRunCount_.load(std::memory_order_relaxed);
+}
+
+void AAudioEngine::getErrorHistogram(uint32_t* outArray, size_t arraySize) {
+    if (outArray == nullptr || arraySize == 0) return;
+    const size_t count = std::min(arraySize, ERROR_HISTOGRAM_BUCKETS);
+    for (size_t i = 0; i < count; ++i) {
+        outArray[i] = errorHistogram_[i].load(std::memory_order_relaxed);
+    }
+}
+
+// УСТРАНЕНИЕ ДЕФЕКТА 125: Разграничение состояний активного вывода и штатной тишины
+void AAudioEngine::setPlaybackActiveState(bool isActive) {
+    isPlaybackRenderingActive_.store(isActive, std::memory_order_release);
+}
+
+// УСТРАНЕНИЕ ДЕФЕКТОВ 126 и 127: Раздельный учет и нормализация размерностей очередей
+size_t AAudioEngine::getPendingPlaybackInputFrames() const {
+    return playbackDspInputBuffer_.availableRead();
+}
+
+size_t AAudioEngine::getPendingPlaybackOutputFrames() const {
+    return playbackBuffer_.availableRead();
+}
+
+size_t AAudioEngine::getPendingPlaybackFrames() const {
+    const int32_t outRate = std::max(1, actualPlaybackSampleRate_.load(std::memory_order_relaxed));
+    const size_t inFrames = playbackDspInputBuffer_.availableRead();
+    const size_t outFrames = playbackBuffer_.availableRead();
+
+    // Математически строгое приведение сэмплов 24 кГц к выходной сетке частот
+    const size_t normalizedInFrames = static_cast<size_t>(
+        static_cast<double>(inFrames) * static_cast<double>(outRate) / static_cast<double>(SAMPLE_RATE_GEMINI_OUT)
+    );
+    return normalizedInFrames + outFrames;
+}
+
+float AAudioEngine::getPendingPlaybackDurationMs() const {
+    const int32_t outRate = std::max(1, actualPlaybackSampleRate_.load(std::memory_order_relaxed));
+    const size_t inFrames = playbackDspInputBuffer_.availableRead();
+    const size_t outFrames = playbackBuffer_.availableRead();
+
+    const float inMs = (static_cast<float>(inFrames) * 1000.0f) / static_cast<float>(SAMPLE_RATE_GEMINI_OUT);
+    const float outMs = (static_cast<float>(outFrames) * 1000.0f) / static_cast<float>(outRate);
+    return inMs + outMs;
+}
+
+// УСТРАНЕНИЕ ДЕФЕКТА 128: Расчет физической аппаратной задержки тракта (HAL/DAC Latency)
+float AAudioEngine::getTotalEstimatedPlaybackLatencyMs() const {
+    const float userQueueMs = getPendingPlaybackDurationMs();
+    float halLatencyMs = ESTIMATED_HAL_SPEAKER_LATENCY_MS;
+
+    if (isBluetoothMode_.load(std::memory_order_relaxed)) {
+        const int32_t outRate = actualPlaybackSampleRate_.load(std::memory_order_relaxed);
+        if (outRate == SAMPLE_RATE_BT_HFP) {
+            halLatencyMs = ESTIMATED_HAL_BT_SCO_LATENCY_MS;
+        } else {
+            halLatencyMs = ESTIMATED_HAL_BT_BLE_LATENCY_MS;
+        }
+    }
+
+    AAudioStream* stream = activePlaybackStream_.load(std::memory_order_acquire);
+    if (stream != nullptr) {
+        int64_t framePosition = 0;
+        int64_t hwTimestampNs = 0;
+        if (AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &framePosition, &hwTimestampNs) == AAUDIO_OK) {
+            const int64_t framesWritten = AAudioStream_getFramesWritten(stream);
+            if (framesWritten > framePosition) {
+                const int32_t rate = AAudioStream_getSampleRate(stream);
+                if (rate > 0) {
+                    const float dacBufferMs = static_cast<float>(framesWritten - framePosition) * 1000.0f / static_cast<float>(rate);
+                    return userQueueMs + std::max(dacBufferMs, halLatencyMs);
+                }
+            }
+        }
+    }
+
+    return userQueueMs + halLatencyMs;
+}
+
+// УСТРАНЕНИЕ ДЕФЕКТА 140: Статистический трекер минимального фонового шума окружения (ITU-T G.160)
 void AAudioEngine::captureDspThreadLoop() {
     pthread_setname_np(pthread_self(), "AudioCapWorker");
     dsp::enableHardwareFtz();
@@ -938,10 +1069,24 @@ void AAudioEngine::captureDspThreadLoop() {
             }
 
             if (finalFrames > 0) {
-                micRms_.store(dsp::calculateRms(finalPcm, finalFrames), std::memory_order_relaxed);
-                const size_t writtenFrames = captureBuffer_.write(finalPcm, finalFrames);
-                if (writtenFrames < finalFrames) {
-                    captureDroppedFrames_.fetch_add(finalFrames - writtenFrames, std::memory_order_relaxed);
+                totalDspProcessedFrames_.fetch_add(finalFrames, std::memory_order_relaxed);
+                const float currentMicRms = dsp::calculateRms(finalPcm, finalFrames);
+                micRms_.store(currentMicRms, std::memory_order_relaxed);
+
+                // Оценка фонового шума по методу минимальной статистики
+                float currentFloor = micNoiseFloorRms_.load(std::memory_order_relaxed);
+                if (currentMicRms < currentFloor) {
+                    currentFloor = currentFloor * 0.95f + currentMicRms * 0.05f;
+                } else {
+                    currentFloor = currentFloor * NOISE_FLOOR_DECAY_COEFF + currentMicRms * NOISE_FLOOR_ATTACK_COEFF;
+                }
+                currentFloor = std::clamp(currentFloor, NOISE_FLOOR_MIN_RMS, NOISE_FLOOR_MAX_RMS);
+                micNoiseFloorRms_.store(currentFloor, std::memory_order_relaxed);
+
+                // УСТРАНЕНИЕ ДЕФЕКТА 124: Запись с семантикой All-or-Nothing
+                const size_t writtenFrames = captureBuffer_.writeAllOrNothing(finalPcm, finalFrames);
+                if (writtenFrames == 0) {
+                    captureDroppedFrames_.fetch_add(finalFrames, std::memory_order_relaxed);
                 }
             }
         }
@@ -957,7 +1102,6 @@ void AAudioEngine::captureDspThreadLoop() {
     captureDspCv_.notify_all();
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 64, 65, 66: Адаптивный джиттер-буфер (AJB), TSM-ресемплинг и гистерезис
 void AAudioEngine::playbackDspThreadLoop() {
     pthread_setname_np(pthread_self(), "AudioDspWorker");
     dsp::enableHardwareFtz();
@@ -992,7 +1136,6 @@ void AAudioEngine::playbackDspThreadLoop() {
             const int32_t actualRate = std::max(1, actualPlaybackSampleRate_.load(std::memory_order_acquire));
             const int32_t actualBurst = actualPlaybackBurst_.load(std::memory_order_acquire);
 
-            // УСТРАНЕНИЕ ДЕФЕКТА 64: Динамический адаптивный целевой буфер
             const size_t currentTargetMs = playbackTargetBufferMs_.load(std::memory_order_relaxed);
             const size_t timeTargetFrames = static_cast<size_t>(
                 static_cast<uint64_t>(actualRate) * currentTargetMs / 1000ULL);
@@ -1000,7 +1143,6 @@ void AAudioEngine::playbackDspThreadLoop() {
                 ? static_cast<size_t>(actualBurst) * PLAYBACK_BURST_MIN_MULTIPLIER : 0U;
             const size_t targetBufferFrames = std::max<size_t>(1U, std::max(timeTargetFrames, burstTargetFrames));
 
-            // УСТРАНЕНИЕ ДЕФЕКТА 66: Раздельные High Watermark и Low Watermark гистерезиса
             const size_t hysteresisFrames = (actualBurst > 0)
                 ? static_cast<size_t>(actualBurst) * 2U : static_cast<size_t>(actualRate * 15 / 1000);
             const size_t highWatermarkFrames = targetBufferFrames + hysteresisFrames;
@@ -1018,9 +1160,8 @@ void AAudioEngine::playbackDspThreadLoop() {
                     earconBuf[i] = static_cast<int16_t>(std::clamp(sample, -32768.0f, 32767.0f));
                 }
 
-                if (playbackEpoch_.load(std::memory_order_acquire) == activeEpoch &&
-                    playbackBuffer_.availableWrite() >= earconFrames) {
-                    const size_t written = playbackBuffer_.write(earconBuf, earconFrames);
+                if (playbackEpoch_.load(std::memory_order_acquire) == activeEpoch) {
+                    const size_t written = playbackBuffer_.writeAllOrNothing(earconBuf, earconFrames);
                     if (written == earconFrames) earconRequested_.store(false, std::memory_order_release);
                 }
             }
@@ -1032,7 +1173,6 @@ void AAudioEngine::playbackDspThreadLoop() {
             const size_t buffered = playbackBuffer_.availableRead();
             const size_t freeSpace = playbackBuffer_.availableWrite();
 
-            // УСТРАНЕНИЕ ДЕФЕКТА 66: Ожидание снижения до lowWatermarkFrames без дребезга переключения
             if (buffered >= highWatermarkFrames || freeSpace < maxOutputFrames) {
                 std::unique_lock<std::mutex> waitLock(playbackDspWaitMutex_);
                 playbackDspCv_.wait(waitLock, [this, activeEpoch, lowWatermarkFrames, maxOutputFrames]() {
@@ -1056,25 +1196,24 @@ void AAudioEngine::playbackDspThreadLoop() {
 
             if (activeEpoch != playbackEpoch_.load(std::memory_order_acquire)) continue;
 
-            // УСТРАНЕНИЕ ДЕФЕКТА 65: Адаптивное управление темпом вывода (Time-Scale Modification)
             float targetRateFactor = 1.0f;
             if (buffered > targetBufferFrames + (hysteresisFrames / 2)) {
-                targetRateFactor = 1.035f; // Ускорение на 3.5% для незаметного сброса накопленного джиттер-буфера
+                targetRateFactor = 1.035f;
             } else if (buffered < lowWatermarkFrames && playbackDspInputBuffer_.availableRead() > 0) {
-                targetRateFactor = 0.965f; // Замедление на 3.5% для предотвращения опустошения
+                targetRateFactor = 0.965f;
             }
             smoothedRateFactor_ = smoothedRateFactor_ * 0.90f + targetRateFactor * 0.10f;
             const bool isNominalRate = std::abs(smoothedRateFactor_ - 1.0f) < 0.008f;
 
             size_t outputFrames = 0;
-            if (isNominalRate && actualRate == SAMPLE_RATE_GEMINI_OUT) {
+            if (isNominalRate && actualRate == SAMPLE_RATE_BT_LC3_24K) {
                 outputFrames = inputFrames;
                 std::memcpy(output, input, outputFrames * sizeof(int16_t));
-            } else if (isNominalRate && (actualRate == SAMPLE_RATE_NATIVE_SPEAKER || actualRate == SAMPLE_RATE_BT_A2DP)) {
+            } else if (isNominalRate && (actualRate == SAMPLE_RATE_NATIVE_SPEAKER || actualRate == SAMPLE_RATE_BT_A2DP || actualRate == SAMPLE_RATE_BT_LC3_48K)) {
                 outputFrames = halfbandResampler24To48_.process(input, inputFrames, output);
             } else if (isNominalRate && actualRate == SAMPLE_RATE_BT_HFP) {
                 outputFrames = resampler24To16_.process(input, inputFrames, output);
-            } else if (isNominalRate && actualRate == 32000) {
+            } else if (isNominalRate && actualRate == SAMPLE_RATE_BT_LC3_32K) {
                 outputFrames = resampler24To32_.process(input, inputFrames, output);
             } else {
                 const int32_t effectiveInputRate = static_cast<int32_t>(std::round(SAMPLE_RATE_GEMINI_OUT * smoothedRateFactor_));
@@ -1113,8 +1252,11 @@ void AAudioEngine::playbackDspThreadLoop() {
 
             if (playbackDspRunning_.load(std::memory_order_acquire) &&
                 playbackEpoch_.load(std::memory_order_acquire) == activeEpoch) {
-                if (outputFrames > playbackBuffer_.availableWrite()) continue;
-                playbackBuffer_.write(output, outputFrames);
+                // УСТРАНЕНИЕ ДЕФЕКТА 124: Запись без усечения фрейма
+                const size_t written = playbackBuffer_.writeAllOrNothing(output, outputFrames);
+                if (written == 0) {
+                    playbackDroppedFrames_.fetch_add(outputFrames, std::memory_order_relaxed);
+                }
             }
         }
     } catch (const std::exception& e) {
@@ -1129,17 +1271,18 @@ void AAudioEngine::playbackDspThreadLoop() {
     playbackDspCv_.notify_all();
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 64, 70, 71: Корректный статус возврата и метрология межпакетного джиттера
 size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation) {
     if (pcm == nullptr || frames == 0 || generation == 0) return 0;
     if (!playbackDspRunning_.load(std::memory_order_acquire)) return 0;
 
     const uint64_t activeEpoch = playbackEpoch_.load(std::memory_order_acquire);
     if (generation != activeEpoch) {
-        return 0; // Строгий отказ при устаревшем поколении: возвращается 0, а не фиктивный успех
+        playbackDroppedFrames_.fetch_add(frames, std::memory_order_relaxed);
+        return 0;
     }
 
-    // Метрология межпакетного сетевого джиттера (RFC 3550 / ITU-T G.1020)
+    isPlaybackRenderingActive_.store(true, std::memory_order_release);
+
     timespec ts{};
     clock_gettime(CLOCK_BOOTTIME, &ts);
     const uint64_t nowNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
@@ -1160,8 +1303,11 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_
         playbackTargetBufferMs_.store(dynamicTargetMs, std::memory_order_relaxed);
     }
 
-    const size_t written = playbackDspInputBuffer_.write(pcm, frames);
-    if (written > 0) {
+    // УСТРАНЕНИЕ ДЕФЕКТА 124: Запись входного сетевого пакета с семантикой All-or-Nothing
+    const size_t written = playbackDspInputBuffer_.writeAllOrNothing(pcm, frames);
+    if (written == 0) {
+        playbackDroppedFrames_.fetch_add(frames, std::memory_order_relaxed);
+    } else {
         playbackDspCv_.notify_one();
     }
     return written;
@@ -1178,7 +1324,12 @@ void AAudioEngine::flushPlayback(uint64_t generation) {
     const uint64_t currentEpoch = playbackEpoch_.load(std::memory_order_acquire);
     if (generation <= currentEpoch) return;
 
+    const size_t pendingInput = playbackDspInputBuffer_.availableRead();
+    const size_t pendingOutput = playbackBuffer_.availableRead();
+    playbackDroppedFrames_.fetch_add(pendingInput + pendingOutput, std::memory_order_relaxed);
+
     playbackEpoch_.store(generation, std::memory_order_release);
+    isPlaybackRenderingActive_.store(false, std::memory_order_release);
     earconRequested_.store(false, std::memory_order_release);
     outRms_.store(0.0f, std::memory_order_relaxed);
     smoothedRateFactor_ = 1.0f;
@@ -1209,10 +1360,6 @@ void AAudioEngine::setMicGain(float gain) {
     micGain_.store(std::clamp(gain, 0.5f, 2.0f), std::memory_order_relaxed);
 }
 
-size_t AAudioEngine::getPendingPlaybackFrames() const {
-    return playbackDspInputBuffer_.availableRead() + playbackBuffer_.availableRead();
-}
-
 void AAudioEngine::getSpectrumData(dsp::SpectrumSnapshot& outSnapshot) {
     fftProcessor_->getLatestSnapshot(outSnapshot);
 }
@@ -1228,6 +1375,7 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     }
 
     auto* engine = static_cast<AAudioEngine*>(userData);
+    engine->totalHardwareCapturedFrames_.fetch_add(static_cast<uint64_t>(numFrames), std::memory_order_relaxed);
 
     int64_t framePosition = 0;
     int64_t hwTimestampNs = 0;
@@ -1250,26 +1398,22 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     const int32_t channels = engine->actualCaptureChannels_.load(std::memory_order_relaxed);
     const size_t ch = static_cast<size_t>(channels > 0 ? channels : 1);
 
-    const size_t availableFrames = engine->captureRawBuffer_.availableWrite() / ch;
-    const size_t framesToWrite = std::min(static_cast<size_t>(numFrames), availableFrames);
-    const size_t samplesToWrite = framesToWrite * ch;
+    const size_t samplesToWrite = static_cast<size_t>(numFrames) * ch;
 
-    const size_t written = engine->captureRawBuffer_.write(inSamples, samplesToWrite);
+    // УСТРАНЕНИЕ ДЕФЕКТА 124: Запись в сырой буфер захвата без фрагментации фрейма
+    const size_t written = engine->captureRawBuffer_.writeAllOrNothing(inSamples, samplesToWrite);
     const size_t writtenFrames = written / ch;
 
-    if (written > 0) {
+    if (writtenFrames == static_cast<size_t>(numFrames)) {
         engine->captureDspCv_.notify_one();
-    }
-
-    if (writtenFrames < static_cast<size_t>(numFrames)) {
-        engine->captureDroppedFrames_.fetch_add(
-            static_cast<size_t>(numFrames) - writtenFrames, std::memory_order_relaxed);
+    } else {
+        engine->captureDroppedFrames_.fetch_add(static_cast<size_t>(numFrames), std::memory_order_relaxed);
     }
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТА 55: Нотификация DSP-воркера из колбэка ЦАП при появлении свободного места
+// УСТРАНЕНИЕ ДЕФЕКТОВ 125, 129, 130: Различение DRAIN vs UNDERRUN и исправление формулы RMS
 aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     AAudioStream* stream,
     void* userData,
@@ -1284,6 +1428,8 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     auto* samples = static_cast<int16_t*>(audioData);
     const size_t frames = static_cast<size_t>(numFrames);
 
+    engine->totalHardwarePlaybackFrames_.fetch_add(static_cast<uint64_t>(numFrames), std::memory_order_relaxed);
+
     int64_t framePosition = 0;
     int64_t dacTimestampNs = 0;
     if (stream != nullptr && AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &framePosition, &dacTimestampNs) == AAUDIO_OK) {
@@ -1292,13 +1438,37 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
 
     engine->playbackSequenceNumber_.fetch_add(1, std::memory_order_relaxed);
 
+    // Опрос счетчика XRun и автокалибровка аппаратного буфера ЦАП
+    if (stream != nullptr) {
+        const int32_t currentXRun = AAudioStream_getXRunCount(stream);
+        const int32_t prevXRun = engine->lastXRunCount_.exchange(currentXRun, std::memory_order_relaxed);
+        if (currentXRun > prevXRun && prevXRun >= 0) {
+            const int32_t deltaXRun = currentXRun - prevXRun;
+            engine->playbackUnderrunCount_.fetch_add(static_cast<uint64_t>(deltaXRun), std::memory_order_relaxed);
+
+            const int32_t burst = AAudioStream_getFramesPerBurst(stream);
+            const int32_t capacity = AAudioStream_getBufferCapacityInFrames(stream);
+            const int32_t currentBufSize = AAudioStream_getBufferSizeInFrames(stream);
+            if (burst > 0 && currentBufSize < capacity) {
+                const int32_t tunedSize = std::min(currentBufSize + burst, capacity);
+                AAudioStream_setBufferSizeInFrames(stream, tunedSize);
+            }
+        }
+    }
+
     const size_t read = engine->playbackBuffer_.read(samples, frames);
     if (read < frames) {
         std::memset(samples + read, 0, (frames - read) * sizeof(int16_t));
+        // УСТРАНЕНИЕ ДЕФЕКТА 125: Учет глитча только при активном выводе фразы ассистента
+        if (engine->isPlaybackRenderingActive_.load(std::memory_order_relaxed)) {
+            engine->playbackUnderrunFrames_.fetch_add(frames - read, std::memory_order_relaxed);
+            engine->playbackUnderrunCount_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 130: Расчет физической мощности RMS по ВСЕМУ кванту frames (включая zero-padding)
     if (read > 0) {
-        const float dacRms = dsp::calculateRms(samples, read);
+        const float dacRms = dsp::calculateRms(samples, frames); // Делитель = frames, исключая скачки RMS
         engine->outRms_.store(dacRms, std::memory_order_relaxed);
         engine->playbackDspCv_.notify_one();
     } else {
@@ -1327,6 +1497,8 @@ void AAudioEngine::errorCallback(
     }
 
     if (direction != 0) {
+        LOGE("AAudioEngine::errorCallback invoked: stream=%p, direction=%d, error=%d (%s)",
+             stream, direction, error, AAudio_convertResultToText(error));
         engine->pushErrorEvent(direction, error);
     }
 }
