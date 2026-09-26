@@ -21,15 +21,114 @@ import kotlinx.coroutines.flow.*
 import javax.inject.Inject
 import javax.inject.Singleton
 
+/**
+ * УСТРАНЕНИЕ ДЕФЕКТА 102:
+ * Дифференцированные аппаратные пути связи:
+ * - SPEAKER_SHARED: встроенный громкоговоритель (48 кГц, нулевая задержка радиоканала).
+ * - BLUETOOTH_SCO: Classic Bluetooth BR/EDR (HFP 1.8 mSBC 16 кГц, задержка 40–80 мс).
+ * - BLUETOOTH_BLE_HEADSET: Bluetooth Low Energy Audio (BAP LC3 24/32 кГц, задержка 20–30 мс).
+ */
 enum class AudioRoutePath {
     SPEAKER_SHARED,
-    BLUETOOTH_COMMUNICATION
+    BLUETOOTH_SCO,
+    BLUETOOTH_BLE_HEADSET,
+
+    @Deprecated("Используйте BLUETOOTH_SCO или BLUETOOTH_BLE_HEADSET для точной настройки")
+    BLUETOOTH_COMMUNICATION;
+
+    val isBluetooth: Boolean
+        get() = this == BLUETOOTH_SCO || this == BLUETOOTH_BLE_HEADSET || this == BLUETOOTH_COMMUNICATION
 }
 
 /**
- * УСТРАНЕНИЕ ДЕФЕКТОВ 96, 97, 98:
- * Очищенный от сторонних зон ответственности DTO топологии маршрута.
- * Пороги нейросети Silero VAD и предзаписи вынесены в специализированные слои аудиодвижка.
+ * УСТРАНЕНИЕ ДЕФЕКТА 104:
+ * Разделение физических возможностей оборудования (Capabilities)
+ * и применённой действующей конфигурации стрима.
+ */
+data class AudioDeviceCapabilities(
+    val supportedSampleRates: List<Int>,
+    val channelMasks: List<Int>,
+    val isLowLatencySupported: Boolean = true
+)
+
+/**
+ * УСТРАНЕНИЕ ДЕФЕКТОВ 105 и 106:
+ * Реестр аппаратных особенностей (Quirks Registry) для калибровки АРУ,
+ * порогов детекции перебивания (Barge-in) и компенсации задержки фильтра ENC.
+ */
+data class DeviceQuirks(
+    val deviceModel: String,
+    val encLatencyMs: Int = 0,
+    val acousticErleRatio: Float = 0.72f,
+    val echoThreshold: Float = 0.18f,
+    val bargeInRequiredStreak: Int = 5,
+    val micGainCompensation: Float = 1.0f,
+    val preferredSampleRate: Int = 16000
+) {
+    companion object {
+        val DEFAULT_SPEAKER = DeviceQuirks(
+            deviceModel = "Built-in Speaker",
+            encLatencyMs = 0,
+            acousticErleRatio = 0.72f,
+            echoThreshold = 0.18f,
+            bargeInRequiredStreak = 5,
+            micGainCompensation = 1.0f,
+            preferredSampleRate = 48000
+        )
+
+        val GENERIC_SCO = DeviceQuirks(
+            deviceModel = "Generic Bluetooth SCO (HFP mSBC)",
+            encLatencyMs = 25,
+            acousticErleRatio = 0.65f,
+            echoThreshold = 0.040f,
+            bargeInRequiredStreak = 4,
+            micGainCompensation = 1.05f,
+            preferredSampleRate = 16000
+        )
+
+        val GENERIC_BLE = DeviceQuirks(
+            deviceModel = "Generic BLE Audio (LC3)",
+            encLatencyMs = 15,
+            acousticErleRatio = 0.68f,
+            echoThreshold = 0.038f,
+            bargeInRequiredStreak = 3,
+            micGainCompensation = 1.0f,
+            preferredSampleRate = 24000
+        )
+
+        // Калиброванный профиль для чипсета Bestechnic BES2600 (наушники CMF Buds 2)
+        val CMF_BUDS_2 = DeviceQuirks(
+            deviceModel = "CMF Buds 2 (Bestechnic BES2600)",
+            encLatencyMs = 35, // Алгоритмическая задержка двухмикрофонного фильтра Clear Voice ENC
+            acousticErleRatio = 0.60f, // Повышенное подавление эха из-за близости микрофонов
+            echoThreshold = 0.035f,
+            bargeInRequiredStreak = 3,
+            micGainCompensation = 1.15f, // Компенсация затухания тихих согласных в шумоподавителе
+            preferredSampleRate = 16000
+        )
+    }
+}
+
+object DeviceProfileRegistry {
+    fun resolveQuirks(device: AudioDeviceInfo?): DeviceQuirks {
+        if (device == null) return DeviceQuirks.DEFAULT_SPEAKER
+        val name = device.productName.toString().lowercase()
+
+        return when {
+            name.contains("cmf") || name.contains("buds 2") || name.contains("nothing") ->
+                DeviceQuirks.CMF_BUDS_2
+            device.type == AudioDeviceInfo.TYPE_BLE_HEADSET ->
+                DeviceQuirks.GENERIC_BLE
+            device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ->
+                DeviceQuirks.GENERIC_SCO
+            else ->
+                DeviceQuirks.DEFAULT_SPEAKER
+        }
+    }
+}
+
+/**
+ * Очищенный от сторонней бизнес-логики DTO топологии звукового маршрута.
  */
 data class RouteProfile(
     val path: AudioRoutePath,
@@ -37,10 +136,12 @@ data class RouteProfile(
     val negotiatedSampleRate: Int = targetSampleRate,
     val deviceName: String,
     val inputDeviceId: Int = 0,
-    val outputDeviceId: Int = 0
+    val outputDeviceId: Int = 0,
+    val capabilities: AudioDeviceCapabilities = AudioDeviceCapabilities(emptyList(), emptyList()),
+    val quirks: DeviceQuirks = DeviceQuirks.DEFAULT_SPEAKER
 ) {
-    // Обратная совместимость для модулей, считывающих sampleRateOut
     val sampleRateOut: Int get() = targetSampleRate
+    val isBluetooth: Boolean get() = path.isBluetooth
 }
 
 @OptIn(FlowPreview::class)
@@ -69,7 +170,6 @@ class AudioDeviceRouter @Inject constructor(
     private var routeStartInProgress = false
     private var isTransitionInProgress = false
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 91 и 92: Кулдаун после неудачной привязки Bluetooth для исключения Route Thrashing
     private var failedDeviceCooldownId: Int? = null
     private var failedDeviceCooldownUntilMs: Long = 0L
 
@@ -77,10 +177,8 @@ class AudioDeviceRouter @Inject constructor(
         const val LEGACY_SCO_RETRY_COOLDOWN_MS = 1500L
         const val BT_BIND_FAILURE_COOLDOWN_MS = 4000L
 
-        // УСТРАНЕНИЕ ДЕФЕКТА 89: Быстрый адаптивный дебаунс (40 мс вместо 180 мс)
         const val ROUTE_DEBOUNCE_FAST_MS = 40L
 
-        // УСТРАНЕНИЕ ДЕФЕКТА 90: Дифференцированные тайм-ауты подтверждения
         const val TIMEOUT_SPEAKER_MS = 150L
         const val TIMEOUT_BLE_COMMUNICATION_MS = 600L
         const val TIMEOUT_LEGACY_SCO_MS = 1500L
@@ -97,7 +195,6 @@ class AudioDeviceRouter @Inject constructor(
     private var isCallbackRegistered = false
     private var isCommunicationListenerRegistered = false
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 94: OnCommunicationDeviceChangedListener является ЕДИНСТВЕННЫМ источником подтверждения активного маршрута
     private val communicationDeviceListener =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             AudioManager.OnCommunicationDeviceChangedListener { device ->
@@ -117,7 +214,6 @@ class AudioDeviceRouter @Inject constructor(
                     }
                 }
 
-                // Немедленное подтверждение без задержки статического дебаунса
                 evaluateActiveRouteImmediate()
                 logger.d("AudioDeviceRouter: OnCommunicationDeviceChangedListener -> id=${device?.id}, type=${device?.type}, name=${device?.productName}")
             }
@@ -134,7 +230,6 @@ class AudioDeviceRouter @Inject constructor(
 
     @Volatile private var activeFingerprint: RouteFingerprint? = null
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 93: Фильтр исключительно релевантных звуковых гарнитур и спикеров
     private fun isRelevantAudioDevice(device: AudioDeviceInfo): Boolean {
         return when (device.type) {
             AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
@@ -150,7 +245,6 @@ class AudioDeviceRouter @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 94: AudioDeviceCallback выполняет только Discovery-роль
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
             val hasRelevant = addedDevices?.any { isRelevantAudioDevice(it) } ?: false
@@ -328,7 +422,6 @@ class AudioDeviceRouter @Inject constructor(
                             pendingCommunicationAcceptSpeakerDefault = false
                             communicationDeviceConfirmation = null
                             if (!isConfirmed) {
-                                // УСТРАНЕНИЕ ДЕФЕКТА 91: Активация кулдауна для предотвращения петли
                                 failedDeviceCooldownId = target.id
                                 failedDeviceCooldownUntilMs = SystemClock.elapsedRealtime() + BT_BIND_FAILURE_COOLDOWN_MS
                             }
@@ -399,7 +492,7 @@ class AudioDeviceRouter @Inject constructor(
                 logger.d(
                     "AudioDeviceRouter: Маршрут подтвержден -> " +
                         "[Path=${profile.path}, Dev='${profile.deviceName}', " +
-                        "OutId=${profile.outputDeviceId}, Rate=${profile.targetSampleRate}Hz]"
+                        "OutId=${profile.outputDeviceId}, Rate=${profile.targetSampleRate}Hz, Model='${profile.quirks.deviceModel}']"
                 )
             }
         } catch (t: Throwable) {
@@ -481,7 +574,6 @@ class AudioDeviceRouter @Inject constructor(
         return signaled && legacyScoConnected && audioManager.isBluetoothScoOn
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 90: Быстрый тайм-аут возврата на динамик (150 мс)
     @RequiresApi(Build.VERSION_CODES.S)
     private suspend fun awaitSpeakerFallback(): Boolean {
         val speaker = runCatching {
@@ -552,6 +644,23 @@ class AudioDeviceRouter @Inject constructor(
         return confirmed || finalSpeaker
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 107: Ранжирование кандидатов при Multipoint (защита от перехвата звука часами)
+    private fun rankBluetoothCandidate(device: AudioDeviceInfo): Int {
+        val name = device.productName.toString().lowercase()
+        val isWatch = name.contains("watch") || name.contains("gear") || name.contains("band")
+        val isTargetHeadset = name.contains("cmf") || name.contains("buds") || name.contains("headset") ||
+            name.contains("ear") || name.contains("airpods")
+
+        var score = 0
+        if (device.type == AudioDeviceInfo.TYPE_BLE_HEADSET) score += 100
+        else if (device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) score += 50
+
+        if (isTargetHeadset) score += 40
+        if (isWatch) score -= 80 // Понижаем приоритет смарт-часов при наличии гарнитуры
+
+        return score
+    }
+
     private fun findPreferredBluetoothCandidateLocked(): AudioDeviceInfo? {
         val hasBtPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             ContextCompat.checkSelfPermission(
@@ -592,9 +701,7 @@ class AudioDeviceRouter @Inject constructor(
             }.getOrDefault(emptyList())
         }
 
-        return candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
-            ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
-            ?: candidates.firstOrNull()
+        return candidates.maxByOrNull { rankBluetoothCandidate(it) }
     }
 
     fun stop() = synchronized(routeLock) {
@@ -657,18 +764,30 @@ class AudioDeviceRouter @Inject constructor(
             routeStartInProgress ||
             isTransitionInProgress
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 100: Возврат 0 (AAUDIO_UNSPECIFIED) при пустом массиве sampleRates
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 100 и 101: Строгий выбор частот mSBC (16 кГц) для HFP и LC3 (24/32 кГц) для BLE
     private fun selectOptimalBluetoothSampleRate(device: AudioDeviceInfo): Int {
         val supportedRates = device.sampleRates
-        if (supportedRates.isEmpty()) {
-            return 0 // Аппаратный драйвер AAudio согласует оптимальную частоту через AudioPolicy
-        }
+        val validRates = supportedRates.filter { it in 8000..48000 }
 
-        return supportedRates
-            .filter { it in 16000..48000 }
-            .minByOrNull { kotlin.math.abs(it - 24000) }
-            ?: supportedRates.minByOrNull { kotlin.math.abs(it - 24000) }
-            ?: 0
+        return when (device.type) {
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> {
+                // Стандарт Bluetooth SIG HFP 1.8 mSBC Wideband Speech работает строго на 16 000 Гц.
+                if (validRates.contains(16000)) 16000
+                else if (validRates.isNotEmpty()) validRates.minByOrNull { kotlin.math.abs(it - 16000) } ?: 16000
+                else 16000
+            }
+            AudioDeviceInfo.TYPE_BLE_HEADSET -> {
+                // Bluetooth LE Audio LC3 (BAP) нативно поддерживает 24 000 Гц (совпадает со стримом Gemini)
+                if (validRates.contains(24000)) 24000
+                else if (validRates.contains(32000)) 32000
+                else if (validRates.isNotEmpty()) validRates.minByOrNull { kotlin.math.abs(it - 24000) } ?: 24000
+                else 24000
+            }
+            else -> {
+                if (validRates.isNotEmpty()) validRates.minByOrNull { kotlin.math.abs(it - 24000) } ?: 0
+                else 0
+            }
+        }
     }
 
     private fun evaluateActiveRouteImmediate() {
@@ -693,7 +812,7 @@ class AudioDeviceRouter @Inject constructor(
             if (activeFingerprint != newFingerprint) {
                 activeFingerprint = newFingerprint
                 _currentProfile.value = newProfile
-                logger.d("AudioDeviceRouter: Аппаратный маршрут переключён -> ${newProfile.path} [InId=${newProfile.inputDeviceId}, OutId=${newProfile.outputDeviceId}, Rate=${newProfile.targetSampleRate}Hz, Name='${newProfile.deviceName}']")
+                logger.d("AudioDeviceRouter: Аппаратный маршрут переключён -> ${newProfile.path} [InId=${newProfile.inputDeviceId}, OutId=${newProfile.outputDeviceId}, Rate=${newProfile.targetSampleRate}Hz, Name='${newProfile.deviceName}', Quirks='${newProfile.quirks.deviceModel}']")
                 onRouteChangedListener?.invoke(newProfile)
             }
         }.onFailure {
@@ -716,6 +835,8 @@ class AudioDeviceRouter @Inject constructor(
         }
 
         return when (profile.path) {
+            AudioRoutePath.BLUETOOTH_SCO,
+            AudioRoutePath.BLUETOOTH_BLE_HEADSET,
             AudioRoutePath.BLUETOOTH_COMMUNICATION -> {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     val communicationDevice = runCatching { audioManager.communicationDevice }.getOrNull()
@@ -809,13 +930,29 @@ class AudioDeviceRouter @Inject constructor(
         }
 
         return if (btOutputDevice != null) {
+            val routePath = if (btOutputDevice.type == AudioDeviceInfo.TYPE_BLE_HEADSET) {
+                AudioRoutePath.BLUETOOTH_BLE_HEADSET
+            } else {
+                AudioRoutePath.BLUETOOTH_SCO
+            }
+
             val sampleRate = selectOptimalBluetoothSampleRate(btOutputDevice)
+            val quirks = DeviceProfileRegistry.resolveQuirks(btOutputDevice)
+            val capabilities = AudioDeviceCapabilities(
+                supportedSampleRates = btOutputDevice.sampleRates.toList(),
+                channelMasks = btOutputDevice.channelMasks.toList(),
+                isLowLatencySupported = true
+            )
+
             RouteProfile(
-                path = AudioRoutePath.BLUETOOTH_COMMUNICATION,
+                path = routePath,
                 targetSampleRate = sampleRate,
+                negotiatedSampleRate = sampleRate,
                 deviceName = btOutputDevice.productName.toString().ifBlank { "Bluetooth communication device" },
                 inputDeviceId = 0,
-                outputDeviceId = btOutputDevice.id
+                outputDeviceId = btOutputDevice.id,
+                capabilities = capabilities,
+                quirks = quirks
             )
         } else {
             createSpeakerProfile()
@@ -852,9 +989,7 @@ class AudioDeviceRouter @Inject constructor(
             when {
                 currentIsBt -> return
                 candidates.isNotEmpty() -> {
-                    val targetDevice = candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
-                        ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
-                        ?: candidates.first()
+                    val targetDevice = candidates.maxByOrNull { rankBluetoothCandidate(it) } ?: candidates.first()
                     if (!bindBluetoothCommunication(targetDevice)) {
                         bindSpeakerCommunication()
                     }
@@ -937,7 +1072,7 @@ class AudioDeviceRouter @Inject constructor(
                 if (currentComm?.id != speaker.id) {
                     val assigned = runCatching { audioManager.setCommunicationDevice(speaker) }.getOrDefault(false)
                     if (!assigned) {
-                        logger.w("AudioDeviceRouter: setCommunicationDevice(speaker) вернул false; выполняем откат через clearCommunicationDevice()")
+                        logger.w("AudioDeviceRouter: setCommunicationDevice(speaker) вернул false; откат через clearCommunicationDevice()")
                         runCatching { audioManager.clearCommunicationDevice() }
                     }
                 }
@@ -970,7 +1105,6 @@ class AudioDeviceRouter @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 99: Динамический опрос частоты дискретизации платформы через AudioManager
     private fun createSpeakerProfile(): RouteProfile {
         val allOutputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
         val allInputs = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
@@ -982,12 +1116,21 @@ class AudioDeviceRouter @Inject constructor(
         val nativeSampleRate = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)
             ?.toIntOrNull() ?: 48000
 
+        val capabilities = AudioDeviceCapabilities(
+            supportedSampleRates = builtInSpeaker?.sampleRates?.toList() ?: listOf(48000),
+            channelMasks = builtInSpeaker?.channelMasks?.toList() ?: emptyList(),
+            isLowLatencySupported = true
+        )
+
         return RouteProfile(
             path = AudioRoutePath.SPEAKER_SHARED,
             targetSampleRate = nativeSampleRate,
+            negotiatedSampleRate = nativeSampleRate,
             deviceName = builtInSpeaker?.productName?.toString()?.ifBlank { "Built-in speaker" } ?: "Built-in speaker",
             inputDeviceId = builtInMic?.id ?: 0,
-            outputDeviceId = builtInSpeaker?.id ?: 0
+            outputDeviceId = builtInSpeaker?.id ?: 0,
+            capabilities = capabilities,
+            quirks = DeviceQuirks.DEFAULT_SPEAKER
         )
     }
 }
