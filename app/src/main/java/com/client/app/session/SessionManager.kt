@@ -1,4 +1,4 @@
-// >>> FILE: app/src/main/java/com/client/app/session/SessionManager.kt
+
 package com.client.app.session
 
 import android.content.Context
@@ -1588,9 +1588,6 @@ class SessionManager @Inject constructor(
 
                     activeSessionId = eventSessionId
 
-                    // Fast-path (Zero Lock Contention): Высокочастотные события печатного текста
-                    // и транскрипций обрабатываются немедленно без захвата жизненного mutex.
-                    // Целостность состояния гарантирована transcriptLock и атомарным Flow update.
                     when (event) {
                         is GeminiEvent.ModelText -> {
                             appendTranscript(
@@ -1630,8 +1627,6 @@ class SessionManager @Inject constructor(
                         }
 
                         else -> {
-                            // Control Plane & Lifecycle: события управления сессией, требующие
-                            // атомарной синхронизации с жизненным циклом через mutex.
                             mutex.withLock {
                                 if (
                                     envelope.sessionId != client.sessionId ||
@@ -2001,7 +1996,6 @@ class SessionManager @Inject constructor(
         scope.launch {
             val generation = audioEngine.currentPlaybackGeneration
 
-            // 1. Ожидаем, пока корутина observeAudio() перельёт остатки аудиопакетов сокета в C++ буфер
             val ingressDeadline = SystemClock.elapsedRealtime() + 1500L
             while (client.hasPendingAudioFrames && SystemClock.elapsedRealtime() < ingressDeadline) {
                 if (client.sessionId != sourceSessionId || client.epoch != sourceEpoch || !connectionDesired) {
@@ -2010,14 +2004,12 @@ class SessionManager @Inject constructor(
                 delay(15L)
             }
 
-            // 2. Адаптивное аппаратное ожидание опустошения очереди ЦАП
             val drained = audioEngine.awaitPlaybackDrained(generation = generation)
             if (!drained && audioEngine.currentPlaybackGeneration == generation) {
                 logger.w("SessionManager: playback drain watchdog detected hardware stall; clearing stalled queue")
                 invalidateAndFlushAudio("playback stall recovery")
             }
 
-            // 3. Атомарный перевод состояния интерфейса в режим ожидания
             val shouldReconnect =
                 mutex.withLock {
                     val lifecycleComplete =
@@ -2095,7 +2087,6 @@ class SessionManager @Inject constructor(
             )
 
             if (call.name != "lookup_pronunciation") {
-                // P1 Fix (Проблема №14): Ответ функции вызывается как suspend с гарантией порядка
                 client.sendToolResponses(
                     listOf(
                         ToolResponse(
