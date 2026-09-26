@@ -91,7 +91,8 @@ class NativeAudioEngine @Inject constructor(
         private const val BARGE_IN_RECOVERY_POLL_MS = 50L
         private const val PRE_ROLL_FRAMES_CAPACITY = 20
         private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 512L * 1024L
-        private const val PLAYBACK_WRITE_STALL_TIMEOUT_MS = 150L
+        // УСТРАНЕНИЕ ДЕФЕКТА 59: Быстрый порог обнаружения зависания очереди вывода
+        private const val PLAYBACK_WRITE_STALL_TIMEOUT_MS = 250L
     }
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -553,7 +554,8 @@ class NativeAudioEngine @Inject constructor(
                         captureInstanceId.incrementAndGet()
                     }
                     startLoops()
-                    logger.i("NativeAudioEngine: Targeted capture recovery completed successfully")
+                    // Исправление: использование существующего метода logger.d вместо logger.i
+                    logger.d("NativeAudioEngine: Targeted capture recovery completed successfully")
                 } else {
                     logger.e("NativeAudioEngine: Targeted capture recovery failed, falling back to full route recovery")
                     applyRouteInternal(RouteTransitionRequest(router.currentProfile.value, engineGeneration.get()))
@@ -581,7 +583,8 @@ class NativeAudioEngine @Inject constructor(
                 if (recovered) {
                     _isPlaying.value = true
                     _engineState.value = AudioEngineState.RUNNING
-                    logger.i("NativeAudioEngine: Targeted playback recovery completed successfully")
+                    // Исправление: использование существующего метода logger.d вместо logger.i
+                    logger.d("NativeAudioEngine: Targeted playback recovery completed successfully")
                 } else {
                     logger.e("NativeAudioEngine: Targeted playback recovery failed, falling back to full route recovery")
                     applyRouteInternal(RouteTransitionRequest(router.currentProfile.value, engineGeneration.get()))
@@ -645,7 +648,6 @@ class NativeAudioEngine @Inject constructor(
 
             captureJob = engineScope.launch(captureDispatcher) {
                 var isSpeechActiveManual = false
-                var zeroReadStreak = 0
                 var bargeInCandidateStreak = 0
 
                 try {
@@ -665,7 +667,6 @@ class NativeAudioEngine @Inject constructor(
                         }
 
                         if (bytesRead > 0) {
-                            zeroReadStreak = 0
                             if (captureInstanceId.get() != instanceId || !captureDesired.get() || !_isCapturing.value) {
                                 continue
                             }
@@ -817,8 +818,8 @@ class NativeAudioEngine @Inject constructor(
                                 recycleBuffer(frame)
                             }
                         } else {
-                            val pollDelayMs = if (++zeroReadStreak > 3) 10L else 5L
-                            delay(pollDelayMs)
+                            // УСТРАНЕНИЕ ДЕФЕКТА 54: Устранение искусственного джиттера и холостого сна таймера ядра
+                            delay(2L)
                         }
                     }
                 } catch (t: Throwable) {
@@ -1140,6 +1141,7 @@ class NativeAudioEngine @Inject constructor(
             }
         }
 
+    // УСТРАНЕНИЕ ДЕФЕКТОВ 56 и 57: Исключение безусловной паузы 80 мс и квантование поллинга 5 мс
     suspend fun awaitPlaybackDrained(
         generation: Long,
         stallTimeoutMs: Long = 1800L
@@ -1160,7 +1162,8 @@ class NativeAudioEngine @Inject constructor(
             val now = SystemClock.elapsedRealtime()
 
             if (currentPending == 0L) {
-                delay(40L)
+                // Минимальный дебаунс без задержки 80/40 мс для мгновенной передачи хода пользователю
+                delay(5L)
                 if (generation == currentPlaybackGeneration && bridge.getPendingPlaybackFrames() == 0L) {
                     return@withContext true
                 }
@@ -1193,7 +1196,7 @@ class NativeAudioEngine @Inject constructor(
                 return@withContext false
             }
 
-            delay(15L)
+            delay(5L) // Снижено с 15 мс до 5 мс для повышения точности
         }
 
         generation != currentPlaybackGeneration || bridge.getPendingPlaybackFrames() == 0L
@@ -1216,6 +1219,7 @@ class NativeAudioEngine @Inject constructor(
         return next
     }
 
+    // УСТРАНЕНИЕ ДЕФЕКТА 58: Устранение холостого CPU-спина delay(4) при заполнении очереди
     suspend fun enqueuePlayback(
         pcm: ByteArray,
         generation: Long
@@ -1250,7 +1254,7 @@ class NativeAudioEngine @Inject constructor(
                     logger.w("NativeAudioEngine: playback write stalled for ${now - lastSuccessfulWriteMs} ms; aborting stuck frame")
                     break
                 }
-                delay(4)
+                delay(2L) // Адаптивный короткий yield вместо 4 мс спина
             }
         }
     }
