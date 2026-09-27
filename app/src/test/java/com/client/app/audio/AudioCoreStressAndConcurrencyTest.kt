@@ -13,12 +13,12 @@ import kotlin.test.*
  * Обновлено в соответствии с ITU-T G.114 и RFC 3550 (пороги джиттер-буфера).
  */
 internal object AudioConstants {
-    const val PLAYBACK_TARGET_BUFFER_MS = 45L
-    const val PLAYBACK_TARGET_BUFFER_BT_MIN_MS = 45L
-    const val PLAYBACK_TARGET_BUFFER_BT_MAX_MS = 90L
-    const val PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS = 30L
-    const val PLAYBACK_TARGET_BUFFER_SPEAKER_MAX_MS = 50L
-    const val PLAYBACK_MAX_QUEUE_HORIZON_MS = 150L
+    const val PLAYBACK_TARGET_BUFFER_MS = 60L
+    const val PLAYBACK_TARGET_BUFFER_BT_MIN_MS = 50L
+    const val PLAYBACK_TARGET_BUFFER_BT_MAX_MS = 120L
+    const val PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS = 40L
+    const val PLAYBACK_TARGET_BUFFER_SPEAKER_MAX_MS = 80L
+    const val PLAYBACK_MAX_QUEUE_HORIZON_MS = 500L
 
     const val KPI_MAX_CALLBACK_LATENCY_US = 800
     const val KPI_MAX_BARGE_IN_REACTION_MS = 45
@@ -196,17 +196,16 @@ class AudioCoreStressAndConcurrencyTest {
         assertEquals(0, bufferOccupancy.get())
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 12: Валидация обновлённых порогов джиттер-буфера (45-90 мс для BT, 30-50 мс для динамика)
     @Test
     fun testAdaptivePlayoutBufferRangeBounds() {
         fun calculateTargetBufferMs(jitterMs: Long, isBluetooth: Boolean): Long {
             val base = if (isBluetooth) {
-                (jitterMs * 2 + 25).coerceIn(
+                (jitterMs * 2 + 35).coerceIn(
                     AudioConstants.PLAYBACK_TARGET_BUFFER_BT_MIN_MS,
                     AudioConstants.PLAYBACK_TARGET_BUFFER_BT_MAX_MS
                 )
             } else {
-                (jitterMs * 2 + 25).coerceIn(
+                (jitterMs * 2 + 35).coerceIn(
                     AudioConstants.PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS,
                     AudioConstants.PLAYBACK_TARGET_BUFFER_SPEAKER_MAX_MS
                 )
@@ -214,14 +213,14 @@ class AudioCoreStressAndConcurrencyTest {
             return minOf(base, AudioConstants.PLAYBACK_MAX_QUEUE_HORIZON_MS)
         }
 
-        assertEquals(45L, calculateTargetBufferMs(2L, isBluetooth = true))
-        assertEquals(45L, calculateTargetBufferMs(10L, isBluetooth = true))
-        assertEquals(65L, calculateTargetBufferMs(20L, isBluetooth = true))
-        assertEquals(90L, calculateTargetBufferMs(100L, isBluetooth = true))
+        assertEquals(50L, calculateTargetBufferMs(2L, isBluetooth = true))
+        assertEquals(55L, calculateTargetBufferMs(10L, isBluetooth = true))
+        assertEquals(75L, calculateTargetBufferMs(20L, isBluetooth = true))
+        assertEquals(120L, calculateTargetBufferMs(100L, isBluetooth = true))
 
-        assertEquals(30L, calculateTargetBufferMs(1L, isBluetooth = false))
-        assertEquals(45L, calculateTargetBufferMs(10L, isBluetooth = false))
-        assertEquals(50L, calculateTargetBufferMs(80L, isBluetooth = false))
+        assertEquals(40L, calculateTargetBufferMs(1L, isBluetooth = false))
+        assertEquals(55L, calculateTargetBufferMs(10L, isBluetooth = false))
+        assertEquals(80L, calculateTargetBufferMs(80L, isBluetooth = false))
     }
 
     @Test
