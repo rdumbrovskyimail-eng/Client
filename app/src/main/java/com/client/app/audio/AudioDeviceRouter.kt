@@ -60,7 +60,7 @@ data class DeviceQuirks(
     companion object {
         // Профиль встроенного динамика S23 Ultra с активным аппаратным AEC Qualcomm Fluence
         val DEFAULT_SPEAKER = DeviceQuirks(
-            deviceModel = "Built-in Speaker (Qualcomm Fluence AEC)",
+            deviceModel = "Built-in Speaker",
             encLatencyMs = 0,
             acousticErleRatio = 0.20f,   // 35-40 дБ подавления аппаратным блоком Hexagon ADSP
             echoThreshold = 0.045f,       // Порог выше остаточного эха, голос пользователя легко преодолевает
@@ -72,8 +72,8 @@ data class DeviceQuirks(
         val GENERIC_SCO = DeviceQuirks(
             deviceModel = "Generic Bluetooth SCO (HFP mSBC)",
             encLatencyMs = 25,
-            acousticErleRatio = 0.05f,   // Гарнитура изолирует ухо от микрофона
-            echoThreshold = 0.035f,
+            acousticErleRatio = 0.65f,
+            echoThreshold = 0.040f,
             bargeInRequiredStreak = 4,
             micGainCompensation = 1.05f,
             preferredSampleRate = 16000
@@ -82,8 +82,8 @@ data class DeviceQuirks(
         val GENERIC_BLE = DeviceQuirks(
             deviceModel = "Generic BLE Audio (LC3)",
             encLatencyMs = 15,
-            acousticErleRatio = 0.04f,
-            echoThreshold = 0.035f,
+            acousticErleRatio = 0.68f,
+            echoThreshold = 0.038f,
             bargeInRequiredStreak = 3,
             micGainCompensation = 1.0f,
             preferredSampleRate = 24000
@@ -92,17 +92,17 @@ data class DeviceQuirks(
         val CMF_BUDS_2 = DeviceQuirks(
             deviceModel = "CMF Buds 2 (Bestechnic BES2600)",
             encLatencyMs = 35,
-            acousticErleRatio = 0.04f,
+            acousticErleRatio = 0.60f,
             echoThreshold = 0.035f,
             bargeInRequiredStreak = 3,
-            micGainCompensation = 1.10f,
+            micGainCompensation = 1.15f,
             preferredSampleRate = 16000
         )
 
         val GENERIC_WIRED = DeviceQuirks(
             deviceModel = "Wired Headset (3.5mm)",
             encLatencyMs = 0,
-            acousticErleRatio = 0.03f,
+            acousticErleRatio = 0.60f,
             echoThreshold = 0.030f,
             bargeInRequiredStreak = 3,
             micGainCompensation = 1.0f,
@@ -112,7 +112,7 @@ data class DeviceQuirks(
         val GENERIC_USB = DeviceQuirks(
             deviceModel = "USB-C Headset",
             encLatencyMs = 5,
-            acousticErleRatio = 0.03f,
+            acousticErleRatio = 0.60f,
             echoThreshold = 0.030f,
             bargeInRequiredStreak = 3,
             micGainCompensation = 1.0f,
@@ -122,6 +122,7 @@ data class DeviceQuirks(
 }
 
 object DeviceProfileRegistry {
+    @Suppress("DEPRECATION")
     fun resolveQuirks(device: AudioDeviceInfo?): DeviceQuirks {
         if (device == null) return DeviceQuirks.DEFAULT_SPEAKER
         val name = device.productName.toString().lowercase()
@@ -841,6 +842,7 @@ class AudioDeviceRouter @Inject constructor(
             type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
     }
 
+    @Suppress("DEPRECATION")
     fun isInputDeviceMatchingRoute(
         profile: RouteProfile,
         actualInputDeviceId: Int
