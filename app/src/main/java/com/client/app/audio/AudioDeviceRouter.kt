@@ -51,28 +51,29 @@ data class AudioDeviceCapabilities(
 data class DeviceQuirks(
     val deviceModel: String,
     val encLatencyMs: Int = 0,
-    val acousticErleRatio: Float = 0.72f,
-    val echoThreshold: Float = 0.18f,
-    val bargeInRequiredStreak: Int = 5,
+    val acousticErleRatio: Float = 0.20f,
+    val echoThreshold: Float = 0.045f,
+    val bargeInRequiredStreak: Int = 6,
     val micGainCompensation: Float = 1.0f,
-    val preferredSampleRate: Int = 16000
+    val preferredSampleRate: Int = 48000
 ) {
     companion object {
+        // Профиль встроенного динамика S23 Ultra с активным аппаратным AEC Qualcomm Fluence
         val DEFAULT_SPEAKER = DeviceQuirks(
-            deviceModel = "Built-in Speaker",
+            deviceModel = "Built-in Speaker (Qualcomm Fluence AEC)",
             encLatencyMs = 0,
-            acousticErleRatio = 0.72f,
-            echoThreshold = 0.18f,
-            bargeInRequiredStreak = 5,
+            acousticErleRatio = 0.20f,   // 35-40 дБ подавления аппаратным блоком Hexagon ADSP
+            echoThreshold = 0.045f,       // Порог выше остаточного эха, голос пользователя легко преодолевает
+            bargeInRequiredStreak = 6,   // 60 мс устойчивого подтверждения речи
             micGainCompensation = 1.0f,
-            preferredSampleRate = 48000
+            preferredSampleRate = 48000  // Нативная частота шины кодека WCD9385
         )
 
         val GENERIC_SCO = DeviceQuirks(
             deviceModel = "Generic Bluetooth SCO (HFP mSBC)",
             encLatencyMs = 25,
-            acousticErleRatio = 0.65f,
-            echoThreshold = 0.040f,
+            acousticErleRatio = 0.05f,   // Гарнитура изолирует ухо от микрофона
+            echoThreshold = 0.035f,
             bargeInRequiredStreak = 4,
             micGainCompensation = 1.05f,
             preferredSampleRate = 16000
@@ -81,8 +82,8 @@ data class DeviceQuirks(
         val GENERIC_BLE = DeviceQuirks(
             deviceModel = "Generic BLE Audio (LC3)",
             encLatencyMs = 15,
-            acousticErleRatio = 0.68f,
-            echoThreshold = 0.038f,
+            acousticErleRatio = 0.04f,
+            echoThreshold = 0.035f,
             bargeInRequiredStreak = 3,
             micGainCompensation = 1.0f,
             preferredSampleRate = 24000
@@ -91,17 +92,17 @@ data class DeviceQuirks(
         val CMF_BUDS_2 = DeviceQuirks(
             deviceModel = "CMF Buds 2 (Bestechnic BES2600)",
             encLatencyMs = 35,
-            acousticErleRatio = 0.60f,
+            acousticErleRatio = 0.04f,
             echoThreshold = 0.035f,
             bargeInRequiredStreak = 3,
-            micGainCompensation = 1.15f,
+            micGainCompensation = 1.10f,
             preferredSampleRate = 16000
         )
 
         val GENERIC_WIRED = DeviceQuirks(
             deviceModel = "Wired Headset (3.5mm)",
             encLatencyMs = 0,
-            acousticErleRatio = 0.60f,
+            acousticErleRatio = 0.03f,
             echoThreshold = 0.030f,
             bargeInRequiredStreak = 3,
             micGainCompensation = 1.0f,
@@ -111,7 +112,7 @@ data class DeviceQuirks(
         val GENERIC_USB = DeviceQuirks(
             deviceModel = "USB-C Headset",
             encLatencyMs = 5,
-            acousticErleRatio = 0.60f,
+            acousticErleRatio = 0.03f,
             echoThreshold = 0.030f,
             bargeInRequiredStreak = 3,
             micGainCompensation = 1.0f,
@@ -435,7 +436,7 @@ class AudioDeviceRouter @Inject constructor(
 
                     // Интервал стабилизации HAL для аппаратного включения AEC WCD9385
                     if (activated) {
-                        delay(50L)
+                        delay(60L)
                     }
 
                     if (!activated) {
@@ -463,7 +464,7 @@ class AudioDeviceRouter @Inject constructor(
                         }
 
                         if (activated) {
-                            delay(50L)
+                            delay(60L)
                         }
 
                         if (!activated) {
@@ -1027,6 +1028,7 @@ class AudioDeviceRouter @Inject constructor(
 
     @Suppress("DEPRECATION")
     private fun bindCommunicationDevice(device: AudioDeviceInfo): Boolean = runCatching {
+        // УСТРАНЕНИЕ СРЫВА АППАРАТНОГО AEC: Режим MODE_IN_COMMUNICATION активируется ПЕРВЫМ
         if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         }
@@ -1068,6 +1070,14 @@ class AudioDeviceRouter @Inject constructor(
 
     @Suppress("DEPRECATION")
     private fun bindSpeakerCommunication(): Boolean {
+        // УСТРАНЕНИЕ СРЫВА АППАРАТНОГО AEC: Перевод AudioManager в режим MODE_IN_COMMUNICATION
+        // строго ДО вызова setCommunicationDevice(), чтобы AudioPolicyService сразу скоммутировал
+        // аппаратный петлевой порт ECHO_REFERENCE для подавителя эха WCD9385.
+        if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
+            runCatching { audioManager.mode = AudioManager.MODE_IN_COMMUNICATION }
+                .onFailure { logger.w("AudioDeviceRouter: Смена режима на MODE_IN_COMMUNICATION не удалась: ${it.message}") }
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val speaker = runCatching {
                 audioManager.availableCommunicationDevices.firstOrNull {
@@ -1096,11 +1106,6 @@ class AudioDeviceRouter @Inject constructor(
             legacyScoRequested = false
             legacyScoConnected = false
             audioManager.isSpeakerphoneOn = true
-        }
-
-        if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
-            runCatching { audioManager.mode = AudioManager.MODE_IN_COMMUNICATION }
-                .onFailure { logger.w("AudioDeviceRouter: Смена режима на MODE_IN_COMMUNICATION не удалась: ${it.message}") }
         }
 
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
