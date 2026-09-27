@@ -90,7 +90,8 @@ void AnalogVoiceEnhancer::process(int16_t* samples, size_t numFrames, int32_t sa
     if (sampleRate > 0 && sampleRate != currentRate_) reset(sampleRate);
 
     for (size_t i = 0; i < numFrames; ++i) {
-        const float inSample = static_cast<float>(samples[i]);
+        // Запас по уровню (-1.4 dBFS) исключает цифровой клиппинг на пиках при подъёме полок эквалайзера
+        const float inSample = static_cast<float>(samples[i]) * 0.85f;
         const float lowPass = lowShelf_.process(inSample);
         const float enhanced = highShelf_.process(lowPass);
         samples[i] = static_cast<int16_t>(std::clamp<int32_t>(
@@ -753,7 +754,6 @@ void AAudioEngine::stopLocked() {
     playbackTargetBufferMs_.store(PLAYBACK_TARGET_BUFFER_MS, std::memory_order_relaxed);
     isPlaybackRenderingActive_.store(false, std::memory_order_release);
 
-    // Сброс счётчика настройки буфера при остановке
     lastTunedXRunCount_.store(0, std::memory_order_relaxed);
 
     engineState_.store(EngineState::IDLE, std::memory_order_release);
@@ -1102,7 +1102,7 @@ void AAudioEngine::playbackDspThreadLoop() {
             const int32_t actualRate = std::max(1, actualPlaybackSampleRate_.load(std::memory_order_acquire));
             const int32_t actualBurst = actualPlaybackBurst_.load(std::memory_order_acquire);
 
-            // УСТРАНЕНИЕ ДЕФЕКТА 9: Безопасная адаптация размера буфера в потоке DSP вне RT-колбэка
+            // Адаптация размера буфера в потоке DSP вне RT-колбэка
             AAudioStream* playStream = activePlaybackStream_.load(std::memory_order_acquire);
             if (playStream != nullptr) {
                 const int32_t currentXRun = lastXRunCount_.load(std::memory_order_relaxed);
@@ -1156,7 +1156,7 @@ void AAudioEngine::playbackDspThreadLoop() {
             const size_t buffered = playbackBuffer_.availableRead();
             const size_t freeSpace = playbackBuffer_.availableWrite();
 
-            // УСТРАНЕНИЕ ДЕФЕКТА 7: wait_for с таймаутом 5 мс предотвращает мёртвое зависание при опустошении буфера ЦАП
+            // Ожидание освобождения места в выходном буфере
             if (buffered >= highWatermarkFrames || freeSpace < maxOutputFrames) {
                 std::unique_lock<std::mutex> waitLock(playbackDspWaitMutex_);
                 playbackDspCv_.wait_for(waitLock, std::chrono::milliseconds(5), [this, activeEpoch, lowWatermarkFrames, maxOutputFrames]() {
@@ -1194,7 +1194,7 @@ void AAudioEngine::playbackDspThreadLoop() {
                 outputFrames = inputFrames;
                 std::memcpy(output, input, outputFrames * sizeof(int16_t));
             } else if (isNominalRate && (actualRate == SAMPLE_RATE_NATIVE_SPEAKER || actualRate == SAMPLE_RATE_BT_A2DP || actualRate == SAMPLE_RATE_BT_LC3_48K)) {
-                outputFrames = halfbandResampler24To48_.process(input, inputFrames, output);
+                outputFrames = halfbandResampler24To48_.process(input, inputFrames, output, playbackDspOutputScratch_.size());
             } else if (isNominalRate && actualRate == SAMPLE_RATE_BT_HFP) {
                 outputFrames = resampler24To16_.process(input, inputFrames, output);
             } else if (isNominalRate && actualRate == SAMPLE_RATE_BT_LC3_32K) {
@@ -1270,14 +1270,15 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_
         interArrivalJitterNs_.store(jitter, std::memory_order_relaxed);
 
         const size_t dynamicTargetMs = static_cast<size_t>(
-            std::clamp<int64_t>((jitter / 1000000LL) * 2 + 25,
+            std::clamp<int64_t>((jitter / 1000000LL) * 2 + 35,
                                 static_cast<int64_t>(PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS),
                                 static_cast<int64_t>(PLAYBACK_TARGET_BUFFER_BT_MAX_MS))
         );
         playbackTargetBufferMs_.store(dynamicTargetMs, std::memory_order_relaxed);
     }
 
-    const size_t written = playbackDspInputBuffer_.writeAllOrNothing(pcm, frames);
+    // Потоковая частичная запись: принимает столько сэмплов, сколько свободно в буфере, исключая зависание
+    const size_t written = playbackDspInputBuffer_.write(pcm, frames);
     if (written == 0) {
         playbackDroppedFrames_.fetch_add(frames, std::memory_order_relaxed);
     } else {
@@ -1339,7 +1340,6 @@ void AAudioEngine::getSpectrumData(dsp::SpectrumSnapshot& outSnapshot) {
     fftProcessor_->getLatestSnapshot(outSnapshot);
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 8 и 11: Полностью RT-безопасный колбэк захвата без getTimestamp
 aaudio_data_callback_result_t AAudioEngine::captureCallback(
     AAudioStream* stream,
     void* userData,
@@ -1352,7 +1352,6 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
 
     auto* engine = static_cast<AAudioEngine*>(userData);
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 11: Немедленная остановка при аппаратном разрыве стрима
     if (stream != nullptr) {
         const aaudio_stream_state_t st = AAudioStream_getState(stream);
         if (st == AAUDIO_STREAM_STATE_DISCONNECTED || st == AAUDIO_STREAM_STATE_CLOSING || st == AAUDIO_STREAM_STATE_CLOSED) {
@@ -1363,7 +1362,6 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
 
     engine->totalHardwareCapturedFrames_.fetch_add(static_cast<uint64_t>(numFrames), std::memory_order_relaxed);
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 8: Замена non-thread-safe вызова AAudioStream_getTimestamp на lock-free clock_gettime
     timespec ts{};
     clock_gettime(CLOCK_BOOTTIME, &ts);
     const uint64_t nowNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
@@ -1392,7 +1390,6 @@ aaudio_data_callback_result_t AAudioEngine::captureCallback(
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
-// УСТРАНЕНИЕ ДЕФЕКТОВ 8, 9, 11: Пассивный RT-колбэк ЦАП без getTimestamp, без IPC setBufferSize и со своевременным STOP
 aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     AAudioStream* stream,
     void* userData,
@@ -1407,7 +1404,6 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     auto* samples = static_cast<int16_t*>(audioData);
     const size_t frames = static_cast<size_t>(numFrames);
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 11: Немедленная остановка при аппаратном разрыве стрима
     if (stream != nullptr) {
         const aaudio_stream_state_t st = AAudioStream_getState(stream);
         if (st == AAUDIO_STREAM_STATE_DISCONNECTED || st == AAUDIO_STREAM_STATE_CLOSING || st == AAUDIO_STREAM_STATE_CLOSED) {
@@ -1418,7 +1414,6 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
 
     engine->totalHardwarePlaybackFrames_.fetch_add(static_cast<uint64_t>(numFrames), std::memory_order_relaxed);
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 8: Замена non-thread-safe вызова AAudioStream_getTimestamp на lock-free clock_gettime
     timespec ts{};
     clock_gettime(CLOCK_BOOTTIME, &ts);
     const uint64_t nowNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
@@ -1426,7 +1421,6 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
 
     engine->playbackSequenceNumber_.fetch_add(1, std::memory_order_relaxed);
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 9: Исключительно атомарный учёт XRun без блокирующего вызова setBufferSizeInFrames
     if (stream != nullptr) {
         const int32_t currentXRun = AAudioStream_getXRunCount(stream);
         const int32_t prevXRun = engine->lastXRunCount_.exchange(currentXRun, std::memory_order_relaxed);
@@ -1437,6 +1431,11 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     }
 
     const size_t read = engine->playbackBuffer_.read(samples, frames);
+    // Пробуждение DSP-воркера при освобождении буфера для исключения 5-мс задержки опроса
+    if (read > 0) {
+        engine->playbackDspCv_.notify_one();
+    }
+
     if (read < frames) {
         std::memset(samples + read, 0, (frames - read) * sizeof(int16_t));
         if (engine->isPlaybackRenderingActive_.load(std::memory_order_relaxed)) {
