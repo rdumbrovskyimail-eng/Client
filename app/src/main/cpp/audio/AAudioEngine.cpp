@@ -36,40 +36,41 @@
 
 namespace client::audio {
 
-void Biquad::reset() {
-    w1 = 0.0f;
-    w2 = 0.0f;
+void BiquadTdf2::reset() {
+    s1 = 0.0;
+    s2 = 0.0;
 }
 
-void Biquad::makeLowShelf(float fc, float gainDb, float fs) {
-    const float A = std::pow(10.0f, gainDb / 40.0f);
-    const float omega = 2.0f * 3.14159265f * fc / fs;
-    const float sn = std::sin(omega);
-    const float cs = std::cos(omega);
-    const float alpha = sn / 2.0f * std::sqrt((A + 1.0f / A) * (1.0f / 0.9f - 1.0f) + 2.0f);
-    const float beta = 2.0f * std::sqrt(A) * alpha;
-    const float a0 = (A + 1.0f) + (A - 1.0f) * cs + beta;
-    b0 = (A * ((A + 1.0f) - (A - 1.0f) * cs + beta)) / a0;
-    b1 = (2.0f * A * ((A - 1.0f) - (A + 1.0f) * cs)) / a0;
-    b2 = (A * ((A + 1.0f) - (A - 1.0f) * cs - beta)) / a0;
-    a1 = (-2.0f * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
-    a2 = ((A + 1.0f) - (A - 1.0f) * cs - beta) / a0;
+void BiquadTdf2::makeLowShelf(double fc, double gainDb, double fs, double S) {
+    const double A = std::pow(10.0, gainDb / 40.0);
+    const double omega = 2.0 * 3.141592653589793 * fc / fs;
+    const double sn = std::sin(omega);
+    const double cs = std::cos(omega);
+    const double alpha = sn / 2.0 * std::sqrt((A + 1.0 / A) * (1.0 / S - 1.0) + 2.0);
+    const double beta = 2.0 * std::sqrt(A) * alpha;
+
+    const double a0 = (A + 1.0) + (A - 1.0) * cs + beta;
+    b0 = (A * ((A + 1.0) - (A - 1.0) * cs + beta)) / a0;
+    b1 = (2.0 * A * ((A - 1.0) - (A + 1.0) * cs)) / a0;
+    b2 = (A * ((A + 1.0) - (A - 1.0) * cs - beta)) / a0;
+    a1 = (-2.0 * ((A - 1.0) + (A + 1.0) * cs)) / a0;
+    a2 = ((A + 1.0) + (A - 1.0) * cs - beta) / a0;
 }
 
-void Biquad::makeHighShelf(float fc, float gainDb, float fs) {
-    const float A = std::pow(10.0f, gainDb / 40.0f);
-    const float omega = 2.0f * 3.14159265f * fc / fs;
-    const float sn = std::sin(omega);
-    const float cs = std::cos(omega);
-    const float alpha = sn / 2.0f * std::sqrt((A + 1.0f / A) * (1.0f / 0.9f - 1.0f) + 2.0f);
-    const float beta = 2.0f * std::sqrt(A) * alpha;
+void BiquadTdf2::makeHighShelf(double fc, double gainDb, double fs, double S) {
+    const double A = std::pow(10.0, gainDb / 40.0);
+    const double omega = 2.0 * 3.141592653589793 * fc / fs;
+    const double sn = std::sin(omega);
+    const double cs = std::cos(omega);
+    const double alpha = sn / 2.0 * std::sqrt((A + 1.0 / A) * (1.0 / S - 1.0) + 2.0);
+    const double beta = 2.0 * std::sqrt(A) * alpha;
 
-    const float a0 = (A + 1.0f) - (A - 1.0f) * cs + beta;
-    b0 = (A * ((A + 1.0f) + (A - 1.0f) * cs + beta)) / a0;
-    b1 = (-2.0f * A * ((A - 1.0f) + (A + 1.0f) * cs)) / a0;
-    b2 = (A * ((A + 1.0f) + (A - 1.0f) * cs - beta)) / a0;
-    a1 = (2.0f * ((A - 1.0f) - (A + 1.0f) * cs)) / a0;
-    a2 = ((A + 1.0f) - (A - 1.0f) * cs - beta) / a0;
+    const double a0 = (A + 1.0) - (A - 1.0) * cs + beta;
+    b0 = (A * ((A + 1.0) + (A - 1.0) * cs + beta)) / a0;
+    b1 = (-2.0 * A * ((A - 1.0) + (A + 1.0) * cs)) / a0;
+    b2 = (A * ((A + 1.0) + (A - 1.0) * cs - beta)) / a0;
+    a1 = (2.0 * ((A - 1.0) - (A + 1.0) * cs)) / a0;
+    a2 = ((A + 1.0) - (A - 1.0) * cs - beta) / a0;
 }
 
 AnalogVoiceEnhancer::AnalogVoiceEnhancer() {
@@ -78,11 +79,15 @@ AnalogVoiceEnhancer::AnalogVoiceEnhancer() {
 
 void AnalogVoiceEnhancer::reset(int32_t sampleRate) {
     currentRate_ = sampleRate > 0 ? sampleRate : 48000;
-    const float fs = static_cast<float>(currentRate_);
+    const double fs = static_cast<double>(currentRate_);
+    dcBlocker_.reset(fs);
     lowShelf_.reset();
     highShelf_.reset();
-    lowShelf_.makeLowShelf(180.0f, 1.8f, fs);
-    highShelf_.makeHighShelf(std::min(4500.0f, fs * 0.44f), 1.2f, fs);
+
+    // 165 Гц (+3.2 дБ): глубокий бархатистый мужской и женский грудной регистр
+    lowShelf_.makeLowShelf(165.0, 3.2, fs, 0.82);
+    // 5200 Гц (+2.4 дБ): кристальная артикуляция согласных звуков без резкости
+    highShelf_.makeHighShelf(std::min(5200.0, fs * 0.44), 2.4, fs, 0.88);
 }
 
 void AnalogVoiceEnhancer::process(int16_t* samples, size_t numFrames, int32_t sampleRate) {
@@ -90,12 +95,37 @@ void AnalogVoiceEnhancer::process(int16_t* samples, size_t numFrames, int32_t sa
     if (sampleRate > 0 && sampleRate != currentRate_) reset(sampleRate);
 
     for (size_t i = 0; i < numFrames; ++i) {
-        // Запас по уровню (-1.4 dBFS) исключает цифровой клиппинг на пиках при подъёме полок эквалайзера
-        const float inSample = static_cast<float>(samples[i]) * 0.85f;
-        const float lowPass = lowShelf_.process(inSample);
-        const float enhanced = highShelf_.process(lowPass);
+        // Денормализация в 64-битный вещественный диапазон [-1.0, 1.0]
+        double x = static_cast<double>(samples[i]) * (1.0 / 32768.0);
+
+        // Каскад 1: DC Blocker (срезает постоянный ток и инфразвуковой гул ниже 15 Гц)
+        x = dcBlocker_.process(x);
+
+        // Каскад 2: TDF-II Low-Shelf (теплота и плотность голоса)
+        x = lowShelf_.process(x);
+
+        // Каскад 3: TDF-II High-Shelf (воздух и четкость фонем)
+        x = highShelf_.process(x);
+
+        // Плотность и громкость: подъем среднего уровня на +2.5 дБ (фактор 1.33)
+        x *= 1.33;
+
+        // Аналоговый кубический софт-сатуратор: f(x) = 1.5*x - 0.5*x^3
+        // При малых уровнях дает линейный звук; при пиках мягко скругляет волну как лампа.
+        // Математически гарантирует порог ровно 1.0 (32767), полностью защищая Smart PA от срабатывания!
+        double saturated;
+        if (x <= -1.0) {
+            saturated = -1.0;
+        } else if (x >= 1.0) {
+            saturated = 1.0;
+        } else {
+            saturated = 1.5 * x - 0.5 * x * x * x;
+        }
+
+        // Преобразование обратно в 16-бит PCM
+        const double scaled = saturated * 32767.0;
         samples[i] = static_cast<int16_t>(std::clamp<int32_t>(
-            static_cast<int32_t>(std::round(enhanced)), -32768, 32767
+            static_cast<int32_t>(std::lrint(scaled)), -32768, 32767
         ));
     }
 }
@@ -1102,7 +1132,6 @@ void AAudioEngine::playbackDspThreadLoop() {
             const int32_t actualRate = std::max(1, actualPlaybackSampleRate_.load(std::memory_order_acquire));
             const int32_t actualBurst = actualPlaybackBurst_.load(std::memory_order_acquire);
 
-            // Адаптация размера буфера в потоке DSP вне RT-колбэка
             AAudioStream* playStream = activePlaybackStream_.load(std::memory_order_acquire);
             if (playStream != nullptr) {
                 const int32_t currentXRun = lastXRunCount_.load(std::memory_order_relaxed);
@@ -1156,7 +1185,6 @@ void AAudioEngine::playbackDspThreadLoop() {
             const size_t buffered = playbackBuffer_.availableRead();
             const size_t freeSpace = playbackBuffer_.availableWrite();
 
-            // Ожидание освобождения места в выходном буфере
             if (buffered >= highWatermarkFrames || freeSpace < maxOutputFrames) {
                 std::unique_lock<std::mutex> waitLock(playbackDspWaitMutex_);
                 playbackDspCv_.wait_for(waitLock, std::chrono::milliseconds(5), [this, activeEpoch, lowWatermarkFrames, maxOutputFrames]() {
@@ -1207,6 +1235,7 @@ void AAudioEngine::playbackDspThreadLoop() {
 
             if (outputFrames == 0) continue;
 
+            // Студийный звуковой процессор речи: теплый бас + открытые верха + плотная громкость без клиппинга
             voiceEnhancer_.process(output, outputFrames, actualRate);
 
             const float volume = playbackVolume_.load(std::memory_order_relaxed);
@@ -1277,7 +1306,6 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_
         playbackTargetBufferMs_.store(dynamicTargetMs, std::memory_order_relaxed);
     }
 
-    // Потоковая частичная запись: принимает столько сэмплов, сколько свободно в буфере, исключая зависание
     const size_t written = playbackDspInputBuffer_.write(pcm, frames);
     if (written == 0) {
         playbackDroppedFrames_.fetch_add(frames, std::memory_order_relaxed);
@@ -1431,7 +1459,6 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     }
 
     const size_t read = engine->playbackBuffer_.read(samples, frames);
-    // Пробуждение DSP-воркера при освобождении буфера для исключения 5-мс задержки опроса
     if (read > 0) {
         engine->playbackDspCv_.notify_one();
     }
