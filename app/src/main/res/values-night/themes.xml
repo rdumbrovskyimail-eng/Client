@@ -1,11 +1,38 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- >>> FILE: app/src/main/res/values-night/themes.xml -->
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <style name="Theme.ClientApp" parent="android:Theme.Material.NoActionBar">
+
+    <!--
+        Фиксация белого листа даже при системном ночном режиме One UI.
+        Концепция чистого белого листа бескомпромиссна и сохраняется
+        независимо от системных настроек темы Android.
+    -->
+    <style name="Theme.ClientApp" parent="android:Theme.Material.Light.NoActionBar">
+
+        <!-- 1. Прозрачные системные бары для Edge-to-Edge -->
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
-        <item name="android:windowLightStatusBar">false</item>
-        <item name="android:windowLightNavigationBar">false</item>
-        <item name="android:windowBackground">@color/background_dark</item>
-        <item name="android:colorBackground">@color/background_dark</item>
+
+        <!-- 2. Черные монохромные системные глифы (часы, Wi-Fi, заряд, полоса жестов) -->
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+
+        <!-- 3. Белый фон окна запуска: исключение черного мигания при холодном старте -->
+        <item name="android:windowBackground">@color/canvas_white</item>
+        <item name="android:colorBackground">@color/canvas_white</item>
+
+        <!-- 4. Активация отрисовки холста под системными панелями -->
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+
+        <!-- 5. Запрет наложения системного серого затемнения (Android 10+ / API 29+) -->
+        <item name="android:enforceStatusBarContrast" tools:targetApi="q">false</item>
+        <item name="android:enforceNavigationBarContrast" tools:targetApi="q">false</item>
+
+        <!-- 6. Элитный системный Splash Screen с монограммой 'G' (Android 12+ / API 31+) -->
+        <item name="android:windowSplashScreenBackground" tools:targetApi="s">@color/canvas_white</item>
+        <item name="android:windowSplashScreenAnimatedIcon" tools:targetApi="s">@drawable/ic_launcher_foreground</item>
+        <item name="android:windowSplashScreenIconBackgroundColor" tools:targetApi="s">@color/canvas_white</item>
+
     </style>
+
 </resources>
