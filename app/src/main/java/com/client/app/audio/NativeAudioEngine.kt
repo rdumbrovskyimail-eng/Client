@@ -74,14 +74,8 @@ private data class RouteTransitionRequest(
 )
 
 /**
- * УСТРАНЕНИЕ ДЕФЕКТОВ 14, 17, 141, 213:
  * Монолитный изолированный DSP-контроллер акустического эхоподавления (AEC)
  * и детекции пользовательского перебивания (Barge-In) по стандартам WebRTC APM и ITU-T G.168.
- *
- * Особенности:
- * 1. Полное разделение акустических моделей: в режиме Bluetooth подавление микрофона динамиком
- *    отключено (гарнитура изолирована от динамика смартфона), задержка реакции минимальна.
- * 2. Для спикерфона адаптация порога эха опирается на фоновый шум комнаты (ITU-T G.160).
  */
 data class BargeInDecision(
     val isAiRendering: Boolean,
@@ -173,22 +167,22 @@ class AcousticEchoBargeInProcessor(
             )
         }
 
-        // УСТРАНЕНИЕ ДЕФЕКТОВ 14, 17, 213: В наушниках нет акустической связи с динамиком телефона
+        // В наушниках нет акустической связи с динамиком телефона
         val canBargeInTimers = if (isBluetooth) {
             (nowMs - lastPlaybackStartMs > 40L) && (nowMs - lastBargeInMs > 150L)
         } else {
             (nowMs - lastPlaybackStartMs > playbackGracePeriodMs) && (nowMs - lastBargeInMs > debounceMs)
         }
 
-        val dynamicErleRatio = quirks.acousticErleRatio + (0.15f * playbackVolume)
-        val nonLinearOffset = if (outputEnergyHangover > 0.45f) {
-            (outputEnergyHangover - 0.45f) * 0.40f
+        val dynamicErleRatio = quirks.acousticErleRatio + (0.25f * playbackVolume)
+        val nonLinearOffset = if (outputEnergyHangover > 0.35f) {
+            (outputEnergyHangover - 0.35f) * 0.50f
         } else {
             0.0f
         }
 
         val echoThreshold = maxOf(
-            ambientNoiseFloor * 2.2f,
+            ambientNoiseFloor * 2.5f,
             maxOf(quirks.echoThreshold, (outputEnergyHangover * dynamicErleRatio) + nonLinearOffset)
         )
         val effectiveThreshold = if (isBluetooth) quirks.echoThreshold else echoThreshold
@@ -238,8 +232,9 @@ class NativeAudioEngine @Inject constructor(
         private const val BARGE_IN_RECOVERY_POLL_MS = 50L
         private const val PRE_ROLL_FRAMES_CAPACITY = 20
 
-        private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 8L * 1024L // ~250 мс звука (защита от bufferbloat)
-        private const val PLAYBACK_WRITE_STALL_TIMEOUT_MS = 250L
+        private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 16L * 1024L // Защитный буфер микрофона
+        private const val PLAYBACK_WRITE_STALL_TIMEOUT_MS = 1500L
+        private const val MAX_JNI_WRITE_CHUNK_BYTES = 4096 // Безопасный квант передачи в JNI
     }
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -924,7 +919,6 @@ class NativeAudioEngine @Inject constructor(
                                     hapticManager.triggerBargeIn()
                                     _bargeInEvents.tryEmit(Unit)
 
-                                    // УСТРАНЕНИЕ ДЕФЕКТА 19: Отправка pre-roll буфера как для Bluetooth, так и для спикера!
                                     val preRoll = mutableListOf<ByteArray>()
                                     synchronized(poolLock) {
                                         while (leadInBuffer.isNotEmpty()) {
@@ -1406,10 +1400,13 @@ class NativeAudioEngine @Inject constructor(
         while (offset < total && _isPlaying.value) {
             if (isBargeInActive || generation != currentPlaybackGeneration) return
 
+            // Чанкирование записи порциями до 4096 байт для предотвращения блокировки GC
+            val bytesToWrite = minOf(total - offset, MAX_JNI_WRITE_CHUNK_BYTES)
+
             val written = bridge.writePlaybackByteArray(
                 pcm,
                 offset,
-                total - offset,
+                bytesToWrite,
                 generation
             )
 
@@ -1450,11 +1447,13 @@ class NativeAudioEngine @Inject constructor(
         while (offset < end && _isPlaying.value) {
             if (isBargeInActive || generation != currentPlaybackGeneration) return
 
+            val bytesToWrite = minOf(end - offset, MAX_JNI_WRITE_CHUNK_BYTES)
+
             val written = playbackDirectMutex.withLock {
                 bridge.writePlaybackDirect(
                     buffer,
                     offset,
-                    end - offset,
+                    bytesToWrite,
                     generation
                 )
             }
@@ -1548,7 +1547,7 @@ class NativeAudioEngine @Inject constructor(
             queuedMicOutputBytes.addAndGet(-bytes)
             recycleBuffer(event.pcm)
             recycleAudioEvent(event)
-            logger.w("NativeAudioEngine: Бэклог микрофона превысил 8 КБ (~250 мс); старый фрейм сброшен без остановки продюсера")
+            logger.w("NativeAudioEngine: Бэклог микрофона превысил лимит; старый фрейм сброшен")
             return false
         }
 
