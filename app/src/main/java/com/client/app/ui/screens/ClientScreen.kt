@@ -1,35 +1,31 @@
-// >>> FILE: app/src/main/java/com/client/app/ui/screens/ClientScreen.kt
 package com.client.app.ui.screens
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -37,15 +33,27 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.client.app.R
-import com.client.app.api.ClientRole
-import com.client.app.session.ChatMessage
-import com.client.app.session.ForvoWord
 import com.client.app.session.LinkState
-import com.client.app.ui.components.AgslVoiceVisualizer
+import com.client.app.ui.components.FmStripAudioVisualizer
+import com.client.app.ui.components.MaterialsConsoleDrawer
+import com.client.app.ui.components.PromptConsoleDrawer
+import com.client.app.ui.components.SessionControlPill
+import com.client.app.ui.components.SettingsGearButton
 import com.client.app.viewmodel.ClientViewModel
 
-@OptIn(ExperimentalMaterial3Api::class)
+// Константы белого минимализма для главного холста
+private val ColorCanvasWhite = Color(0xFFFFFFFF)
+private val ColorErrorCard = Color(0xFFFFFFFF)
+private val ColorHairline = Color(0xFFE2E8F0)
+private val ColorErrorLed = Color(0xFFEF4444)
+private val ColorTextPrimary = Color(0xFF09090B)
+private val ColorTextSecondary = Color(0xFF71717A)
+
+/**
+ * Главный экран приложения: «Чистый белый лист» флагманского уровня на базе Samsung Galaxy S23 Ultra.
+ * Полностью исключает чат и сферу, концентрируя внимание на аналоговой FM-полосе звука,
+ * поворотной черной шестеренке и трех физических выдвижных органах управления.
+ */
 @Composable
 fun ClientScreen(
     onNavigateSettings: () -> Unit,
@@ -56,27 +64,20 @@ fun ClientScreen(
     val errorCount by viewModel.errorCount.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
-    var isSheetOpen by remember { mutableStateOf(false) }
-    var inputText by remember { mutableStateOf("") }
-    val selectedUris = remember { mutableStateListOf<Uri>() }
-
-    val filePickerLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.GetMultipleContents()
-    ) { uris ->
-        selectedUris.clear()
-        selectedUris.addAll(uris)
-    }
-
+    // Обработчик системных разрешений на микрофон и сопутствующие модули
     val permissionsLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
+        contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        if (permissions[Manifest.permission.RECORD_AUDIO] == true ||
-            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+        val audioGranted = permissions[Manifest.permission.RECORD_AUDIO] == true ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+        if (audioGranted) {
             viewModel.toggleConnection()
         }
     }
 
-    fun handleConnectClick() {
+    // Запуск сессии с предварительной проверкой разрешений
+    fun handleSessionClick() {
         val requiredMissing = mutableListOf<String>()
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requiredMissing.add(Manifest.permission.RECORD_AUDIO)
@@ -102,473 +103,137 @@ fun ClientScreen(
         }
     }
 
-    val listState = rememberLazyListState()
-    LaunchedEffect(state.messages.size) {
-        if (state.messages.isNotEmpty()) {
-            listState.animateScrollToItem(state.messages.lastIndex)
-        }
-    }
-
-    Scaffold(
-        contentWindowInsets = WindowInsets(0, 0, 0, 0),
-        containerColor = Color(0xFF09090B),
-        topBar = {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .windowInsetsPadding(WindowInsets.statusBars)
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(
-                    onClick = onNavigateSettings,
-                    modifier = Modifier
-                        .minimumInteractiveComponentSize()
-                        .size(42.dp)
-                        .clip(CircleShape)
-                        .background(Color(0xFF18181B))
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.Tune,
-                        contentDescription = stringResource(R.string.settings_title),
-                        tint = Color(0xFFFAFAFA),
-                        modifier = Modifier.size(20.dp)
-                    )
-                }
-
-                Spacer(Modifier.width(8.dp))
-
-                IconButton(
-                    onClick = onNavigateLogs,
-                    modifier = Modifier
-                        .minimumInteractiveComponentSize()
-                        .size(42.dp)
-                        .clip(CircleShape)
-                        .background(Color(0xFF18181B))
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.Filled.Terminal,
-                            contentDescription = "Системный лог",
-                            tint = if (errorCount > 0) Color(0xFFF87171) else Color(0xFF60A5FA),
-                            modifier = Modifier.size(20.dp)
-                        )
-                        if (errorCount > 0) {
-                            Box(
-                                modifier = Modifier
-                                    .align(Alignment.TopEnd)
-                                    .offset(x = 2.dp, y = (-2).dp)
-                                    .size(8.dp)
-                                    .clip(CircleShape)
-                                    .background(Color(0xFFEF4444))
-                            )
-                        }
-                    }
-                }
-
-                Spacer(Modifier.width(8.dp))
-
-                Row(
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(Color(0xFF18181B))
-                        .border(0.5.dp, Color(0xFF27272A), RoundedCornerShape(24.dp))
-                        .clickable { isSheetOpen = true }
-                        .padding(horizontal = 14.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(Icons.Filled.AutoAwesome, null, tint = Color(0xFF60A5FA), modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        text = state.activePrompt.ifBlank { stringResource(R.string.default_role_placeholder) },
-                        color = Color(0xFFE4E4E7),
-                        fontSize = 13.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Icon(Icons.Filled.KeyboardArrowDown, null, tint = Color(0xFFA1A1AA), modifier = Modifier.size(18.dp))
-                }
-
-                Spacer(Modifier.width(8.dp))
-
-                IconButton(
-                    onClick = { handleConnectClick() },
-                    modifier = Modifier
-                        .minimumInteractiveComponentSize()
-                        .size(42.dp)
-                        .clip(CircleShape)
-                        .background(if (state.isConnected) Color(0xFF064E3B) else Color(0xFF18181B))
-                ) {
-                    Icon(
-                        imageVector = if (state.isConnected) Icons.Filled.PowerSettingsNew else Icons.Filled.PlayArrow,
-                        contentDescription = stringResource(R.string.session_status_desc),
-                        tint = if (state.isConnected) Color(0xFF34D399) else Color(0xFFFAFAFA),
-                        modifier = Modifier.size(22.dp)
-                    )
-                }
-            }
-        },
-        bottomBar = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .windowInsetsPadding(WindowInsets.navigationBars)
-                    .windowInsetsPadding(WindowInsets.ime)
-                    .background(Color(0xFF09090B))
-                    .padding(horizontal = 12.dp, vertical = 8.dp)
-            ) {
-                // Горизонтальный список слов Forvo
-                if (state.forvoWords.isNotEmpty()) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState())
-                            .padding(bottom = 8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        state.forvoWords.forEach { item ->
-                            ForvoWordChip(
-                                word = item,
-                                onClick = { viewModel.playForvo(item) }
-                            )
-                        }
-                    }
-                }
-
-                // Список выбранных файлов перед отправкой
-                if (selectedUris.isNotEmpty()) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState())
-                            .padding(bottom = 6.dp),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        selectedUris.forEachIndexed { index, uri ->
-                            SuggestionChip(
-                                onClick = { selectedUris.removeAt(index) },
-                                label = {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(
-                                            uri.lastPathSegment ?: "файл",
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                            fontSize = 11.sp
-                                        )
-                                        Spacer(Modifier.width(4.dp))
-                                        Icon(
-                                            imageVector = Icons.Filled.Close,
-                                            contentDescription = null,
-                                            modifier = Modifier.size(14.dp)
-                                        )
-                                    }
-                                }
-                            )
-                        }
-                    }
-                }
-
-                // Строка ввода, кнопка вложений и микрофон
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    IconButton(
-                        onClick = { filePickerLauncher.launch("*/*") },
-                        modifier = Modifier
-                            .size(42.dp)
-                            .clip(CircleShape)
-                            .background(Color(0xFF18181B))
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.AttachFile,
-                            contentDescription = stringResource(R.string.attach_file),
-                            tint = if (selectedUris.isNotEmpty()) Color(0xFF60A5FA) else Color(0xFFA1A1AA),
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-
-                    Spacer(Modifier.width(8.dp))
-
-                    OutlinedTextField(
-                        value = inputText,
-                        onValueChange = { inputText = it },
-                        placeholder = { Text(stringResource(R.string.prompt_hint), color = Color(0xFF71717A), fontSize = 13.sp) },
-                        modifier = Modifier
-                            .weight(1f)
-                            .heightIn(min = 44.dp, max = 110.dp),
-                        shape = RoundedCornerShape(22.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = Color(0xFF60A5FA),
-                            unfocusedBorderColor = Color(0xFF27272A),
-                            focusedContainerColor = Color(0xFF141416),
-                            unfocusedContainerColor = Color(0xFF141416),
-                            focusedTextColor = Color(0xFFFAFAFA),
-                            unfocusedTextColor = Color(0xFFFAFAFA)
-                        ),
-                        maxLines = 4
-                    )
-
-                    Spacer(Modifier.width(8.dp))
-
-                    if (inputText.isNotBlank() || selectedUris.isNotEmpty()) {
-                        IconButton(
-                            onClick = {
-                                val textToSend = inputText.trim()
-                                val urisToSend = selectedUris.toList()
-                                inputText = ""
-                                selectedUris.clear()
-                                viewModel.sendText(textToSend, urisToSend)
-                            },
-                            modifier = Modifier
-                                .size(42.dp)
-                                .clip(CircleShape)
-                                .background(Color(0xFF2563EB))
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.Send,
-                                contentDescription = stringResource(R.string.send_message),
-                                tint = Color.White,
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
-                    } else {
-                        IconButton(
-                            onClick = {
-                                if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                                    if (state.isConnected) {
-                                        viewModel.toggleMic()
-                                    } else {
-                                        viewModel.toggleConnection()
-                                    }
-                                } else {
-                                    handleConnectClick()
-                                }
-                            },
-                            modifier = Modifier
-                                .size(42.dp)
-                                .clip(CircleShape)
-                                .background(if (state.isMicActive) Color(0xFF2563EB) else Color(0xFF18181B))
-                        ) {
-                            Icon(
-                                imageVector = if (state.isMicActive) Icons.Filled.Mic else Icons.Filled.MicOff,
-                                contentDescription = stringResource(R.string.mic_content_desc),
-                                tint = if (state.isMicActive) Color.White else Color(0xFFA1A1AA),
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .background(Color(0xFF09090B)),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            // Верхний визуализатор (компактный при наличии сообщений, полный при старте)
-            val visualizerSize = if (state.messages.isEmpty()) 240.dp else 140.dp
-
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 12.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    AgslVoiceVisualizer(
-                        nativeEngine = viewModel.nativeAudioEngine,
-                        state = state,
-                        onClick = {
-                            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                                if (state.isConnected) {
-                                    viewModel.toggleMic()
-                                } else {
-                                    viewModel.toggleConnection()
-                                }
-                            } else {
-                                handleConnectClick()
-                            }
-                        },
-                        size = visualizerSize
-                    )
-
-                    Spacer(Modifier.height(8.dp))
-
-                    Text(
-                        text = when {
-                            state.error != null -> state.error.orEmpty()
-                            state.isAiSpeaking -> "Ассистент говорит..."
-                            state.link == LinkState.CONNECTING -> "Подключение... (нажмите для отмены)"
-                            state.link == LinkState.RECONNECTING -> "Восстановление связи... (нажмите для отмены)"
-                            state.isMicActive -> "Слушаю вас..."
-                            state.isConnected -> "Микрофон на паузе (нажмите на сферу)"
-                            else -> "Нажмите на сферу для запуска"
-                        },
-                        color = when {
-                            state.error != null -> Color(0xFFF87171)
-                            state.isAiSpeaking -> Color(0xFF34D399)
-                            state.isMicActive -> Color(0xFF60A5FA)
-                            else -> Color(0xFF71717A)
-                        },
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Medium
-                    )
-                }
-            }
-
-            // Лента сообщений
-            if (state.messages.isNotEmpty()) {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp),
-                    contentPadding = PaddingValues(bottom = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    items(state.messages, key = { it.id }) { msg ->
-                        MessageBubble(msg)
-                    }
-                }
-            } else {
-                Spacer(Modifier.weight(1f))
-            }
-        }
-    }
-
-    if (isSheetOpen) {
-        ModalBottomSheet(
-            onDismissRequest = { isSheetOpen = false },
-            containerColor = Color(0xFF141416),
-            dragHandle = { BottomSheetDefaults.DragHandle(color = Color(0xFF3F3F46)) }
-        ) {
-            var tempPrompt by remember { mutableStateOf(state.activePrompt) }
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp)
-                    .padding(bottom = 32.dp)
-                    .windowInsetsPadding(WindowInsets.ime)
-            ) {
-                Text(
-                    text = stringResource(R.string.system_role_instruction),
-                    color = Color(0xFFFAFAFA),
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(Modifier.height(12.dp))
-                OutlinedTextField(
-                    value = tempPrompt,
-                    onValueChange = { tempPrompt = it },
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp, max = 240.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Color(0xFF60A5FA),
-                        unfocusedBorderColor = Color(0xFF27272A),
-                        focusedTextColor = Color(0xFFFAFAFA),
-                        unfocusedTextColor = Color(0xFFFAFAFA)
-                    )
-                )
-                Spacer(Modifier.height(16.dp))
-                Button(
-                    onClick = {
-                        viewModel.applyPrompt(tempPrompt)
-                        isSheetOpen = false
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
-                ) {
-                    Text(stringResource(R.string.apply_role), color = Color.White)
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun MessageBubble(msg: ChatMessage) {
-    val isUser = msg.role == ClientRole.USER
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
+    // =========================================================================
+    // БАЗОВЫЙ ХОЛСТ: БЕЛЫЙ ЛИСТ (Screen Canvas)
+    // =========================================================================
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(ColorCanvasWhite)
     ) {
+        val screenHeight = maxHeight
+        // Высота FM-полоски строго на отметке ~1/5 (19-20%) высоты экрана
+        val fmTopOffset = screenHeight * 0.19f
+
+        // =====================================================================
+        // 1. АКУСТИЧЕСКАЯ FM-ПОЛОСКА ВИЗУАЛИЗАЦИИ ЗВУКА (Спикер Gemini Live)
+        // =====================================================================
         Box(
             modifier = Modifier
-                .widthIn(max = 320.dp)
-                .clip(RoundedCornerShape(
-                    topStart = 16.dp,
-                    topEnd = 16.dp,
-                    bottomStart = if (isUser) 16.dp else 4.dp,
-                    bottomEnd = if (isUser) 4.dp else 16.dp
-                ))
-                .background(if (isUser) Color(0xFF1E3A8A) else Color(0xFF18181B))
-                .padding(horizontal = 14.dp, vertical = 10.dp)
+                .fillMaxWidth()
+                .align(Alignment.TopCenter)
+                .padding(top = fmTopOffset)
+                .padding(horizontal = 24.dp)
         ) {
-            Column {
-                if (msg.attachmentNames.isNotEmpty()) {
-                    Text(
-                        text = "📎 " + msg.attachmentNames.joinToString(", "),
-                        color = Color(0xFF93C5FD),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Spacer(Modifier.height(4.dp))
-                }
-
-                Text(
-                    text = msg.text,
-                    color = if (msg.interim) Color(0xFFA1A1AA) else Color(0xFFFAFAFA),
-                    fontSize = 13.sp,
-                    lineHeight = 18.sp
-                )
-            }
+            FmStripAudioVisualizer(
+                nativeEngine = viewModel.nativeAudioEngine,
+                state = state
+            )
         }
-    }
-}
 
-@Composable
-private fun ForvoWordChip(word: ForvoWord, onClick: () -> Unit) {
-    Surface(
-        onClick = onClick,
-        shape = RoundedCornerShape(16.dp),
-        color = Color(0xFF18181B),
-        border = androidx.compose.foundation.BorderStroke(0.5.dp, Color(0xFF27272A))
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
+        // =====================================================================
+        // 2. ВЕРХНИЙ ПРАВЫЙ УГОЛ: ЧЕРНАЯ ШЕСТЕРЕНКА НАСТРОЕК С ПРУЖИННЫМ КРУЧЕНИЕМ
+        // =====================================================================
+        SettingsGearButton(
+            onOpenSettings = onNavigateSettings,
+            onOpenLogs = onNavigateLogs,
+            errorCount = errorCount,
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .windowInsetsPadding(WindowInsets.statusBars)
+                .padding(top = 16.dp, end = 20.dp)
+        )
+
+        // =====================================================================
+        // 3. НИЖНЯЯ ПРАВАЯ ПЛАШКА: "START A SESSION" (Черный -> Изумрудный)
+        // =====================================================================
+        SessionControlPill(
+            linkState = state.link,
+            onClick = { handleSessionClick() },
+            modifier = Modifier
+                .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.navigationBars)
+        )
+
+        // =====================================================================
+        // 4. ЛЕВАЯ НИЖНЯЯ ПЛАШКА И ШУХЛЯДКА ВЛОЖЕНИЙ: "MATERIALS" (Черный -> Лазурный)
+        // =====================================================================
+        MaterialsConsoleDrawer(
+            onSendMaterials = { text, uris ->
+                viewModel.sendText(text, uris)
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // =====================================================================
+        // 5. ЛЕВАЯ ЦЕНТРАЛЬНАЯ ПЛАШКА И ШУХЛЯДКА РОЛИ: "PROMPT" (Радуга "веселка")
+        // =====================================================================
+        PromptConsoleDrawer(
+            currentPrompt = state.activePrompt,
+            onApplyPrompt = { newPrompt ->
+                viewModel.applyPrompt(newPrompt)
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // =====================================================================
+        // 6. ДЕЛИКАТНЫЙ СИСТЕМНЫЙ БЕЙДЖ ОШИБОК (Появляется только при сбое)
+        // =====================================================================
+        AnimatedVisibility(
+            visible = state.error != null,
+            enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
+            exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .padding(bottom = 16.dp, start = 60.dp, end = 60.dp)
         ) {
-            Icon(
-                imageVector = when {
-                    word.isLoading -> Icons.Filled.HourglassEmpty
-                    word.notFound -> Icons.Filled.VolumeOff
-                    else -> Icons.Filled.VolumeUp
-                },
-                contentDescription = null,
-                tint = if (word.audioUrl != null) Color(0xFF34D399) else Color(0xFFA1A1AA),
-                modifier = Modifier.size(16.dp)
-            )
-            Spacer(Modifier.width(6.dp))
-            Text(
-                text = word.word,
-                color = Color(0xFFFAFAFA),
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Medium
-            )
-            if (!word.translation.isNullOrBlank()) {
-                Spacer(Modifier.width(4.dp))
-                Text(
-                    text = "— ${word.translation}",
-                    color = Color(0xFF71717A),
-                    fontSize = 11.sp
-                )
+            state.error?.let { errorMessage ->
+                Box(
+                    modifier = Modifier
+                        .shadow(
+                            elevation = 8.dp,
+                            shape = RoundedCornerShape(16.dp),
+                            ambientColor = Color(0x10000000),
+                            spotColor = Color(0x1A000000)
+                        )
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(ColorErrorCard)
+                        .border(1.dp, ColorHairline, RoundedCornerShape(16.dp))
+                        .clickable { viewModel.clearError() }
+                        .padding(horizontal = 14.dp, vertical = 10.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        // Микросветодиод статуса ошибки
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(ColorErrorLed)
+                        )
+
+                        Text(
+                            text = errorMessage,
+                            color = ColorTextPrimary,
+                            fontSize = 11.5.sp,
+                            fontFamily = FontFamily.SansSerif,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+
+                        Icon(
+                            imageVector = Icons.Filled.Close,
+                            contentDescription = "Закрыть ошибку",
+                            tint = ColorTextSecondary,
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
+                }
             }
         }
     }
