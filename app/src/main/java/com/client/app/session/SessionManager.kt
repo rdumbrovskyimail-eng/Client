@@ -201,8 +201,6 @@ class SessionManager @Inject constructor(
         LiveModelCapabilitiesRegistry.forModel(DEFAULT_LIVE_MODEL)
 
     private val isManualActivityActive = AtomicBoolean(false)
-
-    // УСТРАНЕНИЕ ДЕФЕКТА 3: Транзакционный барьер текстового хода для предотвращения коллизий с микрофоном
     private val isTextTurnInProgress = AtomicBoolean(false)
 
     private val activeToolJobs = ConcurrentHashMap<ToolCallKey, Job>()
@@ -345,7 +343,6 @@ class SessionManager @Inject constructor(
             audioEngine.invalidateAndFlushPlayback(reason)
         }
 
-    // УСТРАНЕНИЕ ДЕФЕКТОВ 1 И 3: Использование realtimeInput.text во время активной сессии и транзакционный барьер
     fun sendText(text: String, uris: List<Uri> = emptyList()) = scope.launch {
         commandMutex.withLock {
             userTurnMutex.withLock {
@@ -372,7 +369,6 @@ class SessionManager @Inject constructor(
                     return@withLock
                 }
 
-                // Транзакционная приостановка передачи микрофона во избежание коллизии аудио и текста
                 isTextTurnInProgress.set(true)
                 try {
                     client.sendRealtimeText(trimmed)
@@ -453,7 +449,6 @@ class SessionManager @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 1: Передача извлечённого OCR-текста документа через realtimeInput.text
     private suspend fun handleAttachments(text: String, uris: List<Uri>) {
         _state.update { it.copy(isAnalyzing = true, error = null) }
         try {
@@ -508,7 +503,6 @@ class SessionManager @Inject constructor(
                     }
                     if (!ensureLive()) return
 
-                    // Отправка через realtimeInput.text вместо недопустимого во время сессии clientContent
                     isTextTurnInProgress.set(true)
                     try {
                         client.sendRealtimeText(a.fullText.take(15000))
@@ -618,7 +612,6 @@ class SessionManager @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 4: Начальная история обязана заканчиваться ходом MODEL
     private fun recentHistory(maxTurns: Int): List<ClientTurn> {
         val raw = _state.value.messages
             .filter { !it.interim && it.text.isNotBlank() }
@@ -636,7 +629,6 @@ class SessionManager @Inject constructor(
         if (firstUser < 0) return emptyList()
 
         var candidateList = candidates.drop(firstUser)
-        // Отсекаем висящие незавершённые реплики USER, чтобы сервер не начинал говорить сразу при старте
         while (candidateList.isNotEmpty() && candidateList.last().role == ClientRole.USER) {
             candidateList = candidateList.dropLast(1)
         }
@@ -1276,7 +1268,6 @@ class SessionManager @Inject constructor(
         micAudioJob?.cancel()
         micControlJob?.cancel()
 
-        // Data Plane: передача PCM-сэмплов с шлюзованием во время текстового хода
         micAudioJob = scope.launch {
             try {
                 for (audio in audioEngine.micAudioOutput) {
@@ -1303,7 +1294,6 @@ class SessionManager @Inject constructor(
             }
         }
 
-        // Control Plane: гарантированная отправка activityStart без гонок CAS
         micControlJob = scope.launch {
             try {
                 for (control in audioEngine.micControlOutput) {
@@ -1898,15 +1888,19 @@ class SessionManager @Inject constructor(
         scope.launch {
             val generation = audioEngine.currentPlaybackGeneration
 
-            val ingressDeadline = SystemClock.elapsedRealtime() + 1500L
+            // Защитный барьер: дожидаемся завершения вычитки входящего канала аудио
+            val ingressDeadline = SystemClock.elapsedRealtime() + 2500L
             while (client.hasPendingAudioFrames && SystemClock.elapsedRealtime() < ingressDeadline) {
                 if (client.sessionId != sourceSessionId || client.epoch != sourceEpoch || !connectionDesired) {
                     return@launch
                 }
-                delay(15L)
+                delay(20L)
             }
 
-            val drained = audioEngine.awaitPlaybackDrained(generation = generation)
+            // Даем нативному буферу 100 мс на начало физического рендеринга перед проверкой опустошения
+            delay(100L)
+
+            val drained = audioEngine.awaitPlaybackDrained(generation = generation, stallTimeoutMs = 2500L)
             if (!drained && audioEngine.currentPlaybackGeneration == generation) {
                 logger.w("SessionManager: playback drain watchdog detected hardware stall; clearing stalled queue")
                 invalidateAndFlushAudio("playback stall recovery")
