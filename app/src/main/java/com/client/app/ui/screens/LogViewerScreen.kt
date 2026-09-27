@@ -1,12 +1,19 @@
 package com.client.app.ui.screens
 
+import android.content.Context
 import android.content.Intent
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.widget.Toast
 import androidx.compose.animation.*
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -14,6 +21,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -23,12 +31,13 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -40,6 +49,20 @@ import com.client.app.logging.LogEntry
 import com.client.app.logging.LogLevel
 import kotlinx.coroutines.launch
 
+// Цветовые константы белого минимализма для журнала логов
+private val ColorCanvasWhite = Color(0xFFFFFFFF)
+private val ColorCardBackground = Color(0xFFFAFAFA)
+private val ColorFieldBackground = Color(0xFFFFFFFF)
+private val ColorHairline = Color(0xFFE2E8F0)
+private val ColorTextPrimary = Color(0xFF09090B)
+private val ColorTextSecondary = Color(0xFF71717A)
+private val ColorTextMuted = Color(0xFFA1A1AA)
+private val ColorPayloadBackground = Color(0xFFF1F5F9)
+private val ColorPayloadText = Color(0xFF0F172A)
+
+private val ColorButtonBlack = Color(0xFF09090B)
+private val ColorButtonTextWhite = Color(0xFFFFFFFF)
+
 private enum class LogFilter(val label: String) {
     ALL("Все"),
     ERRORS("Ошибки"),
@@ -49,6 +72,38 @@ private enum class LogFilter(val label: String) {
     WARN("Предупреждения")
 }
 
+/**
+ * Тактильный импульс для действий в журнале логов.
+ */
+private fun performLogActionHaptic(context: Context, intensity: Float = 0.65f) {
+    runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+            val vibrator = vibratorManager?.defaultVibrator
+            if (vibrator?.hasVibrator() == true) {
+                vibrator.vibrate(
+                    VibrationEffect.startComposition()
+                        .addPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK, intensity, 0)
+                        .compose()
+                )
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            if (vibrator?.hasVibrator() == true) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
+                } else {
+                    vibrator.vibrate(12L)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Экран системного журнала логов, выполненный в эстетике белого минимализма.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LogViewerScreen(
@@ -65,6 +120,7 @@ fun LogViewerScreen(
     var selectedFilter by remember { mutableStateOf(LogFilter.ALL) }
     var autoScroll by remember { mutableStateOf(true) }
 
+    // Фильтрация записей журнала по поисковому запросу и категории
     val filteredLogs = remember(logs, searchQuery, selectedFilter) {
         logs.filter { entry ->
             val matchesFilter = when (selectedFilter) {
@@ -77,8 +133,8 @@ fun LogViewerScreen(
             }
             val matchesSearch = if (searchQuery.isBlank()) true else {
                 entry.message.contains(searchQuery, ignoreCase = true) ||
-                entry.tag.contains(searchQuery, ignoreCase = true) ||
-                (entry.payload?.contains(searchQuery, ignoreCase = true) == true)
+                    entry.tag.contains(searchQuery, ignoreCase = true) ||
+                    (entry.payload?.contains(searchQuery, ignoreCase = true) == true)
             }
             matchesFilter && matchesSearch
         }
@@ -86,14 +142,14 @@ fun LogViewerScreen(
 
     val listState = rememberLazyListState()
 
-    // Автоматический скролл вниз только если включён флаг и пользователь не прокручивает лог вручную
+    // Автоматический скролл вниз к свежим записям
     LaunchedEffect(filteredLogs.size, autoScroll) {
         if (autoScroll && filteredLogs.isNotEmpty()) {
             listState.animateScrollToItem(filteredLogs.lastIndex)
         }
     }
 
-    // Если пользователь потянул список вверх, временно отключаем автоскролл
+    // Отключение автоскролла, если пользователь вручную листает лог вверх
     LaunchedEffect(listState.isScrollInProgress) {
         if (listState.isScrollInProgress) {
             val isAtBottom = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index == filteredLogs.lastIndex
@@ -102,44 +158,72 @@ fun LogViewerScreen(
     }
 
     Scaffold(
-        containerColor = Color(0xFF09090B),
+        containerColor = ColorCanvasWhite,
         topBar = {
             TopAppBar(
                 title = {
                     Column {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("Системный лог", color = Color(0xFFFAFAFA), fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                            Text(
+                                text = "СИСТЕМНЫЙ ЖУРНАЛ",
+                                color = ColorTextPrimary,
+                                fontSize = 14.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 0.8.sp
+                            )
                             Spacer(Modifier.width(8.dp))
                             if (errorCount > 0) {
                                 Box(
                                     modifier = Modifier
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(Color(0xFFEF4444))
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(Color(0xFFFEE2E2))
+                                        .border(1.dp, Color(0xFFEF4444).copy(alpha = 0.4f), RoundedCornerShape(8.dp))
                                         .padding(horizontal = 6.dp, vertical = 2.dp)
                                 ) {
-                                    Text("$errorCount ERR", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                    Text(
+                                        text = "$errorCount ERR",
+                                        color = Color(0xFFDC2626),
+                                        fontSize = 9.5.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.Bold
+                                    )
                                 }
                             }
                         }
-                        Text("${filteredLogs.size} из ${logs.size} записей", color = Color(0xFFA1A1AA), fontSize = 11.sp)
+                        Text(
+                            text = "${filteredLogs.size} из ${logs.size} записей",
+                            color = ColorTextSecondary,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.SansSerif
+                        )
                     }
                 },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Назад", tint = Color(0xFFFAFAFA))
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Назад",
+                            tint = ColorTextPrimary
+                        )
                     }
                 },
                 actions = {
-                    // Переключатель автоскролла
-                    IconButton(onClick = { autoScroll = !autoScroll }) {
+                    // Переключатель режима автоскролла
+                    IconButton(onClick = {
+                        performLogActionHaptic(context, 0.5f)
+                        autoScroll = !autoScroll
+                    }) {
                         Icon(
                             imageVector = if (autoScroll) Icons.Filled.VerticalAlignBottom else Icons.Filled.PauseCircle,
                             contentDescription = "Автоскролл",
-                            tint = if (autoScroll) Color(0xFF34D399) else Color(0xFFA1A1AA)
+                            tint = if (autoScroll) Color(0xFF10B981) else ColorTextMuted
                         )
                     }
-                    // Экспорт в текстовый файл
+
+                    // Экспорт логов в файл
                     IconButton(onClick = {
+                        performLogActionHaptic(context)
                         coroutineScope.launch {
                             val uri = logManager.exportLogsToFile()
                             if (uri != null) {
@@ -148,20 +232,32 @@ fun LogViewerScreen(
                                     putExtra(Intent.EXTRA_STREAM, uri)
                                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                 }
-                                context.startActivity(Intent.createChooser(sendIntent, "Поделиться логами"))
+                                context.startActivity(Intent.createChooser(sendIntent, "Экспорт журнала логов"))
                             } else {
-                                Toast.makeText(context, "Логи пусты", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "Журнал логов пуст", Toast.LENGTH_SHORT).show()
                             }
                         }
                     }) {
-                        Icon(Icons.Filled.Share, contentDescription = "Поделиться", tint = Color(0xFFFAFAFA))
+                        Icon(
+                            imageVector = Icons.Filled.Share,
+                            contentDescription = "Поделиться",
+                            tint = ColorTextPrimary
+                        )
                     }
-                    // Очистка логов
-                    IconButton(onClick = { logManager.clear() }) {
-                        Icon(Icons.Filled.DeleteSweep, contentDescription = "Очистить", tint = Color(0xFFEF4444))
+
+                    // Очистка журнала
+                    IconButton(onClick = {
+                        performLogActionHaptic(context, 0.9f)
+                        logManager.clear()
+                    }) {
+                        Icon(
+                            imageVector = Icons.Filled.DeleteSweep,
+                            contentDescription = "Очистить",
+                            tint = Color(0xFFDC2626)
+                        )
                     }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF141416))
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = ColorCanvasWhite)
             )
         }
     ) { padding ->
@@ -170,94 +266,181 @@ fun LogViewerScreen(
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            // Поле поиска и фильтры
+            // Панель поиска и фильтрации
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF141416))
-                    .padding(horizontal = 12.dp, vertical = 8.dp)
-            ) {
-                OutlinedTextField(
-                    value = searchQuery,
-                    onValueChange = { searchQuery = it },
-                    placeholder = { Text("Поиск по тексту, тегу или JSON...", color = Color(0xFF71717A), fontSize = 13.sp) },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth().height(48.dp),
-                    shape = RoundedCornerShape(10.dp),
-                    trailingIcon = {
-                        if (searchQuery.isNotEmpty()) {
-                            IconButton(onClick = { searchQuery = "" }) {
-                                Icon(Icons.Filled.Close, contentDescription = "Сброс", tint = Color(0xFFA1A1AA), modifier = Modifier.size(16.dp))
-                            }
-                        }
-                    },
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Color(0xFF60A5FA),
-                        unfocusedBorderColor = Color(0xFF27272A),
-                        focusedContainerColor = Color(0xFF09090B),
-                        unfocusedContainerColor = Color(0xFF09090B),
-                        focusedTextColor = Color(0xFFFAFAFA),
-                        unfocusedTextColor = Color(0xFFFAFAFA)
+                    .background(ColorCanvasWhite)
+                    .border(
+                        width = 1.dp,
+                        color = ColorHairline,
+                        shape = RoundedCornerShape(bottomStart = 16.dp, bottomEnd = 16.dp)
                     )
-                )
+                    .padding(horizontal = 14.dp, vertical = 10.dp)
+            ) {
+                // Поле ввода поискового запроса
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(ColorFieldBackground)
+                        .border(1.dp, ColorHairline, RoundedCornerShape(10.dp))
+                        .padding(horizontal = 12.dp),
+                    contentAlignment = Alignment.CenterStart
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Search,
+                            contentDescription = null,
+                            tint = ColorTextMuted,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        BasicTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f),
+                            textStyle = TextStyle(
+                                color = ColorTextPrimary,
+                                fontSize = 12.5.sp,
+                                fontFamily = FontFamily.Monospace
+                            ),
+                            cursorBrush = SolidColor(ColorTextPrimary),
+                            decorationBox = { innerTextField ->
+                                if (searchQuery.isEmpty()) {
+                                    Text(
+                                        text = "Поиск по тегу, тексту сообщения или JSON...",
+                                        color = ColorTextMuted,
+                                        fontSize = 12.sp,
+                                        fontFamily = FontFamily.SansSerif
+                                    )
+                                }
+                                innerTextField()
+                            }
+                        )
+                        if (searchQuery.isNotEmpty()) {
+                            Icon(
+                                imageVector = Icons.Filled.Close,
+                                contentDescription = "Очистить поиск",
+                                tint = ColorTextSecondary,
+                                modifier = Modifier
+                                    .size(16.dp)
+                                    .clickable {
+                                        performLogActionHaptic(context, 0.4f)
+                                        searchQuery = ""
+                                    }
+                            )
+                        }
+                    }
+                }
 
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(10.dp))
 
+                // Горизонтальная карусель категориальных фильтров
                 Row(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    // Использование entries вместо values() исключает аллокацию массивов при каждой рекомпозиции
                     LogFilter.entries.forEach { filter ->
-                        FilterChip(
-                            selected = selectedFilter == filter,
-                            onClick = { selectedFilter = filter },
-                            label = { Text(filter.label, fontSize = 11.sp) },
-                            colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = Color(0xFF2563EB),
-                                selectedLabelColor = Color.White,
-                                containerColor = Color(0xFF18181B),
-                                labelColor = Color(0xFFA1A1AA)
+                        val isSelected = selectedFilter == filter
+                        Box(
+                            modifier = Modifier
+                                .height(32.dp)
+                                .shadow(
+                                    elevation = if (isSelected) 2.dp else 0.dp,
+                                    shape = RoundedCornerShape(16.dp),
+                                    ambientColor = Color(0x0A000000),
+                                    spotColor = Color(0x14000000)
+                                )
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(if (isSelected) ColorButtonBlack else ColorFieldBackground)
+                                .border(1.dp, if (isSelected) ColorButtonBlack else ColorHairline, RoundedCornerShape(16.dp))
+                                .clickable {
+                                    performLogActionHaptic(context, 0.4f)
+                                    selectedFilter = filter
+                                }
+                                .padding(horizontal = 12.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = filter.label,
+                                color = if (isSelected) ColorButtonTextWhite else ColorTextSecondary,
+                                fontSize = 11.5.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
                             )
-                        )
+                        }
                     }
                 }
             }
 
-            // Список логов
-            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            // Список записей системного журнала
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+            ) {
                 SelectionContainer {
                     LazyColumn(
                         state = listState,
-                        modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp),
-                        contentPadding = PaddingValues(vertical = 8.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 10.dp),
+                        contentPadding = PaddingValues(vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         items(items = filteredLogs, key = { it.id }) { entry ->
-                            LogItemRow(entry = entry, onCopy = {
-                                clipboard.setText(AnnotatedString("[${entry.timeFormatted}] [${entry.tag}] ${entry.message}"))
-                                Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
-                            })
+                            WhiteLogItemRow(
+                                entry = entry,
+                                onCopy = {
+                                    performLogActionHaptic(context)
+                                    clipboard.setText(
+                                        AnnotatedString("[${entry.timeFormatted}] [${entry.tag}] ${entry.message}")
+                                    )
+                                    Toast.makeText(context, "Запись скопирована", Toast.LENGTH_SHORT).show()
+                                }
+                            )
                         }
                     }
                 }
 
                 // Плавающая кнопка возврата вниз к свежим логам
                 if (!autoScroll) {
-                    SmallFloatingActionButton(
-                        onClick = {
-                            autoScroll = true
-                            coroutineScope.launch {
-                                if (filteredLogs.isNotEmpty()) listState.animateScrollToItem(filteredLogs.lastIndex)
-                            }
-                        },
+                    Box(
                         modifier = Modifier
                             .align(Alignment.BottomEnd)
-                            .padding(16.dp),
-                        containerColor = Color(0xFF2563EB),
-                        contentColor = Color.White
+                            .padding(16.dp)
+                            .size(44.dp)
+                            .shadow(
+                                elevation = 6.dp,
+                                shape = CircleShape,
+                                ambientColor = Color(0x14000000),
+                                spotColor = Color(0x28000000)
+                            )
+                            .clip(CircleShape)
+                            .background(ColorButtonBlack)
+                            .clickable {
+                                performLogActionHaptic(context)
+                                autoScroll = true
+                                coroutineScope.launch {
+                                    if (filteredLogs.isNotEmpty()) {
+                                        listState.animateScrollToItem(filteredLogs.lastIndex)
+                                    }
+                                }
+                            },
+                        contentAlignment = Alignment.Center
                     ) {
-                        Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Вниз")
+                        Icon(
+                            imageVector = Icons.Filled.KeyboardArrowDown,
+                            contentDescription = "Прокрутить вниз",
+                            tint = ColorButtonTextWhite,
+                            modifier = Modifier.size(22.dp)
+                        )
                     }
                 }
             }
@@ -265,103 +448,133 @@ fun LogViewerScreen(
     }
 }
 
+/**
+ * Строка отдельной записи лога, оформленная как карточка швейцарского технического формуляра.
+ */
 @Composable
-private fun LogItemRow(entry: LogEntry, onCopy: () -> Unit) {
-    val levelColor = when (entry.level) {
-        LogLevel.ERROR -> Color(0xFFEF4444)
-        LogLevel.WARN -> Color(0xFFF59E0B)
-        LogLevel.NETWORK -> Color(0xFF60A5FA)
-        LogLevel.AUDIO -> Color(0xFF34D399)
-        LogLevel.VAD -> Color(0xFFA78BFA)
-        LogLevel.INFO -> Color(0xFF38BDF8)
-        else -> Color(0xFFA1A1AA)
-    }
+private fun WhiteLogItemRow(
+    entry: LogEntry,
+    onCopy: () -> Unit
+) {
+    var isExpanded by remember { mutableStateOf(false) }
 
-    var expanded by remember { mutableStateOf(false) }
+    val (badgeBg, badgeText) = when (entry.level) {
+        LogLevel.ERROR -> Color(0xFFFEE2E2) to Color(0xFFDC2626)
+        LogLevel.WARN -> Color(0xFFFEF3C7) to Color(0xFFD97706)
+        LogLevel.NETWORK -> Color(0xFFDBEAFE) to Color(0xFF2563EB)
+        LogLevel.AUDIO -> Color(0xFFD1FAE5) to Color(0xFF059669)
+        LogLevel.VAD -> Color(0xFFEDE9FE) to Color(0xFF7C3AED)
+        LogLevel.INFO -> Color(0xFFE0F2FE) to Color(0xFF0284C7)
+        else -> Color(0xFFF1F5F9) to Color(0xFF475569)
+    }
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(6.dp))
-            .background(Color(0xFF141416))
-            .border(0.5.dp, Color(0xFF27272A), RoundedCornerShape(6.dp))
+            .shadow(1.dp, RoundedCornerShape(8.dp), ambientColor = Color(0x06000000), spotColor = Color(0x0A000000))
+            .clip(RoundedCornerShape(8.dp))
+            .background(ColorCardBackground)
+            .border(1.dp, ColorHairline, RoundedCornerShape(8.dp))
             .clickable {
-                if (entry.payload != null) expanded = !expanded else onCopy()
+                if (entry.payload != null) {
+                    isExpanded = !isExpanded
+                } else {
+                    onCopy()
+                }
             }
-            .padding(horizontal = 8.dp, vertical = 6.dp)
+            .padding(horizontal = 10.dp, vertical = 8.dp)
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        // Метаданные: время, бейдж уровня, тег компонента и имя потока
+        Row(
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Text(
                 text = entry.timeFormatted,
-                color = Color(0xFF71717A),
+                color = ColorTextSecondary,
                 fontSize = 11.sp,
-                fontFamily = FontFamily.Monospace
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Medium
             )
-            Spacer(Modifier.width(6.dp))
+
+            Spacer(Modifier.width(8.dp))
+
+            // Пастельный бейдж уровня логирования
             Box(
                 modifier = Modifier
                     .clip(RoundedCornerShape(4.dp))
-                    .background(levelColor.copy(alpha = 0.2f))
-                    .padding(horizontal = 4.dp, vertical = 1.dp)
+                    .background(badgeBg)
+                    .padding(horizontal = 5.dp, vertical = 1.dp)
             ) {
                 Text(
                     text = entry.level.tag,
-                    color = levelColor,
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Bold,
-                    fontFamily = FontFamily.Monospace
+                    color = badgeText,
+                    fontSize = 9.5.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold
                 )
             }
-            Spacer(Modifier.width(6.dp))
+
+            Spacer(Modifier.width(8.dp))
+
             Text(
                 text = entry.tag,
-                color = Color(0xFFE4E4E7),
+                color = ColorTextPrimary,
                 fontSize = 11.sp,
-                fontWeight = FontWeight.SemiBold,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
+
             Spacer(Modifier.weight(1f))
+
             Text(
                 text = entry.threadName,
-                color = Color(0xFF52525B),
-                fontSize = 10.sp,
+                color = ColorTextMuted,
+                fontSize = 9.5.sp,
+                fontFamily = FontFamily.Monospace,
                 maxLines = 1
             )
         }
 
-        Spacer(Modifier.height(3.dp))
+        Spacer(Modifier.height(4.dp))
 
+        // Основной текст сообщения
         Text(
             text = entry.message,
-            color = if (entry.level == LogLevel.ERROR) Color(0xFFFCA5A5) else Color(0xFFFAFAFA),
+            color = if (entry.level == LogLevel.ERROR) Color(0xFFDC2626) else ColorTextPrimary,
             fontSize = 12.sp,
             fontFamily = FontFamily.Monospace,
             lineHeight = 16.sp
         )
 
+        // Индикатор и блок инспекции полезной нагрузки (JSON Payload)
         if (entry.payload != null) {
-            Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.height(6.dp))
             Text(
-                text = if (expanded) "▼ Скрыть JSON / Payload" else "▶ Показать Payload (${entry.payload.length} симв.)",
-                color = Color(0xFF60A5FA),
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Medium
+                text = if (isExpanded) "▼ Свернуть Payload" else "▶ Развернуть Payload (${entry.payload.length} байт)",
+                color = Color(0xFF2563EB),
+                fontSize = 10.5.sp,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.SemiBold
             )
-            if (expanded) {
-                Spacer(Modifier.height(4.dp))
+
+            if (isExpanded) {
+                Spacer(Modifier.height(6.dp))
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(4.dp))
-                        .background(Color(0xFF09090B))
-                        .padding(6.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(ColorPayloadBackground)
+                        .border(1.dp, ColorHairline, RoundedCornerShape(6.dp))
+                        .padding(8.dp)
                 ) {
                     Text(
                         text = entry.payload,
-                        color = Color(0xFF93C5FD),
+                        color = ColorPayloadText,
                         fontSize = 11.sp,
-                        fontFamily = FontFamily.Monospace
+                        fontFamily = FontFamily.Monospace,
+                        lineHeight = 15.sp
                     )
                 }
             }
