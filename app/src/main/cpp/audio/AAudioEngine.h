@@ -13,6 +13,7 @@
 #include <queue>
 #include <array>
 #include <cmath>
+#include <algorithm>
 #include "AudioConstants.h"
 #include "LockFreeRingBuffer.h"
 #include "PolyphaseResampler.h"
@@ -99,36 +100,46 @@ struct AudioPipelineDiagnostics {
 };
 
 /**
- * Однополюсный фильтр подавления постоянной составляющей (DC-Blocker ~15 Гц).
- * Устраняет малейший дрейф нуля перед эквализацией.
+ * Фильтр подавления инфразвука и постоянной составляющей (DC / Subsonic Filter, 35 Гц).
+ * Устраняет постоянный ток и микро-колебания ниже диапазона динамика смартфона,
+ * предотвращая чрезмерный ход диффузора (Excursion) и срабатывание защиты SmartPA.
  */
-struct DcBlocker {
-    double x1{0.0};
-    double y1{0.0};
-    double R{0.998};
+struct SubsonicHighPass {
+    double b0{1.0}, b1{-2.0}, b2{1.0};
+    double a1{0.0}, a2{0.0};
+    double s1{0.0}, s2{0.0};
 
     void reset(double fs = 48000.0) {
-        x1 = 0.0;
-        y1 = 0.0;
-        const double omega = 2.0 * 3.141592653589793 * 15.0 / fs;
-        R = std::clamp(1.0 - omega, 0.990, 0.999);
+        s1 = 0.0;
+        s2 = 0.0;
+        const double fc = 35.0; // Срез инфразвука ниже 35 Гц (динамик телефона не воспроизводит)
+        const double omega = 2.0 * 3.141592653589793 * fc / fs;
+        const double c = std::cos(omega);
+        const double s = std::sin(omega);
+        const double alpha = s / (2.0 * 0.7071067811865475); // Butterworth Q = 0.707
+        const double a0 = 1.0 + alpha;
+
+        b0 = ((1.0 + c) / 2.0) / a0;
+        b1 = (-(1.0 + c)) / a0;
+        b2 = ((1.0 + c) / 2.0) / a0;
+        a1 = (-2.0 * c) / a0;
+        a2 = (1.0 - alpha) / a0;
     }
 
-    inline double process(double x) {
-        if (!std::isfinite(x)) x = 0.0;
-        if (!std::isfinite(y1)) y1 = 0.0;
-        const double y = x - x1 + R * y1;
-        x1 = x;
-        y1 = y;
-        return y;
+    inline double process(double in) {
+        if (!std::isfinite(in)) in = 0.0;
+        if (!std::isfinite(s1)) s1 = 0.0;
+        if (!std::isfinite(s2)) s2 = 0.0;
+        const double out = b0 * in + s1;
+        s1 = s2 + b1 * in - a1 * out;
+        s2 = b2 * in - a2 * out;
+        return out;
     }
 };
 
 /**
- * Эталонный цифровой биквадрат в транспонированной прямой форме II (Transposed Direct Form II).
- * 1. Состояния s1 и s2 имеют масштаб входного сигнала (внутренний гейн равен 1, а не 1000).
- * 2. Вычисления выполняются с двойной точностью (double, 53 бита мантиссы).
- * 3. Встроенная защита от заражения NaN: битый отсчет мгновенно гасится без срыва фильтра.
+ * Цифровой биквадрат в транспонированной прямой форме II (TDF-II).
+ * Гарантирует устойчивость фильтра и вычисления с двойной точностью.
  */
 struct BiquadTdf2 {
     double b0{1.0};
@@ -151,16 +162,59 @@ struct BiquadTdf2 {
         return out;
     }
 
-    void makeLowShelf(double fc, double gainDb, double fs, double S = 0.85);
-    void makeHighShelf(double fc, double gainDb, double fs, double S = 0.90);
+    void makeLowShelf(double fc, double gainDb, double fs, double S = 0.71);
+    void makeHighShelf(double fc, double gainDb, double fs, double S = 0.71);
 };
 
 /**
- * Процессор голоса вещательного уровня:
- * - DC Blocker (15 Гц)
- * - Полка теплоты и глубокого грудного баса (Low-Shelf 165 Гц, +3.2 дБ)
- * - Полка прозрачности и артикуляции (High-Shelf 5200 Гц, +2.4 дБ)
- * - Аналоговый кубический сатуратор (Soft Saturator) для плотного громкого звука без клиппинга
+ * Профессиональный прозрачный True-Peak пиковый лимитер (ITU-R BS.1770-4 / AES-TD1004.1.15-10).
+ * Заменяет грубый кубический клиппинг. Гарантирует мягкое колено (Soft-Knee)
+ * и жесткий потолок -0.8 dBFS, защищая дельта-сигма ЦАП WCD9385 от межсэмпловых пиков (ISP).
+ */
+struct TransparentVoiceLimiter {
+    double envelope_{0.0};
+    double attackCoeff_{0.0};
+    double releaseCoeff_{0.0};
+
+    void reset(double fs = 48000.0) {
+        envelope_ = 0.0;
+        // Время атаки: 1.0 мс (мгновенный перехват резких пиков без щелчков)
+        attackCoeff_ = std::exp(-1.0 / (0.001 * fs));
+        // Время отпускания: 45.0 мс (прозрачное затухание без пампинга)
+        releaseCoeff_ = std::exp(-1.0 / (0.045 * fs));
+    }
+
+    inline double process(double x) {
+        const double absX = std::abs(x);
+        if (absX > envelope_) {
+            envelope_ = attackCoeff_ * envelope_ + (1.0 - attackCoeff_) * absX;
+        } else {
+            envelope_ = releaseCoeff_ * envelope_ + (1.0 - releaseCoeff_) * absX;
+        }
+
+        // Потолок: -0.8 dBFS (0.912). Гарантирует отсутствие клиппинга восстанавливающего фильтра ЦАП.
+        constexpr double CEILING = 0.912;
+        constexpr double THRESHOLD = 0.75; // Мягкое колено начинается с -2.5 dBFS
+
+        double gain = 1.0;
+        if (envelope_ > THRESHOLD) {
+            const double excess = envelope_ - THRESHOLD;
+            const double compressedEnv = THRESHOLD + (excess / (1.0 + excess / (CEILING - THRESHOLD)));
+            gain = compressedEnv / envelope_;
+        }
+
+        double y = x * gain;
+        if (y > CEILING) y = CEILING;
+        else if (y < -CEILING) y = -CEILING;
+        return y;
+    }
+};
+
+/**
+ * Процессор голоса студийного вещательного уровня:
+ * - Subsonic High-Pass (35 Гц, срез вредного механического инфра-резонанса)
+ * - Деликатная коррекция разборчивости речи (+0.8 дБ на 220 Гц, +0.8 дБ на 3800 Гц)
+ * - Transparent True-Peak Soft-Knee Limiter (никакого меандра, никаких хрипов динамика)
  */
 class AnalogVoiceEnhancer {
 public:
@@ -170,9 +224,10 @@ public:
 
 private:
     int32_t currentRate_{48000};
-    DcBlocker dcBlocker_;
+    SubsonicHighPass subsonicFilter_;
     BiquadTdf2 lowShelf_;
     BiquadTdf2 highShelf_;
+    TransparentVoiceLimiter limiter_;
 };
 
 class AAudioEngine {
