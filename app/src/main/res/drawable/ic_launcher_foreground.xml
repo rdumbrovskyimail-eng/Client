@@ -1,16 +1,114 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- >>> FILE: app/src/main/res/drawable/ic_launcher_foreground.xml -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+
+    <!-- =================================================================== -->
+    <!-- 1. РАССЕЯННАЯ МИКРОТЕНЬ ПОДЛОЖКИ (Ambient Occlusion Shadow)         -->
+    <!-- =================================================================== -->
+    <!-- Дальнее мягкое затенение -->
     <path
-        android:fillColor="#3B82F6"
-        android:pathData="M54,34 A20,20 0 1,0 54,74 A20,20 0 1,0 54,34 Z" />
+        android:fillColor="#0D000000"
+        android:pathData="M54,22 A33.5,33.5 0 1,0 54,89 A33.5,33.5 0 1,0 54,22 Z" />
+
+    <!-- Ближняя контактная тень -->
     <path
-        android:fillColor="#60A5FA"
-        android:pathData="M54,42 A12,12 0 1,0 54,66 A12,12 0 1,0 54,42 Z" />
+        android:fillColor="#12000000"
+        android:pathData="M54,21.5 A33.5,33.5 0 1,0 54,88.5 A33.5,33.5 0 1,0 54,21.5 Z" />
+
+    <!-- =================================================================== -->
+    <!-- 2. БЕЛАЯ КЕРАМИЧЕСКАЯ ПЛАШКА (Pure White Ceramic Disc)              -->
+    <!-- =================================================================== -->
+    <!-- Основа диска: чистый белый фарфор -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M54,48 A6,6 0 1,0 54,60 A6,6 0 1,0 54,48 Z" />
+        android:pathData="M54,20.5 A33.5,33.5 0 1,0 54,87.5 A33.5,33.5 0 1,0 54,20.5 Z" />
+
+    <!-- Внешняя прецизионная фаска безеля (Hairline Rim) -->
+    <path
+        android:strokeColor="#E2E8F0"
+        android:strokeWidth="1.0"
+        android:pathData="M54,20.5 A33.5,33.5 0 1,0 54,87.5 A33.5,33.5 0 1,0 54,20.5 Z" />
+
+    <!-- Внутреннее светлое кольцо полировки -->
+    <path
+        android:strokeColor="#F8FAFC"
+        android:strokeWidth="0.8"
+        android:pathData="M54,22 A32,32 0 1,0 54,86 A32,32 0 1,0 54,22 Z" />
+
+    <!-- =================================================================== -->
+    <!-- 3. ТОНКАЯ ХРОНОМЕТРИЧЕСКАЯ ШКАЛА (Horological Gauge Ring)           -->
+    <!-- =================================================================== -->
+    <!-- Опорная окружность шкалы -->
+    <path
+        android:strokeColor="#F1F5F9"
+        android:strokeWidth="0.6"
+        android:pathData="M54,26.5 A27.5,27.5 0 1,0 54,81.5 A27.5,27.5 0 1,0 54,26.5 Z" />
+
+    <!-- 12 часов: кардинальная верхняя риска (North) -->
+    <path
+        android:strokeColor="#CBD5E1"
+        android:strokeWidth="1.0"
+        android:strokeLineCap="round"
+        android:pathData="M54,23.5 L54,26.5" />
+
+    <!-- 6 часов: кардинальная нижняя риска (South) -->
+    <path
+        android:strokeColor="#CBD5E1"
+        android:strokeWidth="1.0"
+        android:strokeLineCap="round"
+        android:pathData="M54,81.5 L54,84.5" />
+
+    <!-- 9 часов: кардинальная левая риска (West) -->
+    <path
+        android:strokeColor="#CBD5E1"
+        android:strokeWidth="1.0"
+        android:strokeLineCap="round"
+        android:pathData="M23.5,54 L26.5,54" />
+
+    <!-- 3 часа: кардинальная правая риска (East) -->
+    <path
+        android:strokeColor="#CBD5E1"
+        android:strokeWidth="1.0"
+        android:strokeLineCap="round"
+        android:pathData="M81.5,54 L84.5,54" />
+
+    <!-- =================================================================== -->
+    <!-- 4. ЭЛИТНАЯ МОНОГРАММА «G» (Bauhaus Architectural Monogram)          -->
+    <!-- =================================================================== -->
+    <!--
+        Геометрическая дуга радиуса 16.0 dp с центром в точке (54, 54):
+        - Старт в верхнем квадранте под 42 градуса: (65.9, 43.3)
+        - Непрерывная дуга против часовой стрелки через лево и низ к (70.0, 54.0)
+        - Горизонтальный штрих строго к центру (54, 54)
+        - Толщина линии: 6.2 dp, глубокий обсидиановый монохром #09090B
+    -->
+    <path
+        android:strokeColor="#09090B"
+        android:strokeWidth="6.2"
+        android:strokeLineCap="square"
+        android:strokeLineJoin="miter"
+        android:pathData="M 65.9,43.3 A 16,16 0 1,0 70,54 L 54,54" />
+
+    <!-- =================================================================== -->
+    <!-- 5. ЮВЕЛИРНЫЕ МИКРОАКЦЕНТЫ (Precision Jewel Elements)               -->
+    <!-- =================================================================== -->
+    <!-- Левая титановая микроточка -->
+    <path
+        android:fillColor="#CBD5E1"
+        android:pathData="M49.5,76 A0.9,0.9 0 1,0 49.5,77.8 A0.9,0.9 0 1,0 49.5,76 Z" />
+
+    <!-- Центральный изумрудный кристалл Gemini Live (Emerald Core) -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M54,75.8 A1.2,1.2 0 1,0 54,78.2 A1.2,1.2 0 1,0 54,75.8 Z" />
+
+    <!-- Правая титановая микроточка -->
+    <path
+        android:fillColor="#CBD5E1"
+        android:pathData="M58.5,76 A0.9,0.9 0 1,0 58.5,77.8 A0.9,0.9 0 1,0 58.5,76 Z" />
+
 </vector>
