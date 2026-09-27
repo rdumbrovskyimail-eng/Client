@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <queue>
 #include <array>
+#include <cmath>
 #include "AudioConstants.h"
 #include "LockFreeRingBuffer.h"
 #include "PolyphaseResampler.h"
@@ -97,28 +98,70 @@ struct AudioPipelineDiagnostics {
     int32_t lastXRunCount{0};
 };
 
-struct Biquad {
-    float b0{1.0f};
-    float b1{0.0f};
-    float b2{0.0f};
-    float a1{0.0f};
-    float a2{0.0f};
-    float w1{0.0f};
-    float w2{0.0f};
+/**
+ * Однополюсный фильтр подавления постоянной составляющей (DC-Blocker ~15 Гц).
+ * Устраняет малейший дрейф нуля перед эквализацией.
+ */
+struct DcBlocker {
+    double x1{0.0};
+    double y1{0.0};
+    double R{0.998};
+
+    void reset(double fs = 48000.0) {
+        x1 = 0.0;
+        y1 = 0.0;
+        const double omega = 2.0 * 3.141592653589793 * 15.0 / fs;
+        R = std::clamp(1.0 - omega, 0.990, 0.999);
+    }
+
+    inline double process(double x) {
+        if (!std::isfinite(x)) x = 0.0;
+        if (!std::isfinite(y1)) y1 = 0.0;
+        const double y = x - x1 + R * y1;
+        x1 = x;
+        y1 = y;
+        return y;
+    }
+};
+
+/**
+ * Эталонный цифровой биквадрат в транспонированной прямой форме II (Transposed Direct Form II).
+ * 1. Состояния s1 и s2 имеют масштаб входного сигнала (внутренний гейн равен 1, а не 1000).
+ * 2. Вычисления выполняются с двойной точностью (double, 53 бита мантиссы).
+ * 3. Встроенная защита от заражения NaN: битый отсчет мгновенно гасится без срыва фильтра.
+ */
+struct BiquadTdf2 {
+    double b0{1.0};
+    double b1{0.0};
+    double b2{0.0};
+    double a1{0.0};
+    double a2{0.0};
+    double s1{0.0};
+    double s2{0.0};
 
     void reset();
-    inline float process(float in) {
-        const float w0 = in - a1 * w1 - a2 * w2;
-        const float out = b0 * w0 + b1 * w1 + b2 * w2;
-        w2 = w1;
-        w1 = w0;
+    inline double process(double in) {
+        if (!std::isfinite(in)) in = 0.0;
+        if (!std::isfinite(s1)) s1 = 0.0;
+        if (!std::isfinite(s2)) s2 = 0.0;
+
+        const double out = b0 * in + s1;
+        s1 = s2 + b1 * in - a1 * out;
+        s2 = b2 * in - a2 * out;
         return out;
     }
 
-    void makeLowShelf(float fc, float gainDb, float fs);
-    void makeHighShelf(float fc, float gainDb, float fs);
+    void makeLowShelf(double fc, double gainDb, double fs, double S = 0.85);
+    void makeHighShelf(double fc, double gainDb, double fs, double S = 0.90);
 };
 
+/**
+ * Процессор голоса вещательного уровня:
+ * - DC Blocker (15 Гц)
+ * - Полка теплоты и глубокого грудного баса (Low-Shelf 165 Гц, +3.2 дБ)
+ * - Полка прозрачности и артикуляции (High-Shelf 5200 Гц, +2.4 дБ)
+ * - Аналоговый кубический сатуратор (Soft Saturator) для плотного громкого звука без клиппинга
+ */
 class AnalogVoiceEnhancer {
 public:
     AnalogVoiceEnhancer();
@@ -127,8 +170,9 @@ public:
 
 private:
     int32_t currentRate_{48000};
-    Biquad lowShelf_;
-    Biquad highShelf_;
+    DcBlocker dcBlocker_;
+    BiquadTdf2 lowShelf_;
+    BiquadTdf2 highShelf_;
 };
 
 class AAudioEngine {
@@ -292,7 +336,6 @@ private:
     void captureDspThreadLoop();
     void fftTapThreadLoop();
 
-    // Пассивные RT колбэки (без блокировок, IPC и getTimestamp)
     static aaudio_data_callback_result_t captureCallback(
         AAudioStream* stream,
         void* userData,
@@ -391,10 +434,8 @@ private:
     alignas(64) std::atomic<uint32_t> playbackErrorCount_{0};
     alignas(64) std::atomic<int32_t> lastXRunCount_{0};
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 9: Счётчик XRun, учтённых DSP-потоком для безопасной адаптации размера буфера
     alignas(64) std::atomic<int32_t> lastTunedXRunCount_{0};
 
-    // Гистограмма кодов ошибок (RFC 7004)
     alignas(64) std::array<std::atomic<uint32_t>, ERROR_HISTOGRAM_BUCKETS> errorHistogram_{};
 
     std::thread playbackDspThread_;
