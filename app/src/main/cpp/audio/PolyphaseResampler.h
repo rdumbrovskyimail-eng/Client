@@ -241,14 +241,9 @@ private:
 };
 
 /**
- * УСТРАНЕНИЕ ДЕФЕКТА 10:
  * 36-таповый симметричный дециматор 3:1 (48 кГц -> 16 кГц) для микрофонного тракта.
  * Срез fc = 7.2 кГц, подавление зеркальных каналов > 75 dB.
  * Точная нормализация Q16 (\sum H = 65536, Gain DC = 1.000000, 0.00 dB).
- *
- * Математический инвариант:
- * Фазовый аккумулятор и предыстория строго непрерывны между квантами произвольной длины.
- * Исключены выпадения сэмплов и фазовые разрывы звуковой волны.
  */
 class Decimator48To16 : public IStreamingResampler {
 public:
@@ -300,7 +295,6 @@ public:
             }
         }
 
-        // Если выходной буфер был меньше необходимого, остаточные сэмплы не теряются
         if (processedIn < inFrames) {
             updateHistory(in + processedIn, inFrames - processedIn);
             phase_ = static_cast<int32_t>((static_cast<size_t>(phase_) + (inFrames - processedIn)) % 3u);
@@ -322,7 +316,6 @@ private:
         int16_t* out,
         size_t maxOut) {
 
-        // 18 пар коэффициентов полуполосного сглаживающего КИХ (Q16). 2 * sum(COEFFS) = 65536.
         static constexpr int32_t COEFFS[HALF_TAPS] = {
             -13, -27, -35, 10, 103, 174, 126, -94, -447,
             -655, -364, 569, 2101, 3903, 5590, 6781, 7410, 7636
@@ -332,10 +325,8 @@ private:
         std::memcpy(workBuf, history_, HISTORY * sizeof(int16_t));
         std::memcpy(workBuf + HISTORY, in, inFrames * sizeof(int16_t));
 
-        // Вычисление смещения до первого кратного отсчета по текущей фазе (M=3)
         const size_t offsetToFirst = (3u - static_cast<size_t>(phase_)) % 3u;
         size_t outCount = 0;
-        size_t consumedIn = 0;
 
         for (size_t i = offsetToFirst; i < inFrames && outCount < maxOut; i += 3u) {
             const size_t centerIdx = HISTORY + i;
@@ -350,13 +341,9 @@ private:
             constexpr int64_t ROUND_CONST = 1LL << 15;
             const int32_t rounded = static_cast<int32_t>((acc + ROUND_CONST) >> 16);
             out[outCount++] = static_cast<int16_t>(std::clamp<int32_t>(rounded, -32768, 32767));
-            consumedIn = i + 1u;
         }
 
-        // Корректное обновление фазы для следующего блока с учётом фактического количества входных отсчетов
         phase_ = static_cast<int32_t>((static_cast<size_t>(phase_) + inFrames) % 3u);
-
-        // Обновление предыстории всеми поступившими сэмплами чанка без потерь
         updateHistory(in, inFrames);
 
         return outCount;
@@ -857,7 +844,9 @@ public:
         if (inputRate_ != inputRate || outputRate_ != outputRate) {
             inputRate_ = inputRate;
             outputRate_ = outputRate;
-            reset();
+            // ИСКЛЮЧЕНИЕ ДЕСТРУКТИВНОГО СБРОСА: не вызываем reset(), чтобы сохранить непрерывность
+            // фазового аккумулятора (phase_), отсчетов firHistory_ и previousSample_
+            // при плавной подстройке джиттер-буфера. Это полностью исключает фазовые щелчки.
         }
     }
 
