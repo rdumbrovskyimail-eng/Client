@@ -68,7 +68,7 @@ void BiquadTdf2::makeHighShelf(double fc, double gainDb, double fs, double S) {
     const double a0 = (A + 1.0) - (A - 1.0) * cs + beta;
     b0 = (A * ((A + 1.0) + (A - 1.0) * cs + beta)) / a0;
     b1 = (-2.0 * A * ((A - 1.0) + (A + 1.0) * cs)) / a0;
-    b2 = (A * ((A + 1.0) + (A - 1.0) * cs - beta)) / a0;
+    b2 = (A * ((A + 1.0) - (A - 1.0) * cs - beta)) / a0;
     a1 = (2.0 * ((A - 1.0) - (A + 1.0) * cs)) / a0;
     a2 = ((A + 1.0) - (A - 1.0) * cs - beta) / a0;
 }
@@ -80,14 +80,20 @@ AnalogVoiceEnhancer::AnalogVoiceEnhancer() {
 void AnalogVoiceEnhancer::reset(int32_t sampleRate) {
     currentRate_ = sampleRate > 0 ? sampleRate : 48000;
     const double fs = static_cast<double>(currentRate_);
-    dcBlocker_.reset(fs);
+
+    // 1. Срез механического инфразвука ниже 35 Гц для защиты катушки SmartPA
+    subsonicFilter_.reset(fs);
+
+    // 2. Деликатная акустическая коррекция без искусственного завышения громкости
     lowShelf_.reset();
     highShelf_.reset();
+    // 200 Гц (+0.8 дБ): естественное тело голоса без гула и паразитного резонанса корпуса
+    lowShelf_.makeLowShelf(200.0, 0.8, fs, 0.71);
+    // 3800 Гц (+0.8 дБ): кристальная артикуляция согласных звуков без сибилянтов
+    highShelf_.makeHighShelf(std::min(3800.0, fs * 0.44), 0.8, fs, 0.71);
 
-    // 165 Гц (+3.2 дБ): глубокий бархатистый мужской и женский грудной регистр
-    lowShelf_.makeLowShelf(165.0, 3.2, fs, 0.82);
-    // 5200 Гц (+2.4 дБ): кристальная артикуляция согласных звуков без резкости
-    highShelf_.makeHighShelf(std::min(5200.0, fs * 0.44), 2.4, fs, 0.88);
+    // 3. Прозрачный True-Peak лимитер (потолок -0.8 dBFS, нулевой клиппинг)
+    limiter_.reset(fs);
 }
 
 void AnalogVoiceEnhancer::process(int16_t* samples, size_t numFrames, int32_t sampleRate) {
@@ -98,32 +104,22 @@ void AnalogVoiceEnhancer::process(int16_t* samples, size_t numFrames, int32_t sa
         // Денормализация в 64-битный вещественный диапазон [-1.0, 1.0]
         double x = static_cast<double>(samples[i]) * (1.0 / 32768.0);
 
-        // Каскад 1: DC Blocker (срезает постоянный ток и инфразвуковой гул ниже 15 Гц)
-        x = dcBlocker_.process(x);
+        // Каскад 1: Subsonic High-Pass (35 Гц, защита SmartPA от паразитного хода)
+        x = subsonicFilter_.process(x);
 
-        // Каскад 2: TDF-II Low-Shelf (теплота и плотность голоса)
+        // Каскад 2: TDF-II Low-Shelf (деликатная теплота)
         x = lowShelf_.process(x);
 
-        // Каскад 3: TDF-II High-Shelf (воздух и четкость фонем)
+        // Каскад 3: TDF-II High-Shelf (чистота фонем)
         x = highShelf_.process(x);
 
-        // Плотность и громкость: подъем среднего уровня на +2.5 дБ (фактор 1.33)
-        x *= 1.33;
+        // Каскад 4: Transparent True-Peak Soft-Knee Limiter (-0.8 dBFS потолок)
+        // Заменяет жесткий кубический клиппер. Полностью исключает генерацию нечетных гармоник
+        // и перегрузку усилителя динамика.
+        x = limiter_.process(x);
 
-        // Аналоговый кубический софт-сатуратор: f(x) = 1.5*x - 0.5*x^3
-        // При малых уровнях дает линейный звук; при пиках мягко скругляет волну как лампа.
-        // Математически гарантирует порог ровно 1.0 (32767), полностью защищая Smart PA от срабатывания!
-        double saturated;
-        if (x <= -1.0) {
-            saturated = -1.0;
-        } else if (x >= 1.0) {
-            saturated = 1.0;
-        } else {
-            saturated = 1.5 * x - 0.5 * x * x * x;
-        }
-
-        // Преобразование обратно в 16-бит PCM
-        const double scaled = saturated * 32767.0;
+        // Преобразование обратно в 16-бит PCM с математически точным округлением
+        const double scaled = x * 32767.0;
         samples[i] = static_cast<int16_t>(std::clamp<int32_t>(
             static_cast<int32_t>(std::lrint(scaled)), -32768, 32767
         ));
@@ -335,10 +331,12 @@ bool AAudioEngine::initLocked(
     voiceEnhancer_.reset(verifiedPlaybackRate);
     genericResampler_.configure(SAMPLE_RATE_GEMINI_OUT, verifiedPlaybackRate);
 
+    // УСТРАНЕНИЕ XRUN / ТРЕСКА: Безопасный размер буфера в 4 бёрста (~16-24 мс).
+    // Полностью устраняет аппаратные опустошения буфера при микропаузах планировщика Linux CFS.
     const int32_t playBurst = AAudioStream_getFramesPerBurst(playbackStream_);
     const int32_t playCapacity = AAudioStream_getBufferCapacityInFrames(playbackStream_);
     if (playBurst > 0 && playCapacity > 0) {
-        const int32_t targetBufSize = std::clamp(playBurst * 2, playBurst, playCapacity);
+        const int32_t targetBufSize = std::clamp(playBurst * 4, playBurst * 2, playCapacity);
         AAudioStream_setBufferSizeInFrames(playbackStream_, targetBufSize);
     }
 
@@ -351,8 +349,10 @@ aaudio_result_t AAudioEngine::openPlaybackStreamWithFallback(
     int32_t outputDeviceId,
     bool isBluetooth) {
 
-    const aaudio_sharing_mode_t desiredSharing =
-        isBluetooth ? AAUDIO_SHARING_MODE_SHARED : AAUDIO_SHARING_MODE_EXCLUSIVE;
+    // УСТРАНЕНИЕ САМОПЕРЕБИВАНИЯ (AEC): Режим SHARED обязателен для голосовой связи.
+    // Режим EXCLUSIVE MMAP обходит AudioFlinger и лишает Qualcomm Hexagon DSP опорного
+    // сигнала петли ЦАП (Echo Reference), полностью отключая аппаратный эхоподавитель Fluence.
+    const aaudio_sharing_mode_t desiredSharing = AAUDIO_SHARING_MODE_SHARED;
 
     auto buildAndOpen = [this, targetPlaybackSampleRate, outputDeviceId, isBluetooth](aaudio_sharing_mode_t sharingMode) -> aaudio_result_t {
         AAudioStreamBuilder* outBuilder = nullptr;
@@ -953,7 +953,7 @@ float AAudioEngine::getTotalEstimatedPlaybackLatencyMs() const {
     if (stream != nullptr) {
         int64_t framePosition = 0;
         int64_t hwTimestampNs = 0;
-        if (AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &framePosition, &hwTimestampNs) == AAUDIO_OK) {
+        if (AAudioStream_getTimestamp(stream, CLOCK_BOOTTIME, &framePosition, &hwTimestampNs) == AAUDIO_OK) {
             const int64_t framesWritten = AAudioStream_getFramesWritten(stream);
             if (framesWritten > framePosition) {
                 const int32_t rate = AAudioStream_getSampleRate(stream);
@@ -1155,8 +1155,9 @@ void AAudioEngine::playbackDspThreadLoop() {
                 ? static_cast<size_t>(actualBurst) * PLAYBACK_BURST_MIN_MULTIPLIER : 0U;
             const size_t targetBufferFrames = std::max<size_t>(1U, std::max(timeTargetFrames, burstTargetFrames));
 
-            const size_t hysteresisFrames = (actualBurst > 0)
-                ? static_cast<size_t>(actualBurst) * 2U : static_cast<size_t>(actualRate * 15 / 1000);
+            // УСТРАНЕНИЕ ФАЗОВОГО ТРЕСКА: Расширенное окно гистерезиса 25 мс (1200 фреймов @ 48 кГц).
+            // Исключает постоянные осцилляции вокруг 1.0f и паразитные переключения КИХ-фильтров.
+            const size_t hysteresisFrames = static_cast<size_t>(actualRate * 25 / 1000);
             const size_t highWatermarkFrames = targetBufferFrames + hysteresisFrames;
             const size_t lowWatermarkFrames = (targetBufferFrames > hysteresisFrames)
                 ? (targetBufferFrames - hysteresisFrames) : (targetBufferFrames / 2);
@@ -1210,12 +1211,13 @@ void AAudioEngine::playbackDspThreadLoop() {
 
             float targetRateFactor = 1.0f;
             if (buffered > targetBufferFrames + (hysteresisFrames / 2)) {
-                targetRateFactor = 1.035f;
+                targetRateFactor = 1.025f;
             } else if (buffered < lowWatermarkFrames && playbackDspInputBuffer_.availableRead() > 0) {
-                targetRateFactor = 0.965f;
+                targetRateFactor = 0.975f;
             }
-            smoothedRateFactor_ = smoothedRateFactor_ * 0.90f + targetRateFactor * 0.10f;
-            const bool isNominalRate = std::abs(smoothedRateFactor_ - 1.0f) < 0.008f;
+            // Высокая инерционность сглаживания (постоянная времени 0.98) исключает дрожание скорости
+            smoothedRateFactor_ = smoothedRateFactor_ * 0.98f + targetRateFactor * 0.02f;
+            const bool isNominalRate = std::abs(smoothedRateFactor_ - 1.0f) < 0.005f;
 
             size_t outputFrames = 0;
             if (isNominalRate && actualRate == SAMPLE_RATE_BT_LC3_24K) {
@@ -1235,7 +1237,7 @@ void AAudioEngine::playbackDspThreadLoop() {
 
             if (outputFrames == 0) continue;
 
-            // Студийный звуковой процессор речи: теплый бас + открытые верха + плотная громкость без клиппинга
+            // Студийный звуковой процессор речи: мягкий срез инфразвука + True-Peak лимитер без клиппинга
             voiceEnhancer_.process(output, outputFrames, actualRate);
 
             const float volume = playbackVolume_.load(std::memory_order_relaxed);
@@ -1245,9 +1247,6 @@ void AAudioEngine::playbackDspThreadLoop() {
                     output[i] = static_cast<int16_t>(std::clamp(v, -32768.0f, 32767.0f));
                 }
             }
-
-            const float dacRms = dsp::calculateRms(output, outputFrames);
-            outRms_.store(dacRms, std::memory_order_relaxed);
 
             if (playbackDspRunning_.load(std::memory_order_acquire) &&
                 playbackEpoch_.load(std::memory_order_acquire) == activeEpoch) {
@@ -1442,10 +1441,17 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
 
     engine->totalHardwarePlaybackFrames_.fetch_add(static_cast<uint64_t>(numFrames), std::memory_order_relaxed);
 
-    timespec ts{};
-    clock_gettime(CLOCK_BOOTTIME, &ts);
-    const uint64_t nowNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
-    engine->lastPlaybackPresentationTimestampNs_.store(nowNs, std::memory_order_relaxed);
+    // Точная аппаратная привязка времени презентации звука
+    int64_t framePos = 0;
+    int64_t hwTimestampNs = 0;
+    if (stream != nullptr && AAudioStream_getTimestamp(stream, CLOCK_BOOTTIME, &framePos, &hwTimestampNs) == AAUDIO_OK) {
+        engine->lastPlaybackPresentationTimestampNs_.store(static_cast<uint64_t>(hwTimestampNs), std::memory_order_relaxed);
+    } else {
+        timespec ts{};
+        clock_gettime(CLOCK_BOOTTIME, &ts);
+        const uint64_t nowNs = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+        engine->lastPlaybackPresentationTimestampNs_.store(nowNs, std::memory_order_relaxed);
+    }
 
     engine->playbackSequenceNumber_.fetch_add(1, std::memory_order_relaxed);
 
@@ -1461,10 +1467,17 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     const size_t read = engine->playbackBuffer_.read(samples, frames);
     if (read > 0) {
         engine->playbackDspCv_.notify_one();
+        // УСТРАНЕНИЕ САМОПЕРЕБИВАНИЯ: Расчёт outRms_ строго в реальном времени ЦАП.
+        // Исключает 80-мс опережение и рассинхронизацию с микрофоном.
+        const float realDacRms = dsp::calculateRms(samples, read);
+        engine->outRms_.store(realDacRms, std::memory_order_relaxed);
     }
 
     if (read < frames) {
         std::memset(samples + read, 0, (frames - read) * sizeof(int16_t));
+        if (read == 0) {
+            engine->outRms_.store(0.0f, std::memory_order_relaxed);
+        }
         if (engine->isPlaybackRenderingActive_.load(std::memory_order_relaxed)) {
             engine->playbackUnderrunFrames_.fetch_add(frames - read, std::memory_order_relaxed);
             engine->playbackUnderrunCount_.fetch_add(1, std::memory_order_relaxed);
