@@ -22,7 +22,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * УСТРАНЕНИЕ ДЕФЕКТА 20: Дифференцированные аппаратные пути связи
+ * Дифференцированные аппаратные пути связи
  * с полной поддержкой проводных (3.5 мм) и USB-C гарнитур.
  */
 enum class AudioRoutePath {
@@ -433,6 +433,11 @@ class AudioDeviceRouter @Inject constructor(
                         isConfirmed
                     }
 
+                    // Интервал стабилизации HAL для аппаратного включения AEC WCD9385
+                    if (activated) {
+                        delay(50L)
+                    }
+
                     if (!activated) {
                         logger.w("AudioDeviceRouter: Маршрут ${target.id} не подтвержден; откат на встроенный динамик")
                         awaitSpeakerFallback()
@@ -455,6 +460,10 @@ class AudioDeviceRouter @Inject constructor(
                                 }
                             }
                             isConfirmed
+                        }
+
+                        if (activated) {
+                            delay(50L)
                         }
 
                         if (!activated) {
@@ -831,7 +840,6 @@ class AudioDeviceRouter @Inject constructor(
             type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 19: Строгая проверка физического ID входного порта (actualInputDeviceId)
     fun isInputDeviceMatchingRoute(
         profile: RouteProfile,
         actualInputDeviceId: Int
@@ -905,7 +913,6 @@ class AudioDeviceRouter @Inject constructor(
         }
     }
 
-    // УСТРАНЕНИЕ ДЕФЕКТА 20: Поддержка проводных и USB-C гарнитур при формировании RouteProfile
     @Suppress("DEPRECATION")
     private fun evaluateActiveProfileLocked(): RouteProfile {
         val hasBtPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
