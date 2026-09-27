@@ -122,22 +122,22 @@ class WhiteMinimalistUiStateTest {
     @Test
     fun testRotationalSpringDampedOscillatorSettling() {
         // Уравнение кручения: d^2(theta)/dt^2 + 2*zeta*omega*d(theta)/dt + omega^2*(theta - target) = 0
-        // Для stiffness = 160f, dampingRatio = 0.65f:
+        // Для Compose Spring: stiffness = 160.0, dampingRatio = 0.65
         val stiffness = 160.0
         val dampingRatio = 0.65
-        val omega = sqrt(stiffness) // ~12.65 рад/с
-        val gamma = dampingRatio * omega // ~8.22
-        val omegaDamped = omega * sqrt(1.0 - dampingRatio * dampingRatio) // ~9.61 рад/с
+        val omega = sqrt(stiffness) // ~12.649 рад/с
+        val gamma = dampingRatio * omega // ~8.222
+        val omegaDamped = omega * sqrt(1.0 - dampingRatio * dampingRatio) // ~9.613 рад/с
 
         val targetAngle = 360.0
         var maxOvershoot = 0.0
+        var angleAt700ms = 0.0
+        var finalAngle = 0.0
 
-        // Численное интегрирование с шагом 1 мс на интервале 500 мс
         val dt = 0.001
-        for (step in 0..500) {
+        for (step in 0..1000) {
             val t = step * dt
-            // Аналитическое решение гармонического осциллятора с недодемпфированием:
-            // theta(t) = target - target * exp(-gamma*t) * (cos(omega_d*t) + (gamma/omega_d)*sin(omega_d*t))
+            // Аналитическое решение колебательного контура второго порядка
             val envelope = exp(-gamma * t)
             val oscillation = cos(omegaDamped * t) + (gamma / omegaDamped) * sin(omegaDamped * t)
             val currentAngle = targetAngle - targetAngle * envelope * oscillation
@@ -145,16 +145,33 @@ class WhiteMinimalistUiStateTest {
             if (currentAngle > maxOvershoot) {
                 maxOvershoot = currentAngle
             }
-
-            // На отметке 350 мс угол должен практически совпасть с целевым 360 градусов (погрешность < 1%)
-            if (t >= 0.350) {
-                val error = abs(currentAngle - targetAngle)
-                assertTrue(error < 3.6, "На 350 мс погрешность угла должна быть < 1% ($error градусов)")
+            if (step == 700) {
+                angleAt700ms = currentAngle
+            }
+            if (step == 1000) {
+                finalAngle = currentAngle
             }
         }
 
-        // Проверка наличия легкого благородного перелета (overshoot в пределах 370-380 градусов)
-        assertTrue(maxOvershoot in 370.0..380.0, "Механический овершут шестеренки обязан быть в диапазоне 370-380 градусов (факт: $maxOvershoot)")
+        // 1. Пиковый овершут для zeta=0.65 составляет e^(-pi*0.65/sqrt(1-0.65^2)) ~ 6.81%, то есть ~384.5 градусов
+        assertTrue(
+            maxOvershoot in 382.0..388.0,
+            "Механический овершут шестеренки обязан быть около 384.5 градусов (факт: $maxOvershoot)"
+        )
+
+        // 2. На отметке 700 мс ошибка затухания должна быть < 1% (< 3.6 градусов)
+        val errorAt700ms = abs(angleAt700ms - targetAngle)
+        assertTrue(
+            errorAt700ms < 3.6,
+            "На 700 мс погрешность угла должна быть < 1% (факт: $errorAt700ms градусов)"
+        )
+
+        // 3. К 1000 мс система полностью успокаивается с погрешностью менее 0.5 градуса
+        val finalError = abs(finalAngle - targetAngle)
+        assertTrue(
+            finalError < 0.5,
+            "К 1000 мс система должна затухнуть с точностью до 0.5 градуса (факт: $finalError градусов)"
+        )
     }
 
     // =========================================================================
@@ -238,19 +255,29 @@ class WhiteMinimalistUiStateTest {
         val lumWhite = calculateLuminance(255, 255, 255)
         assertEquals(1.0, lumWhite, 1e-4)
 
-        // Обсидиановый черный шрифт: #09090B
+        // Обсидиановый черный шрифт: #09090B (RGB: 9, 9, 11)
         val lumBlack = calculateLuminance(9, 9, 11)
 
         val contrastBlackOnWhite = calculateContrastRatio(lumWhite, lumBlack)
-        // Контрастность черного текста на белом фоне должна превышать 20:1
-        assertTrue(contrastBlackOnWhite >= 20.0, "Контрастность черного текста на белом листе обязана быть >= 20:1 (факт: $contrastBlackOnWhite)")
+        // Фактический контраст для #09090B на #FFFFFF составляет ~19.9:1, что почти в 3 раза превышает норматив WCAG AAA (7.0:1)
+        assertTrue(
+            contrastBlackOnWhite >= 19.5,
+            "Контрастность черного текста на белом листе обязана быть >= 19.5:1 (факт: $contrastBlackOnWhite)"
+        )
+        assertTrue(
+            contrastBlackOnWhite >= 7.0,
+            "Контрастность обязана с запасом превосходить норматив WCAG AAA (>= 7.0:1)"
+        )
 
-        // Разделительная микрофаска: #E2E8F0
+        // Разделительная микрофаска: #E2E8F0 (RGB: 226, 232, 240)
         val lumHairline = calculateLuminance(226, 232, 240)
         val contrastHairlineOnWhite = calculateContrastRatio(lumWhite, lumHairline)
 
-        // Контрастность однопиксельной рамки должна быть мягкой (в диапазоне 1.15 : 1 .. 1.30 : 1)
-        assertTrue(contrastHairlineOnWhite in 1.15..1.35, "Окантовка обязана быть деликатной и не резать глаз (факт: $contrastHairlineOnWhite)")
+        // Контрастность однопиксельной рамки должна быть мягкой (в диапазоне 1.15 : 1 .. 1.35 : 1)
+        assertTrue(
+            contrastHairlineOnWhite in 1.15..1.35,
+            "Окантовка обязана быть деликатной и не резать глаз (факт: $contrastHairlineOnWhite)"
+        )
     }
 
     // =========================================================================
