@@ -1,16 +1,23 @@
-// >>> FILE: app/src/main/java/com/client/app/ui/screens/SettingsScreen.kt
 package com.client.app.ui.screens
 
+import android.content.Context
 import android.content.Intent
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.Settings
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -22,8 +29,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -33,6 +42,47 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.client.app.viewmodel.SettingsViewModel
+
+// Палитра белого минимализма для экрана настроек
+private val ColorCanvasWhite = Color(0xFFFFFFFF)
+private val ColorCardBackground = Color(0xFFFAFAFA)
+private val ColorFieldBackground = Color(0xFFFFFFFF)
+private val ColorHairline = Color(0xFFE2E8F0)
+private val ColorTextPrimary = Color(0xFF09090B)
+private val ColorTextSecondary = Color(0xFF71717A)
+private val ColorTextMuted = Color(0xFFA1A1AA)
+
+private val ColorControlBlack = Color(0xFF09090B)
+private val ColorControlWhite = Color(0xFFFFFFFF)
+
+/**
+ * Тактильный микроотклик для переключателей и чипов настроек.
+ */
+private fun performSettingsHaptic(context: Context) {
+    runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+            val vibrator = vibratorManager?.defaultVibrator
+            if (vibrator?.hasVibrator() == true) {
+                vibrator.vibrate(
+                    VibrationEffect.startComposition()
+                        .addPrimitive(VibrationEffect.Composition.PRIMITIVE_TICK, 0.60f, 0)
+                        .compose()
+                )
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            if (vibrator?.hasVibrator() == true) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK))
+                } else {
+                    vibrator.vibrate(10L)
+                }
+            }
+        }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,16 +118,29 @@ fun SettingsScreen(
     )
 
     Scaffold(
-        containerColor = Color(0xFF09090B),
+        containerColor = ColorCanvasWhite,
         topBar = {
             TopAppBar(
-                title = { Text("Параметры Gemini 3.8 Live", color = Color(0xFFFAFAFA), fontSize = 18.sp, fontWeight = FontWeight.SemiBold) },
+                title = {
+                    Text(
+                        text = "ПАРАМЕТРЫ GEMINI 3.8 LIVE",
+                        color = ColorTextPrimary,
+                        fontSize = 14.5.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 0.8.sp
+                    )
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Color(0xFFFAFAFA))
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Назад",
+                            tint = ColorTextPrimary
+                        )
                     }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF09090B))
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = ColorCanvasWhite)
             )
         }
     ) { padding ->
@@ -86,30 +149,39 @@ fun SettingsScreen(
                 .fillMaxSize()
                 .padding(padding)
                 .verticalScroll(rememberScrollState())
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
+
+            // Информационный баннер архитектуры белого листа
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color(0xFF1E293B))
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color(0xFFF8FAFC))
+                    .border(1.dp, ColorHairline, RoundedCornerShape(12.dp))
                     .padding(12.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Filled.Info, null, tint = Color(0xFF60A5FA), modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(8.dp))
+                    Icon(
+                        imageVector = Icons.Filled.Info,
+                        contentDescription = null,
+                        tint = ColorTextPrimary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(10.dp))
                     Text(
-                        text = "Изменения параметров сессии применяются при следующем подключении.",
-                        color = Color(0xFFCBD5E1),
+                        text = "Изменения параметров применяются при следующем цикле запуска сессии.",
+                        color = ColorTextSecondary,
                         fontSize = 12.sp,
+                        fontFamily = FontFamily.SansSerif,
                         lineHeight = 16.sp
                     )
                 }
             }
 
-            // 1. API & Model
-            SettingsCard(title = "1. API КЛЮЧ И МОДЕЛЬ") {
+            // 1. API КЛЮЧ И МОДЕЛЬ
+            SettingsCard(title = "1. API КЛЮЧ И МОДЕЛЬ ДУПЛЕКСА") {
                 OutlinedTextField(
                     value = settings.apiKey,
                     onValueChange = viewModel::setApiKey,
@@ -122,17 +194,17 @@ fun SettingsScreen(
                             Icon(
                                 imageVector = if (showGeminiKey) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
                                 contentDescription = null,
-                                tint = Color(0xFFA1A1AA)
+                                tint = ColorTextMuted
                             )
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(10.dp),
-                    colors = darkFieldColors()
+                    colors = whiteFieldColors()
                 )
 
                 Spacer(Modifier.height(10.dp))
-                Text("Live модель:", color = Color(0xFFA1A1AA), fontSize = 12.sp)
+                Text("Голосовая модель Gemini Live:", color = ColorTextSecondary, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace)
                 Spacer(Modifier.height(6.dp))
                 Row(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -141,38 +213,48 @@ fun SettingsScreen(
                     liveModels.forEach { model ->
                         FilterChip(
                             selected = settings.liveModel == model,
-                            onClick = { viewModel.setLiveModel(model) },
-                            label = {
-                                Text(
-                                    model,
-                                    fontSize = 10.sp
-                                )
+                            onClick = {
+                                performSettingsHaptic(context)
+                                viewModel.setLiveModel(model)
                             },
-                            colors = chipColors()
+                            label = { Text(model, fontSize = 11.sp, fontFamily = FontFamily.Monospace) },
+                            colors = whiteChipColors()
                         )
                     }
                 }
-                Spacer(Modifier.height(4.dp))
+
+                Spacer(Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Анализатор (OCR/Vision):", color = Color(0xFFA1A1AA), fontSize = 13.sp)
+                    Text("Vision OCR анализатор:", color = ColorTextSecondary, fontSize = 12.sp)
                     Spacer(Modifier.width(8.dp))
-                    Text(settings.analyzerModel, color = Color(0xFF60A5FA), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        text = settings.analyzerModel,
+                        color = ColorTextPrimary,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold
+                    )
                 }
             }
 
-            // 2. Generation & Media
+            // 2. ПАРАМЕТРЫ ГЕНЕРАЦИИ И МЕДИА
             SettingsCard(title = "2. ПАРАМЕТРЫ ГЕНЕРАЦИИ И МЕДИА") {
-                Text("Температура декодера: ${"%.2f".format(tempDraft)}", color = Color(0xFFE4E4E7), fontSize = 13.sp)
+                Text(
+                    text = "Температура декодера: ${"%.2f".format(tempDraft)}",
+                    color = ColorTextPrimary,
+                    fontSize = 12.5.sp,
+                    fontFamily = FontFamily.Monospace
+                )
                 Slider(
                     value = tempDraft,
                     onValueChange = { tempDraft = it },
                     onValueChangeFinished = { viewModel.setTemperature(tempDraft) },
                     valueRange = 0.0f..1.5f,
-                    colors = sliderColors()
+                    colors = whiteSliderColors()
                 )
 
-                Spacer(Modifier.height(8.dp))
-                Text("Разрешение медиа / видео (mediaResolution):", color = Color(0xFFA1A1AA), fontSize = 12.sp)
+                Spacer(Modifier.height(6.dp))
+                Text("Разрешение медиа (mediaResolution):", color = ColorTextSecondary, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace)
                 Spacer(Modifier.height(6.dp))
                 Row(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -181,17 +263,20 @@ fun SettingsScreen(
                     resolutions.forEach { res ->
                         FilterChip(
                             selected = settings.mediaResolution == res,
-                            onClick = { viewModel.setMediaResolution(res) },
+                            onClick = {
+                                performSettingsHaptic(context)
+                                viewModel.setMediaResolution(res)
+                            },
                             label = { Text(res.removePrefix("MEDIA_RESOLUTION_"), fontSize = 11.sp) },
-                            colors = chipColors()
+                            colors = whiteChipColors()
                         )
                     }
                 }
             }
 
-            // 3. Voice & Speech
+            // 3. ГОЛОС И ЯЗЫК СИНТЕЗА
             SettingsCard(title = "3. ГОЛОС И ЯЗЫК СИНТЕЗА") {
-                Text("Голос модели (voiceName):", color = Color(0xFFA1A1AA), fontSize = 12.sp)
+                Text("Голос ассистента (voiceName):", color = ColorTextSecondary, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace)
                 Spacer(Modifier.height(6.dp))
                 Row(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -200,9 +285,12 @@ fun SettingsScreen(
                     coreVoices.forEach { v ->
                         FilterChip(
                             selected = settings.voice == v,
-                            onClick = { viewModel.setVoice(v) },
-                            label = { Text(v, fontSize = 12.sp) },
-                            colors = chipColors()
+                            onClick = {
+                                performSettingsHaptic(context)
+                                viewModel.setVoice(v)
+                            },
+                            label = { Text(v, fontSize = 11.5.sp) },
+                            colors = whiteChipColors()
                         )
                     }
                 }
@@ -211,36 +299,46 @@ fun SettingsScreen(
                 OutlinedTextField(
                     value = settings.speechLanguage,
                     onValueChange = viewModel::setSpeechLanguage,
-                    label = { Text("BCP-47 язык синтеза (например: ru-RU, en-US, de-DE; пусто = автоопределение)") },
+                    label = { Text("Языковой код BCP-47 (например: ru-RU, en-US, de-DE)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(10.dp),
-                    colors = darkFieldColors()
+                    colors = whiteFieldColors()
                 )
             }
 
-            // 4. Input Audio Transcription
+            // 4. ТРАНСКРИПЦИЯ ВХОДА (INPUT ASR)
             ExpandableSettingsCard(title = "4. ТРАНСКРИПЦИЯ ВХОДА (INPUT ASR)") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text("Включить распознавание речи пользователя", color = Color(0xFFFAFAFA), fontSize = 13.sp)
-                    Switch(checked = settings.inputTxEnabled, onCheckedChange = viewModel::setInputTxEnabled)
+                    Text("Распознавание речи пользователя", color = ColorTextPrimary, fontSize = 13.sp)
+                    Switch(
+                        checked = settings.inputTxEnabled,
+                        onCheckedChange = {
+                            performSettingsHaptic(context)
+                            viewModel.setInputTxEnabled(it)
+                        },
+                        colors = whiteSwitchColors()
+                    )
                 }
 
                 if (settings.inputTxEnabled) {
                     Spacer(Modifier.height(10.dp))
-                    Text("Режим распознавания (mode):", color = Color(0xFFA1A1AA), fontSize = 12.sp)
+                    Text("Режим распознавания:", color = ColorTextSecondary, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace)
                     Spacer(Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         txModes.forEach { mode ->
                             FilterChip(
                                 selected = settings.inputTxMode == mode,
-                                onClick = { viewModel.setInputTxMode(mode) },
+                                onClick = {
+                                    performSettingsHaptic(context)
+                                    viewModel.setInputTxMode(mode)
+                                },
                                 label = { Text(mode, fontSize = 11.sp) },
-                                colors = chipColors()
+                                colors = whiteChipColors()
                             )
                         }
                     }
@@ -249,47 +347,57 @@ fun SettingsScreen(
                     OutlinedTextField(
                         value = settings.inputTxLanguages,
                         onValueChange = viewModel::setInputTxLanguages,
-                        label = { Text("BCP-47 языки через запятую (например: ru-RU, en-US)") },
+                        label = { Text("BCP-47 коды языков через запятую") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(10.dp),
-                        colors = darkFieldColors()
+                        colors = whiteFieldColors()
                     )
 
                     Spacer(Modifier.height(10.dp))
                     OutlinedTextField(
                         value = settings.inputTxVocab,
                         onValueChange = viewModel::setInputTxVocab,
-                        label = { Text("Кастомный словарь терминов (до 1000 слов через запятую)") },
+                        label = { Text("Кастомный словарь терминов (до 1000 слов)") },
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(10.dp),
-                        colors = darkFieldColors()
+                        colors = whiteFieldColors()
                     )
                 }
             }
 
-            // 5. Output Audio Transcription
+            // 5. ТРАНСКРИПЦИЯ ВЫВОДА (OUTPUT ASR)
             ExpandableSettingsCard(title = "5. ТРАНСКРИПЦИЯ ВЫВОДА (OUTPUT ASR)") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text("Генерировать текст речи модели", color = Color(0xFFFAFAFA), fontSize = 13.sp)
-                    Switch(checked = settings.outputTxEnabled, onCheckedChange = viewModel::setOutputTxEnabled)
+                    Text("Генерация субтитров речи модели", color = ColorTextPrimary, fontSize = 13.sp)
+                    Switch(
+                        checked = settings.outputTxEnabled,
+                        onCheckedChange = {
+                            performSettingsHaptic(context)
+                            viewModel.setOutputTxEnabled(it)
+                        },
+                        colors = whiteSwitchColors()
+                    )
                 }
 
                 if (settings.outputTxEnabled) {
                     Spacer(Modifier.height(10.dp))
-                    Text("Режим вывода (mode):", color = Color(0xFFA1A1AA), fontSize = 12.sp)
+                    Text("Режим вывода:", color = ColorTextSecondary, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace)
                     Spacer(Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         txModes.forEach { mode ->
                             FilterChip(
                                 selected = settings.outputTxMode == mode,
-                                onClick = { viewModel.setOutputTxMode(mode) },
+                                onClick = {
+                                    performSettingsHaptic(context)
+                                    viewModel.setOutputTxMode(mode)
+                                },
                                 label = { Text(mode, fontSize = 11.sp) },
-                                colors = chipColors()
+                                colors = whiteChipColors()
                             )
                         }
                     }
@@ -298,26 +406,26 @@ fun SettingsScreen(
                     OutlinedTextField(
                         value = settings.outputTxLanguages,
                         onValueChange = viewModel::setOutputTxLanguages,
-                        label = { Text("BCP-47 языки через запятую (пусто = авто)") },
+                        label = { Text("BCP-47 языки субтитров (пусто = авто)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(10.dp),
-                        colors = darkFieldColors()
+                        colors = whiteFieldColors()
                     )
 
                     Spacer(Modifier.height(10.dp))
                     OutlinedTextField(
                         value = settings.outputTxVocab,
                         onValueChange = viewModel::setOutputTxVocab,
-                        label = { Text("Кастомный словарь вывода (до 1000 слов через запятую)") },
+                        label = { Text("Кастомный словарь вывода через запятую") },
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(10.dp),
-                        colors = darkFieldColors()
+                        colors = whiteFieldColors()
                     )
                 }
             }
 
-            // 6. Realtime Input / VAD / Turn Detection
+            // 6. ДЕТЕКЦИЯ РЕЧИ (СЕРВЕРНЫЙ VAD / AAD)
             ExpandableSettingsCard(title = "6. ДЕТЕКЦИЯ РЕЧИ (СЕРВЕРНЫЙ VAD / AAD)") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -325,91 +433,93 @@ fun SettingsScreen(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("Автоматическая детекция речи (AAD)", color = Color(0xFFFAFAFA), fontSize = 13.sp)
-                        Text("При выключении используется ручной режим activityStart/End", color = Color(0xFF71717A), fontSize = 11.sp)
+                        Text("Автоматическая детекция речи (AAD)", color = ColorTextPrimary, fontSize = 13.sp)
+                        Text("При отключении используется ручной режим активности", color = ColorTextMuted, fontSize = 11.sp)
                     }
-                    Switch(checked = settings.aadEnabled, onCheckedChange = viewModel::setAadEnabled)
+                    Switch(
+                        checked = settings.aadEnabled,
+                        onCheckedChange = {
+                            performSettingsHaptic(context)
+                            viewModel.setAadEnabled(it)
+                        },
+                        colors = whiteSwitchColors()
+                    )
                 }
 
                 if (settings.aadEnabled) {
                     Spacer(Modifier.height(12.dp))
-                    Text("Чувствительность старта речи (startOfSpeechSensitivity):", color = Color(0xFFA1A1AA), fontSize = 12.sp)
+                    Text("Чувствительность начала речи:", color = ColorTextSecondary, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace)
                     Spacer(Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         sensitivities.forEach { s ->
                             FilterChip(
                                 selected = settings.aadStartSensitivity == s,
-                                onClick = { viewModel.setAadStartSensitivity(s) },
+                                onClick = {
+                                    performSettingsHaptic(context)
+                                    viewModel.setAadStartSensitivity(s)
+                                },
                                 label = { Text(s.removePrefix("START_SENSITIVITY_"), fontSize = 11.sp) },
-                                colors = chipColors()
+                                colors = whiteChipColors()
                             )
                         }
                     }
 
                     Spacer(Modifier.height(10.dp))
-                    Text("Чувствительность конца речи (endOfSpeechSensitivity):", color = Color(0xFFA1A1AA), fontSize = 12.sp)
+                    Text("Чувствительность окончания речи:", color = ColorTextSecondary, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace)
                     Spacer(Modifier.height(6.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         endSensitivities.forEach { s ->
                             FilterChip(
                                 selected = settings.aadEndSensitivity == s,
-                                onClick = { viewModel.setAadEndSensitivity(s) },
+                                onClick = {
+                                    performSettingsHaptic(context)
+                                    viewModel.setAadEndSensitivity(s)
+                                },
                                 label = { Text(s.removePrefix("END_SENSITIVITY_"), fontSize = 11.sp) },
-                                colors = chipColors()
+                                colors = whiteChipColors()
                             )
                         }
                     }
 
-                    Spacer(Modifier.height(14.dp))
-                    Text("Префиксный буфер тишины: ${prefixPaddingDraft} мс", color = Color(0xFFE4E4E7), fontSize = 13.sp)
+                    Spacer(Modifier.height(12.dp))
+                    Text("Префиксный буфер тишины: ${prefixPaddingDraft} мс", color = ColorTextPrimary, fontSize = 12.5.sp, fontFamily = FontFamily.Monospace)
                     Slider(
                         value = prefixPaddingDraft.toFloat(),
                         onValueChange = { prefixPaddingDraft = it.toInt() },
                         onValueChangeFinished = { viewModel.setPrefixPaddingMs(prefixPaddingDraft) },
                         valueRange = 0f..300f,
-                        colors = sliderColors()
+                        colors = whiteSliderColors()
                     )
 
-                    Text("Тишина для закрытия хода: ${silenceDurationDraft} мс", color = Color(0xFFE4E4E7), fontSize = 13.sp)
+                    Text("Тишина для закрытия хода: ${silenceDurationDraft} мс", color = ColorTextPrimary, fontSize = 12.5.sp, fontFamily = FontFamily.Monospace)
                     Slider(
                         value = silenceDurationDraft.toFloat(),
                         onValueChange = { silenceDurationDraft = it.toInt() },
                         onValueChangeFinished = { viewModel.setSilenceDurationMs(silenceDurationDraft) },
                         valueRange = 200f..1500f,
-                        colors = sliderColors()
+                        colors = whiteSliderColors()
                     )
                 }
 
-                Spacer(Modifier.height(10.dp))
-                Text("Политика перебивания (activityHandling):", color = Color(0xFFA1A1AA), fontSize = 12.sp)
+                Spacer(Modifier.height(8.dp))
+                Text("Политика перебивания (activityHandling):", color = ColorTextSecondary, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace)
                 Spacer(Modifier.height(6.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     activityHandlings.forEach { h ->
                         FilterChip(
                             selected = settings.activityHandling == h,
-                            onClick = { viewModel.setActivityHandling(h) },
+                            onClick = {
+                                performSettingsHaptic(context)
+                                viewModel.setActivityHandling(h)
+                            },
                             label = { Text(if (h.contains("INTERRUPTS")) "Перебивать" else "Без прерывания", fontSize = 11.sp) },
-                            colors = chipColors()
-                        )
-                    }
-                }
-
-                Spacer(Modifier.height(10.dp))
-                Text("Покрытие данных в ходе (turnCoverage):", color = Color(0xFFA1A1AA), fontSize = 12.sp)
-                Spacer(Modifier.height(6.dp))
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    turnCoverages.forEach { tc ->
-                        FilterChip(
-                            selected = settings.turnCoverage == tc,
-                            onClick = { viewModel.setTurnCoverage(tc) },
-                            label = { Text(tc, fontSize = 10.sp) },
-                            colors = chipColors()
+                            colors = whiteChipColors()
                         )
                     }
                 }
             }
 
-            // 7. Context & Resumption
+            // 7. УПРАВЛЕНИЕ КОНТЕКСТОМ И СЕССИЕЙ
             ExpandableSettingsCard(title = "7. УПРАВЛЕНИЕ КОНТЕКСТОМ И СЕССИЕЙ") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -417,10 +527,17 @@ fun SettingsScreen(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("Сжатие контекста (slidingWindow)", color = Color(0xFFFAFAFA), fontSize = 13.sp)
-                        Text("0/0 = серверные пороги; trigger > target > 0 для кастомных", color = Color(0xFF71717A), fontSize = 11.sp)
+                        Text("Сжатие контекста (slidingWindow)", color = ColorTextPrimary, fontSize = 13.sp)
+                        Text("Автоматическое скольжение окна токенов", color = ColorTextMuted, fontSize = 11.sp)
                     }
-                    Switch(checked = settings.compressionEnabled, onCheckedChange = viewModel::setCompressionEnabled)
+                    Switch(
+                        checked = settings.compressionEnabled,
+                        onCheckedChange = {
+                            performSettingsHaptic(context)
+                            viewModel.setCompressionEnabled(it)
+                        },
+                        colors = whiteSwitchColors()
+                    )
                 }
 
                 Spacer(Modifier.height(12.dp))
@@ -430,24 +547,31 @@ fun SettingsScreen(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("Восстановление сессии (sessionResumption)", color = Color(0xFFFAFAFA), fontSize = 13.sp)
-                        Text("Бесшовный реконнект по токену handle при сбоях сети", color = Color(0xFF71717A), fontSize = 11.sp)
+                        Text("Восстановление сессии (sessionResumption)", color = ColorTextPrimary, fontSize = 13.sp)
+                        Text("Бесшовный реконнект по токену handle при сбоях сети", color = ColorTextMuted, fontSize = 11.sp)
                     }
-                    Switch(checked = settings.sessionResumptionEnabled, onCheckedChange = viewModel::setSessionResumptionEnabled)
+                    Switch(
+                        checked = settings.sessionResumptionEnabled,
+                        onCheckedChange = {
+                            performSettingsHaptic(context)
+                            viewModel.setSessionResumptionEnabled(it)
+                        },
+                        colors = whiteSwitchColors()
+                    )
                 }
 
-                Spacer(Modifier.height(14.dp))
-                Text("Загружаемая начальная история: ${historyTurnsDraft} ходов", color = Color(0xFFE4E4E7), fontSize = 13.sp)
+                Spacer(Modifier.height(12.dp))
+                Text("Загружаемая история диалога: ${historyTurnsDraft} ходов", color = ColorTextPrimary, fontSize = 12.5.sp, fontFamily = FontFamily.Monospace)
                 Slider(
                     value = historyTurnsDraft.toFloat(),
                     onValueChange = { historyTurnsDraft = it.toInt() },
                     onValueChangeFinished = { viewModel.setInitialHistoryTurns(historyTurnsDraft) },
                     valueRange = 5f..50f,
-                    colors = sliderColors()
+                    colors = whiteSliderColors()
                 )
             }
 
-            // 8. Tools & Grounding
+            // 8. ИНСТРУМЕНТЫ (TOOLS & GROUNDING)
             SettingsCard(title = "8. ИНСТРУМЕНТЫ (TOOLS & GROUNDING)") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -455,10 +579,17 @@ fun SettingsScreen(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("Google Search Grounding", color = Color(0xFFFAFAFA), fontSize = 13.sp)
-                        Text("Поиск актуальной информации в интернете во время речи", color = Color(0xFF71717A), fontSize = 11.sp)
+                        Text("Google Search Grounding", color = ColorTextPrimary, fontSize = 13.sp)
+                        Text("Поиск актуальных фактов в веб-сети в реальном времени", color = ColorTextMuted, fontSize = 11.sp)
                     }
-                    Switch(checked = settings.enableGoogleSearch, onCheckedChange = viewModel::setEnableGoogleSearch)
+                    Switch(
+                        checked = settings.enableGoogleSearch,
+                        onCheckedChange = {
+                            performSettingsHaptic(context)
+                            viewModel.setEnableGoogleSearch(it)
+                        },
+                        colors = whiteSwitchColors()
+                    )
                 }
 
                 Spacer(Modifier.height(12.dp))
@@ -468,10 +599,17 @@ fun SettingsScreen(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("Интеграция с Forvo (Произношение)", color = Color(0xFFFAFAFA), fontSize = 13.sp)
-                        Text("Асинхронный инструмент (NON_BLOCKING + WHEN_IDLE)", color = Color(0xFF71717A), fontSize = 11.sp)
+                        Text("Интеграция с Forvo (Произношение)", color = ColorTextPrimary, fontSize = 13.sp)
+                        Text("Асинхронный инструмент произношения носителей", color = ColorTextMuted, fontSize = 11.sp)
                     }
-                    Switch(checked = settings.enableForvo, onCheckedChange = viewModel::setEnableForvo)
+                    Switch(
+                        checked = settings.enableForvo,
+                        onCheckedChange = {
+                            performSettingsHaptic(context)
+                            viewModel.setEnableForvo(it)
+                        },
+                        colors = whiteSwitchColors()
+                    )
                 }
 
                 if (settings.enableForvo) {
@@ -488,139 +626,174 @@ fun SettingsScreen(
                                 Icon(
                                     imageVector = if (showForvoKey) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
                                     contentDescription = null,
-                                    tint = Color(0xFFA1A1AA)
+                                    tint = ColorTextMuted
                                 )
                             }
                         },
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(10.dp),
-                        colors = darkFieldColors()
+                        colors = whiteFieldColors()
                     )
                 }
             }
 
-            // 9. Hardware Audio
-            SettingsCard(title = "9. АППАРАТНЫЙ ТРАКТ GALAXY S23 ULTRA") {
-                Text("Громкость ЦАП WCD9385: ${(volumeDraft * 100).toInt()}%", color = Color(0xFFE4E4E7), fontSize = 13.sp)
+            // 9. АППАРАТНЫЙ ТРАКТ GALAXY S23 ULTRA
+            SettingsCard(title = "9. АППАРАТНЫЙ АУДИОТРАКТ S23 ULTRA") {
+                Text(
+                    text = "Громкость ЦАП Qualcomm WCD9385: ${(volumeDraft * 100).toInt()}%",
+                    color = ColorTextPrimary,
+                    fontSize = 12.5.sp,
+                    fontFamily = FontFamily.Monospace
+                )
                 Slider(
                     value = volumeDraft,
                     onValueChange = { volumeDraft = it },
                     onValueChangeFinished = { viewModel.setVolume(volumeDraft) },
                     valueRange = 0.3f..1.0f,
-                    colors = sliderColors()
+                    colors = whiteSliderColors()
                 )
 
-                Spacer(Modifier.height(8.dp))
-                Text("Чувствительность АЦП микрофона: ${(micGainDraft * 100).toInt()}%", color = Color(0xFFE4E4E7), fontSize = 13.sp)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "Чувствительность АЦП микрофона: ${(micGainDraft * 100).toInt()}%",
+                    color = ColorTextPrimary,
+                    fontSize = 12.5.sp,
+                    fontFamily = FontFamily.Monospace
+                )
                 Slider(
                     value = micGainDraft,
                     onValueChange = { micGainDraft = it },
                     onValueChangeFinished = { viewModel.setMicGain(micGainDraft) },
                     valueRange = 0.5f..2.0f,
-                    colors = sliderColors()
+                    colors = whiteSliderColors()
                 )
             }
 
-            // 10. System Prompt
-            SettingsCard(title = "10. СИСТЕМНАЯ ИНСТРУКЦИЯ РОЛИ") {
-                OutlinedTextField(
-                    value = settings.systemPrompt,
-                    onValueChange = viewModel::setSystemPrompt,
-                    label = { Text("Системный промпт (setup.systemInstruction)") },
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp, max = 220.dp),
-                    maxLines = 8,
-                    shape = RoundedCornerShape(10.dp),
-                    colors = darkFieldColors()
-                )
-            }
-
-            // 11. System Information
-            SettingsCard(title = "11. СИСТЕМНАЯ ИНФОРМАЦИЯ") {
+            // 10. СИСТЕМНАЯ ИНФОРМАЦИЯ И БАТАРЕЯ
+            SettingsCard(title = "10. СИСТЕМНЫЙ СТАТУС И ЭНЕРГОПОТРЕБЛЕНИЕ") {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Filled.Bolt, null, tint = Color(0xFF34D399), modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Proactive Audio: Всегда активно (Gemini 3.8 Live)", color = Color(0xFFE4E4E7), fontSize = 12.sp)
+                    Icon(Icons.Filled.Bolt, null, tint = Color(0xFF10B981), modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Proactive Audio Engine: AAudio MMAP / Shared", color = ColorTextPrimary, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
                 }
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(6.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Filled.Psychology, null, tint = Color(0xFF60A5FA), modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Рассуждения: Interleaved Reasoning (Нативно)", color = Color(0xFFE4E4E7), fontSize = 12.sp)
+                    Icon(Icons.Filled.Psychology, null, tint = ColorTextPrimary, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Interleaved Reasoning: Включено нативно", color = ColorTextPrimary, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
                 }
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(10.dp))
                 Text(
-                    text = "Аппаратный дуплекс защищен системной MediaSessionCompat (STATE_PLAYING), Partial WakeLock и Low Latency WiFi Lock. Для предотвращения засыпания микрофона отключите оптимизацию батареи.",
-                    color = Color(0xFFA1A1AA),
-                    fontSize = 11.sp,
+                    text = "Для предотвращения засыпания микрофона при отключенном экране выберите режим работы батареи «Без ограничений».",
+                    color = ColorTextSecondary,
+                    fontSize = 11.5.sp,
                     lineHeight = 15.sp
                 )
-                Spacer(Modifier.height(10.dp))
+                Spacer(Modifier.height(12.dp))
                 OutlinedButton(
                     onClick = {
+                        performSettingsHaptic(context)
                         runCatching {
                             context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
                         }.onFailure {
-                            Toast.makeText(context, "Откройте Настройки -> Приложения -> Батарея -> Без ограничений", Toast.LENGTH_LONG).show()
+                            Toast.makeText(context, "Настройки -> Приложения -> Батарея -> Без ограничений", Toast.LENGTH_LONG).show()
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF60A5FA))
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = ColorTextPrimary),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, ColorHairline)
                 ) {
                     Icon(Icons.Filled.BatteryChargingFull, null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("Настройки батареи устройства", fontSize = 13.sp)
+                    Text(
+                        text = "Оптимизация питания One UI",
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.SemiBold
+                    )
                 }
             }
         }
     }
 }
 
+/**
+ * Базовая белая карточка настроек в немецком функциональном стиле.
+ */
 @Composable
 private fun SettingsCard(title: String, content: @Composable ColumnScope.() -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .shadow(2.dp, RoundedCornerShape(14.dp), ambientColor = Color(0x0A000000), spotColor = Color(0x10000000))
             .clip(RoundedCornerShape(14.dp))
-            .background(Color(0xFF141416))
-            .border(0.5.dp, Color(0xFF27272A), RoundedCornerShape(14.dp))
+            .background(ColorCardBackground)
+            .border(1.dp, ColorHairline, RoundedCornerShape(14.dp))
             .padding(16.dp)
     ) {
-        Text(title, color = Color(0xFF71717A), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(10.dp))
+        Text(
+            text = title,
+            color = ColorTextSecondary,
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 0.8.sp
+        )
+        Spacer(Modifier.height(12.dp))
         content()
     }
 }
 
+/**
+ * Раскрывающаяся белая карточка настроек с плавной стрелкой-индикатором.
+ */
 @Composable
 private fun ExpandableSettingsCard(title: String, content: @Composable ColumnScope.() -> Unit) {
     var expanded by remember { mutableStateOf(false) }
+    val context = LocalContext.current
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .shadow(2.dp, RoundedCornerShape(14.dp), ambientColor = Color(0x0A000000), spotColor = Color(0x10000000))
             .clip(RoundedCornerShape(14.dp))
-            .background(Color(0xFF141416))
-            .border(0.5.dp, Color(0xFF27272A), RoundedCornerShape(14.dp))
+            .background(ColorCardBackground)
+            .border(1.dp, ColorHairline, RoundedCornerShape(14.dp))
             .padding(16.dp)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable { expanded = !expanded },
+                .clickable {
+                    performSettingsHaptic(context)
+                    expanded = !expanded
+                },
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(title, color = Color(0xFF71717A), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            Text(
+                text = title,
+                color = ColorTextSecondary,
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.8.sp
+            )
             Icon(
                 imageVector = if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
                 contentDescription = null,
-                tint = Color(0xFFA1A1AA)
+                tint = ColorTextPrimary,
+                modifier = Modifier.size(18.dp)
             )
         }
-        AnimatedVisibility(visible = expanded) {
+        AnimatedVisibility(
+            visible = expanded,
+            enter = androidx.compose.animation.expandVertically(animationSpec = tween(250, easing = FastOutSlowInEasing)),
+            exit = androidx.compose.animation.shrinkVertically(animationSpec = tween(200))
+        ) {
             Column {
-                Spacer(Modifier.height(10.dp))
+                Spacer(Modifier.height(14.dp))
                 content()
             }
         }
@@ -628,28 +801,38 @@ private fun ExpandableSettingsCard(title: String, content: @Composable ColumnSco
 }
 
 @Composable
-private fun darkFieldColors() = OutlinedTextFieldDefaults.colors(
-    focusedBorderColor = Color(0xFF60A5FA),
-    unfocusedBorderColor = Color(0xFF27272A),
-    focusedContainerColor = Color(0xFF09090B),
-    unfocusedContainerColor = Color(0xFF09090B),
-    focusedTextColor = Color(0xFFFAFAFA),
-    unfocusedTextColor = Color(0xFFFAFAFA),
-    focusedLabelColor = Color(0xFF60A5FA),
-    unfocusedLabelColor = Color(0xFF71717A)
+private fun whiteFieldColors() = OutlinedTextFieldDefaults.colors(
+    focusedBorderColor = ColorControlBlack,
+    unfocusedBorderColor = ColorHairline,
+    focusedContainerColor = ColorFieldBackground,
+    unfocusedContainerColor = ColorFieldBackground,
+    focusedTextColor = ColorTextPrimary,
+    unfocusedTextColor = ColorTextPrimary,
+    focusedLabelColor = ColorControlBlack,
+    unfocusedLabelColor = ColorTextSecondary,
+    cursorColor = ColorControlBlack
 )
 
 @Composable
-private fun sliderColors() = SliderDefaults.colors(
-    thumbColor = Color(0xFF60A5FA),
-    activeTrackColor = Color(0xFF3B82F6),
-    inactiveTrackColor = Color(0xFF27272A)
+private fun whiteSliderColors() = SliderDefaults.colors(
+    thumbColor = ColorControlBlack,
+    activeTrackColor = ColorControlBlack,
+    inactiveTrackColor = ColorHairline
 )
 
 @Composable
-private fun chipColors() = FilterChipDefaults.filterChipColors(
-    selectedContainerColor = Color(0xFF064E3B),
-    selectedLabelColor = Color(0xFF6EE7B7),
-    containerColor = Color(0xFF18181B),
-    labelColor = Color(0xFFA1A1AA)
+private fun whiteChipColors() = FilterChipDefaults.filterChipColors(
+    selectedContainerColor = ColorControlBlack,
+    selectedLabelColor = ColorControlWhite,
+    containerColor = ColorFieldBackground,
+    labelColor = ColorTextSecondary
+)
+
+@Composable
+private fun whiteSwitchColors() = SwitchDefaults.colors(
+    checkedThumbColor = ColorControlWhite,
+    checkedTrackColor = ColorControlBlack,
+    uncheckedThumbColor = ColorControlWhite,
+    uncheckedTrackColor = ColorHairline,
+    uncheckedBorderColor = ColorHairline
 )
