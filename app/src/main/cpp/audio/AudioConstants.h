@@ -34,18 +34,18 @@ constexpr size_t BYTES_PER_SAMPLE = sizeof(int16_t);
 // Квант DSP воспроизведения: 10 мс (240 сэмплов @ 24 кГц)
 constexpr size_t PLAYBACK_DSP_INPUT_CHUNK_FRAMES = BURST_10MS_24K;
 
-// Емкость кольцевых буферов
-constexpr size_t RING_BUFFER_CAPACITY_CAPTURE = 4096; // ~256 мс @ 16 кГц (8 КиБ)
-constexpr size_t RING_BUFFER_CAPACITY_PLAYBACK = 8192; // ~341 мс @ 24 кГц (16 КиБ)
+// Емкость кольцевых буферов (строго степень двойки для SPSC битовой маски без деления)
+constexpr size_t RING_BUFFER_CAPACITY_CAPTURE = 16384;  // ~1024 мс @ 16 кГц (32 КиБ)
+constexpr size_t RING_BUFFER_CAPACITY_PLAYBACK = 65536; // ~2730 мс @ 24 кГц (131 КиБ)
 
-// УСТРАНЕНИЕ ДЕФЕКТА 12: Адаптивный сетевой горизонт воспроизведения по ITU-T G.114 и RFC 3550
-// Базовый порог увеличен с 25 мс до 45 мс для поглощения радиоджиттера eSCO/BLE BAP (20–45 мс)
-constexpr size_t PLAYBACK_TARGET_BUFFER_MS = 45;
-constexpr size_t PLAYBACK_TARGET_BUFFER_BT_MIN_MS = 45;      // 45 мс адаптивный минимум для гарнитур
-constexpr size_t PLAYBACK_TARGET_BUFFER_BT_MAX_MS = 90;      // 90 мс адаптивный максимум для гарнитур
-constexpr size_t PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS = 30; // 30 мс для встроенного динамика S23 Ultra
-constexpr size_t PLAYBACK_TARGET_BUFFER_SPEAKER_MAX_MS = 50; // 50 мс для встроенного динамика S23 Ultra
-constexpr size_t PLAYBACK_MAX_QUEUE_HORIZON_MS = 150;        // Защитный предел против bufferbloat
+// Адаптивный сетевой горизонт воспроизведения по ITU-T G.114 и RFC 3550
+// Базовый порог оптимизирован под поглощение радиовсплесков LTE/5G и eSCO/BLE BAP
+constexpr size_t PLAYBACK_TARGET_BUFFER_MS = 60;
+constexpr size_t PLAYBACK_TARGET_BUFFER_BT_MIN_MS = 50;      // 50 мс адаптивный минимум для гарнитур
+constexpr size_t PLAYBACK_TARGET_BUFFER_BT_MAX_MS = 120;     // 120 мс адаптивный максимум для гарнитур
+constexpr size_t PLAYBACK_TARGET_BUFFER_SPEAKER_MIN_MS = 40; // 40 мс для встроенного динамика S23 Ultra
+constexpr size_t PLAYBACK_TARGET_BUFFER_SPEAKER_MAX_MS = 80; // 80 мс для встроенного динамика S23 Ultra
+constexpr size_t PLAYBACK_MAX_QUEUE_HORIZON_MS = 500;        // Защитный предел против bufferbloat
 
 // Множитель бёрстов AAudio для минимизации джиттера
 constexpr size_t PLAYBACK_BURST_MIN_MULTIPLIER = 2;
