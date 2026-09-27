@@ -85,8 +85,8 @@ data class BargeInDecision(
 )
 
 class AcousticEchoBargeInProcessor(
-    private val debounceMs: Long = 400L,
-    private val playbackGracePeriodMs: Long = 250L
+    private val debounceMs: Long = 450L,
+    private val playbackGracePeriodMs: Long = 450L
 ) {
     @Volatile var outputEnergyHangover: Float = 0f
         private set
@@ -102,6 +102,9 @@ class AcousticEchoBargeInProcessor(
 
     fun onPlaybackStarted(nowMs: Long) {
         lastPlaybackStartMs = nowMs
+        // Превентивный импульс огибающей гарантирует, что isAiRendering включится
+        // до того, как первая волна физически покинет диффузор динамика
+        outputEnergyHangover = maxOf(outputEnergyHangover, 0.08f)
     }
 
     fun onBargeInTriggered(nowMs: Long) {
@@ -128,14 +131,15 @@ class AcousticEchoBargeInProcessor(
         pendingDurationMs: Float,
         nowMs: Long
     ) {
-        if (instantaneousOut > 0.02f && outputEnergyHangover <= 0.005f) {
+        if (instantaneousOut > 0.02f) {
             lastPlaybackStartMs = nowMs
         }
 
-        outputEnergyHangover = if (!isPlaying || (pendingDurationMs <= 0.5f && instantaneousOut <= 0.001f)) {
+        outputEnergyHangover = if (!isPlaying || (pendingDurationMs <= 1.0f && instantaneousOut <= 0.002f)) {
             0f
         } else {
-            maxOf(instantaneousOut, outputEnergyHangover * 0.96f)
+            // Гласс-фильтр спада с коэффициентом 0.94 (~60 мс время полураспада)
+            maxOf(instantaneousOut, outputEnergyHangover * 0.94f)
         }
     }
 
@@ -145,6 +149,7 @@ class AcousticEchoBargeInProcessor(
         isPlaying: Boolean,
         isBargeInActive: Boolean,
         isVocalized: Boolean,
+        vadProbability: Float,
         pendingDurationMs: Float,
         quirks: DeviceQuirks,
         isBluetooth: Boolean,
@@ -154,8 +159,8 @@ class AcousticEchoBargeInProcessor(
     ): BargeInDecision {
         updateHangover(instantaneousOut, isPlaying, pendingDurationMs, nowMs)
 
-        // Инвариант: воспроизведение активно, если в тракте есть звук (> 15 мс)
-        val isAiRendering = isPlaying && (outputEnergyHangover > 0.015f || pendingDurationMs > 15.0f)
+        // Инвариант: воспроизведение активно, если в тракте есть звук (> 5 мс) или огибающая ЦАП ненулевая
+        val isAiRendering = isPlaying && (outputEnergyHangover > 0.008f || pendingDurationMs > 5.0f)
 
         if (!isAiRendering) {
             bargeInCandidateStreak = 0
@@ -167,33 +172,48 @@ class AcousticEchoBargeInProcessor(
             )
         }
 
-        // В наушниках нет акустической связи с динамиком телефона
+        // В наушниках нет акустической связи диффузора с микрофоном телефона
         val canBargeInTimers = if (isBluetooth) {
-            (nowMs - lastPlaybackStartMs > 40L) && (nowMs - lastBargeInMs > 150L)
+            (nowMs - lastPlaybackStartMs > 60L) && (nowMs - lastBargeInMs > 200L)
         } else {
+            // Для встроенного динамика выдерживаем время сходимости адаптивного фильтра Qualcomm AEC (450 мс)
             (nowMs - lastPlaybackStartMs > playbackGracePeriodMs) && (nowMs - lastBargeInMs > debounceMs)
         }
 
-        val dynamicErleRatio = quirks.acousticErleRatio + (0.25f * playbackVolume)
-        val nonLinearOffset = if (outputEnergyHangover > 0.35f) {
-            (outputEnergyHangover - 0.35f) * 0.50f
+        // При включенном аппаратном AEC в SHARED режиме остаточная утечка составляет 15-25%
+        val dynamicErleRatio = if (isBluetooth) {
+            0.05f
+        } else {
+            0.18f + (0.12f * playbackVolume)
+        }
+
+        val nonLinearOffset = if (outputEnergyHangover > 0.30f) {
+            (outputEnergyHangover - 0.30f) * 0.25f
         } else {
             0.0f
         }
 
+        // Адаптивный порог отсечения остаточного эха
         val echoThreshold = maxOf(
-            ambientNoiseFloor * 2.5f,
+            ambientNoiseFloor * 2.8f,
             maxOf(quirks.echoThreshold, (outputEnergyHangover * dynamicErleRatio) + nonLinearOffset)
         )
-        val effectiveThreshold = if (isBluetooth) quirks.echoThreshold else echoThreshold
+        val effectiveThreshold = if (isBluetooth) quirks.echoThreshold else maxOf(0.045f, echoThreshold)
 
-        if (instantaneousMic > effectiveThreshold) {
+        // Для подтверждения перебивания требуется, чтобы сигнал микрофона уверенно превосходил остаточное эхо
+        if (instantaneousMic > effectiveThreshold && vadProbability >= 0.65f) {
             bargeInCandidateStreak++
         } else {
             bargeInCandidateStreak = maxOf(0, bargeInCandidateStreak - 1)
         }
 
-        val requiredStreak = quirks.bargeInRequiredStreak
+        // Для встроенного динамика требуется подтверждение на протяжении не менее 7 фреймов (70 мс)
+        val requiredStreak = if (isBluetooth) {
+            quirks.bargeInRequiredStreak
+        } else {
+            maxOf(7, quirks.bargeInRequiredStreak + 2)
+        }
+
         val isConfirmedInterruption = isVocalized &&
             (bargeInCandidateStreak >= requiredStreak) &&
             canBargeInTimers
@@ -225,16 +245,16 @@ class NativeAudioEngine @Inject constructor(
 
     companion object {
         private const val BURST_BYTES = 160 * 2 // 10 мс @ 16 кГц 16-бит моно
-        private const val PLAYBACK_GRACE_PERIOD_MS = 250L
-        private const val BARGE_IN_DEBOUNCE_MS = 400L
-        private const val BARGE_IN_MIN_HOLD_MS = 250L
+        private const val PLAYBACK_GRACE_PERIOD_MS = 450L
+        private const val BARGE_IN_DEBOUNCE_MS = 450L
+        private const val BARGE_IN_MIN_HOLD_MS = 350L
         private const val BARGE_IN_HARD_RECOVERY_MS = 3000L
         private const val BARGE_IN_RECOVERY_POLL_MS = 50L
         private const val PRE_ROLL_FRAMES_CAPACITY = 20
 
-        private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 16L * 1024L // Защитный буфер микрофона
+        private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 16L * 1024L
         private const val PLAYBACK_WRITE_STALL_TIMEOUT_MS = 1500L
-        private const val MAX_JNI_WRITE_CHUNK_BYTES = 4096 // Безопасный квант передачи в JNI
+        private const val MAX_JNI_WRITE_CHUNK_BYTES = 4096
     }
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -401,8 +421,8 @@ class NativeAudioEngine @Inject constructor(
     private fun applyAcousticProfileForRoute(profile: RouteProfile) {
         val quirks = profile.quirks
         vadDetector.setThresholds(
-            start = if (profile.isBluetooth) 0.40f else 0.50f,
-            end = if (profile.isBluetooth) 0.20f else 0.25f
+            start = if (profile.isBluetooth) 0.40f else 0.55f,
+            end = if (profile.isBluetooth) 0.20f else 0.28f
         )
         bridge.setMicGain(quirks.micGainCompensation)
         logger.d("NativeAudioEngine: Акустический профиль применен: ${quirks.deviceModel} (ENC Delay=${quirks.encLatencyMs}ms, ERLE=${quirks.acousticErleRatio})")
@@ -410,7 +430,7 @@ class NativeAudioEngine @Inject constructor(
 
     private fun getLeadInCapacityForRoute(profile: RouteProfile): Int {
         return if (profile.isBluetooth) {
-            (260 * 16) / 160 // ~26 пакетов с учетом аппаратной задержки ENC
+            (260 * 16) / 160 // ~26 пакетов
         } else {
             (160 * 16) / 160 // ~16 пакетов
         }
@@ -829,7 +849,7 @@ class NativeAudioEngine @Inject constructor(
             sumSq += norm * norm
             i += 2
         }
-        return sqrt(sumSq / sampleCount).toFloat()
+        return sqrt((sumSq + 1e-9) / sampleCount).toFloat()
     }
 
     private fun startLoops() {
@@ -897,6 +917,7 @@ class NativeAudioEngine @Inject constructor(
                                 onSpeechEnd = { speechEndedOnFrame = true }
                             )
 
+                            val vadProb = vadDetector.speechProbability.value
                             val isVocalized = speechStartedOnFrame || vadDetector.isSpeechDetected.value
 
                             val decision = acousticProcessor.evaluate(
@@ -905,6 +926,7 @@ class NativeAudioEngine @Inject constructor(
                                 isPlaying = _isPlaying.value,
                                 isBargeInActive = isBargeInActive,
                                 isVocalized = isVocalized,
+                                vadProbability = vadProb,
                                 pendingDurationMs = pendingDurationMs,
                                 quirks = quirks,
                                 isBluetooth = isBluetooth,
@@ -919,20 +941,22 @@ class NativeAudioEngine @Inject constructor(
                                     hapticManager.triggerBargeIn()
                                     _bargeInEvents.tryEmit(Unit)
 
-                                    val preRoll = mutableListOf<ByteArray>()
+                                    // УСТРАНЕНИЕ САМОПЕРЕБИВАНИЯ: Если пользователь перебил модель во время
+                                    // её речи, мы полностью очищаем накопленный пред-буфер (leadInBuffer).
+                                    // В нём содержалось эхо синтеза ассистента. Сброс этого эха на сервер
+                                    // приводил к ложному "server interrupted". Теперь передаётся строго
+                                    // свежий голос пользователя!
                                     synchronized(poolLock) {
-                                        while (leadInBuffer.isNotEmpty()) {
-                                            preRoll.add(leadInBuffer.removeFirst())
-                                        }
+                                        recycleLeadInBuffersLocked()
                                     }
-                                    for (pf in preRoll) {
-                                        sendMicDataEvent(obtainAudioEvent(pf, pf.size, seqNum, captureTimestampNs), instanceId)
-                                    }
-                                }
 
-                                if (decision.shouldStreamMicData) {
+                                    sendMicDataEvent(obtainAudioEvent(frame, bytesRead, seqNum, captureTimestampNs), instanceId)
+                                } else if (decision.shouldStreamMicData) {
+                                    // Поток передаётся только если перебивание подтверждено или модель молчит
                                     sendMicDataEvent(obtainAudioEvent(frame, bytesRead, seqNum, captureTimestampNs), instanceId)
                                 } else {
+                                    // Пока модель говорит, а пользователь молчит, накапливаем кадры только
+                                    // в локальный кольцевой буфер для компенсации латентности VAD
                                     synchronized(poolLock) {
                                         leadInBuffer.addLast(frame)
                                         val maxPreRoll = getLeadInCapacityForRoute(router.currentProfile.value)
@@ -1400,7 +1424,6 @@ class NativeAudioEngine @Inject constructor(
         while (offset < total && _isPlaying.value) {
             if (isBargeInActive || generation != currentPlaybackGeneration) return
 
-            // Чанкирование записи порциями до 4096 байт для предотвращения блокировки GC
             val bytesToWrite = minOf(total - offset, MAX_JNI_WRITE_CHUNK_BYTES)
 
             val written = bridge.writePlaybackByteArray(
