@@ -39,7 +39,6 @@ private const val GEMINI_INPUT_AUDIO_MIME_TYPE = "audio/pcm;rate=16000"
 
 /**
  * Структурированная телеметрия качества и потерь аудиоданных сетевого транспорта.
- * УСТРАНЕНИЕ ДЕФЕКТОВ 119, 120, 121.
  */
 data class TransportAudioStats(
     val serverAudioFramesReceived: Long,
@@ -61,20 +60,22 @@ class GeminiProtobufLiveClient @Inject constructor(
         const val WS_HOST = "generativelanguage.googleapis.com"
         const val WS_PATH = "ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
-        private const val MAX_QUEUE_BYTES = 256L * 1024L
+        private const val MAX_QUEUE_BYTES = 512L * 1024L
 
         private const val DEFAULT_AUDIO_BATCH_THRESHOLD_BYTES = 640 // 20 мс @ 16 кГц
         private const val MIN_AUDIO_BATCH_THRESHOLD_BYTES = 320     // 10 мс @ 16 кГц (низкий RTT)
         private const val MAX_AUDIO_BATCH_THRESHOLD_BYTES = 1280    // 40 мс @ 16 кГц (высокий RTT)
         private const val DEFAULT_BATCH_DEADLINE_MS = 20L
-        private const val AUDIO_FRAME_DEFAULT_TTL_MS = 500L
+        
+        // Порог жизни кадра 5000 мс гарантирует сохранение всех предложений ответа модели
+        private const val AUDIO_FRAME_DEFAULT_TTL_MS = 5000L
 
-        private const val AUDIO_PCM_CHANNEL_CAPACITY = 24
+        private const val AUDIO_PCM_CHANNEL_CAPACITY = 32
         private const val CONTROL_COMMAND_CHANNEL_CAPACITY = 32
         private const val MAX_INITIAL_HISTORY_TURNS = 20
 
-        private const val MAX_AI_AUDIO_BACKLOG_BYTES = 384L * 1024L
-        private const val MAX_DATA_EVENTS_IN_FLIGHT = 256
+        private const val MAX_AI_AUDIO_BACKLOG_BYTES = 1024L * 1024L // 1 МБ резерва сетевого буфера
+        private const val MAX_DATA_EVENTS_IN_FLIGHT = 512
     }
 
     private val json = Json {
@@ -652,7 +653,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             writerReadySignal = readySignal
         }
 
-        // Воркер 1: Сторожевой таймер сброса частичного аудиобуфера по дедлайну
+        // Воркер 1: Сброс частичного аудиобуфера по дедлайну
         scope.launch {
             while (isActive) {
                 delay(10L)
@@ -684,7 +685,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
         }
 
-        // Воркер 2 (Data Plane): Передача PCM с подсчетом сквозного баланса фреймов
+        // Воркер 2 (Data Plane): Передача PCM с подсчетом баланса фреймов
         scope.launch {
             try {
                 while (true) {
