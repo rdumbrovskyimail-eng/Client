@@ -1,8 +1,38 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- >>> FILE: app/src/main/res/values/colors.xml -->
 <resources>
-    <color name="background_dark">#09090B</color>
-    <color name="surface_dark">#18181B</color>
-    <color name="accent_blue">#3B82F6</color>
+    <!-- 1. Иерархия поверхностей чистого белого листа (Pure White Surface Hierarchy) -->
+    <color name="canvas_white">#FFFFFF</color>
+    <color name="surface_card">#FAFAFA</color>
+    <color name="surface_input">#F8FAFC</color>
+    <color name="hairline_border">#E2E8F0</color>
+    <color name="hairline_border_subtle">#CBD5E1</color>
+
+    <!-- 2. Монохромная контрастная типографика и акциденция (Monochrome Obsidian Black) -->
+    <color name="monochrome_black">#09090B</color>
+    <color name="monochrome_charcoal">#18181B</color>
+    <color name="monochrome_border_dark">#27272A</color>
+    <color name="text_secondary">#71717A</color>
+    <color name="text_muted">#A1A1AA</color>
+
+    <!-- 3. Событийные хроматические акценты (Event-Driven Accents) -->
+    <color name="accent_emerald">#10B981</color>
+    <color name="accent_emerald_glow">#1410B981</color>
+    <color name="accent_cyan">#0EA5E9</color>
+    <color name="accent_amber">#F59E0B</color>
+    <color name="error_red">#DC2626</color>
+    <color name="error_badge_bg">#FEE2E2</color>
+
+    <!-- 4. FM-лента визуализации звука (Analog Graticule & Fluid Waves) -->
+    <color name="fm_wave_deep">#E2E8F0</color>
+    <color name="fm_wave_mid">#CBD5E1</color>
+    <color name="fm_wave_air">#94A3B8</color>
+    <color name="fm_tick_major">#09090B</color>
+    <color name="fm_tick_minor">#64748B</color>
+
+    <!-- 5. Защита холодного старта ОС: предотвращение мигания черным экраном -->
+    <color name="background_dark">#FFFFFF</color>
+    <color name="surface_dark">#FAFAFA</color>
+    <color name="accent_blue">#0EA5E9</color>
     <color name="accent_green">#10B981</color>
-    <color name="error_red">#EF4444</color>
 </resources>
