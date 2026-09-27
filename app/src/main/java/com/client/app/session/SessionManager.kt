@@ -279,8 +279,7 @@ class SessionManager @Inject constructor(
                     } else {
                         _state.update {
                             it.copy(
-                                error =
-                                    "Сессия ещё не готова: микрофон будет запущен после подключения"
+                                error = "Сессия ещё не готова: микрофон будет запущен после подключения"
                             )
                         }
                     }
@@ -1677,6 +1676,7 @@ class SessionManager @Inject constructor(
                                     }
 
                                     is GeminiEvent.Interrupted -> {
+                                        // МГНОВЕННЫЙ СБРОС: Модель прервана сервером или локально
                                         invalidateAndFlushAudio(
                                             "server interrupted"
                                         )
@@ -1897,8 +1897,8 @@ class SessionManager @Inject constructor(
                 delay(20L)
             }
 
-            // Даем нативному буферу 100 мс на начало физического рендеринга перед проверкой опустошения
-            delay(100L)
+            // Даем нативному буферу 60 мс на начало физического рендеринга перед проверкой опустошения
+            delay(60L)
 
             val drained = audioEngine.awaitPlaybackDrained(generation = generation, stallTimeoutMs = 2500L)
             if (!drained && audioEngine.currentPlaybackGeneration == generation) {
