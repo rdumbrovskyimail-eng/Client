@@ -1,44 +1,118 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- >>> FILE: app/src/main/res/values/strings.xml -->
 <resources>
+    <!-- Базовые идентификаторы приложения -->
     <string name="app_name">Gemini Live Ultra</string>
     <string name="session_active_title">Gemini Live Ultra активен</string>
     <string name="session_active_desc">Аппаратный дуплекс и микрофон S23 Ultra активны</string>
 
-    <!-- UI: Экран диалога (ClientScreen) -->
-    <string name="settings_title">Настройки</string>
-    <string name="apply_role">Применить роль</string>
-    <string name="prompt_hint">Спросить или дать команду...</string>
-    <string name="default_role_placeholder">Задать системную роль...</string>
-    <string name="system_role_instruction">Системная инструкция роли</string>
-    <string name="attach_file">Прикрепить</string>
-    <string name="send_message">Отправить</string>
-    <string name="mic_content_desc">Микрофон</string>
-    <string name="session_status_desc">Статус сессии</string>
+    <!-- UI: Семантические описания доступности (Accessibility / TalkBack) -->
+    <string name="desc_fm_visualizer">Аналоговая FM-лента визуализации речи Gemini Live</string>
+    <string name="desc_settings_gear">Настройки параметров и модели Gemini Live</string>
+    <string name="desc_log_terminal">Системный журнал логов и сетевой терминал</string>
+    <string name="desc_prompt_pill">Плашка системной роли Prompt. Нажмите для открытия редактора роли</string>
+    <string name="desc_materials_pill">Плашка материалов и документов. Нажмите для прикрепления вложений</string>
+    <string name="desc_session_pill">Клавиша голосовой сессии. Нажмите для старта или завершения дуплекса</string>
+    <string name="desc_close">Закрыть консоль</string>
+    <string name="desc_clear">Очистить поле ввода</string>
+    <string name="desc_copy">Скопировать текст в буфер обмена</string>
+    <string name="desc_paste">Вставить текст из буфера обмена</string>
+    <string name="desc_apply">Применить системную роль</string>
+    <string name="desc_send_materials">Подтвердить и отправить материалы в Gemini Live</string>
+    <string name="desc_attach_files">Выбрать файлы, документы или фотографии</string>
 
-    <!-- UI: Экран настроек (SettingsScreen) -->
-    <string name="settings_keys_header">КЛЮЧИ И СЕРВЕР GEMINI</string>
-    <string name="gemini_api_key_label">Gemini API Key</string>
-    <string name="show_key_desc">Показать ключ</string>
-    <string name="live_model_label">Голосовая модель Gemini Live (дуплекс):</string>
-    <string name="analyzer_model_label">Модель разбора материалов (Vision OCR):</string>
+    <!-- UI: Микротипографика FM-полоски (Braun / Dieter Rams Style) -->
+    <string name="fm_scale_start">88.0</string>
+    <string name="fm_scale_92">92.0</string>
+    <string name="fm_scale_96">96.0</string>
+    <string name="fm_scale_100">100.0</string>
+    <string name="fm_scale_104">104.0</string>
+    <string name="fm_scale_end">108.0</string>
+    <string name="fm_scale_title">FM SCALE</string>
+    <string name="fm_device_title">S23 ULTRA</string>
+    <string name="fm_status_ready">FM TUNER READY</string>
+    <string name="fm_status_speaking">GEMINI LIVE • 24.0 kHz SPEECH</string>
+    <string name="fm_status_listening">MICROPHONE • 16.0 kHz INPUT</string>
+    <string name="fm_status_live">DUPLEX CONNECTED • WCD9385</string>
+    <string name="fm_status_error">AUDIO FAULT DETECTED</string>
+
+    <!-- UI: Консоль системной роли (Prompt Drawer) -->
+    <string name="prompt_drawer_title">СИСТЕМНАЯ РОЛЬ И ПРОМПТ</string>
+    <string name="prompt_drawer_subtitle">Инструкция мышления и поведения ассистента</string>
+    <string name="prompt_hint">Задайте системную инструкцию роли Gemini Live...</string>
+    <string name="btn_copy">Копия</string>
+    <string name="btn_paste">Вставка</string>
+    <string name="btn_reset">Сброс</string>
+    <string name="btn_ready">Готово</string>
+    <string name="toast_copied">Скопировано в буфер</string>
+    <string name="toast_prompt_applied">Роль обновлена</string>
+
+    <!-- UI: Консоль материалов и вложений (Materials Drawer) -->
+    <string name="materials_drawer_title">МАТЕРИАЛЫ И КОНТЕКСТ</string>
+    <string name="materials_drawer_subtitle">Отправка документов, изображений и текста в Gemini Live</string>
+    <string name="materials_hint">Текстовое сообщение или инструкция к файлам (необязательно)...</string>
+    <string name="btn_attach">Файлы / Фото</string>
+    <string name="btn_ok">OK</string>
+    <string name="attached_files_count">Вложенные файлы (%1$d):</string>
+
+    <!-- UI: Настройки параметров (SettingsScreen) -->
+    <string name="settings_title">ПАРАМЕТРЫ GEMINI 3.8 LIVE</string>
+    <string name="settings_info_banner">Изменения параметров применяются при следующем цикле запуска сессии.</string>
     
-    <string name="settings_audio_header">ГОЛОС И ЗВУКОВАЯ СИСТЕМА S23 ULTRA</string>
-    <string name="tts_voice_label">Голос модели (TTS):</string>
-    <string name="speaker_volume">Громкость динамика: %1$d%%</string>
-    <string name="mic_sensitivity">Чувствительность микрофона: %1$d%%</string>
-    <string name="mic_quiet_boost"> (Усиление для тихой речи)</string>
-    
-    <string name="settings_prompt_header">СИСТЕМНЫЙ ПРОМПТ ПО УМОЛЧАНИЮ</string>
-    <string name="system_prompt_label">Базовая инструкция ассистента</string>
-    
-    <string name="settings_forvo_header">ИНТЕГРАЦИЯ С FORVO</string>
-    <string name="forvo_enable_title">Включить Forvo Tool</string>
-    <string name="forvo_enable_desc">Озвучка слов носителями языка с Forvo.com</string>
-    <string name="forvo_api_key_label">Forvo API Key</string>
-    <string name="show_forvo_key_desc">Показать Forvo ключ</string>
-    
-    <string name="settings_battery_header">ФОНОВАЯ РАБОТА НА SAMSUNG ONE UI</string>
-    <string name="battery_opt_desc">Samsung One UI может усыплять микрофонный сервис через 10–15 минут сна экрана. Выберите «Не оптимизировать» (Работа без ограничений).</string>
-    <string name="battery_opt_button">Настройки батареи устройства</string>
-    <string name="battery_toast_fallback">Откройте: Настройки -> Приложения -> Батарея -> Без ограничений</string>
+    <string name="sec_api_model">1. API КЛЮЧ И МОДЕЛЬ ДУПЛЕКСА</string>
+    <string name="label_gemini_api_key">Gemini API Key</string>
+    <string name="label_live_model">Голосовая модель Gemini Live:</string>
+    <string name="label_ocr_model">Vision OCR анализатор:</string>
+
+    <string name="sec_generation_media">2. ПАРАМЕТРЫ ГЕНЕРАЦИИ И МЕДИА</string>
+    <string name="label_temperature">Температура декодера: %1$.2f</string>
+    <string name="label_media_resolution">Разрешение медиа (mediaResolution):</string>
+
+    <string name="sec_voice_speech">3. ГОЛОС И ЯЗЫК СИНТЕЗА</string>
+    <string name="label_voice_name">Голос ассистента (voiceName):</string>
+    <string name="label_speech_language">Языковой код BCP-47 (например: ru-RU, en-US, de-DE)</string>
+
+    <string name="sec_input_asr">4. ТРАНСКРИПЦИЯ ВХОДА (INPUT ASR)</string>
+    <string name="label_input_asr_toggle">Распознавание речи пользователя</string>
+    <string name="label_asr_mode">Режим распознавания:</string>
+    <string name="label_input_languages">BCP-47 коды языков через запятую</string>
+    <string name="label_input_vocab">Кастомный словарь терминов (до 1000 слов)</string>
+
+    <string name="sec_output_asr">5. ТРАНСКРИПЦИЯ ВЫВОДА (OUTPUT ASR)</string>
+    <string name="label_output_asr_toggle">Генерация субтитров речи модели</string>
+    <string name="label_output_languages">BCP-47 языки субтитров (пусто = авто)</string>
+    <string name="label_output_vocab">Кастомный словарь вывода через запятую</string>
+
+    <string name="sec_vad_turn">6. ДЕТЕКЦИЯ РЕЧИ (СЕРВЕРНЫЙ VAD / AAD)</string>
+    <string name="label_aad_toggle">Автоматическая детекция речи (AAD)</string>
+    <string name="desc_aad_toggle">При отключении используется ручной режим активности</string>
+    <string name="label_start_sensitivity">Чувствительность начала речи:</string>
+    <string name="label_end_sensitivity">Чувствительность окончания речи:</string>
+    <string name="label_prefix_padding">Префиксный буфер тишины: %1$d мс</string>
+    <string name="label_silence_duration">Тишина для закрытия хода: %1$d мс</string>
+    <string name="label_activity_handling">Политика перебивания (activityHandling):</string>
+
+    <string name="sec_context_resumption">7. УПРАВЛЕНИЕ КОНТЕКСТОМ И СЕССИЕЙ</string>
+    <string name="label_compression_toggle">Сжатие контекста (slidingWindow)</string>
+    <string name="desc_compression_toggle">Автоматическое скольжение окна токенов</string>
+    <string name="label_resumption_toggle">Восстановление сессии (sessionResumption)</string>
+    <string name="desc_resumption_toggle">Бесшовный реконнект по токену handle при сбоях сети</string>
+    <string name="label_history_turns">Загружаемая история диалога: %1$d ходов</string>
+
+    <string name="sec_tools_grounding">8. ИНСТРУМЕНТЫ (TOOLS &amp; GROUNDING)</string>
+    <string name="label_search_toggle">Google Search Grounding</string>
+    <string name="desc_search_toggle">Поиск актуальных фактов в веб-сети в реальном времени</string>
+    <string name="label_forvo_toggle">Интеграция с Forvo (Произношение)</string>
+    <string name="desc_forvo_toggle">Асинхронный инструмент произношения носителей</string>
+    <string name="label_forvo_key">Forvo API Key</string>
+
+    <string name="sec_hardware_audio">9. АППАРАТНЫЙ АУДИОТРАКТ S23 ULTRA</string>
+    <string name="label_dac_volume">Громкость ЦАП Qualcomm WCD9385: %1$d%%</string>
+    <string name="label_adc_gain">Чувствительность АЦП микрофона: %1$d%%</string>
+
+    <string name="sec_system_info">10. СИСТЕМНЫЙ СТАТУС И ЭНЕРГОПОТРЕБЛЕНИЕ</string>
+    <string name="info_proactive_audio">Proactive Audio Engine: AAudio MMAP / Shared</string>
+    <string name="info_reasoning">Interleaved Reasoning: Включено нативно</string>
+    <string name="info_battery_optimization">Для предотвращения засыпания микрофона при отключенном экране выберите режим работы батареи «Без ограничений».</string>
+    <string name="btn_battery_optimization">Оптимизация питания One UI</string>
 </resources>
