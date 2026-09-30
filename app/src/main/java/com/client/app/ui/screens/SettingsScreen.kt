@@ -491,7 +491,7 @@ fun SettingsScreen(
                         colors = whiteSliderColors()
                     )
 
-                    Text("Тишина для закрытия хода: ${silenceDurationDraft} мс", color = ColorTextPrimary, fontSize = 12.5.sp, fontFamily = FontFamily.Monospace)
+                    Text("Пауза конца фразы: ${silenceDurationDraft} мс", color = ColorTextPrimary, fontSize = 12.5.sp, fontFamily = FontFamily.Monospace)
                     Slider(
                         value = silenceDurationDraft.toFloat(),
                         onValueChange = { silenceDurationDraft = it.toInt() },
