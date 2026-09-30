@@ -791,7 +791,7 @@ class SessionManager @Inject constructor(
             startSensitivity = prefs[KEY_AAD_START_SENSITIVITY] ?: "START_SENSITIVITY_HIGH",
             endSensitivity = prefs[KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_HIGH",
             prefixPaddingMs = prefs[KEY_PREFIX_PADDING_MS] ?: 60,
-            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 600,
+            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 500,
             activityHandling = prefs[KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
             turnCoverage = prefs[KEY_TURN_COVERAGE] ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
         )
@@ -892,7 +892,10 @@ class SessionManager @Inject constructor(
                     thinkingLevel = thinkingLevel,
                     inputTranscription = inputTx,
                     outputTranscription = outputTx,
-                    realtimeInput = realtimeInput,
+                    // Серверная пауза — страховка на 200 мс длиннее клиентской (фразу закрывает клиент)
+                    realtimeInput = realtimeInput.copy(
+                        silenceDurationMs = (realtimeInput.silenceDurationMs + 200).coerceAtMost(3000)
+                    ),
                     compression = compression,
                     sessionResumptionEnabled = resumptionEnabled,
                     resumptionHandle = if (resume && resumptionEnabled) resumptionHandle else null,
@@ -1381,8 +1384,8 @@ class SessionManager @Inject constructor(
                             continue
                         }
 
-                        _state.update {
-                            it.copy(isAiSpeaking = true)
+                        if (!_state.value.isAiSpeaking) {
+                            _state.update { it.copy(isAiSpeaking = true) }
                         }
 
                         audioEngine.enqueuePlayback(
@@ -1415,8 +1418,7 @@ class SessionManager @Inject constructor(
     private fun observeBargeIn() = scope.launch {
         audioEngine.bargeInEvents.collect {
             if (!_state.value.isAiSpeaking) return@collect
-            invalidateAndFlushAudio("local barge-in")
-
+            // Вывод уже сброшен движком, хвост генерации отсечён транспортом
             _state.update {
                 it.copy(isAiSpeaking = false)
             }
@@ -1637,7 +1639,14 @@ class SessionManager @Inject constructor(
                                             goAwayJob = scope.launch {
                                                 try {
                                                     val millisLeft = event.millisLeft ?: 0L
-                                                    delay(millisLeft.coerceAtLeast(0L))
+                                                    // Переход в паузе диалога (модель молчит, фраза не передаётся),
+                                                    // но не позже чем за 1.5 с до обрыва сервером
+                                                    val deadline = SystemClock.elapsedRealtime() +
+                                                        (millisLeft - 1500L).coerceAtLeast(0L)
+                                                    while (SystemClock.elapsedRealtime() < deadline) {
+                                                        if (!_state.value.isAiSpeaking && !audioEngine.isUplinkActive) break
+                                                        delay(100L)
+                                                    }
 
                                                     if (
                                                         timerToken ==
@@ -1651,8 +1660,9 @@ class SessionManager @Inject constructor(
                                                         goAwayToken.incrementAndGet()
 
                                                         scheduleReconnect(
-                                                            "дедлайн goAway",
-                                                            sourceEpoch
+                                                            "плановый переход goAway",
+                                                            sourceEpoch,
+                                                            immediate = true
                                                         )
                                                     }
                                                 } catch (cancelled: CancellationException) {
@@ -1677,11 +1687,7 @@ class SessionManager @Inject constructor(
                                     }
 
                                     is GeminiEvent.Interrupted -> {
-                                        // МГНОВЕННЫЙ СБРОС: Модель прервана сервером или локально
-                                        invalidateAndFlushAudio(
-                                            "server interrupted"
-                                        )
-
+                                        // Очередь и вывод уже сброшены клиентом синхронно, в порядке сообщений сокета
                                         audioEngine.resetBargeInState()
 
                                         _state.update {
@@ -1950,7 +1956,8 @@ class SessionManager @Inject constructor(
             if (shouldReconnect) {
                 scheduleReconnect(
                     "плановый переход goAway",
-                    sourceEpoch
+                    sourceEpoch,
+                    immediate = true
                 )
             }
         }
