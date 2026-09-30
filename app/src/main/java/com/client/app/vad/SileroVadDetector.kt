@@ -84,6 +84,13 @@ class SileroVadDetector @Inject constructor(
     val thresholdSpeechStart: Float get() = Float.fromBits(thresholdSpeechStartBits.get())
     val thresholdSpeechEnd: Float get() = Float.fromBits(thresholdSpeechEndBits.get())
 
+    // Пауза конца фразы в окнах Silero по 32 мс (гибридный VAD: по ней клиент шлёт audioStreamEnd)
+    @Volatile private var endWindowsRequired = 16
+
+    fun setEndHangoverMs(ms: Int) {
+        endWindowsRequired = (ms.coerceIn(200, 2000) + 31) / 32
+    }
+
     // Состояния рекуррентной нейросети
     private val stateBuffer = FloatArray(STATE_SIZE)
     private val stateBackupBuffer = FloatArray(STATE_SIZE) // УСТРАНЕНИЕ ДЕФЕКТА 134: Резервный откат
@@ -333,7 +340,7 @@ class SileroVadDetector @Inject constructor(
             // УСТРАНЕНИЕ ДЕФЕКТА 133: Сокращение паузы тишины до 4 окон (120 мс) по ITU-T G.729B
             if (prob < currentEndThresh) {
                 speechEndStreak++
-                if (speechEndStreak >= 16) { // 16 × 32 мс ≈ 512 мс (рекомендация Google: не менее 500 мс)
+                if (speechEndStreak >= endWindowsRequired) {
                     _isSpeechDetected.value = false
                     speechEndStreak = 0
                     speechStartStreak = 0
@@ -446,6 +453,13 @@ class SileroVadDetector @Inject constructor(
         persistentSrTensor = null
         ortSession = null
         ortEnvironment = null
+    }
+
+    /** Сброс только решения «идёт речь» (RNN не обнуляется): после окончания ответа модели. */
+    fun resetDecisionState() = synchronized(audioProcessingLock) {
+        speechStartStreak = 0
+        speechEndStreak = 0
+        _isSpeechDetected.value = false
     }
 
     fun resetState() = synchronized(audioProcessingLock) {
