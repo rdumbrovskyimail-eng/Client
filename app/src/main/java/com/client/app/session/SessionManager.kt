@@ -788,7 +788,7 @@ class SessionManager @Inject constructor(
         val realtimeInput = RealtimeInputSettings(
             aadEnabled = aadEnabled,
             startSensitivity = prefs[KEY_AAD_START_SENSITIVITY] ?: "START_SENSITIVITY_HIGH",
-            endSensitivity = prefs[KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_LOW",
+            endSensitivity = prefs[KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_HIGH",
             prefixPaddingMs = prefs[KEY_PREFIX_PADDING_MS] ?: 60,
             silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 600,
             activityHandling = prefs[KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
@@ -1414,7 +1414,6 @@ class SessionManager @Inject constructor(
         audioEngine.bargeInEvents.collect {
             if (!_state.value.isAiSpeaking) return@collect
             invalidateAndFlushAudio("local barge-in")
-            audioEngine.triggerBargeInEarcon()
 
             _state.update {
                 it.copy(isAiSpeaking = false)
