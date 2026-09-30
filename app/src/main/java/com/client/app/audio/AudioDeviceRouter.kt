@@ -32,11 +32,15 @@ enum class AudioRoutePath {
     WIRED_HEADSET,
     USB_HEADSET,
 
+    // Звук через A2DP (AAC/SBC, стерео 48 кГц), микрофон телефона; без режима связи и без SCO
+    BLUETOOTH_A2DP_HIFI,
+
     @Deprecated("Используйте BLUETOOTH_SCO или BLUETOOTH_BLE_HEADSET для точной настройки")
     BLUETOOTH_COMMUNICATION;
 
     val isBluetooth: Boolean
-        get() = this == BLUETOOTH_SCO || this == BLUETOOTH_BLE_HEADSET || this == BLUETOOTH_COMMUNICATION
+        get() = this == BLUETOOTH_SCO || this == BLUETOOTH_BLE_HEADSET || this == BLUETOOTH_COMMUNICATION ||
+            this == BLUETOOTH_A2DP_HIFI
 
     val isHeadset: Boolean
         get() = isBluetooth || this == WIRED_HEADSET || this == USB_HEADSET
@@ -199,6 +203,48 @@ class AudioDeviceRouter @Inject constructor(
     private val debounceTrigger = MutableSharedFlow<Unit>(
         replay = 0, extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
+
+    // Hi-Fi Bluetooth: при подключённых A2DP-наушниках звук идёт как медиа, голос — с микрофона телефона
+    @Volatile var bluetoothHiFiEnabled: Boolean = true
+
+    fun requestReevaluation() {
+        debounceTrigger.tryEmit(Unit)
+    }
+
+    private fun findHiFiA2dpOutputLocked(): AudioDeviceInfo? {
+        if (!bluetoothHiFiEnabled) return null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return null
+        }
+        val outputs = runCatching {
+            audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList()
+        }.getOrDefault(emptyList())
+        // Проводная/USB гарнитура приоритетнее беспроводной
+        if (outputs.any {
+                it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                    it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+            }
+        ) {
+            return null
+        }
+        return outputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP }
+    }
+
+    /** Hi-Fi: режим связи и SCO не нужны — иначе система переведёт наушники в узкополосный HFP. */
+    private fun bindHiFiMediaRoute(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            runCatching { audioManager.clearCommunicationDevice() }
+        }
+        if (audioManager.mode != AudioManager.MODE_NORMAL) {
+            runCatching { audioManager.mode = AudioManager.MODE_NORMAL }
+                .onFailure { logger.w("AudioDeviceRouter: Смена режима на MODE_NORMAL не удалась: ${it.message}") }
+        }
+        return true
+    }
 
     private val _currentProfile = MutableStateFlow(createSpeakerProfile())
     val currentProfile: StateFlow<RouteProfile> = _currentProfile.asStateFlow()
@@ -681,6 +727,9 @@ class AudioDeviceRouter @Inject constructor(
 
         val now = SystemClock.elapsedRealtime()
 
+        // Hi-Fi: Bluetooth не назначается устройством связи (иначе включится HFP/SCO)
+        if (findHiFiA2dpOutputLocked() != null) return null
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val current = runCatching { audioManager.communicationDevice }.getOrNull()
             if (current != null && (
@@ -906,6 +955,14 @@ class AudioDeviceRouter @Inject constructor(
                 true
             }
 
+            AudioRoutePath.BLUETOOTH_A2DP_HIFI -> {
+                if (actualInput.type != AudioDeviceInfo.TYPE_BUILTIN_MIC) {
+                    logger.w("AudioDeviceRouter: Hi-Fi ожидает микрофон телефона, получен тип ${actualInput.type}")
+                    return false
+                }
+                true
+            }
+
             AudioRoutePath.SPEAKER_SHARED -> {
                 if (actualInput.type != AudioDeviceInfo.TYPE_BUILTIN_MIC) {
                     logger.e("AudioDeviceRouter: SPEAKER_SHARED разрешился в не-встроенный микрофон: id=${actualInput.id}, тип=${actualInput.type}")
@@ -934,6 +991,25 @@ class AudioDeviceRouter @Inject constructor(
 
         val allOutputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList()
         val allInputs = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
+
+        findHiFiA2dpOutputLocked()?.let { a2dp ->
+            val builtinMic = allInputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+            return RouteProfile(
+                path = AudioRoutePath.BLUETOOTH_A2DP_HIFI,
+                targetSampleRate = 48000,
+                negotiatedSampleRate = 48000,
+                deviceName = a2dp.productName.toString().ifBlank { "Bluetooth Hi-Fi" },
+                inputDeviceId = builtinMic?.id ?: 0,
+                outputDeviceId = a2dp.id,
+                capabilities = AudioDeviceCapabilities(
+                    supportedSampleRates = a2dp.sampleRates.toList(),
+                    channelMasks = a2dp.channelMasks.toList(),
+                    isLowLatencySupported = false
+                ),
+                // Микрофон телефона: компенсация усиления гарнитуры не применяется
+                quirks = DeviceQuirks.DEFAULT_SPEAKER
+            )
+        }
 
         val currentCommunication = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             runCatching { audioManager.communicationDevice }.getOrNull()
@@ -1069,6 +1145,8 @@ class AudioDeviceRouter @Inject constructor(
 
     @Suppress("DEPRECATION")
     private fun bindSpeakerCommunication(): Boolean {
+        if (findHiFiA2dpOutputLocked() != null) return bindHiFiMediaRoute()
+
         // УСТРАНЕНИЕ СРЫВА АППАРАТНОГО AEC: Перевод AudioManager в режим MODE_IN_COMMUNICATION
         // строго ДО вызова setCommunicationDevice(), чтобы AudioPolicyService сразу скоммутировал
         // аппаратный петлевой порт ECHO_REFERENCE для подавителя эха WCD9385.
