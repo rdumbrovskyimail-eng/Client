@@ -41,6 +41,7 @@ data class AppSettingsState(
     val outputTxMode: String = "VERBATIM",
 
     val aadEnabled: Boolean = true,
+    val btHiFiMode: Boolean = true,
     val aadStartSensitivity: String = "START_SENSITIVITY_HIGH",
     val aadEndSensitivity: String = "END_SENSITIVITY_HIGH",
     val prefixPaddingMs: Int = 60,
@@ -152,6 +153,7 @@ class SettingsViewModel @Inject constructor(
                         outputTxMode = p[SessionManager.KEY_OUTPUT_TRANSCRIPTION_MODE] ?: "VERBATIM",
 
                         aadEnabled = p[SessionManager.KEY_AAD_ENABLED] ?: true,
+                        btHiFiMode = p[SessionManager.KEY_BT_HIFI_MODE] ?: true,
                         aadStartSensitivity = p[SessionManager.KEY_AAD_START_SENSITIVITY] ?: "START_SENSITIVITY_HIGH",
                         aadEndSensitivity = p[SessionManager.KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_HIGH",
                         prefixPaddingMs = p[SessionManager.KEY_PREFIX_PADDING_MS] ?: 60,
@@ -345,6 +347,11 @@ class SettingsViewModel @Inject constructor(
     fun setAadEnabled(enabled: Boolean) {
         _settings.update { it.copy(aadEnabled = enabled) }
         viewModelScope.launch { dataStore.edit { it[SessionManager.KEY_AAD_ENABLED] = enabled } }
+    }
+
+    fun setBtHiFiMode(enabled: Boolean) {
+        _settings.update { it.copy(btHiFiMode = enabled) }
+        viewModelScope.launch { dataStore.edit { it[SessionManager.KEY_BT_HIFI_MODE] = enabled } }
     }
 
     fun setAadStartSensitivity(s: String) {
