@@ -164,70 +164,78 @@ struct BiquadTdf2 {
 
     void makeLowShelf(double fc, double gainDb, double fs, double S = 0.71);
     void makeHighShelf(double fc, double gainDb, double fs, double S = 0.71);
+    void makeHighPass(double fc, double q, double fs);
+    void makePeaking(double fc, double gainDb, double q, double fs);
+    void makeIdentity();
 };
 
 /**
- * Профессиональный прозрачный True-Peak пиковый лимитер (ITU-R BS.1770-4 / AES-TD1004.1.15-10).
- * Заменяет грубый кубический клиппинг. Гарантирует мягкое колено (Soft-Knee)
- * и жесткий потолок -0.8 dBFS, защищая дельта-сигма ЦАП WCD9385 от межсэмпловых пиков (ISP).
+ * Пиковый лимитер с предпросмотром ~1.5 мс: усиление снижается ДО прихода пика,
+ * поэтому нет жёсткого срезания вершин и нечётных гармоник (прежний лимитер без задержки
+ * пропускал атаку и досрезал её клиппером). Потолок −1 dBFS.
  */
-struct TransparentVoiceLimiter {
-    double envelope_{0.0};
-    double attackCoeff_{0.0};
-    double releaseCoeff_{0.0};
+class LookaheadPeakLimiter {
+public:
+    static constexpr size_t MAX_LOOKAHEAD = 256;
 
-    void reset(double fs = 48000.0) {
-        envelope_ = 0.0;
-        // Время атаки: 1.0 мс (мгновенный перехват резких пиков без щелчков)
-        attackCoeff_ = std::exp(-1.0 / (0.001 * fs));
-        // Время отпускания: 45.0 мс (прозрачное затухание без пампинга)
-        releaseCoeff_ = std::exp(-1.0 / (0.045 * fs));
-    }
+    void reset(double fs);
 
     inline double process(double x) {
-        const double absX = std::abs(x);
-        if (absX > envelope_) {
-            envelope_ = attackCoeff_ * envelope_ + (1.0 - attackCoeff_) * absX;
-        } else {
-            envelope_ = releaseCoeff_ * envelope_ + (1.0 - releaseCoeff_) * absX;
+        const double a = std::fabs(x);
+        required_[pos_] = (a > ceiling_) ? (ceiling_ / a) : 1.0;
+        delay_[pos_] = x;
+        pos_ = (pos_ + 1 == lookahead_) ? 0 : pos_ + 1;
+
+        double target = 1.0;
+        for (size_t i = 0; i < lookahead_; ++i) {
+            target = std::min(target, required_[i]);
         }
+        gain_ = (target < gain_)
+            ? target + (gain_ - target) * attackCoeff_
+            : target + (gain_ - target) * releaseCoeff_;
 
-        // Потолок: -0.8 dBFS (0.912). Гарантирует отсутствие клиппинга восстанавливающего фильтра ЦАП.
-        constexpr double CEILING = 0.912;
-        constexpr double THRESHOLD = 0.75; // Мягкое колено начинается с -2.5 dBFS
-
-        double gain = 1.0;
-        if (envelope_ > THRESHOLD) {
-            const double excess = envelope_ - THRESHOLD;
-            const double compressedEnv = THRESHOLD + (excess / (1.0 + excess / (CEILING - THRESHOLD)));
-            gain = compressedEnv / envelope_;
-        }
-
-        double y = x * gain;
-        if (y > CEILING) y = CEILING;
-        else if (y < -CEILING) y = -CEILING;
+        double y = delay_[pos_] * gain_;
+        if (y > ceiling_) y = ceiling_;
+        else if (y < -ceiling_) y = -ceiling_;
         return y;
     }
+
+private:
+    double delay_[MAX_LOOKAHEAD]{};
+    double required_[MAX_LOOKAHEAD]{};
+    size_t lookahead_{1};
+    size_t pos_{0};
+    double gain_{1.0};
+    double attackCoeff_{0.0};
+    double releaseCoeff_{0.0};
+    double ceiling_{0.891}; // −1 dBFS
 };
 
 /**
- * Процессор голоса студийного вещательного уровня:
- * - Subsonic High-Pass (35 Гц, срез вредного механического инфра-резонанса)
- * - Деликатная коррекция разборчивости речи (+0.8 дБ на 220 Гц, +0.8 дБ на 3800 Гц)
- * - Transparent True-Peak Soft-Knee Limiter (никакого меандра, никаких хрипов динамика)
+ * Тонкомпенсация голоса под маршрут вывода («тёплый» тембр без гула и перегрузки):
+ * - SPEAKER: ФВЧ 120 Гц (не тратим ход диффузора на недоступный бас), +1.5 дБ полка 320 Гц (тело голоса),
+ *   −1.0 дБ полка 7 кГц (мягче сибилянты на малом динамике);
+ * - HEADSET_VOICE (HFP): ФВЧ 70 Гц, +2.0 дБ полка 200 Гц, +1.2 дБ пик 2.8 кГц (разборчивость через mSBC);
+ * - HEADPHONES: ФВЧ 25 Гц, +2.5 дБ полка 160 Гц (теплота), +1.0 дБ полка 9 кГц (воздух).
+ * Предусиление компенсирует подъёмы, лимитер с предпросмотром страхует пики.
  */
 class AnalogVoiceEnhancer {
 public:
     AnalogVoiceEnhancer();
     void reset(int32_t sampleRate);
+    void configure(int32_t sampleRate, int32_t profile);
     void process(int16_t* samples, size_t numFrames, int32_t sampleRate);
+    int32_t profile() const { return profile_; }
 
 private:
     int32_t currentRate_{48000};
-    SubsonicHighPass subsonicFilter_;
-    BiquadTdf2 lowShelf_;
-    BiquadTdf2 highShelf_;
-    TransparentVoiceLimiter limiter_;
+    int32_t profile_{OUTPUT_EQ_SPEAKER};
+    double preGain_{1.0};
+    BiquadTdf2 highPass_;
+    BiquadTdf2 lowBand_;
+    BiquadTdf2 midBand_;
+    BiquadTdf2 highBand_;
+    LookaheadPeakLimiter limiter_;
 };
 
 class AAudioEngine {
@@ -265,6 +273,17 @@ public:
 
     void setVolume(float vol);
     void setMicGain(float gain);
+
+    // Мягкая пауза вывода без потери данных (перебивание): позиция очереди удерживается
+    void setPlaybackPaused(bool paused);
+    bool isPlaybackPaused() const { return playbackPaused_.load(std::memory_order_acquire); }
+
+    // Тонкомпенсация под маршрут: OUTPUT_EQ_SPEAKER / OUTPUT_EQ_HEADSET_VOICE / OUTPUT_EQ_HEADPHONES
+    void setOutputEqProfile(int32_t profile);
+
+    // Блокирующее ожидание целого кадра захвата (вместо опроса с задержкой 2 мс)
+    bool waitForCaptureFrames(size_t frames, int32_t timeoutMs);
+    int32_t getCaptureSessionId() const { return captureSessionId_.load(std::memory_order_relaxed); }
 
     float getMicRms() const { return micRms_.load(std::memory_order_relaxed); }
     float getOutRms() const { return outRms_.load(std::memory_order_relaxed); }
@@ -421,7 +440,7 @@ private:
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_CAPTURE> captureRawBuffer_;
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_CAPTURE> captureBuffer_;
 
-    LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_PLAYBACK> playbackDspInputBuffer_;
+    LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_PLAYBACK_INPUT> playbackDspInputBuffer_;
     LockFreeRingBuffer<int16_t, RING_BUFFER_CAPACITY_PLAYBACK> playbackBuffer_;
     LockFreeRingBuffer<int16_t, FFT_TAP_BUFFER_CAPACITY> fftTapBuffer_;
 
@@ -509,6 +528,20 @@ private:
     std::condition_variable fftTapCv_;
 
     std::atomic<bool> micPipelineAdmitted_{false};
+
+    // Пауза/предзаполнение/тонкомпенсация вывода
+    std::atomic<bool> playbackPaused_{false};
+    std::atomic<bool> playbackPrimeRequested_{true};
+    std::atomic<int32_t> outputEqProfile_{OUTPUT_EQ_SPEAKER};
+    std::atomic<bool> outputEqDirty_{true};
+    // Состояние RT-колбэка воспроизведения (изменяется только потоком колбэка)
+    float playbackRampGain_{0.0f};
+    bool playbackPriming_{true};
+
+    // Захват: сессия эффектов (AEC/NS) и сигнал готовности кадра
+    std::atomic<int32_t> captureSessionId_{0};
+    std::mutex captureReadyMutex_;
+    std::condition_variable captureReadyCv_;
 
     alignas(64) std::atomic<uint64_t> playbackEpoch_{0};
     alignas(64) std::atomic<uint64_t> playbackDspResetAcknowledgedEpoch_{0};
