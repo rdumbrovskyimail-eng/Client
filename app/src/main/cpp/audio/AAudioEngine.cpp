@@ -73,26 +73,92 @@ void BiquadTdf2::makeHighShelf(double fc, double gainDb, double fs, double S) {
     a2 = ((A + 1.0) - (A - 1.0) * cs - beta) / a0;
 }
 
+void BiquadTdf2::makeHighPass(double fc, double q, double fs) {
+    const double omega = 2.0 * 3.141592653589793 * fc / fs;
+    const double cs = std::cos(omega);
+    const double alpha = std::sin(omega) / (2.0 * q);
+    const double a0 = 1.0 + alpha;
+    b0 = ((1.0 + cs) / 2.0) / a0;
+    b1 = (-(1.0 + cs)) / a0;
+    b2 = ((1.0 + cs) / 2.0) / a0;
+    a1 = (-2.0 * cs) / a0;
+    a2 = (1.0 - alpha) / a0;
+}
+
+void BiquadTdf2::makePeaking(double fc, double gainDb, double q, double fs) {
+    const double A = std::pow(10.0, gainDb / 40.0);
+    const double omega = 2.0 * 3.141592653589793 * fc / fs;
+    const double cs = std::cos(omega);
+    const double alpha = std::sin(omega) / (2.0 * q);
+    const double a0 = 1.0 + alpha / A;
+    b0 = (1.0 + alpha * A) / a0;
+    b1 = (-2.0 * cs) / a0;
+    b2 = (1.0 - alpha * A) / a0;
+    a1 = (-2.0 * cs) / a0;
+    a2 = (1.0 - alpha / A) / a0;
+}
+
+void BiquadTdf2::makeIdentity() {
+    b0 = 1.0; b1 = 0.0; b2 = 0.0; a1 = 0.0; a2 = 0.0;
+}
+
+void LookaheadPeakLimiter::reset(double fs) {
+    lookahead_ = std::clamp<size_t>(static_cast<size_t>(std::lround(0.0015 * fs)), 2, MAX_LOOKAHEAD);
+    pos_ = 0;
+    gain_ = 1.0;
+    for (size_t i = 0; i < MAX_LOOKAHEAD; ++i) {
+        delay_[i] = 0.0;
+        required_[i] = 1.0;
+    }
+    // Атака успевает за окно предпросмотра (≈5 постоянных времени), отпускание 80 мс без «пампинга»
+    attackCoeff_ = std::exp(-5.0 / static_cast<double>(lookahead_ - 1));
+    releaseCoeff_ = std::exp(-1.0 / (0.080 * fs));
+}
+
 AnalogVoiceEnhancer::AnalogVoiceEnhancer() {
-    reset(48000);
+    configure(48000, OUTPUT_EQ_SPEAKER);
 }
 
 void AnalogVoiceEnhancer::reset(int32_t sampleRate) {
+    configure(sampleRate, profile_);
+}
+
+void AnalogVoiceEnhancer::configure(int32_t sampleRate, int32_t profile) {
     currentRate_ = sampleRate > 0 ? sampleRate : 48000;
+    profile_ = std::clamp(profile, OUTPUT_EQ_SPEAKER, OUTPUT_EQ_HEADPHONES);
     const double fs = static_cast<double>(currentRate_);
+    const double nyquistGuard = fs * 0.45;
 
-    // 1. Срез механического инфразвука ниже 35 Гц для защиты катушки SmartPA
-    subsonicFilter_.reset(fs);
+    highPass_.reset();
+    lowBand_.reset();
+    midBand_.reset();
+    highBand_.reset();
 
-    // 2. Деликатная акустическая коррекция без искусственного завышения громкости
-    lowShelf_.reset();
-    highShelf_.reset();
-    // 200 Гц (+0.8 дБ): естественное тело голоса без гула и паразитного резонанса корпуса
-    lowShelf_.makeLowShelf(200.0, 0.8, fs, 0.71);
-    // 3800 Гц (+0.8 дБ): кристальная артикуляция согласных звуков без сибилянтов
-    highShelf_.makeHighShelf(std::min(3800.0, fs * 0.44), 0.8, fs, 0.71);
+    switch (profile_) {
+        case OUTPUT_EQ_HEADSET_VOICE:
+            highPass_.makeHighPass(70.0, 0.7071, fs);
+            lowBand_.makeLowShelf(200.0, 2.0, fs, 0.8);
+            midBand_.makePeaking(std::min(2800.0, nyquistGuard), 1.2, 1.0, fs);
+            highBand_.makeIdentity();
+            preGain_ = std::pow(10.0, -1.0 / 20.0);
+            break;
+        case OUTPUT_EQ_HEADPHONES:
+            highPass_.makeHighPass(25.0, 0.7071, fs);
+            lowBand_.makeLowShelf(160.0, 2.5, fs, 0.8);
+            midBand_.makeIdentity();
+            highBand_.makeHighShelf(std::min(9000.0, nyquistGuard), 1.0, fs, 0.8);
+            preGain_ = std::pow(10.0, -1.5 / 20.0);
+            break;
+        case OUTPUT_EQ_SPEAKER:
+        default:
+            highPass_.makeHighPass(120.0, 0.7071, fs);
+            lowBand_.makeLowShelf(320.0, 1.5, fs, 0.8);
+            midBand_.makeIdentity();
+            highBand_.makeHighShelf(std::min(7000.0, nyquistGuard), -1.0, fs, 0.8);
+            preGain_ = std::pow(10.0, -0.5 / 20.0);
+            break;
+    }
 
-    // 3. Прозрачный True-Peak лимитер (потолок -0.8 dBFS, нулевой клиппинг)
     limiter_.reset(fs);
 }
 
@@ -101,28 +167,14 @@ void AnalogVoiceEnhancer::process(int16_t* samples, size_t numFrames, int32_t sa
     if (sampleRate > 0 && sampleRate != currentRate_) reset(sampleRate);
 
     for (size_t i = 0; i < numFrames; ++i) {
-        // Денормализация в 64-битный вещественный диапазон [-1.0, 1.0]
-        double x = static_cast<double>(samples[i]) * (1.0 / 32768.0);
-
-        // Каскад 1: Subsonic High-Pass (35 Гц, защита SmartPA от паразитного хода)
-        x = subsonicFilter_.process(x);
-
-        // Каскад 2: TDF-II Low-Shelf (деликатная теплота)
-        x = lowShelf_.process(x);
-
-        // Каскад 3: TDF-II High-Shelf (чистота фонем)
-        x = highShelf_.process(x);
-
-        // Каскад 4: Transparent True-Peak Soft-Knee Limiter (-0.8 dBFS потолок)
-        // Заменяет жесткий кубический клиппер. Полностью исключает генерацию нечетных гармоник
-        // и перегрузку усилителя динамика.
+        double x = static_cast<double>(samples[i]) * (1.0 / 32768.0) * preGain_;
+        x = highPass_.process(x);
+        x = lowBand_.process(x);
+        x = midBand_.process(x);
+        x = highBand_.process(x);
         x = limiter_.process(x);
-
-        // Преобразование обратно в 16-бит PCM с математически точным округлением
-        const double scaled = x * 32767.0;
         samples[i] = static_cast<int16_t>(std::clamp<int32_t>(
-            static_cast<int32_t>(std::lrint(scaled)), -32768, 32767
-        ));
+            static_cast<int32_t>(std::lrint(x * 32767.0)), -32768, 32767));
     }
 }
 
@@ -177,6 +229,7 @@ bool AAudioEngine::init(
 
 void AAudioEngine::closeCaptureStreamLocked() {
     activeCaptureStream_.store(nullptr, std::memory_order_release);
+    captureSessionId_.store(0, std::memory_order_relaxed);
     if (captureStream_ != nullptr) {
         AAudioStream_close(captureStream_);
         captureStream_ = nullptr;
@@ -207,11 +260,9 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
     AAudioStreamBuilder_setChannelCount(inBuilder, CHANNEL_COUNT_MONO);
     AAudioStreamBuilder_setFormat(inBuilder, AAUDIO_FORMAT_PCM_I16);
 
-    const bool isBt = isBluetoothMode_.load(std::memory_order_relaxed);
-
-    if (!isBt && inputDeviceId > 0) {
-        AAudioStreamBuilder_setDeviceId(inBuilder, inputDeviceId);
-    }
+    // Маршрут микрофона задаёт setCommunicationDevice(). Явная привязка к порту BUILTIN_MIC
+    // выбирала один микрофон и отключала многомикрофонное шумоподавление/AEC VoIP-тракта.
+    (void)inputDeviceId;
 
     AAudioStreamBuilder_setSharingMode(inBuilder, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setInputPreset(inBuilder, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
@@ -230,6 +281,7 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
     }
 
     activeCaptureStream_.store(captureStream_, std::memory_order_release);
+    captureSessionId_.store(AAudioStream_getSessionId(captureStream_), std::memory_order_relaxed);
 
     const int32_t actualInRate = AAudioStream_getSampleRate(captureStream_);
     const int32_t actualInChannels = AAudioStream_getChannelCount(captureStream_);
@@ -357,7 +409,10 @@ aaudio_result_t AAudioEngine::openPlaybackStreamWithFallback(
     // сигнала петли ЦАП (Echo Reference), полностью отключая аппаратный эхоподавитель Fluence.
     const aaudio_sharing_mode_t desiredSharing = AAUDIO_SHARING_MODE_SHARED;
 
-    auto buildAndOpen = [this, targetPlaybackSampleRate, outputDeviceId, isBluetooth](aaudio_sharing_mode_t sharingMode) -> aaudio_result_t {
+    // Маршрут вывода задаёт setCommunicationDevice(); привязка к порту не нужна
+    (void)outputDeviceId;
+
+    auto buildAndOpen = [this, targetPlaybackSampleRate, isBluetooth](aaudio_sharing_mode_t sharingMode) -> aaudio_result_t {
         AAudioStreamBuilder* outBuilder = nullptr;
         if (AAudio_createStreamBuilder(&outBuilder) != AAUDIO_OK) return AAUDIO_ERROR_INTERNAL;
 
@@ -372,12 +427,11 @@ aaudio_result_t AAudioEngine::openPlaybackStreamWithFallback(
             AAudioStreamBuilder_setSampleRate(outBuilder, targetPlaybackSampleRate);
         }
 
-        if (outputDeviceId > 0 && !isBluetooth) {
-            AAudioStreamBuilder_setDeviceId(outBuilder, outputDeviceId);
-        }
-
         AAudioStreamBuilder_setSharingMode(outBuilder, sharingMode);
         AAudioStreamBuilder_setUsage(outBuilder, AAUDIO_USAGE_VOICE_COMMUNICATION);
+        AAudioStreamBuilder_setContentType(outBuilder, AAUDIO_CONTENT_TYPE_SPEECH);
+        // Legacy-путь (VOIP_RX в режиме связи): эталон эха для аппаратного AEC гарантирован
+        AAudioStreamBuilder_setSessionId(outBuilder, AAUDIO_SESSION_ID_ALLOCATE);
         AAudioStreamBuilder_setDataCallback(outBuilder, playbackCallback, this);
         AAudioStreamBuilder_setErrorCallback(outBuilder, errorCallback, this);
 
@@ -500,6 +554,9 @@ bool AAudioEngine::startPlayback() {
     playbackDspInputBuffer_.resetQuiesced();
     playbackBuffer_.resetQuiesced();
     fftTapBuffer_.resetQuiesced();
+    playbackPaused_.store(false, std::memory_order_release);
+    playbackPrimeRequested_.store(true, std::memory_order_release);
+    outputEqDirty_.store(true, std::memory_order_release);
 
     const aaudio_result_t result = AAudioStream_requestStart(playbackStream_);
     if (result != AAUDIO_OK || !waitForStreamState(playbackStream_, AAUDIO_STREAM_STATE_STARTED, 2000)) {
@@ -677,6 +734,9 @@ bool AAudioEngine::restartPlaybackStream() {
     const int32_t reopenedRate = actualPlaybackSampleRate_.load(std::memory_order_acquire);
     voiceEnhancer_.reset(reopenedRate);
     genericResampler_.configure(SAMPLE_RATE_GEMINI_OUT, reopenedRate);
+    playbackPaused_.store(false, std::memory_order_release);
+    playbackPrimeRequested_.store(true, std::memory_order_release);
+    outputEqDirty_.store(true, std::memory_order_release);
 
     const aaudio_result_t result = AAudioStream_requestStart(playbackStream_);
     if (result != AAUDIO_OK || !waitForStreamState(playbackStream_, AAUDIO_STREAM_STATE_STARTED, 2000)) {
@@ -709,6 +769,7 @@ void AAudioEngine::stopCaptureLocked() {
     micPipelineAdmitted_.store(false, std::memory_order_release);
     captureDspRunning_.store(false, std::memory_order_release);
     captureDspCv_.notify_all();
+    captureReadyCv_.notify_all();
 
     joinCaptureDspThreadLocked();
 
@@ -746,6 +807,8 @@ void AAudioEngine::stopPlaybackLocked() {
     fftTapBuffer_.resetQuiesced();
     outRms_.store(0.0f, std::memory_order_relaxed);
     isPlaybackRenderingActive_.store(false, std::memory_order_release);
+    playbackPaused_.store(false, std::memory_order_release);
+    playbackPrimeRequested_.store(true, std::memory_order_release);
 }
 
 void AAudioEngine::stopLocked() {
@@ -1035,6 +1098,8 @@ void AAudioEngine::captureDspThreadLoop() {
                 const size_t writtenFrames = captureBuffer_.writeAllOrNothing(finalPcm, finalFrames);
                 if (writtenFrames == 0) {
                     captureDroppedFrames_.fetch_add(finalFrames, std::memory_order_relaxed);
+                } else {
+                    captureReadyCv_.notify_one();
                 }
             }
         }
@@ -1113,6 +1178,12 @@ void AAudioEngine::playbackDspThreadLoop() {
         uint64_t workerDspEpoch = playbackEpoch_.load(std::memory_order_acquire);
 
         while (playbackDspRunning_.load(std::memory_order_acquire)) {
+            if (outputEqDirty_.exchange(false, std::memory_order_acq_rel)) {
+                voiceEnhancer_.configure(
+                    std::max(1, actualPlaybackSampleRate_.load(std::memory_order_acquire)),
+                    outputEqProfile_.load(std::memory_order_acquire));
+            }
+
             const uint64_t activeEpoch = playbackEpoch_.load(std::memory_order_acquire);
             if (activeEpoch != workerDspEpoch) {
                 const int32_t currentRate = std::max(1, actualPlaybackSampleRate_.load(std::memory_order_acquire));
@@ -1331,6 +1402,8 @@ void AAudioEngine::flushPlayback(uint64_t generation) {
 
     playbackEpoch_.store(generation, std::memory_order_release);
     isPlaybackRenderingActive_.store(false, std::memory_order_release);
+    playbackPaused_.store(false, std::memory_order_release);
+    playbackPrimeRequested_.store(true, std::memory_order_release);
     earconRequested_.store(false, std::memory_order_release);
     outRms_.store(0.0f, std::memory_order_relaxed);
     smoothedRateFactor_ = 1.0f;
@@ -1361,6 +1434,30 @@ void AAudioEngine::setVolume(float vol) {
 
 void AAudioEngine::setMicGain(float gain) {
     micGain_.store(std::clamp(gain, 0.5f, 2.0f), std::memory_order_relaxed);
+}
+
+void AAudioEngine::setPlaybackPaused(bool paused) {
+    playbackPaused_.store(paused, std::memory_order_release);
+    playbackDspCv_.notify_all();
+}
+
+void AAudioEngine::setOutputEqProfile(int32_t profile) {
+    const int32_t clamped = std::clamp(profile, OUTPUT_EQ_SPEAKER, OUTPUT_EQ_HEADPHONES);
+    if (outputEqProfile_.exchange(clamped, std::memory_order_acq_rel) != clamped) {
+        outputEqDirty_.store(true, std::memory_order_release);
+        playbackDspCv_.notify_all();
+    }
+}
+
+bool AAudioEngine::waitForCaptureFrames(size_t frames, int32_t timeoutMs) {
+    if (frames == 0) return true;
+    if (captureBuffer_.availableRead() >= frames) return true;
+    std::unique_lock<std::mutex> lock(captureReadyMutex_);
+    captureReadyCv_.wait_for(lock, std::chrono::milliseconds(std::max(0, timeoutMs)), [this, frames]() {
+        return captureBuffer_.availableRead() >= frames ||
+               !captureDspRunning_.load(std::memory_order_acquire);
+    });
+    return captureBuffer_.availableRead() >= frames;
 }
 
 void AAudioEngine::getSpectrumData(dsp::SpectrumSnapshot& outSnapshot) {
@@ -1464,25 +1561,89 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
         }
     }
 
-    const size_t read = engine->playbackBuffer_.read(samples, frames);
+    const int32_t rate = std::max(1, engine->actualPlaybackSampleRate_.load(std::memory_order_relaxed));
+    const size_t fadeFrames = std::max<size_t>(1, static_cast<size_t>(rate) * PLAYBACK_FADE_MS / 1000);
+    const float rampStep = 1.0f / static_cast<float>(fadeFrames);
+
+    if (engine->playbackPrimeRequested_.exchange(false, std::memory_order_acq_rel)) {
+        engine->playbackPriming_ = true;
+        engine->playbackRampGain_ = 0.0f;
+    }
+
+    const bool paused = engine->playbackPaused_.load(std::memory_order_acquire);
+
+    // 1) Полная пауза: тишина, позиция очереди сохраняется (ничего не теряется)
+    if (paused && engine->playbackRampGain_ <= 0.0f) {
+        std::memset(samples, 0, frames * sizeof(int16_t));
+        engine->outRms_.store(0.0f, std::memory_order_relaxed);
+        return AAUDIO_CALLBACK_RESULT_CONTINUE;
+    }
+
+    // 2) Предзаполнение перед стартом фразы: убирает заикание первого слога при сетевом джиттере
+    if (engine->playbackPriming_ && !paused) {
+        const size_t buffered = engine->playbackBuffer_.availableRead();
+        const size_t primeFrames = static_cast<size_t>(rate) * PLAYBACK_PRIME_MS / 1000;
+        bool startNow = buffered >= primeFrames;
+        if (!startNow && buffered > 0 && engine->playbackDspInputBuffer_.availableRead() == 0) {
+            const uint64_t lastWrite = engine->lastPlaybackWriteNs_.load(std::memory_order_relaxed);
+            timespec tsPrime{};
+            clock_gettime(CLOCK_BOOTTIME, &tsPrime);
+            const uint64_t nowPrimeNs = static_cast<uint64_t>(tsPrime.tv_sec) * 1000000000ULL +
+                                        static_cast<uint64_t>(tsPrime.tv_nsec);
+            startNow = lastWrite != 0 && nowPrimeNs > lastWrite &&
+                nowPrimeNs - lastWrite >= static_cast<uint64_t>(PLAYBACK_PRIME_IDLE_MS) * 1000000ULL;
+        }
+        if (!startNow) {
+            std::memset(samples, 0, frames * sizeof(int16_t));
+            engine->outRms_.store(0.0f, std::memory_order_relaxed);
+            return AAUDIO_CALLBACK_RESULT_CONTINUE;
+        }
+        engine->playbackPriming_ = false;
+        engine->playbackRampGain_ = 0.0f;
+    }
+
+    // 3) При уходе в паузу читаем ровно столько, сколько занимает затухание: остальное остаётся в очереди
+    size_t want = frames;
+    if (paused) {
+        const size_t rampFrames = static_cast<size_t>(std::ceil(engine->playbackRampGain_ / rampStep));
+        want = std::min(frames, std::max<size_t>(1, rampFrames));
+    }
+
+    const size_t read = engine->playbackBuffer_.read(samples, want);
     if (read > 0) {
         engine->playbackDspCv_.notify_one();
-        // УСТРАНЕНИЕ САМОПЕРЕБИВАНИЯ: Расчёт outRms_ строго в реальном времени ЦАП.
-        // Исключает 80-мс опережение и рассинхронизацию с микрофоном.
-        const float realDacRms = dsp::calculateRms(samples, read);
-        engine->outRms_.store(realDacRms, std::memory_order_relaxed);
+    }
+
+    float ramp = engine->playbackRampGain_;
+    if ((paused && ramp > 0.0f) || (!paused && ramp < 1.0f)) {
+        for (size_t i = 0; i < read; ++i) {
+            ramp = paused ? std::max(0.0f, ramp - rampStep) : std::min(1.0f, ramp + rampStep);
+            samples[i] = static_cast<int16_t>(std::lrintf(static_cast<float>(samples[i]) * ramp));
+        }
+        engine->playbackRampGain_ = ramp;
     }
 
     if (read < frames) {
         std::memset(samples + read, 0, (frames - read) * sizeof(int16_t));
-        if (read == 0) {
-            engine->outRms_.store(0.0f, std::memory_order_relaxed);
-        }
-        if (engine->isPlaybackRenderingActive_.load(std::memory_order_relaxed)) {
-            engine->playbackUnderrunFrames_.fetch_add(frames - read, std::memory_order_relaxed);
-            engine->playbackUnderrunCount_.fetch_add(1, std::memory_order_relaxed);
+        if (!paused) {
+            // Опустошение: гасим хвост без щелчка и готовим предзаполнение следующей фразы
+            const size_t tail = std::min(read, fadeFrames);
+            for (size_t i = 0; i < tail; ++i) {
+                const float g = static_cast<float>(tail - i) / static_cast<float>(tail + 1);
+                const size_t idx = read - tail + i;
+                samples[idx] = static_cast<int16_t>(std::lrintf(static_cast<float>(samples[idx]) * g));
+            }
+            engine->playbackPriming_ = true;
+            engine->playbackRampGain_ = 0.0f;
+            if (engine->isPlaybackRenderingActive_.load(std::memory_order_relaxed)) {
+                engine->playbackUnderrunFrames_.fetch_add(frames - read, std::memory_order_relaxed);
+                engine->playbackUnderrunCount_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
+
+    // Эталон эха: RMS фактически выданного в ЦАП кадра (с учётом фейдов и тишины)
+    engine->outRms_.store(read > 0 ? dsp::calculateRms(samples, frames) : 0.0f, std::memory_order_relaxed);
 
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
