@@ -129,6 +129,7 @@ class SessionManager @Inject constructor(
         val KEY_AAD_END_SENSITIVITY = stringPreferencesKey("gemini_aad_end_sensitivity")
         val KEY_PREFIX_PADDING_MS = intPreferencesKey("gemini_prefix_padding_ms")
         val KEY_SILENCE_DURATION_MS = intPreferencesKey("gemini_silence_duration_ms")
+        val KEY_BT_HIFI_MODE = booleanPreferencesKey("bt_hifi_mode")
         val KEY_ACTIVITY_HANDLING = stringPreferencesKey("gemini_activity_handling")
         val KEY_TURN_COVERAGE = stringPreferencesKey("gemini_turn_coverage")
 
@@ -785,6 +786,7 @@ class SessionManager @Inject constructor(
         val aadEnabled = prefs[KEY_AAD_ENABLED] ?: true
         currentAadEnabled = aadEnabled
         audioEngine.isAadMode = aadEnabled
+        audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: true)
 
         val realtimeInput = RealtimeInputSettings(
             aadEnabled = aadEnabled,
@@ -2349,6 +2351,7 @@ class SessionManager @Inject constructor(
         dataStore.data.collect { prefs ->
             audioEngine.setVolume(prefs[KEY_VOLUME] ?: 1.0f)
             audioEngine.setMicGain(prefs[KEY_MIC_GAIN] ?: 1.0f)
+            audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: true)
             if (prefs[KEY_SESSION_RESUMPTION_ENABLED] == false) {
                 val hasStoredHandle = !prefs[KEY_SESSION_RESUMPTION_HANDLE].isNullOrBlank()
                 val hasStoredTimestamp = prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] != null
