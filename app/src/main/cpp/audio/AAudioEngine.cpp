@@ -202,7 +202,8 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
 
     AAudioStreamBuilder_setDirection(inBuilder, AAUDIO_DIRECTION_INPUT);
     AAudioStreamBuilder_setPerformanceMode(inBuilder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-    AAudioStreamBuilder_setSampleRate(inBuilder, AAUDIO_UNSPECIFIED);
+    // 16 кГц нативно: VoIP-профиль HAL отдаёт сигнал после AEC/NS без нашей децимации
+    AAudioStreamBuilder_setSampleRate(inBuilder, SAMPLE_RATE_GEMINI_IN);
     AAudioStreamBuilder_setChannelCount(inBuilder, CHANNEL_COUNT_MONO);
     AAudioStreamBuilder_setFormat(inBuilder, AAUDIO_FORMAT_PCM_I16);
 
@@ -214,6 +215,8 @@ bool AAudioEngine::openCaptureStreamLocked(int32_t inputDeviceId) {
 
     AAudioStreamBuilder_setSharingMode(inBuilder, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setInputPreset(inBuilder, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
+    // Сессия => legacy-путь (не MMAP): к VOICE_COMMUNICATION гарантированно цепляются AEC/NS/AGC
+    AAudioStreamBuilder_setSessionId(inBuilder, AAUDIO_SESSION_ID_ALLOCATE);
     AAudioStreamBuilder_setDataCallback(inBuilder, captureCallback, this);
     AAudioStreamBuilder_setErrorCallback(inBuilder, errorCallback, this);
 
@@ -1209,15 +1212,10 @@ void AAudioEngine::playbackDspThreadLoop() {
 
             if (activeEpoch != playbackEpoch_.load(std::memory_order_acquire)) continue;
 
-            float targetRateFactor = 1.0f;
-            if (buffered > targetBufferFrames + (hysteresisFrames / 2)) {
-                targetRateFactor = 1.025f;
-            } else if (buffered < lowWatermarkFrames && playbackDspInputBuffer_.availableRead() > 0) {
-                targetRateFactor = 0.975f;
-            }
-            // Высокая инерционность сглаживания (постоянная времени 0.98) исключает дрожание скорости
-            smoothedRateFactor_ = smoothedRateFactor_ * 0.98f + targetRateFactor * 0.02f;
-            const bool isNominalRate = std::abs(smoothedRateFactor_ - 1.0f) < 0.005f;
+            // Поток Gemini приходит быстрее реального времени: подстройка скорости не нужна.
+            // Прежний TSM давал плавание тона и щелчки при смене ресемплеров.
+            smoothedRateFactor_ = 1.0f;
+            const bool isNominalRate = true;
 
             size_t outputFrames = 0;
             if (isNominalRate && actualRate == SAMPLE_RATE_BT_LC3_24K) {
@@ -1316,6 +1314,8 @@ size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_
 
 size_t AAudioEngine::readCapturePcm(int16_t* pcm, size_t maxFrames) {
     if (pcm == nullptr || maxFrames == 0) return 0;
+    // Только целые кадры: частичное чтение + нулевой паддинг в Kotlin ломали VAD
+    if (captureBuffer_.availableRead() < maxFrames) return 0;
     return captureBuffer_.read(pcm, maxFrames);
 }
 
