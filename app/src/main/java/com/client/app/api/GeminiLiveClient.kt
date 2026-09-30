@@ -295,7 +295,7 @@ data class LiveConfig(
     val systemInstruction: String,
     val voiceName: String = "Charon",
     val speechLanguage: String? = null,
-    val temperature: Float = 0.5f,
+    val temperature: Float = 1.0f, // Gemini 3: рекомендовано Google, ниже — риск зацикливания
     val mediaResolution: String = "MEDIA_RESOLUTION_HIGH",
     val inputTranscription: TranscriptionSettings = TranscriptionSettings(),
     val outputTranscription: TranscriptionSettings = TranscriptionSettings(),
