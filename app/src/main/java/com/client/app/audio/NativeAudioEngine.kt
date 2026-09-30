@@ -298,6 +298,13 @@ class NativeAudioEngine @Inject constructor(
         vadDetector.setEndHangoverMs(ms)
     }
 
+    /** Hi-Fi Bluetooth (A2DP + микрофон телефона) / голосовая гарнитура (HFP). Применяется на лету. */
+    fun setBluetoothHiFiEnabled(enabled: Boolean) {
+        if (router.bluetoothHiFiEnabled == enabled) return
+        router.bluetoothHiFiEnabled = enabled
+        router.requestReevaluation()
+    }
+
     fun setVadThresholds(start: Float, end: Float) {
         val s = start.coerceIn(0.05f, 0.95f)
         val e = end.coerceIn(0.01f, s)
@@ -388,6 +395,7 @@ class NativeAudioEngine @Inject constructor(
         // Пороги Silero V5 (последовательные окна 32 мс): старт и гистерезис конца речи по маршруту
         when {
             profile.path == AudioRoutePath.SPEAKER_SHARED -> vadDetector.setThresholds(start = 0.55f, end = 0.35f)
+            profile.path == AudioRoutePath.BLUETOOTH_A2DP_HIFI -> vadDetector.setThresholds(start = 0.50f, end = 0.35f)
             profile.isBluetooth -> vadDetector.setThresholds(start = 0.45f, end = 0.30f)
             else -> vadDetector.setThresholds(start = 0.50f, end = 0.35f)
         }
@@ -521,6 +529,7 @@ class NativeAudioEngine @Inject constructor(
                 val profile = router.currentProfile.value
 
                 val inited = captureDirectMutex.withLock {
+                    bridge.setMediaPlaybackUsage(profile.path == AudioRoutePath.BLUETOOTH_A2DP_HIFI)
                     bridge.initAudioRoute(
                         isBluetooth = profile.isBluetooth,
                         sampleRate = profile.targetSampleRate,
@@ -1070,8 +1079,10 @@ class NativeAudioEngine @Inject constructor(
         val sessionId = runCatching { bridge.getCaptureSessionId() }.getOrDefault(0)
         if (sessionId <= 0 || sessionId == attachedEffectSessionId) return
         releaseVoiceEffects()
-        // В Bluetooth-гарнитуре эхо и шум подавляет сама гарнитура: второй NS на телефоне портит голос
-        if (router.currentProfile.value.isBluetooth) return
+        // В Bluetooth-гарнитуре эхо и шум подавляет сама гарнитура: второй NS на телефоне портит голос.
+        // В Hi-Fi микрофон — телефонный, эффекты нужны.
+        val routePath = router.currentProfile.value.path
+        if (routePath.isBluetooth && routePath != AudioRoutePath.BLUETOOTH_A2DP_HIFI) return
         attachedEffectSessionId = sessionId
 
         if (AcousticEchoCanceler.isAvailable()) {
@@ -1255,6 +1266,7 @@ class NativeAudioEngine @Inject constructor(
 
             captureDirectMutex.withLock {
                 bridge.stopAudio()
+                bridge.setMediaPlaybackUsage(req.profile.path == AudioRoutePath.BLUETOOTH_A2DP_HIFI)
                 routeInited = bridge.initAudioRoute(
                     isBluetooth = req.profile.isBluetooth,
                     sampleRate = req.profile.targetSampleRate,
