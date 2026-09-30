@@ -425,6 +425,36 @@ fun SettingsScreen(
                 }
             }
 
+            // BLUETOOTH-НАУШНИКИ: Hi-Fi (A2DP + микрофон телефона) или гарнитура (HFP)
+            ExpandableSettingsCard(title = "BLUETOOTH-НАУШНИКИ") {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Hi-Fi звук (A2DP) + микрофон телефона", color = ColorTextPrimary, fontSize = 13.sp)
+                        Text(
+                            if (settings.btHiFiMode) {
+                                "Стерео 48 кГц, тёплый полный голос. Держите телефон рядом: слушает его микрофон"
+                            } else {
+                                "Гарнитура HFP: микрофон наушников, звук ограничен полосой 8 кГц (моно)"
+                            },
+                            color = ColorTextMuted,
+                            fontSize = 11.sp
+                        )
+                    }
+                    Switch(
+                        checked = settings.btHiFiMode,
+                        onCheckedChange = {
+                            performSettingsHaptic(context)
+                            viewModel.setBtHiFiMode(it)
+                        },
+                        colors = whiteSwitchColors()
+                    )
+                }
+            }
+
             // 6. ДЕТЕКЦИЯ РЕЧИ (СЕРВЕРНЫЙ VAD / AAD)
             ExpandableSettingsCard(title = "6. ДЕТЕКЦИЯ РЕЧИ (СЕРВЕРНЫЙ VAD / AAD)") {
                 Row(
