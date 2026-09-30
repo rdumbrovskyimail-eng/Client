@@ -44,8 +44,8 @@ import com.client.app.viewmodel.ClientViewModel
 // Константы белого минимализма для главного холста
 private val ColorCanvasWhite = Color(0xFFFFFFFF)
 private val ColorErrorCard = Color(0xFFFFFFFF)
-private val ColorHairline = Color(0xFFE2E8F0)
-private val ColorErrorLed = Color(0xFFEF4444)
+private val ColorHairline = Color(0xFFEBEBEB)
+private val ColorErrorLed = Color(0xFFEA4335) // красный Gemini
 private val ColorTextPrimary = Color(0xFF09090B)
 private val ColorTextSecondary = Color(0xFF71717A)
 
