@@ -742,7 +742,7 @@ class SessionManager @Inject constructor(
 
         val voice = prefs[KEY_VOICE]?.ifBlank { null } ?: "Charon"
         val speechLang = prefs[KEY_SPEECH_LANGUAGE]?.ifBlank { "ru-RU" } ?: "ru-RU"
-        val temperature = prefs[KEY_TEMPERATURE] ?: 0.5f
+        val temperature = prefs[KEY_TEMPERATURE] ?: 1.0f
         val mediaResolution = prefs[KEY_MEDIA_RESOLUTION] ?: "MEDIA_RESOLUTION_HIGH"
 
         val inputTx = TranscriptionSettings(
@@ -873,7 +873,7 @@ class SessionManager @Inject constructor(
         }
 
         val forvoEnabled = prefs[KEY_ENABLE_FORVO] ?: false
-        val searchEnabled = prefs[KEY_ENABLE_SEARCH] ?: false
+        val searchEnabled = prefs[KEY_ENABLE_SEARCH] ?: true
 
         val dynamicTools = if (forvoEnabled) {
             buildJsonArray { add(buildForvoToolDeclaration()) }
