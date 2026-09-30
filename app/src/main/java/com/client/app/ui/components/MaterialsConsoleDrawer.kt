@@ -53,10 +53,10 @@ import kotlinx.coroutines.launch
 private val ColorPillBackground = Color(0xFFFFFFFF)
 private val ColorDrawerBackground = Color(0xFFFAFAFA)
 private val ColorCardBackground = Color(0xFFFFFFFF)
-private val ColorHairline = Color(0xFFE2E8F0)
+private val ColorHairline = Color(0xFFEBEBEB)
 private val ColorTextPrimary = Color(0xFF09090B)
 private val ColorTextSecondary = Color(0xFF71717A)
-private val ColorActionCyan = Color(0xFF0EA5E9)
+private val ColorActionCyan = Color(0xFF4285F4) // синий Gemini
 private val ColorButtonBlack = Color(0xFF09090B)
 private val ColorButtonTextWhite = Color(0xFFFAFAFA)
 private val ColorScrim = Color(0x28000000)
