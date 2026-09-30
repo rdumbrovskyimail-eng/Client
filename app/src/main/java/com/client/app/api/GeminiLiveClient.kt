@@ -175,7 +175,7 @@ data class RealtimeInputSettings(
     val startSensitivity: String = "START_SENSITIVITY_HIGH",
     val endSensitivity: String = "END_SENSITIVITY_HIGH",
     val prefixPaddingMs: Int = 60,
-    val silenceDurationMs: Int = 600,
+    val silenceDurationMs: Int = 500,
     val activityHandling: String = "START_OF_ACTIVITY_INTERRUPTS",
     val turnCoverage: String = "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
 )
