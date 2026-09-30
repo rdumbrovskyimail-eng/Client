@@ -55,7 +55,7 @@ struct StreamErrorEvent {
     int32_t direction{0}; // 1 = Input (Capture), 2 = Output (Playback)
     int32_t errorCode{0}; // Код AAUDIO_ERROR_*
     StreamFaultType faultType{StreamFaultType::NONE};
-    uint64_t timestampNs{0};
+    uint64_timestampNs{0};
 };
 
 /**
@@ -280,6 +280,9 @@ public:
 
     // Тонкомпенсация под маршрут: OUTPUT_EQ_SPEAKER / OUTPUT_EQ_HEADSET_VOICE / OUTPUT_EQ_HEADPHONES
     void setOutputEqProfile(int32_t profile);
+
+    // Hi-Fi Bluetooth: вывод как медиа (A2DP, стерео 48 кГц) вместо голосового канала связи (HFP/SCO)
+    void setMediaPlaybackUsage(bool enabled) { mediaPlaybackUsage_.store(enabled, std::memory_order_release); }
 
     // Блокирующее ожидание целого кадра захвата (вместо опроса с задержкой 2 мс)
     bool waitForCaptureFrames(size_t frames, int32_t timeoutMs);
@@ -534,6 +537,7 @@ private:
     std::atomic<bool> playbackPrimeRequested_{true};
     std::atomic<int32_t> outputEqProfile_{OUTPUT_EQ_SPEAKER};
     std::atomic<bool> outputEqDirty_{true};
+    std::atomic<bool> mediaPlaybackUsage_{false};
     // Состояние RT-колбэка воспроизведения (изменяется только потоком колбэка)
     float playbackRampGain_{0.0f};
     bool playbackPriming_{true};
