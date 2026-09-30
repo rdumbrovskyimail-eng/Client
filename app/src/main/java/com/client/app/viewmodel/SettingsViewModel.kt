@@ -24,7 +24,7 @@ data class AppSettingsState(
     val analyzerModel: String = VocabularyExtractor.DEFAULT_MODEL,
     val voice: String = "Charon",
     val speechLanguage: String = "ru-RU",
-    val temperature: Float = 0.5f,
+    val temperature: Float = 1.0f,
     val mediaResolution: String = "MEDIA_RESOLUTION_HIGH",
     val systemPrompt: String = SessionManager.DEFAULT_SYSTEM_PROMPT,
     val volume: Float = 1.0f,
@@ -57,7 +57,7 @@ data class AppSettingsState(
     val initialHistoryTurns: Int = 20,
     val enableForvo: Boolean = false,
     val forvoApiKey: String = "",
-    val enableGoogleSearch: Boolean = false
+    val enableGoogleSearch: Boolean = true
 )
 
 @OptIn(FlowPreview::class)
@@ -136,7 +136,7 @@ class SettingsViewModel @Inject constructor(
                         analyzerModel = p[SessionManager.KEY_ANALYZER_MODEL] ?: VocabularyExtractor.DEFAULT_MODEL,
                         voice = p[SessionManager.KEY_VOICE] ?: "Charon",
                         speechLanguage = p[SessionManager.KEY_SPEECH_LANGUAGE]?.ifBlank { "ru-RU" } ?: "ru-RU",
-                        temperature = p[SessionManager.KEY_TEMPERATURE] ?: 0.5f,
+                        temperature = p[SessionManager.KEY_TEMPERATURE] ?: 1.0f,
                         mediaResolution = p[SessionManager.KEY_MEDIA_RESOLUTION] ?: "MEDIA_RESOLUTION_HIGH",
                         systemPrompt = p[SessionManager.KEY_SYSTEM_PROMPT] ?: SessionManager.DEFAULT_SYSTEM_PROMPT,
                         volume = p[SessionManager.KEY_VOLUME] ?: 1.0f,
@@ -173,7 +173,7 @@ class SettingsViewModel @Inject constructor(
                             p[ForvoRepository.KEY_FORVO_API].orEmpty(),
                             "Forvo API key"
                         ),
-                        enableGoogleSearch = p[SessionManager.KEY_ENABLE_SEARCH] ?: false
+                        enableGoogleSearch = p[SessionManager.KEY_ENABLE_SEARCH] ?: true
                     )
                 }
             }
