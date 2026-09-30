@@ -421,6 +421,13 @@ class NativeAudioEngine @Inject constructor(
             end = if (profile.isBluetooth) 0.20f else 0.28f
         )
         bridge.setMicGain(quirks.micGainCompensation)
+        bridge.setOutputEqProfile(
+            when (profile.path) {
+                AudioRoutePath.SPEAKER_SHARED -> 0
+                AudioRoutePath.BLUETOOTH_SCO -> 1
+                else -> 2
+            }
+        )
         logger.d("NativeAudioEngine: Акустический профиль применен: ${quirks.deviceModel} (ENC Delay=${quirks.encLatencyMs}ms, ERLE=${quirks.acousticErleRatio})")
     }
 
