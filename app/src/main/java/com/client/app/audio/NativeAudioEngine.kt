@@ -131,10 +131,6 @@ class AcousticEchoBargeInProcessor(
         pendingDurationMs: Float,
         nowMs: Long
     ) {
-        if (instantaneousOut > 0.02f) {
-            lastPlaybackStartMs = nowMs
-        }
-
         outputEnergyHangover = if (!isPlaying || (pendingDurationMs <= 1.0f && instantaneousOut <= 0.002f)) {
             0f
         } else {
