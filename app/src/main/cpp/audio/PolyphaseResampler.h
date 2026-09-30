@@ -727,18 +727,19 @@ private:
 };
 
 /**
- * 41-таповый полуполосный КИХ-интерполятор 24 кГц -> 48 кГц.
+ * Полуполосный КИХ-интерполятор 24 кГц -> 48 кГц: 95 отводов, окно Кайзера (β = 8.6).
+ * Неравномерность полосы 0–10.5 кГц < 0.001 дБ, подавление зеркальных частот ≥ 87 дБ от 13.5 кГц.
+ * (Прежний фильтр давал всего −16 дБ на 14 кГц: «металлический» призвук сибилянтов.)
+ * Задержка: 24 входных отсчёта (1 мс). Коэффициенты рассчитываются один раз в конструкторе.
  */
 class HalfbandResampler24To48 : public IStreamingResampler {
 public:
-    static constexpr size_t TAPS = 41;
-    static constexpr size_t ORDER = TAPS - 1; // 40
-    static constexpr size_t DELAY_IN = ORDER / 4; // 10 входных отсчетов
-    static constexpr size_t HISTORY = ORDER / 2; // 20 входных отсчетов
-    static constexpr size_t ODD_INTERP_PAIRS = 10;
+    static constexpr size_t PAIRS = 24;
+    static constexpr size_t HISTORY = PAIRS * 2 - 1; // 47 предыдущих входных отсчётов
     static constexpr size_t CHUNK_SIZE = 1024;
 
     HalfbandResampler24To48() {
+        designCoefficients();
         reset();
     }
 
@@ -755,62 +756,49 @@ public:
         int16_t* out,
         size_t maxOutFrames = std::numeric_limits<size_t>::max()) override {
 
-        if (in == nullptr || out == nullptr || inFrames == 0 || maxOutFrames == 0) return 0;
-
-        size_t totalOut = 0;
-        size_t processed = 0;
+        if (in == nullptr || out == nullptr || inFrames == 0 || maxOutFrames < 2) return 0;
 
         if (!primed_) {
-            std::fill(history_, history_ + HISTORY, in[0]);
+            // Инициализация истории первым отсчётом: без щелчка на старте фразы
+            std::fill(history_, history_ + HISTORY, static_cast<float>(in[0]));
             primed_ = true;
         }
 
-        static constexpr int32_t INTERP_COEFFS[ODD_INTERP_PAIRS] = {
-            19034, -4056, 2152, -1140, 582, -272, 108, -30, 8, -2
-        };
+        size_t processed = 0;
+        size_t totalOut = 0;
 
         while (processed < inFrames && totalOut + 2 <= maxOutFrames) {
             const size_t chunk = std::min(inFrames - processed, CHUNK_SIZE);
             const int16_t* chunkIn = in + processed;
 
-            std::memcpy(workBuffer_, history_, HISTORY * sizeof(int16_t));
-            std::memcpy(workBuffer_ + HISTORY, chunkIn, chunk * sizeof(int16_t));
+            std::memcpy(work_, history_, HISTORY * sizeof(float));
+            for (size_t i = 0; i < chunk; ++i) {
+                work_[HISTORY + i] = static_cast<float>(chunkIn[i]);
+            }
 
-            const size_t base = HISTORY;
-
+            size_t consumed = 0;
             for (size_t i = 0; i < chunk; ++i) {
                 if (totalOut + 2 > maxOutFrames) break;
+                const size_t idx = HISTORY + i;
 
-                const size_t idx = base + i;
-
-                const int16_t directSample = workBuffer_[idx - DELAY_IN];
-
-                int64_t oddAcc = 0;
-                for (size_t k = 0; k < ODD_INTERP_PAIRS; ++k) {
-                    const int32_t pair =
-                        static_cast<int32_t>(workBuffer_[idx - (DELAY_IN - 1 - k)]) +
-                        static_cast<int32_t>(workBuffer_[idx - (DELAY_IN + k)]);
-                    oddAcc += static_cast<int64_t>(INTERP_COEFFS[k]) * pair;
+                const float direct = work_[idx - PAIRS];
+                float odd = 0.0f;
+                for (size_t k = 0; k < PAIRS; ++k) {
+                    odd += coeffs_[k] * (work_[idx - PAIRS - k] + work_[idx - PAIRS + 1 + k]);
                 }
 
-                constexpr int64_t ROUND_CONST = 1LL << 14;
-                const int32_t oddRounded = static_cast<int32_t>((oddAcc + ROUND_CONST) >> 15);
-
-                out[totalOut++] = directSample;
-                out[totalOut++] = static_cast<int16_t>(std::clamp<int32_t>(oddRounded, -32768, 32767));
+                out[totalOut++] = toPcm16(direct);
+                out[totalOut++] = toPcm16(odd);
+                ++consumed;
             }
 
-            if (chunk >= HISTORY) {
-                std::memcpy(history_, workBuffer_ + chunk, HISTORY * sizeof(int16_t));
-            } else {
-                std::memmove(history_, history_ + chunk, (HISTORY - chunk) * sizeof(int16_t));
-                std::memcpy(history_ + (HISTORY - chunk), chunkIn, chunk * sizeof(int16_t));
-            }
-
-            processed += chunk;
+            // История = последние HISTORY отсчётов из обработанной части окна
+            std::memcpy(history_, work_ + consumed, HISTORY * sizeof(float));
+            processed += consumed;
+            if (consumed < chunk) break;
         }
 
-        totalInSamples_ += inFrames;
+        totalInSamples_ += processed;
         totalOutSamples_ += totalOut;
         return totalOut;
     }
@@ -819,8 +807,48 @@ public:
     uint64_t getTotalOutSamples() const override { return totalOutSamples_; }
 
 private:
-    alignas(16) int16_t history_[HISTORY]{0};
-    alignas(16) int16_t workBuffer_[HISTORY + CHUNK_SIZE]{0};
+    static inline int16_t toPcm16(float v) {
+        const long r = std::lrintf(v);
+        return static_cast<int16_t>(std::clamp<long>(r, -32768L, 32767L));
+    }
+
+    static double besselI0(double x) {
+        double sum = 1.0;
+        double term = 1.0;
+        for (int k = 1; k < 64; ++k) {
+            const double t = x / (2.0 * static_cast<double>(k));
+            term *= t * t;
+            sum += term;
+            if (term < 1e-14 * sum) break;
+        }
+        return sum;
+    }
+
+    void designCoefficients() {
+        constexpr double BETA = 8.6;
+        constexpr double PI = 3.14159265358979323846;
+        const double m1 = static_cast<double>(2 * PAIRS); // M + 1, где M = 2·PAIRS − 1
+        const double i0Beta = besselI0(BETA);
+        double sum = 0.0;
+        double raw[PAIRS];
+        for (size_t k = 0; k < PAIRS; ++k) {
+            const double j = static_cast<double>(2 * k + 1);
+            const double r = j / m1;
+            const double window = besselI0(BETA * std::sqrt(std::max(0.0, 1.0 - r * r))) / i0Beta;
+            const double x = j / 2.0;
+            const double sinc = std::sin(PI * x) / (PI * x);
+            raw[k] = 2.0 * 0.5 * sinc * window;
+            sum += 2.0 * raw[k];
+        }
+        // Коэффициент передачи нечётной ветви на DC = 1 (иначе появится тон 24 кГц)
+        for (size_t k = 0; k < PAIRS; ++k) {
+            coeffs_[k] = static_cast<float>(raw[k] / sum);
+        }
+    }
+
+    float coeffs_[PAIRS]{};
+    float history_[HISTORY]{};
+    float work_[HISTORY + CHUNK_SIZE]{};
     bool primed_{false};
     uint64_t totalInSamples_{0};
     uint64_t totalOutSamples_{0};
