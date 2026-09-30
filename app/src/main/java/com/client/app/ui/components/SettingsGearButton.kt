@@ -32,9 +32,9 @@ import kotlinx.coroutines.launch
 
 // Цветовые константы белого минимализма
 private val ColorPillBackground = Color(0xFFFFFFFF)
-private val ColorHairline = Color(0xFFE2E8F0)
+private val ColorHairline = Color(0xFFEBEBEB)
 private val ColorIconBlack = Color(0xFF09090B)
-private val ColorErrorBadge = Color(0xFFEF4444)
+private val ColorErrorBadge = Color(0xFFEA4335) // красный Gemini
 
 /**
  * Тактильный микрощелчок часового механизма для шестеренки настроек.
