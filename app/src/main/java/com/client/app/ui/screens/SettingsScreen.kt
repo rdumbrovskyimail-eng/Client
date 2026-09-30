@@ -47,7 +47,7 @@ import com.client.app.viewmodel.SettingsViewModel
 private val ColorCanvasWhite = Color(0xFFFFFFFF)
 private val ColorCardBackground = Color(0xFFFAFAFA)
 private val ColorFieldBackground = Color(0xFFFFFFFF)
-private val ColorHairline = Color(0xFFE2E8F0)
+private val ColorHairline = Color(0xFFEBEBEB)
 private val ColorTextPrimary = Color(0xFF09090B)
 private val ColorTextSecondary = Color(0xFF71717A)
 private val ColorTextMuted = Color(0xFFA1A1AA)
@@ -458,8 +458,8 @@ fun SettingsScreen(
                 }
             }
 
-            // BLUETOOTH-НАУШНИКИ: Hi-Fi (A2DP + микрофон телефона) или гарнитура (HFP)
-            ExpandableSettingsCard(title = "BLUETOOTH-НАУШНИКИ") {
+            // 6. BLUETOOTH-НАУШНИКИ: Hi-Fi (A2DP + микрофон телефона) или гарнитура (HFP)
+            ExpandableSettingsCard(title = "6. BLUETOOTH-НАУШНИКИ") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -488,8 +488,8 @@ fun SettingsScreen(
                 }
             }
 
-            // 6. ДЕТЕКЦИЯ РЕЧИ (СЕРВЕРНЫЙ VAD / AAD)
-            ExpandableSettingsCard(title = "6. ДЕТЕКЦИЯ РЕЧИ (СЕРВЕРНЫЙ VAD / AAD)") {
+            // 7. ДЕТЕКЦИЯ РЕЧИ (СЕРВЕРНЫЙ VAD / AAD)
+            ExpandableSettingsCard(title = "7. ДЕТЕКЦИЯ РЕЧИ (СЕРВЕРНЫЙ VAD / AAD)") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -582,8 +582,8 @@ fun SettingsScreen(
                 }
             }
 
-            // 7. УПРАВЛЕНИЕ КОНТЕКСТОМ И СЕССИЕЙ
-            ExpandableSettingsCard(title = "7. УПРАВЛЕНИЕ КОНТЕКСТОМ И СЕССИЕЙ") {
+            // 8. УПРАВЛЕНИЕ КОНТЕКСТОМ И СЕССИЕЙ
+            ExpandableSettingsCard(title = "8. УПРАВЛЕНИЕ КОНТЕКСТОМ И СЕССИЕЙ") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -634,8 +634,8 @@ fun SettingsScreen(
                 )
             }
 
-            // 8. ИНСТРУМЕНТЫ (TOOLS & GROUNDING)
-            SettingsCard(title = "8. ИНСТРУМЕНТЫ (TOOLS & GROUNDING)") {
+            // 9. ИНСТРУМЕНТЫ (TOOLS & GROUNDING)
+            SettingsCard(title = "9. ИНСТРУМЕНТЫ (TOOLS & GROUNDING)") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -700,8 +700,8 @@ fun SettingsScreen(
                 }
             }
 
-            // 9. АППАРАТНЫЙ ТРАКТ GALAXY S23 ULTRA
-            SettingsCard(title = "9. АППАРАТНЫЙ АУДИОТРАКТ S23 ULTRA") {
+            // 10. АППАРАТНЫЙ ТРАКТ GALAXY S23 ULTRA
+            SettingsCard(title = "10. АППАРАТНЫЙ АУДИОТРАКТ S23 ULTRA") {
                 Text(
                     text = "Громкость ЦАП Qualcomm WCD9385: ${(volumeDraft * 100).toInt()}%",
                     color = ColorTextPrimary,
@@ -732,8 +732,8 @@ fun SettingsScreen(
                 )
             }
 
-            // 10. СИСТЕМНАЯ ИНФОРМАЦИЯ И БАТАРЕЯ
-            SettingsCard(title = "10. СИСТЕМНЫЙ СТАТУС И ЭНЕРГОПОТРЕБЛЕНИЕ") {
+            // 11. СИСТЕМНАЯ ИНФОРМАЦИЯ И БАТАРЕЯ
+            SettingsCard(title = "11. СИСТЕМНЫЙ СТАТУС И ЭНЕРГОПОТРЕБЛЕНИЕ") {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Filled.Bolt, null, tint = Color(0xFF10B981), modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(8.dp))
