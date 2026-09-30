@@ -42,7 +42,7 @@ data class AppSettingsState(
 
     val aadEnabled: Boolean = true,
     val aadStartSensitivity: String = "START_SENSITIVITY_HIGH",
-    val aadEndSensitivity: String = "END_SENSITIVITY_LOW",
+    val aadEndSensitivity: String = "END_SENSITIVITY_HIGH",
     val prefixPaddingMs: Int = 60,
     val silenceDurationMs: Int = 600,
     val activityHandling: String = "START_OF_ACTIVITY_INTERRUPTS",
@@ -153,7 +153,7 @@ class SettingsViewModel @Inject constructor(
 
                         aadEnabled = p[SessionManager.KEY_AAD_ENABLED] ?: true,
                         aadStartSensitivity = p[SessionManager.KEY_AAD_START_SENSITIVITY] ?: "START_SENSITIVITY_HIGH",
-                        aadEndSensitivity = p[SessionManager.KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_LOW",
+                        aadEndSensitivity = p[SessionManager.KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_HIGH",
                         prefixPaddingMs = p[SessionManager.KEY_PREFIX_PADDING_MS] ?: 60,
                         silenceDurationMs = p[SessionManager.KEY_SILENCE_DURATION_MS] ?: 600,
                         activityHandling = p[SessionManager.KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
