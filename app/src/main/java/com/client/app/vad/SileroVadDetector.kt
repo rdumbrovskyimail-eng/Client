@@ -264,18 +264,10 @@ class SileroVadDetector @Inject constructor(
             offset += toCopy
 
             if (slidingWindowCount >= WINDOW_SIZE_SAMPLES) {
-                // Окно 512 сэмплов заполнено: исполняем детерминированный инференс
+                // Silero V5 — RNN: окна строго последовательные, без перекрытия.
+                // Контекст 64 отсчёта = хвост предыдущего окна (обновляется в evaluateNeuralZeroAlloc)
                 evaluateWindow(slidingWindowBuffer, onSpeechStart, onSpeechEnd)
-
-                // Продвигаем окно: сдвигаем влево на 160 сэмплов, сохраняя историю 352 сэмплов
-                System.arraycopy(
-                    slidingWindowBuffer,
-                    HOP_SIZE_SAMPLES,
-                    slidingWindowBuffer,
-                    0,
-                    WINDOW_SIZE_SAMPLES - HOP_SIZE_SAMPLES
-                )
-                slidingWindowCount = WINDOW_SIZE_SAMPLES - HOP_SIZE_SAMPLES
+                slidingWindowCount = 0
             }
         }
     }
@@ -341,7 +333,7 @@ class SileroVadDetector @Inject constructor(
             // УСТРАНЕНИЕ ДЕФЕКТА 133: Сокращение паузы тишины до 4 окон (120 мс) по ITU-T G.729B
             if (prob < currentEndThresh) {
                 speechEndStreak++
-                if (speechEndStreak >= 4) {
+                if (speechEndStreak >= 16) { // 16 × 32 мс ≈ 512 мс (рекомендация Google: не менее 500 мс)
                     _isSpeechDetected.value = false
                     speechEndStreak = 0
                     speechStartStreak = 0
