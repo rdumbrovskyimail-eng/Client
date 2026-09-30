@@ -969,11 +969,8 @@ class AudioDeviceRouter @Inject constructor(
             }
 
             if (routePath != AudioRoutePath.SPEAKER_SHARED) {
-                val sampleRate = if (routePath.isBluetooth) {
-                    selectOptimalBluetoothSampleRate(activeOutputDevice)
-                } else {
-                    48000
-                }
+                // Единый путь 24→48 кГц (полуполосный КИХ); к SCO/LC3 ресемплирует AudioFlinger
+                val sampleRate = 48000
 
                 val matchedInput = allInputs.firstOrNull { inDev ->
                     when (routePath) {
