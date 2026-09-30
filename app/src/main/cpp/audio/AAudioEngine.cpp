@@ -428,7 +428,10 @@ aaudio_result_t AAudioEngine::openPlaybackStreamWithFallback(
         }
 
         AAudioStreamBuilder_setSharingMode(outBuilder, sharingMode);
-        AAudioStreamBuilder_setUsage(outBuilder, AAUDIO_USAGE_VOICE_COMMUNICATION);
+        // Режим связи → голосовой канал (AEC-эталон, HFP); Hi-Fi Bluetooth → медиа (A2DP)
+        AAudioStreamBuilder_setUsage(outBuilder, mediaPlaybackUsage_.load(std::memory_order_acquire)
+            ? AAUDIO_USAGE_MEDIA
+            : AAUDIO_USAGE_VOICE_COMMUNICATION);
         AAudioStreamBuilder_setContentType(outBuilder, AAUDIO_CONTENT_TYPE_SPEECH);
         // Legacy-путь (VOIP_RX в режиме связи): эталон эха для аппаратного AEC гарантирован
         AAudioStreamBuilder_setSessionId(outBuilder, AAUDIO_SESSION_ID_ALLOCATE);
