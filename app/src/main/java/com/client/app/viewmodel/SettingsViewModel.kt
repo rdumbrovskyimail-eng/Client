@@ -44,7 +44,7 @@ data class AppSettingsState(
     val aadStartSensitivity: String = "START_SENSITIVITY_HIGH",
     val aadEndSensitivity: String = "END_SENSITIVITY_HIGH",
     val prefixPaddingMs: Int = 60,
-    val silenceDurationMs: Int = 600,
+    val silenceDurationMs: Int = 500,
     val activityHandling: String = "START_OF_ACTIVITY_INTERRUPTS",
     val turnCoverage: String = "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO",
 
@@ -155,7 +155,7 @@ class SettingsViewModel @Inject constructor(
                         aadStartSensitivity = p[SessionManager.KEY_AAD_START_SENSITIVITY] ?: "START_SENSITIVITY_HIGH",
                         aadEndSensitivity = p[SessionManager.KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_HIGH",
                         prefixPaddingMs = p[SessionManager.KEY_PREFIX_PADDING_MS] ?: 60,
-                        silenceDurationMs = p[SessionManager.KEY_SILENCE_DURATION_MS] ?: 600,
+                        silenceDurationMs = p[SessionManager.KEY_SILENCE_DURATION_MS] ?: 500,
                         activityHandling = p[SessionManager.KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
                         turnCoverage = p[SessionManager.KEY_TURN_COVERAGE] ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO",
 
