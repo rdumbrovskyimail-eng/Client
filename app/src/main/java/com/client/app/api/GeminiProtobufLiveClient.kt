@@ -63,18 +63,18 @@ class GeminiProtobufLiveClient @Inject constructor(
         private const val MAX_QUEUE_BYTES = 512L * 1024L
 
         private const val DEFAULT_AUDIO_BATCH_THRESHOLD_BYTES = 640 // 20 мс @ 16 кГц
-        private const val MIN_AUDIO_BATCH_THRESHOLD_BYTES = 320     // 10 мс @ 16 кГц (низкий RTT)
+        private const val MIN_AUDIO_BATCH_THRESHOLD_BYTES = 640     // 20 мс — нижняя граница рекомендаций Live API
         private const val MAX_AUDIO_BATCH_THRESHOLD_BYTES = 1280    // 40 мс @ 16 кГц (высокий RTT)
         private const val DEFAULT_BATCH_DEADLINE_MS = 20L
         
         // Порог жизни кадра 5000 мс гарантирует сохранение всех предложений ответа модели
-        private const val AUDIO_FRAME_DEFAULT_TTL_MS = 5000L
+        private const val AUDIO_FRAME_DEFAULT_TTL_MS = Long.MAX_VALUE / 4 // кадры ответа не протухают
 
         private const val AUDIO_PCM_CHANNEL_CAPACITY = 32
         private const val CONTROL_COMMAND_CHANNEL_CAPACITY = 32
         private const val MAX_INITIAL_HISTORY_TURNS = 20
 
-        private const val MAX_AI_AUDIO_BACKLOG_BYTES = 1024L * 1024L // 1 МБ резерва сетевого буфера
+        private const val MAX_AI_AUDIO_BACKLOG_BYTES = 16L * 1024L * 1024L // ~5.8 мин @ 24 кГц
         private const val MAX_DATA_EVENTS_IN_FLIGHT = 512
     }
 
@@ -309,8 +309,7 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
 
     private val _audio = Channel<AudioFrame>(
-        capacity = 64,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        capacity = Channel.UNLIMITED,
         onUndeliveredElement = { frame -> releaseAudio(frame) }
     )
 
@@ -1289,9 +1288,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                                 put("voiceName", cfg.voiceName)
                             }
                         }
-
-                        val targetLang = cfg.speechLanguage?.ifBlank { "ru-RU" } ?: "ru-RU"
-                        put("languageCode", targetLang)
                     }
                 }
 
@@ -1342,18 +1338,9 @@ class GeminiProtobufLiveClient @Inject constructor(
                     val target = cfg.compression.targetTokens
 
                     putJsonObject("contextWindowCompression") {
-                        when {
-                            target > 0 -> {
-                                putJsonObject("slidingWindow") {
-                                    put("targetTokens", target)
-                                }
-                            }
-                            trigger > 0 -> {
-                                put("triggerTokens", trigger)
-                            }
-                            else -> {
-                                putJsonObject("slidingWindow") {}
-                            }
+                        if (trigger > 0) put("triggerTokens", trigger)
+                        putJsonObject("slidingWindow") {
+                            if (target > 0) put("targetTokens", target)
                         }
                     }
                 }
