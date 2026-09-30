@@ -331,6 +331,13 @@ class NativeAudioEngine @Inject constructor(
     // Перебивание разрешено (activityHandling != NO_INTERRUPTION)
     @Volatile var localBargeInEnabled: Boolean = true
 
+    // Вызывается синхронно ДО сброса вывода при подтверждённом перебивании (транспорт отсекает хвост генерации)
+    @Volatile var bargeInCommitListener: (() -> Unit)? = null
+
+    // Фраза пользователя сейчас передаётся на сервер (для бесшовного GoAway)
+    @Volatile var isUplinkActive: Boolean = false
+        private set
+
     @Volatile private var nextVadPrepareAttemptMs = 0L
 
     // Аппаратные эффекты захвата (AEC/NS) текущей аудиосессии; живут в потоке захвата
@@ -1012,6 +1019,7 @@ class NativeAudioEngine @Inject constructor(
         u.lastOutputActiveMs = 0L
         bargeInDetector.resetStreak()
         activateBargeIn(now)
+        runCatching { bargeInCommitListener?.invoke() }
         invalidateAndFlushPlayback("local barge-in")
         hapticManager.triggerBargeIn()
         _bargeInEvents.tryEmit(Unit)
@@ -1038,6 +1046,7 @@ class NativeAudioEngine @Inject constructor(
     ) {
         if (u.uplinkOpen) return
         u.uplinkOpen = true
+        isUplinkActive = true
         u.echoOnlyFrames = 0
         sendMicControlEvent(AudioStreamControlEvent.SpeechStart)
         while (u.preRoll.size > preRollFrames.coerceAtLeast(1)) {
@@ -1052,6 +1061,7 @@ class NativeAudioEngine @Inject constructor(
     private fun closeUplink(u: UplinkState) {
         if (!u.uplinkOpen) return
         u.uplinkOpen = false
+        isUplinkActive = false
         u.echoOnlyFrames = 0
         sendMicControlEvent(AudioStreamControlEvent.SpeechEnd)
     }
@@ -1127,6 +1137,7 @@ class NativeAudioEngine @Inject constructor(
                         runCatching { bridge.setPlaybackPaused(false) }
                     }
                     uplink.recycleAll()
+                    isUplinkActive = false
                     releaseVoiceEffects()
                     if (captureInstanceId.get() == instanceId) {
                         _isCapturing.value = false
