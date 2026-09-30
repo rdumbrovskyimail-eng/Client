@@ -90,6 +90,20 @@ class NativeAudioBridge @Inject constructor() {
 
     external fun flushPlayback(generation: Long)
     external fun triggerBargeInEarcon()
+
+    // Мягкая пауза вывода без потери данных (перебивание с подтверждением)
+    external fun setPlaybackPaused(paused: Boolean)
+    external fun isPlaybackPaused(): Boolean
+
+    // Тонкомпенсация: 0 = динамик, 1 = гарнитура HFP, 2 = наушники (A2DP/проводные/USB/LE)
+    external fun setOutputEqProfile(profile: Int)
+
+    // Блокирующее ожидание целого кадра захвата; true — кадр готов
+    external fun waitForCaptureFrames(frames: Int, timeoutMs: Int): Boolean
+
+    // Аудиосессия захвата для явного включения AEC/NS
+    external fun getCaptureSessionId(): Int
+
     external fun tuneNativeSocket(fd: Int)
     external fun getSpectrumData(outArray: FloatArray)
     external fun drainNativeLogs(): Array<String>?
