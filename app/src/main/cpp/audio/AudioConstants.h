@@ -36,7 +36,18 @@ constexpr size_t PLAYBACK_DSP_INPUT_CHUNK_FRAMES = BURST_10MS_24K;
 
 // Емкость кольцевых буферов (строго степень двойки для SPSC битовой маски без деления)
 constexpr size_t RING_BUFFER_CAPACITY_CAPTURE = 16384;  // ~1024 мс @ 16 кГц (32 КиБ)
-constexpr size_t RING_BUFFER_CAPACITY_PLAYBACK = 65536; // ~2730 мс @ 24 кГц (131 КиБ)
+constexpr size_t RING_BUFFER_CAPACITY_PLAYBACK = 65536; // выходная очередь после DSP (~1.36 с @ 48 кГц)
+constexpr size_t RING_BUFFER_CAPACITY_PLAYBACK_INPUT = 1u << 20; // ~43.7 с @ 24 кГц: весь ответ модели без потерь, пауза без переполнения
+
+// Старт фразы и плавные переходы воспроизведения
+constexpr int32_t PLAYBACK_PRIME_MS = 50;       // предзаполнение перед стартом фразы (против заикания первого слога)
+constexpr int32_t PLAYBACK_PRIME_IDLE_MS = 60;  // если сеть молчит дольше — играем то, что есть (хвост фразы)
+constexpr int32_t PLAYBACK_FADE_MS = 8;         // затухание/нарастание при паузе, перебивании и опустошении
+
+// Профили тонкомпенсации выхода
+constexpr int32_t OUTPUT_EQ_SPEAKER = 0;        // встроенный динамик (режим связи)
+constexpr int32_t OUTPUT_EQ_HEADSET_VOICE = 1;  // Bluetooth HFP/SCO (полоса до 8 кГц)
+constexpr int32_t OUTPUT_EQ_HEADPHONES = 2;     // A2DP / проводные / USB / LE Audio
 
 // Адаптивный сетевой горизонт воспроизведения по ITU-T G.114 и RFC 3550
 // Базовый порог оптимизирован под поглощение радиовсплесков LTE/5G и eSCO/BLE BAP
