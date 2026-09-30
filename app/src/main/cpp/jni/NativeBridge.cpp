@@ -395,6 +395,11 @@ Java_com_client_app_audio_NativeAudioBridge_getCaptureSessionId(JNIEnv * /* env 
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_client_app_audio_NativeAudioBridge_setMediaPlaybackUsage(JNIEnv * /* env */, jobject /* this */, jboolean enabled) {
+    AAudioEngine::getInstance().setMediaPlaybackUsage(enabled == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_client_app_audio_NativeAudioBridge_tuneNativeSocket(JNIEnv * /* env */, jobject /* this */, jint fd) {
     if (fd <= 0) return;
 
