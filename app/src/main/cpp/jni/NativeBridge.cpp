@@ -367,6 +367,34 @@ Java_com_client_app_audio_NativeAudioBridge_triggerBargeInEarcon(JNIEnv * /* env
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_client_app_audio_NativeAudioBridge_setPlaybackPaused(JNIEnv * /* env */, jobject /* this */, jboolean paused) {
+    AAudioEngine::getInstance().setPlaybackPaused(paused == JNI_TRUE);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_isPlaybackPaused(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jboolean>(AAudioEngine::getInstance().isPlaybackPaused());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_client_app_audio_NativeAudioBridge_setOutputEqProfile(JNIEnv * /* env */, jobject /* this */, jint profile) {
+    AAudioEngine::getInstance().setOutputEqProfile(static_cast<int32_t>(profile));
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_client_app_audio_NativeAudioBridge_waitForCaptureFrames(
+    JNIEnv * /* env */, jobject /* this */, jint frames, jint timeoutMs) {
+    if (frames <= 0) return JNI_TRUE;
+    return static_cast<jboolean>(AAudioEngine::getInstance().waitForCaptureFrames(
+        static_cast<size_t>(frames), static_cast<int32_t>(timeoutMs)));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_client_app_audio_NativeAudioBridge_getCaptureSessionId(JNIEnv * /* env */, jobject /* this */) {
+    return static_cast<jint>(AAudioEngine::getInstance().getCaptureSessionId());
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_client_app_audio_NativeAudioBridge_tuneNativeSocket(JNIEnv * /* env */, jobject /* this */, jint fd) {
     if (fd <= 0) return;
 
