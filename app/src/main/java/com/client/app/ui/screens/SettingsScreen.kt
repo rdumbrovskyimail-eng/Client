@@ -105,11 +105,44 @@ fun SettingsScreen(
     var silenceDurationDraft by remember(settings.silenceDurationMs) { mutableIntStateOf(settings.silenceDurationMs) }
     var historyTurnsDraft by remember(settings.initialHistoryTurns) { mutableIntStateOf(settings.initialHistoryTurns) }
 
-    val coreVoices = listOf("Charon", "Puck", "Kore", "Fenrir", "Aoede")
+    // 30 голосов Live API (официальный список Google); тёплые и мягкие — первыми
+    val liveVoices = listOf(
+        "Sulafat" to "тёплый",
+        "Achernar" to "мягкий",
+        "Vindemiatrix" to "нежный",
+        "Achird" to "дружелюбный",
+        "Charon" to "информативный",
+        "Algieba" to "плавный",
+        "Despina" to "плавный",
+        "Umbriel" to "непринуждённый",
+        "Callirrhoe" to "непринуждённый",
+        "Gacrux" to "зрелый",
+        "Schedar" to "ровный",
+        "Iapetus" to "чёткий",
+        "Erinome" to "чёткий",
+        "Rasalgethi" to "информативный",
+        "Sadaltager" to "эрудированный",
+        "Zubenelgenubi" to "расслабленный",
+        "Enceladus" to "с придыханием",
+        "Aoede" to "лёгкий",
+        "Kore" to "твёрдый",
+        "Orus" to "твёрдый",
+        "Alnilam" to "твёрдый",
+        "Algenib" to "с хрипотцой",
+        "Pulcherrima" to "напористый",
+        "Leda" to "молодой",
+        "Puck" to "бодрый",
+        "Laomedeia" to "бодрый",
+        "Zephyr" to "яркий",
+        "Autonoe" to "яркий",
+        "Sadachbia" to "живой",
+        "Fenrir" to "эмоциональный"
+    )
+
     val resolutions = listOf("MEDIA_RESOLUTION_HIGH", "MEDIA_RESOLUTION_MEDIUM", "MEDIA_RESOLUTION_LOW")
     val txModes = listOf("VERBATIM", "SMART")
     val sensitivities = listOf("START_SENSITIVITY_HIGH", "START_SENSITIVITY_LOW")
-    val endSensitivities = listOf("END_SENSITIVITY_LOW", "END_SENSITIVITY_HIGH")
+    val endSensitivities = listOf("END_SENSITIVITY_HIGH", "END_SENSITIVITY_LOW")
     val activityHandlings = listOf("START_OF_ACTIVITY_INTERRUPTS", "NO_INTERRUPTION")
     val turnCoverages = listOf(
         "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO",
@@ -240,7 +273,7 @@ fun SettingsScreen(
             // 2. ПАРАМЕТРЫ ГЕНЕРАЦИИ И МЕДИА
             SettingsCard(title = "2. ПАРАМЕТРЫ ГЕНЕРАЦИИ И МЕДИА") {
                 Text(
-                    text = "Температура декодера: ${"%.2f".format(tempDraft)}",
+                    text = "Температура: ${"%.2f".format(tempDraft)} (Gemini 3: рекомендовано 1.00)",
                     color = ColorTextPrimary,
                     fontSize = 12.5.sp,
                     fontFamily = FontFamily.Monospace
@@ -282,14 +315,14 @@ fun SettingsScreen(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    coreVoices.forEach { v ->
+                    liveVoices.forEach { (v, trait) ->
                         FilterChip(
                             selected = settings.voice == v,
                             onClick = {
                                 performSettingsHaptic(context)
                                 viewModel.setVoice(v)
                             },
-                            label = { Text(v, fontSize = 11.5.sp) },
+                            label = { Text("$v · $trait", fontSize = 11.5.sp) },
                             colors = whiteChipColors()
                         )
                     }
