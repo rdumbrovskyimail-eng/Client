@@ -104,6 +104,9 @@ class NativeAudioBridge @Inject constructor() {
     // Аудиосессия захвата для явного включения AEC/NS
     external fun getCaptureSessionId(): Int
 
+    // Hi-Fi Bluetooth: вывод как медиа (A2DP) вместо канала связи (HFP)
+    external fun setMediaPlaybackUsage(enabled: Boolean)
+
     external fun tuneNativeSocket(fd: Int)
     external fun getSpectrumData(outArray: FloatArray)
     external fun drainNativeLogs(): Array<String>?
