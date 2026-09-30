@@ -21,6 +21,7 @@ import com.client.app.audio.AudioFocusEvent
 import com.client.app.audio.AudioStreamControlEvent
 import com.client.app.audio.AudioStreamDataEvent
 import com.client.app.audio.CaptureShutdownResult
+import com.client.app.audio.MicEvent
 import com.client.app.audio.NativeAudioEngine
 import com.client.app.audio.PronunciationPlayer
 import com.client.app.forvo.ForvoRepository
@@ -795,6 +796,10 @@ class SessionManager @Inject constructor(
             turnCoverage = prefs[KEY_TURN_COVERAGE] ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
         )
 
+        // Гибридный VAD: клиент закрывает фразу по своей паузе (audioStreamEnd), серверный VAD страхует
+        audioEngine.setEndOfSpeechHangoverMs(realtimeInput.silenceDurationMs)
+        audioEngine.localBargeInEnabled = realtimeInput.activityHandling != "NO_INTERRUPTION"
+
         val compression = CompressionSettings(
             enabled = prefs[KEY_COMPRESSION_ENABLED] ?: true,
             triggerTokens = prefs[KEY_COMPRESSION_TRIGGER_TOKENS] ?: 0,
@@ -1266,68 +1271,65 @@ class SessionManager @Inject constructor(
 
         micAudioJob?.cancel()
         micControlJob?.cancel()
+        micControlJob = null
 
+        // Один упорядоченный потребитель: кадры и события речи уходят строго в порядке захвата
         micAudioJob = scope.launch {
             try {
-                for (audio in audioEngine.micAudioOutput) {
+                for (event in audioEngine.micOutput) {
                     if (!isActive) break
-                    try {
-                        if (
-                            !forvoPlayer.isPlaying.value &&
-                            !isTextTurnInProgress.get() &&
-                            (currentAadEnabled || isManualActivityActive.get()) &&
-                            connectionDesired &&
-                            client.isReady
-                        ) {
-                            client.sendAudioPcm(audio.pcm, audio.length)
+                    when (event) {
+                        is MicEvent.Audio -> {
+                            val audio = event.data
+                            try {
+                                if (
+                                    !forvoPlayer.isPlaying.value &&
+                                    !isTextTurnInProgress.get() &&
+                                    (currentAadEnabled || isManualActivityActive.get()) &&
+                                    connectionDesired &&
+                                    client.isReady
+                                ) {
+                                    client.sendAudioPcm(audio.pcm, audio.length)
+                                }
+                            } finally {
+                                audioEngine.releaseCapturedBuffer(audio.pcm)
+                                audioEngine.recycleAudioEvent(audio)
+                            }
                         }
-                    } finally {
-                        audioEngine.releaseCapturedBuffer(audio.pcm)
-                        audioEngine.recycleAudioEvent(audio)
+
+                        is MicEvent.Control -> when (event.event) {
+                            is AudioStreamControlEvent.SpeechStart -> {
+                                if (!currentAadEnabled && client.isReady) {
+                                    isManualActivityActive.set(true)
+                                    logger.d("SessionManager: VAD SpeechStart -> activityStart")
+                                    client.sendActivityStart()
+                                }
+                            }
+
+                            is AudioStreamControlEvent.SpeechEnd -> {
+                                if (currentAadEnabled && client.isReady) {
+                                    // Гибридный VAD: клиент закрывает фразу сам — сервер отвечает без своей паузы
+                                    client.sendAudioStreamEnd()
+                                } else if (!currentAadEnabled && client.isReady) {
+                                    isManualActivityActive.set(false)
+                                    withTimeoutOrNull(500L) {
+                                        client.sendActivityEnd()
+                                    } ?: logger.w("SessionManager: SpeechEnd activityEnd timed out")
+                                }
+                            }
+
+                            is AudioStreamControlEvent.StreamStop -> {
+                                finalizeMicActivityBounded()
+                                _state.update { it.copy(isMicActive = false) }
+                                break
+                            }
+                        }
                     }
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (t: Throwable) {
-                logger.e("SessionManager: mic audio consumer crashed", t)
-            }
-        }
-
-        micControlJob = scope.launch {
-            try {
-                for (control in audioEngine.micControlOutput) {
-                    if (!isActive) break
-                    when (control) {
-                        is AudioStreamControlEvent.SpeechStart -> {
-                            if (!currentAadEnabled && client.isReady) {
-                                isManualActivityActive.set(true)
-                                logger.d("SessionManager: VAD SpeechStart -> sendActivityStart")
-                                client.sendActivityStart()
-                            }
-                        }
-
-                        is AudioStreamControlEvent.SpeechEnd -> {
-                            if (currentAadEnabled && client.isReady) {
-                                client.flushAudio()
-                            } else if (!currentAadEnabled && client.isReady) {
-                                isManualActivityActive.set(false)
-                                withTimeoutOrNull(500L) {
-                                    client.sendActivityEnd()
-                                } ?: logger.w("SessionManager: SpeechEnd activityEnd timed out")
-                            }
-                        }
-
-                        is AudioStreamControlEvent.StreamStop -> {
-                            finalizeMicActivityBounded()
-                            _state.update { it.copy(isMicActive = false) }
-                            break
-                        }
-                    }
-                }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (t: Throwable) {
-                logger.e("SessionManager: mic control consumer crashed", t)
+                logger.e("SessionManager: mic consumer crashed", t)
             }
         }
     }
@@ -2082,14 +2084,18 @@ class SessionManager @Inject constructor(
                                                                 w.copy(
                                                                     audioUrl =
                                                                         res.pronunciation.mp3Url,
-                                                                    isLoading = false,
-                                                                    notFound = false
+                                                                    isLoading =
+                                                                        false,
+                                                                    notFound =
+                                                                        false
                                                                 )
 
                                                             else ->
                                                                 w.copy(
-                                                                    isLoading = false,
-                                                                    notFound = true
+                                                                    isLoading =
+                                                                        false,
+                                                                    notFound =
+                                                                        true
                                                                 )
                                                         }
                                                     }
