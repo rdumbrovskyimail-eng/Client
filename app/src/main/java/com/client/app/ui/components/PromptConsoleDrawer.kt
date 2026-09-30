@@ -51,7 +51,7 @@ import kotlin.math.roundToInt
 private val ColorPillBackground = Color(0xFFFFFFFF)
 private val ColorDrawerBackground = Color(0xFFFAFAFA)
 private val ColorInputBackground = Color(0xFFFFFFFF)
-private val ColorHairline = Color(0xFFE2E8F0)
+private val ColorHairline = Color(0xFFEBEBEB)
 private val ColorTextPrimary = Color(0xFF09090B)
 private val ColorTextSecondary = Color(0xFF71717A)
 private val ColorButtonBackground = Color(0xFFFFFFFF)
@@ -117,15 +117,13 @@ fun PromptConsoleDrawer(
         isDrawerOpen = false
     }
 
-    // Радужная кисть для эффекта хроматической дисперсии
+    // Кисть четырёх цветов Gemini: синий → красный → жёлтый → зелёный
     val rainbowColors = listOf(
-        Color(0xFFFF0055),
-        Color(0xFFFF8800),
-        Color(0xFFFFEE00),
-        Color(0xFF00E676),
-        Color(0xFF00B0FF),
-        Color(0xFF651FFF),
-        Color(0xFFFF0055)
+        Color(0xFF4285F4),
+        Color(0xFFEA4335),
+        Color(0xFFFBBC04),
+        Color(0xFF34A853),
+        Color(0xFF4285F4)
     )
 
     val rainbowBrush = Brush.verticalGradient(
