@@ -173,7 +173,7 @@ data class TranscriptionSettings(
 data class RealtimeInputSettings(
     val aadEnabled: Boolean = true,
     val startSensitivity: String = "START_SENSITIVITY_HIGH",
-    val endSensitivity: String = "END_SENSITIVITY_LOW",
+    val endSensitivity: String = "END_SENSITIVITY_HIGH",
     val prefixPaddingMs: Int = 60,
     val silenceDurationMs: Int = 600,
     val activityHandling: String = "START_OF_ACTIVITY_INTERRUPTS",
