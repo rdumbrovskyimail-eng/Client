@@ -55,7 +55,7 @@ struct StreamErrorEvent {
     int32_t direction{0}; // 1 = Input (Capture), 2 = Output (Playback)
     int32_t errorCode{0}; // Код AAUDIO_ERROR_*
     StreamFaultType faultType{StreamFaultType::NONE};
-    uint64_timestampNs{0};
+    uint64_t timestampNs{0};
 };
 
 /**
