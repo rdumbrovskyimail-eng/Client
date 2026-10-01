@@ -170,7 +170,7 @@ class VocabularyExtractor @Inject constructor(
                     Base64OutputStream(nonClosingStream, Base64.NO_WRAP).use { out ->
                         out.write(bytes)
                     }
-                    sink.writeUtf8("""}},""")
+                    sink.writeUtf8("\"}},")
                 }
                 if (textJson != null) sink.writeUtf8("""{"text":$textJson},""")
                 sink.writeUtf8("""{"text":$instructionJson}]}],""")
