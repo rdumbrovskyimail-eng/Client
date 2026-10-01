@@ -144,7 +144,8 @@ class SessionManager @Inject constructor(
         val KEY_INITIAL_HISTORY_TURNS = intPreferencesKey("gemini_initial_history_turns")
 
         val KEY_ENABLE_FORVO = booleanPreferencesKey("enable_forvo")
-        val KEY_ENABLE_SEARCH = booleanPreferencesKey("enable_search")
+        // Новый ключ: прежнее сохранённое «true» больше не включает поиск (из-за него сессия падала по квоте)
+        val KEY_ENABLE_SEARCH = booleanPreferencesKey("enable_search_v2")
         val KEY_VOLUME = floatPreferencesKey("audio_volume")
         val KEY_MIC_GAIN = floatPreferencesKey("audio_mic_gain")
 
@@ -477,7 +478,8 @@ class SessionManager @Inject constructor(
                 images = processed.images,
                 plainText = processed.extractedText,
                 forLanguageLearning = forvoOn,
-                model = VocabularyExtractor.DEFAULT_MODEL
+                model = prefs[KEY_ANALYZER_MODEL]?.trim()?.takeIf { it.isNotBlank() }
+                    ?: VocabularyExtractor.DEFAULT_MODEL
             )
 
             when (result) {
@@ -635,7 +637,9 @@ class SessionManager @Inject constructor(
         }
         if (candidateList.isEmpty()) return emptyList()
 
-        val maxHistoryChars = (131_072 * 3).coerceAtMost(240_000)
+        // 240k символов ≈ десятки тысяч токенов на КАЖДОЕ новое подключение — на бесплатном
+        // уровне это само по себе выбивает лимит токенов в минуту
+        val maxHistoryChars = 24_000
         val out = ArrayDeque<ClientTurn>()
         var chars = 0
 
@@ -873,7 +877,8 @@ class SessionManager @Inject constructor(
         }
 
         val forvoEnabled = prefs[KEY_ENABLE_FORVO] ?: false
-        val searchEnabled = prefs[KEY_ENABLE_SEARCH] ?: true
+        // Google Search по умолчанию ВЫКЛЮЧЕН: с ним сервер закрывал сессию 1011 «quota exceeded»
+        val searchEnabled = prefs[KEY_ENABLE_SEARCH] ?: false
 
         val dynamicTools = if (forvoEnabled) {
             buildJsonArray { add(buildForvoToolDeclaration()) }
@@ -1782,13 +1787,11 @@ class SessionManager @Inject constructor(
 
                                         cancelAllPendingToolJobs()
 
+                                        // 1007 — сервер отверг содержимое setup, 1008 — нарушение политики
+                                        // (ключ, доступ к модели). Повтор с тем же конфигом бесполезен.
+                                        val configRejectCodes = setOf(400, 403, 404, 1007, 1008)
                                         val resumeRejected =
-                                            activeConnectUsedResumption &&
-                                                (
-                                                    event.code == 400 ||
-                                                    event.code == 403 ||
-                                                    event.code == 404
-                                                )
+                                            activeConnectUsedResumption && event.code in configRejectCodes
 
                                         if (resumeRejected) {
                                             logger.w(
@@ -1806,19 +1809,16 @@ class SessionManager @Inject constructor(
                                             }
                                         }
 
-                                        val authOrClientFatal = if (resumeRejected) {
-                                            false
-                                        } else {
-                                            event.code == 400 ||
-                                                event.code == 401 ||
-                                                event.code == 403 ||
-                                                event.code == 404
-                                        }
+                                        val authOrClientFatal = !resumeRejected &&
+                                            (event.code == 401 || event.code in configRejectCodes)
 
                                         if (authOrClientFatal) {
                                             logger.e(
                                                 "SessionManager: Фатальная ошибка клиента (${event.code}). Остановка сессии."
                                             )
+                                            _state.update {
+                                                it.copy(error = "Сервер закрыл сессию (${event.code}): ${event.reason.ifBlank { "без описания" }}")
+                                            }
                                             connectionDesired = false
                                             userMicDesired = false
                                             cancelReconnectWork()
@@ -1841,7 +1841,7 @@ class SessionManager @Inject constructor(
                                                     if (resumeRejected) {
                                                         "resumption отклонён сервером (${event.code}), запуск чистой сессии"
                                                     } else {
-                                                        "код ${event.code}"
+                                                        "код ${event.code}: ${event.reason.take(120)}"
                                                     },
                                                 sourceEpoch =
                                                     event.epoch,
