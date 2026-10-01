@@ -270,6 +270,7 @@ Java_com_client_app_audio_NativeAudioBridge_writePlaybackByteArray(
     if (!byteArray || offset < 0 || length <= 0) return 0;
     if (generation <= 0) return 0;
     if ((length & 1) != 0) return 0;
+    if ((offset & 1) != 0) return 0;
     const jsize arrayLen = env->GetArrayLength(byteArray);
     if (arrayLen < 0) return 0;
 
