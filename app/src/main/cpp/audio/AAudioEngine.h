@@ -465,6 +465,14 @@ private:
     alignas(64) std::atomic<uint64_t> lastCaptureTimestampNs_{0};
     alignas(64) std::atomic<uint64_t> playbackSequenceNumber_{0};
     alignas(64) std::atomic<uint64_t> lastPlaybackPresentationTimestampNs_{0};
+    // Публикуются ТОЛЬКО колбэком воспроизведения: AAudioStream_getTimestamp() нельзя вызывать
+    // конкурентно из других потоков, а сам поток может быть закрыт stop() под lifecycleMutex_
+    std::atomic<int64_t> lastHwFramePosition_{0};
+    std::atomic<int64_t> lastHwFramesWritten_{0};
+    // Сериализует JNI-продюсеров (Gemini, Forvo) и flush. В RT-колбэке AAudio НЕ используется.
+    std::mutex playbackProducerMutex_;
+    // tail входной очереди на момент последнего flush: DSP-поток отбрасывает только данные ДО него
+    std::atomic<size_t> playbackFlushInputMark_{0};
 
     // Адаптивный джиттер-буфер (AJB) и контроллер скорости вывода (TSM)
     alignas(64) std::atomic<size_t> playbackTargetBufferMs_{PLAYBACK_TARGET_BUFFER_MS};
