@@ -749,7 +749,7 @@ class NativeAudioEngine @Inject constructor(
                     logger.d("NativeAudioEngine: Targeted capture recovery completed successfully")
                 } else {
                     logger.e("NativeAudioEngine: Targeted capture recovery failed, falling back to full route recovery")
-                    applyRouteInternal(RouteTransitionRequest(router.currentProfile.value, engineGeneration.get()))
+                    applyRouteLocked(RouteTransitionRequest(router.currentProfile.value, engineGeneration.get()))
                 }
             }
         }
@@ -776,7 +776,7 @@ class NativeAudioEngine @Inject constructor(
                     logger.d("NativeAudioEngine: Targeted playback recovery completed successfully")
                 } else {
                     logger.e("NativeAudioEngine: Targeted playback recovery failed, falling back to full route recovery")
-                    applyRouteInternal(RouteTransitionRequest(router.currentProfile.value, engineGeneration.get()))
+                    applyRouteLocked(RouteTransitionRequest(router.currentProfile.value, engineGeneration.get()))
                 }
             }
         }
@@ -1208,7 +1208,12 @@ class NativeAudioEngine @Inject constructor(
 
     private suspend fun applyRouteInternal(
         req: RouteTransitionRequest
-    ) = audioLifecycleMutex.withLock {
+    ) = audioLifecycleMutex.withLock { applyRouteLocked(req) }
+
+    /** Только под audioLifecycleMutex: kotlinx Mutex не реентерабелен. */
+    private suspend fun applyRouteLocked(
+        req: RouteTransitionRequest
+    ) {
         withContext(Dispatchers.IO) {
             val keepPlaying = playbackDesired.get()
             val keepCapturing = captureDesired.get()
