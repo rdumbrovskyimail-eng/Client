@@ -145,6 +145,17 @@ class SileroVadDetector @Inject constructor(
                         return@withContext false
                     }
 
+                    // Деградировавшая сессия ещё не закрыта — иначе каждый повторный prepare() её терял
+                    persistentInputsMap = null
+                    runCatching { persistentInputTensor?.close() }
+                    runCatching { persistentStateTensor?.close() }
+                    runCatching { persistentSrTensor?.close() }
+                    runCatching { ortSession?.close() }
+                    persistentInputTensor = null
+                    persistentStateTensor = null
+                    persistentSrTensor = null
+                    ortSession = null
+
                     val env = OrtEnvironment.getEnvironment()
                     val sessionOptions = OrtSession.SessionOptions().apply {
                         setIntraOpNumThreads(1)
