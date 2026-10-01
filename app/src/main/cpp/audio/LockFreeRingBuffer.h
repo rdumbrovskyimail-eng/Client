@@ -200,6 +200,27 @@ public:
         discardAll();
     }
 
+    /**
+     * Вызывать ТОЛЬКО из потока-потребителя. Сдвигает head не дальше mark (и не дальше tail),
+     * не затрагивая данные, записанные продюсером после mark.
+     */
+    void discardUpTo(size_t mark) noexcept {
+        size_t currentHead = head_.load(std::memory_order_relaxed);
+        while (true) {
+            const size_t target = std::min(mark, tail_.load(std::memory_order_acquire));
+            if (target <= currentHead) return;
+            if (head_.compare_exchange_weak(currentHead, target,
+                                            std::memory_order_release,
+                                            std::memory_order_relaxed)) {
+                return;
+            }
+        }
+    }
+
+    size_t tailPosition() const noexcept {
+        return tail_.load(std::memory_order_acquire);
+    }
+
     void resetQuiesced() noexcept {
         head_.store(0, std::memory_order_seq_cst);
         tail_.store(0, std::memory_order_seq_cst);
