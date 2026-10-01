@@ -68,10 +68,12 @@ fun ClientScreen(
     val permissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        val audioGranted = permissions[Manifest.permission.RECORD_AUDIO] == true ||
-            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        // Старт только если микрофон запрашивали ИМЕННО в этом диалоге и его выдали. Иначе
+        // (запрошены лишь уведомления/Bluetooth при уже выданном микрофоне) повторный
+        // toggleConnection() сразу останавливал только что запущенную сессию.
+        val audioJustGranted = permissions[Manifest.permission.RECORD_AUDIO] == true
 
-        if (audioGranted) {
+        if (audioJustGranted) {
             viewModel.toggleConnection()
         }
     }
