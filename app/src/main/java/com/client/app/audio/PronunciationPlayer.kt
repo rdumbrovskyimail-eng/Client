@@ -173,7 +173,12 @@ class PronunciationPlayer @Inject constructor(
 
             val timeoutUs = 5000L
 
+            val decodeDeadlineMs = android.os.SystemClock.elapsedRealtime() + 10_000L
             while (!sawOutputEos) {
+                if (android.os.SystemClock.elapsedRealtime() > decodeDeadlineMs) {
+                    logger.w("PronunciationPlayer: декодер не выдал EOS за 10 с — прерываем")
+                    return null
+                }
                 if (!sawInputEos) {
                     val inputBufIndex = codec.dequeueInputBuffer(timeoutUs)
                     if (inputBufIndex >= 0) {
@@ -297,6 +302,4 @@ class PronunciationPlayer @Inject constructor(
             outBytes[outByteIdx++] = ((interpolated shr 8) and 0xFF).toByte()
         }
 
-        return outBytes
-    }
-}
+        return
