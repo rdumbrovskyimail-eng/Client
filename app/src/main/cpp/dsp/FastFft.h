@@ -55,8 +55,10 @@ private:
     // Четное значение = стабильный снимок, нечетное = идет публикация писателем
     mutable std::atomic<uint32_t> snapshotSeq_{0};
 
-    // Однородная структура снимка без разделения на 7 отдельных атомиков
-    alignas(16) SpectrumSnapshot activeSnapshot_{};
+    // Полезная нагрузка seqlock — атомики с relaxed-доступом (канонический seqlock для C++)
+    std::atomic<float> snapshotBands_[audio::SPECTRUM_BANDS]{};
+    std::atomic<float> snapshotMicRms_{0.0f};
+    std::atomic<float> snapshotOutRms_{0.0f};
 };
 
 } // namespace client::dsp
