@@ -1,4 +1,3 @@
-// >>> FILE: app/src/main/java/com/client/app/api/ContextCacheService.kt
 package com.client.app.api
 
 import androidx.datastore.core.DataStore
@@ -95,7 +94,7 @@ class ContextCacheService @Inject constructor(
             // hand an unverified cache ID to the caller.
             val existingStillValid = runCatching {
                 val verifyUrl =
-                    "$BASE_URL/${existingId.removePrefix("cachedContents/")}"
+                    "$BASE_URL/cachedContents/${existingId.removePrefix("cachedContents/")}"
 
                 httpClient.newCall(
                     Request.Builder()
