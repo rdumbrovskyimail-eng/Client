@@ -302,4 +302,6 @@ class PronunciationPlayer @Inject constructor(
             outBytes[outByteIdx++] = ((interpolated shr 8) and 0xFF).toByte()
         }
 
-        return
+        return outBytes
+    }
+}
