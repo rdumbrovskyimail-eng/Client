@@ -554,9 +554,13 @@ bool AAudioEngine::startPlayback() {
         smoothedRateFactor_ = 1.0f;
     }
 
-    playbackDspInputBuffer_.resetQuiesced();
-    playbackBuffer_.resetQuiesced();
-    fftTapBuffer_.resetQuiesced();
+    {
+        std::lock_guard<std::mutex> producerLock(playbackProducerMutex_);
+        playbackDspInputBuffer_.resetQuiesced();
+        playbackBuffer_.resetQuiesced();
+        fftTapBuffer_.resetQuiesced();
+        playbackFlushInputMark_.store(0, std::memory_order_relaxed);
+    }
     playbackPaused_.store(false, std::memory_order_release);
     playbackPrimeRequested_.store(true, std::memory_order_release);
     outputEqDirty_.store(true, std::memory_order_release);
@@ -583,6 +587,8 @@ bool AAudioEngine::startPlayback() {
         fftTapRunning_.store(false, std::memory_order_release);
         playbackDspCv_.notify_all();
         fftTapCv_.notify_all();
+        joinPlaybackDspThreadLocked();
+        joinFftTapThreadLocked();
         if (playbackStream_) closePlaybackStreamLocked();
         pushErrorEvent(AAUDIO_DIRECTION_OUTPUT, AAUDIO_ERROR_INTERNAL);
         engineState_.store(EngineState::RECOVERING, std::memory_order_release);
@@ -755,6 +761,10 @@ bool AAudioEngine::restartPlaybackStream() {
     } catch (...) {
         playbackDspRunning_.store(false, std::memory_order_release);
         fftTapRunning_.store(false, std::memory_order_release);
+        playbackDspCv_.notify_all();
+        fftTapCv_.notify_all();
+        joinPlaybackDspThreadLocked();
+        joinFftTapThreadLocked();
         closePlaybackStreamLocked();
         return false;
     }
@@ -805,9 +815,15 @@ void AAudioEngine::stopPlaybackLocked() {
         closePlaybackStreamLocked();
     }
 
-    playbackDspInputBuffer_.resetQuiesced();
-    playbackBuffer_.resetQuiesced();
-    fftTapBuffer_.resetQuiesced();
+    {
+        std::lock_guard<std::mutex> producerLock(playbackProducerMutex_);
+        playbackDspInputBuffer_.resetQuiesced();
+        playbackBuffer_.resetQuiesced();
+        fftTapBuffer_.resetQuiesced();
+        playbackFlushInputMark_.store(0, std::memory_order_relaxed);
+    }
+    lastHwFramePosition_.store(0, std::memory_order_relaxed);
+    lastHwFramesWritten_.store(0, std::memory_order_relaxed);
     outRms_.store(0.0f, std::memory_order_relaxed);
     isPlaybackRenderingActive_.store(false, std::memory_order_release);
     playbackPaused_.store(false, std::memory_order_release);
@@ -918,7 +934,8 @@ void AAudioEngine::pushErrorEvent(int32_t direction, aaudio_result_t errorCode) 
     }
 
     StreamErrorEvent evt{
-        .direction = direction,
+        // Контракт с Kotlin (drainAndDispatchNativeErrors): 1 = захват, 2 = вывод
+        .direction = (direction == AAUDIO_DIRECTION_INPUT) ? 1 : 2,
         .errorCode = errorCode,
         .faultType = faultType,
         .timestampNs = nowNs
@@ -1018,19 +1035,14 @@ float AAudioEngine::getTotalEstimatedPlaybackLatencyMs() const {
         }
     }
 
-    AAudioStream* stream = activePlaybackStream_.load(std::memory_order_acquire);
-    if (stream != nullptr) {
-        int64_t framePosition = 0;
-        int64_t hwTimestampNs = 0;
-        if (AAudioStream_getTimestamp(stream, CLOCK_BOOTTIME, &framePosition, &hwTimestampNs) == AAUDIO_OK) {
-            const int64_t framesWritten = AAudioStream_getFramesWritten(stream);
-            if (framesWritten > framePosition) {
-                const int32_t rate = AAudioStream_getSampleRate(stream);
-                if (rate > 0) {
-                    const float dacBufferMs = static_cast<float>(framesWritten - framePosition) * 1000.0f / static_cast<float>(rate);
-                    return userQueueMs + std::max(dacBufferMs, halLatencyMs);
-                }
-            }
+    // Только значения, опубликованные колбэком: никаких обращений к AAudioStream* вне RT-колбэка
+    if (activePlaybackStream_.load(std::memory_order_acquire) != nullptr) {
+        const int64_t framePosition = lastHwFramePosition_.load(std::memory_order_relaxed);
+        const int64_t framesWritten = lastHwFramesWritten_.load(std::memory_order_relaxed);
+        const int32_t rate = actualPlaybackSampleRate_.load(std::memory_order_relaxed);
+        if (framePosition > 0 && framesWritten > framePosition && rate > 0) {
+            const float dacBufferMs = static_cast<float>(framesWritten - framePosition) * 1000.0f / static_cast<float>(rate);
+            return userQueueMs + std::max(dacBufferMs, halLatencyMs);
         }
     }
 
@@ -1198,7 +1210,8 @@ void AAudioEngine::playbackDspThreadLoop() {
                 genericResampler_.configure(SAMPLE_RATE_GEMINI_OUT, currentRate);
                 smoothedRateFactor_ = 1.0f;
 
-                playbackDspInputBuffer_.discardAllQuiesced();
+                // Только устаревшее (до метки flush); новый ответ, записанный после flush, сохраняется
+                playbackDspInputBuffer_.discardUpTo(playbackFlushInputMark_.load(std::memory_order_acquire));
                 fftTapBuffer_.discardAllQuiesced();
                 workerDspEpoch = activeEpoch;
 
@@ -1345,6 +1358,8 @@ void AAudioEngine::playbackDspThreadLoop() {
 
 size_t AAudioEngine::writePlaybackPcm(const int16_t* pcm, size_t frames, uint64_t generation) {
     if (pcm == nullptr || frames == 0 || generation == 0) return 0;
+    // Один продюсер за раз + проверка эпохи и запись атомарны относительно flushPlayback()
+    std::lock_guard<std::mutex> producerLock(playbackProducerMutex_);
     if (!playbackDspRunning_.load(std::memory_order_acquire)) return 0;
 
     const uint64_t activeEpoch = playbackEpoch_.load(std::memory_order_acquire);
@@ -1395,6 +1410,7 @@ size_t AAudioEngine::readCapturePcm(int16_t* pcm, size_t maxFrames) {
 
 void AAudioEngine::flushPlayback(uint64_t generation) {
     if (generation == 0) return;
+    std::lock_guard<std::mutex> producerLock(playbackProducerMutex_);
 
     const uint64_t currentEpoch = playbackEpoch_.load(std::memory_order_acquire);
     if (generation <= currentEpoch) return;
@@ -1403,13 +1419,13 @@ void AAudioEngine::flushPlayback(uint64_t generation) {
     const size_t pendingOutput = playbackBuffer_.availableRead();
     playbackDroppedFrames_.fetch_add(pendingInput + pendingOutput, std::memory_order_relaxed);
 
+    playbackFlushInputMark_.store(playbackDspInputBuffer_.tailPosition(), std::memory_order_relaxed);
     playbackEpoch_.store(generation, std::memory_order_release);
     isPlaybackRenderingActive_.store(false, std::memory_order_release);
     playbackPaused_.store(false, std::memory_order_release);
     playbackPrimeRequested_.store(true, std::memory_order_release);
     earconRequested_.store(false, std::memory_order_release);
     outRms_.store(0.0f, std::memory_order_relaxed);
-    smoothedRateFactor_ = 1.0f;
     lastPlaybackWriteNs_.store(0, std::memory_order_relaxed);
     interArrivalJitterNs_.store(0, std::memory_order_relaxed);
     playbackTargetBufferMs_.store(PLAYBACK_TARGET_BUFFER_MS, std::memory_order_relaxed);
@@ -1546,6 +1562,8 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
     int64_t hwTimestampNs = 0;
     if (stream != nullptr && AAudioStream_getTimestamp(stream, CLOCK_BOOTTIME, &framePos, &hwTimestampNs) == AAUDIO_OK) {
         engine->lastPlaybackPresentationTimestampNs_.store(static_cast<uint64_t>(hwTimestampNs), std::memory_order_relaxed);
+        engine->lastHwFramePosition_.store(framePos, std::memory_order_relaxed);
+        engine->lastHwFramesWritten_.store(AAudioStream_getFramesWritten(stream), std::memory_order_relaxed);
     } else {
         timespec ts{};
         clock_gettime(CLOCK_BOOTTIME, &ts);
@@ -1662,14 +1680,18 @@ void AAudioEngine::errorCallback(
     const AAudioStream* activeCapture = engine->activeCaptureStream_.load(std::memory_order_acquire);
     const AAudioStream* activePlayback = engine->activePlaybackStream_.load(std::memory_order_acquire);
 
-    int32_t direction = 0;
+    // AAUDIO_DIRECTION_OUTPUT == 0: прежняя проверка «!= 0» теряла все ошибки вывода
+    bool matched = false;
+    int32_t direction = AAUDIO_DIRECTION_OUTPUT;
     if (stream == activeCapture) {
         direction = AAUDIO_DIRECTION_INPUT;
+        matched = true;
     } else if (stream == activePlayback) {
         direction = AAUDIO_DIRECTION_OUTPUT;
+        matched = true;
     }
 
-    if (direction != 0) {
+    if (matched) {
         LOGE("AAudioEngine::errorCallback invoked: stream=%p, direction=%d, error=%d (%s)",
              stream, direction, error, AAudio_convertResultToText(error));
         engine->pushErrorEvent(direction, error);
