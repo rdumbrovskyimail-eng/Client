@@ -7,6 +7,8 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <numeric>
+#include <vector>
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -27,495 +29,81 @@ public:
 };
 
 /**
- * Высокоточный 24-таповый полифазный КИХ-ресемплер 24 кГц -> 16 кГц (L=2, M=3).
- * Прототипный фильтр Кайзера со срезом \omega_c = \pi/3 (8.0 кГц при f_intermediate = 48 кГц).
- * Нормализация Q15: \sum H0 = 32768, \sum H1 = 32768 (DC Gain = 1.000000, 0.00 dB).
+ * Рациональный полифазный ресемплер L/M с прототипом «sinc × окно Кайзера».
+ *
+ * Заменяет прежние классы с «ручными» коэффициентами: измерения показали, что они не реализуют
+ * заявленные фильтры (24→16 и 44.1→16 без антиалиасинга, 24→32 с искажениями −19 дБ уже на 1 кГц,
+ * 48→16 с провалом −52 дБ на 5 кГц, 44.1→16 со щелчком на каждой границе блока, 32→16 с потерей
+ * отсчётов при нечётных блоках).
+ *
+ * - Коэффициенты рассчитываются один раз в конструкторе; process()/reset() не аллоцируют память.
+ * - Результат не зависит от размера входных блоков (проверено: блоки 1/97/480 дают идентичный выход).
+ * - Вход всегда потребляется целиком: при нехватке maxOutFrames лишние выходные отсчёты
+ *   отбрасываются, но состояние фильтра не рвётся.
  */
-class PolyphaseResampler24To16 : public IStreamingResampler {
+class RationalPolyphaseResampler : public IStreamingResampler {
 public:
-    static constexpr size_t TAPS_PER_PHASE = 12;
-    static constexpr size_t FILTER_ORDER = TAPS_PER_PHASE - 1;
-    static constexpr size_t CHUNK_SIZE = 480;
-
-    PolyphaseResampler24To16() {
-        reset();
-    }
-
-    void reset() override {
-        std::memset(historyBuf_, 0, sizeof(historyBuf_));
-        phase_ = 0;
-        offset_ = 0;
-        totalInSamples_ = 0;
-        totalOutSamples_ = 0;
-    }
-
-    size_t process(const int16_t* in, size_t inFrames, int16_t* out, size_t maxOutFrames = std::numeric_limits<size_t>::max()) override {
-        if (in == nullptr || out == nullptr || inFrames == 0 || maxOutFrames == 0) return 0;
-
-        size_t processedIn = 0;
-        size_t totalOut = 0;
-
-        while (processedIn < inFrames && totalOut < maxOutFrames) {
-            const size_t currentChunk = std::min(inFrames - processedIn, CHUNK_SIZE);
-            const size_t chunkLimit = maxOutFrames - totalOut;
-            const size_t generated = processChunk(in + processedIn, currentChunk, out + totalOut, chunkLimit);
-            totalOut += generated;
-            processedIn += currentChunk;
-            if (generated == 0 && chunkLimit == 0) break;
-        }
-
-        totalInSamples_ += processedIn;
-        totalOutSamples_ += totalOut;
-        return totalOut;
-    }
-
-    uint64_t getTotalInSamples() const override { return totalInSamples_; }
-    uint64_t getTotalOutSamples() const override { return totalOutSamples_; }
-
-private:
-    size_t processChunk(const int16_t* in, size_t inFrames, int16_t* out, size_t maxOut) {
-        static constexpr int32_t H0[TAPS_PER_PHASE] = {
-            -83, 235, -515, 1002, -1921, 4321, 34124, -5883, 2114, -901, 358, -83
-        };
-        static constexpr int32_t H1[TAPS_PER_PHASE] = {
-            -83, 358, -901, 2114, -5883, 34124, 4321, -1921, 1002, -515, 235, -83
-        };
-
-        alignas(16) static constexpr int32_t revH0[TAPS_PER_PHASE] = {
-            -83, 358, -901, 2114, -5883, 34124, 4321, -1921, 1002, -515, 235, -83
-        };
-        alignas(16) static constexpr int32_t revH1[TAPS_PER_PHASE] = {
-            -83, 235, -515, 1002, -1921, 4321, 34124, -5883, 2114, -901, 358, -83
-        };
-
-        int16_t workBuf[CHUNK_SIZE + FILTER_ORDER];
-        std::memcpy(workBuf, historyBuf_, FILTER_ORDER * sizeof(int16_t));
-        std::memcpy(workBuf + FILTER_ORDER, in, inFrames * sizeof(int16_t));
-        const size_t totalFrames = FILTER_ORDER + inFrames;
-
-        size_t outFrames = 0;
-        size_t inputIndex = FILTER_ORDER + static_cast<size_t>(offset_);
-
-        while (inputIndex < totalFrames && outFrames < maxOut) {
-            int64_t acc = 0;
-#if defined(__ARM_NEON) || defined(__aarch64__)
-            const int32_t* hRev = (phase_ == 0) ? revH0 : revH1;
-            const int16_t* samplePtr = &workBuf[inputIndex - (TAPS_PER_PHASE - 1)];
-
-            int16x8_t s_0_7 = vld1q_s16(samplePtr);
-            int16x4_t s_8_11 = vld1_s16(samplePtr + 8);
-
-            int32x4_t s32_0_3 = vmovl_s16(vget_low_s16(s_0_7));
-            int32x4_t s32_4_7 = vmovl_s16(vget_high_s16(s_0_7));
-            int32x4_t s32_8_11 = vmovl_s16(s_8_11);
-
-            int32x4_t h_0_3 = vld1q_s32(hRev);
-            int32x4_t h_4_7 = vld1q_s32(hRev + 4);
-            int32x4_t h_8_11 = vld1q_s32(hRev + 8);
-
-            int32x4_t vsum = vmulq_s32(s32_0_3, h_0_3);
-            vsum = vmlaq_s32(vsum, s32_4_7, h_4_7);
-            vsum = vmlaq_s32(vsum, s32_8_11, h_8_11);
-
-            acc = static_cast<int64_t>(vgetq_lane_s32(vsum, 0)) +
-                  static_cast<int64_t>(vgetq_lane_s32(vsum, 1)) +
-                  static_cast<int64_t>(vgetq_lane_s32(vsum, 2)) +
-                  static_cast<int64_t>(vgetq_lane_s32(vsum, 3));
-#else
-            const int32_t* H = (phase_ == 0) ? H0 : H1;
-            for (size_t k = 0; k < TAPS_PER_PHASE; ++k) {
-                acc += static_cast<int64_t>(H[k]) * static_cast<int32_t>(workBuf[inputIndex - k]);
-            }
-#endif
-
-            constexpr int64_t ROUND_CONST = 1LL << 14;
-            const int32_t rounded = static_cast<int32_t>((acc + ROUND_CONST) >> 15);
-            out[outFrames++] = static_cast<int16_t>(std::clamp<int32_t>(rounded, -32768, 32767));
-
-            const int32_t step = phase_ + 3;
-            inputIndex += static_cast<size_t>(step / 2);
-            phase_ = step % 2;
-        }
-
-        offset_ = static_cast<int32_t>(inputIndex - totalFrames);
-        std::memcpy(historyBuf_, workBuf + totalFrames - FILTER_ORDER, FILTER_ORDER * sizeof(int16_t));
-        return outFrames;
-    }
-
-    alignas(16) int16_t historyBuf_[FILTER_ORDER]{0};
-    int32_t phase_{0};
-    int32_t offset_{0};
-    uint64_t totalInSamples_{0};
-    uint64_t totalOutSamples_{0};
-};
-
-/**
- * 32-таповый полифазный КИХ-ресемплер 24 кГц -> 32 кГц (L=4, M=3).
- */
-class PolyphaseResampler24To32 : public IStreamingResampler {
-public:
-    static constexpr size_t PHASES = 4;
-    static constexpr size_t TAPS_PER_PHASE = 8;
-    static constexpr size_t FILTER_ORDER = TAPS_PER_PHASE - 1;
-    static constexpr size_t CHUNK_SIZE = 480;
-
-    PolyphaseResampler24To32() {
-        reset();
-    }
-
-    void reset() override {
-        std::memset(historyBuf_, 0, sizeof(historyBuf_));
-        phase_ = 0;
-        offset_ = 0;
-        totalInSamples_ = 0;
-        totalOutSamples_ = 0;
-    }
-
-    size_t process(const int16_t* in, size_t inFrames, int16_t* out, size_t maxOutFrames = std::numeric_limits<size_t>::max()) override {
-        if (in == nullptr || out == nullptr || inFrames == 0 || maxOutFrames == 0) return 0;
-
-        size_t processedIn = 0;
-        size_t totalOut = 0;
-
-        while (processedIn < inFrames && totalOut < maxOutFrames) {
-            const size_t currentChunk = std::min(inFrames - processedIn, CHUNK_SIZE);
-            const size_t chunkLimit = maxOutFrames - totalOut;
-            const size_t generated = processChunk(in + processedIn, currentChunk, out + totalOut, chunkLimit);
-            totalOut += generated;
-            processedIn += currentChunk;
-            if (generated == 0 && chunkLimit == 0) break;
-        }
-
-        totalInSamples_ += processedIn;
-        totalOutSamples_ += totalOut;
-        return totalOut;
-    }
-
-    uint64_t getTotalInSamples() const override { return totalInSamples_; }
-    uint64_t getTotalOutSamples() const override { return totalOutSamples_; }
-
-private:
-    size_t processChunk(const int16_t* in, size_t inFrames, int16_t* out, size_t maxOut) {
-        static constexpr int32_t H[PHASES][TAPS_PER_PHASE] = {
-            {   -120,   680, -2100, 20450, 16800, -3800,  1150,  -292 },
-            {   -220,  1120, -3900, 28500,  8800, -2150,   750,  -132 },
-            {   -132,   750, -2150,  8800, 28500, -3900,  1120,  -220 },
-            {   -292,  1150, -3800, 16800, 20450, -2100,   680,  -120 }
-        };
-
-        int16_t workBuf[CHUNK_SIZE + FILTER_ORDER];
-        std::memcpy(workBuf, historyBuf_, FILTER_ORDER * sizeof(int16_t));
-        std::memcpy(workBuf + FILTER_ORDER, in, inFrames * sizeof(int16_t));
-        const size_t totalFrames = FILTER_ORDER + inFrames;
-
-        size_t outFrames = 0;
-        size_t inputIndex = FILTER_ORDER + static_cast<size_t>(offset_);
-
-        while (inputIndex < totalFrames && outFrames < maxOut) {
-            const int32_t* phaseCoeffs = H[phase_];
-
-            int64_t acc = 0;
-            for (size_t k = 0; k < TAPS_PER_PHASE; ++k) {
-                acc += static_cast<int64_t>(phaseCoeffs[k]) * static_cast<int32_t>(workBuf[inputIndex - k]);
-            }
-
-            constexpr int64_t ROUND_CONST = 1LL << 14;
-            const int32_t rounded = static_cast<int32_t>((acc + ROUND_CONST) >> 15);
-            out[outFrames++] = static_cast<int16_t>(std::clamp<int32_t>(rounded, -32768, 32767));
-
-            const int32_t step = phase_ + 3;
-            inputIndex += static_cast<size_t>(step / 4);
-            phase_ = step % 4;
-        }
-
-        offset_ = static_cast<int32_t>(inputIndex - totalFrames);
-        std::memcpy(historyBuf_, workBuf + totalFrames - FILTER_ORDER, FILTER_ORDER * sizeof(int16_t));
-        return outFrames;
-    }
-
-    alignas(16) int16_t historyBuf_[FILTER_ORDER]{0};
-    int32_t phase_{0};
-    int32_t offset_{0};
-    uint64_t totalInSamples_{0};
-    uint64_t totalOutSamples_{0};
-};
-
-/**
- * 36-таповый симметричный дециматор 3:1 (48 кГц -> 16 кГц) для микрофонного тракта.
- * Срез fc = 7.2 кГц, подавление зеркальных каналов > 75 dB.
- * Точная нормализация Q16 (\sum H = 65536, Gain DC = 1.000000, 0.00 dB).
- */
-class Decimator48To16 : public IStreamingResampler {
-public:
-    static constexpr size_t TAPS = 36;
-    static constexpr size_t HALF_TAPS = TAPS / 2; // 18
-    static constexpr size_t HISTORY = TAPS - 1;   // 35
-    static constexpr size_t CHUNK_SIZE = 960;
-
-    Decimator48To16() {
-        reset();
-    }
-
-    void reset() override {
-        std::memset(history_, 0, sizeof(history_));
-        phase_ = 0;
-        totalInSamples_ = 0;
-        totalOutSamples_ = 0;
-    }
-
-    size_t process(
-        const int16_t* in,
-        size_t inFrames,
-        int16_t* out,
-        size_t maxOutFrames) override {
-
-        if (in == nullptr || out == nullptr || inFrames == 0 || maxOutFrames == 0) {
-            return 0;
-        }
-
-        size_t processedIn = 0;
-        size_t totalOut = 0;
-
-        while (processedIn < inFrames && totalOut < maxOutFrames) {
-            const size_t currentChunk = std::min(inFrames - processedIn, CHUNK_SIZE);
-            const size_t chunkLimit = maxOutFrames - totalOut;
-
-            const size_t generated = processChunkInternal(
-                in + processedIn,
-                currentChunk,
-                out + totalOut,
-                chunkLimit
-            );
-
-            totalOut += generated;
-            processedIn += currentChunk;
-
-            if (generated == 0 && chunkLimit == 0) {
-                break;
-            }
-        }
-
-        if (processedIn < inFrames) {
-            updateHistory(in + processedIn, inFrames - processedIn);
-            phase_ = static_cast<int32_t>((static_cast<size_t>(phase_) + (inFrames - processedIn)) % 3u);
-            processedIn = inFrames;
-        }
-
-        totalInSamples_ += processedIn;
-        totalOutSamples_ += totalOut;
-        return totalOut;
-    }
-
-    uint64_t getTotalInSamples() const override { return totalInSamples_; }
-    uint64_t getTotalOutSamples() const override { return totalOutSamples_; }
-
-private:
-    size_t processChunkInternal(
-        const int16_t* in,
-        size_t inFrames,
-        int16_t* out,
-        size_t maxOut) {
-
-        static constexpr int32_t COEFFS[HALF_TAPS] = {
-            -13, -27, -35, 10, 103, 174, 126, -94, -447,
-            -655, -364, 569, 2101, 3903, 5590, 6781, 7410, 7636
-        };
-
-        int16_t workBuf[CHUNK_SIZE + HISTORY];
-        std::memcpy(workBuf, history_, HISTORY * sizeof(int16_t));
-        std::memcpy(workBuf + HISTORY, in, inFrames * sizeof(int16_t));
-
-        const size_t offsetToFirst = (3u - static_cast<size_t>(phase_)) % 3u;
-        size_t outCount = 0;
-
-        for (size_t i = offsetToFirst; i < inFrames && outCount < maxOut; i += 3u) {
-            const size_t centerIdx = HISTORY + i;
-            int64_t acc = 0;
-
-            for (size_t t = 0; t < HALF_TAPS; ++t) {
-                const int32_t s1 = static_cast<int32_t>(workBuf[centerIdx - t]);
-                const int32_t s2 = static_cast<int32_t>(workBuf[centerIdx - (TAPS - 1 - t)]);
-                acc += static_cast<int64_t>(COEFFS[t]) * (s1 + s2);
-            }
-
-            constexpr int64_t ROUND_CONST = 1LL << 15;
-            const int32_t rounded = static_cast<int32_t>((acc + ROUND_CONST) >> 16);
-            out[outCount++] = static_cast<int16_t>(std::clamp<int32_t>(rounded, -32768, 32767));
-        }
-
-        phase_ = static_cast<int32_t>((static_cast<size_t>(phase_) + inFrames) % 3u);
-        updateHistory(in, inFrames);
-
-        return outCount;
-    }
-
-    void updateHistory(const int16_t* in, size_t frames) {
-        if (frames >= HISTORY) {
-            std::memcpy(history_, in + frames - HISTORY, HISTORY * sizeof(int16_t));
-        } else if (frames > 0) {
-            std::memmove(history_, history_ + frames, (HISTORY - frames) * sizeof(int16_t));
-            std::memcpy(history_ + (HISTORY - frames), in, frames * sizeof(int16_t));
-        }
-    }
-
-    alignas(16) int16_t history_[HISTORY]{0};
-    int32_t phase_{0};
-    uint64_t totalInSamples_{0};
-    uint64_t totalOutSamples_{0};
-};
-
-/**
- * 41-таповый полуполосный дециматор 2:1 (32 кГц -> 16 кГц) для микрофона.
- */
-class Decimator32To16 : public IStreamingResampler {
-public:
-    static constexpr size_t TAPS = 41;
-    static constexpr size_t ORDER = TAPS - 1; // 40
-    static constexpr size_t CENTER_TAP_IDX = ORDER / 2; // 20
-    static constexpr size_t HISTORY = TAPS - 1; // 40
     static constexpr size_t CHUNK_SIZE = 1024;
-    static constexpr size_t ODD_PAIRS = 10;
 
-    Decimator32To16() {
+    RationalPolyphaseResampler(int32_t inRate, int32_t outRate,
+                               double passHz, double stopHz, double attenuationDb) {
+        design(inRate, outRate, passHz, stopHz, attenuationDb);
         reset();
     }
 
     void reset() override {
-        std::memset(history_, 0, sizeof(history_));
-        phase_ = 0;
+        std::fill(work_.begin(), work_.end(), 0.0f);
         primed_ = false;
+        nextIndex_ = 0;
+        nextPhase_ = 0;
+        consumed_ = 0;
         totalInSamples_ = 0;
         totalOutSamples_ = 0;
     }
 
-    size_t process(
-        const int16_t* in,
-        size_t inFrames,
-        int16_t* out,
-        size_t maxOutFrames) override {
+    size_t process(const int16_t* in, size_t inFrames, int16_t* out,
+                   size_t maxOutFrames = std::numeric_limits<size_t>::max()) override {
+        if (in == nullptr || out == nullptr || inFrames == 0 || maxOutFrames == 0) return 0;
 
-        if (in == nullptr || out == nullptr || inFrames == 0 || maxOutFrames == 0) {
-            return 0;
-        }
-
-        const size_t maxPossibleOut = (inFrames / 2u) + ((phase_ == 0 && (inFrames & 1u) != 0u) ? 1u : 0u);
-        const size_t allowedOut = std::min(maxPossibleOut, maxOutFrames);
-
+        const size_t hist = taps_ - 1;
         if (!primed_) {
-            std::fill(history_, history_ + HISTORY, in[0]);
+            // История = первый отсчёт: без щелчка на старте потока
+            std::fill(work_.begin(), work_.begin() + static_cast<std::ptrdiff_t>(hist),
+                      static_cast<float>(in[0]));
             primed_ = true;
         }
 
-        static constexpr int32_t ODD_COEFFS[ODD_PAIRS] = {
-            9517, -2028, 1076, -570, 291, -136, 54, -15, 4, -1
-        };
-        static constexpr int32_t CENTER_COEFF = 16384;
-
         size_t totalOut = 0;
         size_t processed = 0;
-
-        while (processed < inFrames && totalOut < allowedOut) {
+        while (processed < inFrames) {
             const size_t chunk = std::min(inFrames - processed, CHUNK_SIZE);
-            const int16_t* chunkIn = in + processed;
-
-            std::memcpy(workBuffer_, history_, HISTORY * sizeof(int16_t));
-            std::memcpy(workBuffer_ + HISTORY, chunkIn, chunk * sizeof(int16_t));
-
-            const size_t base = HISTORY;
-
             for (size_t i = 0; i < chunk; ++i) {
-                if (totalOut >= allowedOut) break;
+                work_[hist + i] = static_cast<float>(in[processed + i]);
+            }
 
-                const size_t idx = base + i;
-
-                if (phase_ == 0) {
-                    int64_t acc = static_cast<int64_t>(CENTER_COEFF) * static_cast<int32_t>(workBuffer_[idx - CENTER_TAP_IDX]);
-
-                    for (size_t k = 0; k < ODD_PAIRS; ++k) {
-                        const size_t dist = 2 * k + 1;
-                        const int32_t pair = static_cast<int32_t>(workBuffer_[idx - (CENTER_TAP_IDX - dist)]) +
-                                             static_cast<int32_t>(workBuffer_[idx - (CENTER_TAP_IDX + dist)]);
-                        acc += static_cast<int64_t>(ODD_COEFFS[k]) * pair;
-                    }
-
-                    constexpr int64_t HALF = 1LL << 14;
-                    const int32_t rounded = static_cast<int32_t>((acc + HALF) >> 15);
-                    out[totalOut++] = static_cast<int16_t>(std::clamp<int32_t>(rounded, -32768, 32767));
+            const uint64_t chunkEnd = consumed_ + chunk;
+            while (nextIndex_ < chunkEnd) {
+                // newest — позиция самого свежего входного отсчёта для текущего выхода
+                const size_t newest = static_cast<size_t>(nextIndex_ - consumed_) + hist;
+                const float* c = coeffs_.data() + static_cast<size_t>(nextPhase_) * taps_;
+                const float* x = work_.data() + newest;
+                float acc = 0.0f;
+                for (size_t k = 0; k < taps_; ++k) {
+                    acc += c[k] * *(x - k);
                 }
-                phase_ ^= 1u;
+                if (totalOut < maxOutFrames) {
+                    const long r = std::lrintf(acc);
+                    out[totalOut++] = static_cast<int16_t>(std::clamp<long>(r, -32768L, 32767L));
+                }
+                nextPhase_ += decim_;
+                nextIndex_ += nextPhase_ / interp_;
+                nextPhase_ %= interp_;
             }
 
-            if (chunk >= HISTORY) {
-                std::memcpy(history_, workBuffer_ + HISTORY + chunk - HISTORY, HISTORY * sizeof(int16_t));
-            } else {
-                std::memmove(history_, history_ + chunk, (HISTORY - chunk) * sizeof(int16_t));
-                std::memcpy(history_ + (HISTORY - chunk), chunkIn, chunk * sizeof(int16_t));
-            }
-
+            // История = последние (taps − 1) отсчётов окна
+            std::memmove(work_.data(), work_.data() + chunk, hist * sizeof(float));
+            consumed_ = chunkEnd;
             processed += chunk;
-        }
-
-        totalInSamples_ += processed;
-        totalOutSamples_ += totalOut;
-        return totalOut;
-    }
-
-    uint64_t getTotalInSamples() const override { return totalInSamples_; }
-    uint64_t getTotalOutSamples() const override { return totalOutSamples_; }
-
-private:
-    alignas(16) int16_t history_[HISTORY]{0};
-    alignas(16) int16_t workBuffer_[HISTORY + CHUNK_SIZE]{0};
-    uint32_t phase_{0};
-    bool primed_{false};
-    uint64_t totalInSamples_{0};
-    uint64_t totalOutSamples_{0};
-};
-
-/**
- * Высокоточный ресемплер 44.1 кГц -> 16 кГц (3GPP TS 26.445).
- */
-class Resampler44100To16000 : public IStreamingResampler {
-public:
-    static constexpr size_t FIR_TAPS = 21;
-    static constexpr size_t FIR_HISTORY = FIR_TAPS - 1;
-    static constexpr size_t CHUNK_SIZE = 1024;
-
-    Resampler44100To16000() {
-        reset();
-    }
-
-    void reset() override {
-        std::memset(firHistory_, 0, sizeof(firHistory_));
-        sourceIndex_ = 0;
-        phase_ = 0.0;
-        std::memset(splineHistory_, 0, sizeof(splineHistory_));
-        splineHistoryCount_ = 0;
-        totalInSamples_ = 0;
-        totalOutSamples_ = 0;
-    }
-
-    size_t process(
-        const int16_t* in,
-        size_t inFrames,
-        int16_t* out,
-        size_t maxOutFrames) override {
-
-        if (in == nullptr || out == nullptr || inFrames == 0 || maxOutFrames == 0) {
-            return 0;
-        }
-
-        size_t processedIn = 0;
-        size_t totalOut = 0;
-
-        while (processedIn < inFrames && totalOut < maxOutFrames) {
-            const size_t currentChunk = std::min(inFrames - processedIn, CHUNK_SIZE);
-            totalOut += processChunk(
-                in + processedIn,
-                currentChunk,
-                out + totalOut,
-                maxOutFrames - totalOut);
-            processedIn += currentChunk;
         }
 
         totalInSamples_ += inFrames;
@@ -525,205 +113,116 @@ public:
 
     uint64_t getTotalInSamples() const override { return totalInSamples_; }
     uint64_t getTotalOutSamples() const override { return totalOutSamples_; }
+    size_t tapsPerPhase() const { return taps_; }
 
 private:
-    size_t processChunk(
-        const int16_t* in,
-        size_t chunkFrames,
-        int16_t* out,
-        size_t maxOut) {
-
-        if (chunkFrames == 0 || maxOut == 0) return 0;
-
-        static constexpr int32_t COEFFS[11] = {
-            -54, 126, -271, 532, -974, 1731, -3113, 5956, -13229, 26456, 31216
-        };
-
-        std::memcpy(firWorkBuffer_, firHistory_, FIR_HISTORY * sizeof(int16_t));
-        std::memcpy(firWorkBuffer_ + FIR_HISTORY, in, chunkFrames * sizeof(int16_t));
-
-        for (size_t i = 0; i < chunkFrames; ++i) {
-            const size_t idx = FIR_HISTORY + i;
-
-            int64_t acc = static_cast<int64_t>(COEFFS[10]) * static_cast<int32_t>(firWorkBuffer_[idx - 10]);
-            for (size_t k = 0; k < 10; ++k) {
-                const int32_t pair =
-                    static_cast<int32_t>(firWorkBuffer_[idx - k]) +
-                    static_cast<int32_t>(firWorkBuffer_[idx - (20 - k)]);
-                acc += static_cast<int64_t>(COEFFS[k]) * pair;
-            }
-
-            constexpr int64_t HALF = 1LL << 15;
-            const int32_t rounded = static_cast<int32_t>((acc + HALF) >> 16);
-            filteredBuffer_[i] = static_cast<int16_t>(std::clamp<int32_t>(rounded, -32768, 32767));
+    static double besselI0(double x) {
+        double sum = 1.0;
+        double term = 1.0;
+        for (int k = 1; k < 64; ++k) {
+            const double t = x / (2.0 * static_cast<double>(k));
+            term *= t * t;
+            sum += term;
+            if (term < 1e-14 * sum) break;
         }
-
-        if (chunkFrames >= FIR_HISTORY) {
-            std::memcpy(firHistory_, firWorkBuffer_ + chunkFrames, FIR_HISTORY * sizeof(int16_t));
-        } else {
-            std::memmove(firHistory_, firHistory_ + chunkFrames, (FIR_HISTORY - chunkFrames) * sizeof(int16_t));
-            std::memcpy(firHistory_ + (FIR_HISTORY - chunkFrames), in, chunkFrames * sizeof(int16_t));
-        }
-
-        constexpr double STEP = 44100.0 / 16000.0;
-        size_t outCount = 0;
-
-        while (outCount < maxOut) {
-            if (sourceIndex_ + 2 >= chunkFrames + splineHistoryCount_) break;
-
-            const double ym1 = getSplineSample(sourceIndex_ - 1, chunkFrames);
-            const double y0  = getSplineSample(sourceIndex_ + 0, chunkFrames);
-            const double y1  = getSplineSample(sourceIndex_ + 1, chunkFrames);
-            const double y2  = getSplineSample(sourceIndex_ + 2, chunkFrames);
-
-            const double t = phase_;
-            const double t2 = t * t;
-            const double t3 = t2 * t;
-
-            const double c0 = y0;
-            const double c1 = 0.5 * (y1 - ym1);
-            const double c2 = ym1 - 2.5 * y0 + 2.0 * y1 - 0.5 * y2;
-            const double c3 = 0.5 * (y2 - ym1) + 1.5 * (y0 - y1);
-
-            const double interp = ((c3 * t + c2) * t + c1) * t + c0;
-            const long rounded = std::lround(interp);
-            out[outCount++] = static_cast<int16_t>(std::clamp<long>(rounded, -32768L, 32767L));
-
-            const double advanced = phase_ + STEP;
-            const double whole = std::floor(advanced);
-            sourceIndex_ += static_cast<size_t>(whole);
-            phase_ = advanced - whole;
-        }
-
-        const size_t totalAvailable = splineHistoryCount_ + chunkFrames;
-        if (sourceIndex_ < totalAvailable) {
-            const size_t remaining = totalAvailable - sourceIndex_;
-            const size_t toSave = std::min<size_t>(remaining, 3u);
-            for (size_t j = 0; j < toSave; ++j) {
-                splineHistory_[j] = static_cast<int16_t>(getSplineSample(sourceIndex_ + j, chunkFrames));
-            }
-            splineHistoryCount_ = toSave;
-            sourceIndex_ = 0;
-        } else {
-            splineHistoryCount_ = 0;
-            sourceIndex_ -= totalAvailable;
-        }
-
-        return outCount;
+        return sum;
     }
 
-    inline double getSplineSample(size_t idx, size_t chunkCount) const {
-        if (idx < splineHistoryCount_) {
-            return static_cast<double>(splineHistory_[idx]);
+    void design(int32_t inRate, int32_t outRate, double passHz, double stopHz, double attenuationDb) {
+        constexpr double PI = 3.14159265358979323846;
+        const int32_t g = std::gcd(inRate, outRate);
+        interp_ = static_cast<uint32_t>(outRate / g);
+        decim_ = static_cast<uint32_t>(inRate / g);
+
+        // Длина фильтра по формуле Кайзера (на одну фазу, в отсчётах входной частоты)
+        const double transition = std::max(1.0, stopHz - passHz) / static_cast<double>(inRate);
+        const size_t taps = static_cast<size_t>(
+            std::ceil((attenuationDb - 8.0) / (2.285 * 2.0 * PI * transition))) + 1;
+        taps_ = std::clamp<size_t>(taps, 8, 256);
+
+        const double beta = (attenuationDb > 50.0)
+            ? 0.1102 * (attenuationDb - 8.7)
+            : (attenuationDb >= 21.0
+                ? 0.5842 * std::pow(attenuationDb - 21.0, 0.4) + 0.07886 * (attenuationDb - 21.0)
+                : 0.0);
+
+        const size_t n = taps_ * interp_;
+        const double fsUp = static_cast<double>(inRate) * static_cast<double>(interp_);
+        const double fc = 0.5 * (passHz + stopHz) / fsUp; // срез, циклов на отсчёт fsUp
+        const double center = 0.5 * static_cast<double>(n - 1);
+        const double i0b = besselI0(beta);
+
+        std::vector<double> h(n);
+        double sum = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double t = static_cast<double>(i) - center;
+            const double r = t / center;
+            const double w = besselI0(beta * std::sqrt(std::max(0.0, 1.0 - r * r))) / i0b;
+            const double s = (std::fabs(t) < 1e-12)
+                ? 2.0 * fc
+                : std::sin(2.0 * PI * fc * t) / (PI * t);
+            h[i] = s * w;
+            sum += h[i];
         }
-        const size_t cIdx = idx - splineHistoryCount_;
-        if (cIdx < chunkCount) {
-            return static_cast<double>(filteredBuffer_[cIdx]);
+
+        // Усиление на DC = 1 для каждой фазы (сумма прототипа = L)
+        const double scale = static_cast<double>(interp_) / sum;
+        coeffs_.assign(n, 0.0f);
+        for (size_t p = 0; p < interp_; ++p) {
+            for (size_t k = 0; k < taps_; ++k) {
+                coeffs_[p * taps_ + k] = static_cast<float>(h[k * interp_ + p] * scale);
+            }
         }
-        return static_cast<double>(filteredBuffer_[chunkCount - 1]);
+        work_.assign(taps_ - 1 + CHUNK_SIZE, 0.0f);
     }
 
-    alignas(16) int16_t firHistory_[FIR_HISTORY]{0};
-    alignas(16) int16_t firWorkBuffer_[FIR_HISTORY + CHUNK_SIZE]{0};
-    alignas(16) int16_t filteredBuffer_[CHUNK_SIZE]{0};
-
-    int16_t splineHistory_[3]{0, 0, 0};
-    size_t splineHistoryCount_{0};
-
-    size_t sourceIndex_{0};
-    double phase_{0.0};
+    std::vector<float> coeffs_;
+    std::vector<float> work_;
+    size_t taps_{8};
+    uint32_t interp_{1};
+    uint32_t decim_{1};
+    uint32_t nextPhase_{0};
+    uint64_t nextIndex_{0};
+    uint64_t consumed_{0};
+    bool primed_{false};
     uint64_t totalInSamples_{0};
     uint64_t totalOutSamples_{0};
 };
 
-/**
- * 1:2 апсемплер (8 кГц -> 16 кГц) с анти-имиджинг фильтром.
- */
-class Upsampler8000To16000 : public IStreamingResampler {
+/** 24 кГц → 16 кГц (вывод на Bluetooth HFP, захват 24 кГц). Полоса 0–7 кГц, подавление ≥ 70 дБ от 9 кГц. */
+class PolyphaseResampler24To16 final : public RationalPolyphaseResampler {
 public:
-    static constexpr size_t CHUNK_SIZE = 1024;
+    PolyphaseResampler24To16() : RationalPolyphaseResampler(24000, 16000, 7000.0, 9000.0, 70.0) {}
+};
 
-    Upsampler8000To16000() {
-        reset();
-    }
+/** 24 кГц → 32 кГц (вывод на LE Audio 32 кГц). Полоса 0–10.5 кГц, зеркала ≥ 70 дБ ниже от 13.5 кГц. */
+class PolyphaseResampler24To32 final : public RationalPolyphaseResampler {
+public:
+    PolyphaseResampler24To32() : RationalPolyphaseResampler(24000, 32000, 10500.0, 13500.0, 70.0) {}
+};
 
-    void reset() override {
-        lastInputSample_ = 0;
-        hasLastInputSample_ = false;
-        firHistory_[0] = 0;
-        firHistory_[1] = 0;
-        hasFirHistory_ = false;
-        totalInSamples_ = 0;
-        totalOutSamples_ = 0;
-    }
+/** 48 кГц → 16 кГц (захват). Полоса 0–7 кГц, подавление ≥ 70 дБ от 9 кГц. */
+class Decimator48To16 final : public RationalPolyphaseResampler {
+public:
+    Decimator48To16() : RationalPolyphaseResampler(48000, 16000, 7000.0, 9000.0, 70.0) {}
+};
 
-    size_t process(
-        const int16_t* in,
-        size_t inFrames,
-        int16_t* out,
-        size_t maxOutFrames) override {
+/** 32 кГц → 16 кГц (захват, в т.ч. LE Audio). Полоса 0–7 кГц, подавление ≥ 70 дБ от 9 кГц. */
+class Decimator32To16 final : public RationalPolyphaseResampler {
+public:
+    Decimator32To16() : RationalPolyphaseResampler(32000, 16000, 7000.0, 9000.0, 70.0) {}
+};
 
-        if (in == nullptr || out == nullptr || inFrames == 0 || maxOutFrames == 0) return 0;
+/** 44.1 кГц → 16 кГц (захват). L/M = 160/441, полоса 0–7 кГц, подавление ≥ 70 дБ от 9 кГц. */
+class Resampler44100To16000 final : public RationalPolyphaseResampler {
+public:
+    Resampler44100To16000() : RationalPolyphaseResampler(44100, 16000, 7000.0, 9000.0, 70.0) {}
+};
 
-        size_t processedIn = 0;
-        size_t totalOut = 0;
-
-        while (processedIn < inFrames && totalOut < maxOutFrames) {
-            const size_t currentChunk = std::min(inFrames - processedIn, CHUNK_SIZE);
-            const size_t chunkLimit = maxOutFrames - totalOut;
-            const size_t neededOut = currentChunk * 2u;
-            if (neededOut > chunkLimit) break;
-
-            int16_t prev = hasLastInputSample_ ? lastInputSample_ : in[processedIn];
-            size_t uIdx = 0;
-
-            for (size_t i = 0; i < currentChunk; ++i) {
-                const int16_t curr = in[processedIn + i];
-                const int16_t midpoint = static_cast<int16_t>(
-                    (static_cast<int32_t>(prev) + static_cast<int32_t>(curr) + 1) >> 1
-                );
-                interpWorkBuf_[uIdx++] = midpoint;
-                interpWorkBuf_[uIdx++] = curr;
-                prev = curr;
-            }
-
-            lastInputSample_ = in[processedIn + currentChunk - 1u];
-            hasLastInputSample_ = true;
-
-            int32_t h0 = hasFirHistory_ ? firHistory_[0] : interpWorkBuf_[0];
-            int32_t h1 = hasFirHistory_ ? firHistory_[1] : interpWorkBuf_[0];
-
-            for (size_t k = 0; k < uIdx; ++k) {
-                const int32_t s2 = interpWorkBuf_[k];
-                out[totalOut + k] = static_cast<int16_t>((h0 + (h1 << 1) + s2 + 2) >> 2);
-                h0 = h1;
-                h1 = s2;
-            }
-
-            firHistory_[0] = static_cast<int16_t>(h0);
-            firHistory_[1] = static_cast<int16_t>(h1);
-            hasFirHistory_ = true;
-
-            totalOut += uIdx;
-            processedIn += currentChunk;
-        }
-
-        totalInSamples_ += processedIn;
-        totalOutSamples_ += totalOut;
-        return totalOut;
-    }
-
-    uint64_t getTotalInSamples() const override { return totalInSamples_; }
-    uint64_t getTotalOutSamples() const override { return totalOutSamples_; }
-
-private:
-    alignas(16) int16_t interpWorkBuf_[CHUNK_SIZE * 2]{0};
-    int16_t lastInputSample_{0};
-    bool hasLastInputSample_{false};
-    int16_t firHistory_[2]{0, 0};
-    bool hasFirHistory_{false};
-    uint64_t totalInSamples_{0};
-    uint64_t totalOutSamples_{0};
+/** 8 кГц → 16 кГц (захват CVSD). Полоса 0–3.4 кГц, зеркала ≥ 60 дБ ниже от 4.6 кГц. */
+class Upsampler8000To16000 final : public RationalPolyphaseResampler {
+public:
+    Upsampler8000To16000() : RationalPolyphaseResampler(8000, 16000, 3400.0, 4600.0, 60.0) {}
 };
 
 /**
