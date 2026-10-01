@@ -77,6 +77,7 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         private const val MAX_AI_AUDIO_BACKLOG_BYTES = 16L * 1024L * 1024L // ~5.8 мин @ 24 кГц
         private const val MAX_DATA_EVENTS_IN_FLIGHT = 512
+        private val EMPTY_PCM = ByteArray(0)
     }
 
     private val json = Json {
@@ -144,13 +145,10 @@ class GeminiProtobufLiveClient @Inject constructor(
         synchronized(sessionStateLock) {
             while (true) {
                 val frame = _audio.tryReceive().getOrNull() ?: break
-                if (targetGeneration == -1L || frame.generation <= targetGeneration) {
-                    releaseAudio(frame)
-                    purgedCount++
-                } else {
-                    releaseAudio(frame)
-                    purgedCount++
-                }
+                // Все вызовы передают -1L (полная очистка). Частичная очистка канала без push-back
+                // невозможна, параметр оставлен только ради совместимости API.
+                releaseAudio(frame)
+                purgedCount++
             }
         }
         return purgedCount
@@ -173,6 +171,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                 }
             }
         }
+        frame.pcm = EMPTY_PCM // пул не должен удерживать PCM-массивы
         synchronized(audioFramePoolLock) {
             if (audioFramePool.size < 64) {
                 audioFramePool.addLast(frame)
@@ -524,7 +523,7 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         logManager.net(
             "WebSocket",
-            "Инициализация Bidi сессии Gemini 3.8 Live (epoch=$myEpoch, key=[REDACTED])"
+            "Инициализация Bidi сессии ${cfg.model} (epoch=$myEpoch, key=[REDACTED])"
         )
 
         val req = Request.Builder()
@@ -615,6 +614,20 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                     stopOutboundWorkers(expectedWs = ws, expectedEpoch = myEpoch)
 
+                    // Квота/биллинг не лечатся переподключением: каждая попытка снова бьёт в лимит проекта
+                    if (isQuotaClose(code, reason)) {
+                        emitControlEvent(
+                            GeminiEvent.Error(
+                                "Gemini отклонил сессию: исчерпана квота (модели или Google Search) " +
+                                    "либо проблема с оплатой проекта (код $code). Выключите Google Search " +
+                                    "в настройках, проверьте лимиты и биллинг в Google AI Studio " +
+                                    "или выберите другую Live-модель.",
+                                fatal = true
+                            ),
+                            myEpoch
+                        )
+                    }
+
                     emitControlEvent(
                         GeminiEvent.Disconnected(code, reason, mySessionId, myEpoch),
                         myEpoch
@@ -639,7 +652,7 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                     stopOutboundWorkers(expectedWs = ws, expectedEpoch = myEpoch)
 
-                    val fatal = httpCode == 401 || httpCode == 403
+                    val fatal = httpCode == 401 || httpCode == 403 || httpCode == 429
 
                     emitControlEvent(
                         GeminiEvent.Error("Сетевой сбой ($httpCode): ${t.localizedMessage}", fatal),
@@ -805,10 +818,10 @@ class GeminiProtobufLiveClient @Inject constructor(
     private suspend fun awaitWriterReady(ws: WebSocket, writerEpoch: Long): Boolean {
         if (isReady && writerEpoch == epoch && webSocket === ws) return true
         val signal = synchronized(sessionStateLock) { writerReadySignal } ?: return false
-        return withTimeoutOrNull(5000L) {
-            signal.await()
-            writerEpoch == epoch && webSocket === ws
-        } ?: false
+        // Без таймаута: при закрытии сессии scope воркеров отменяется в stopOutboundWorkers().
+        // Прежние 5 с навсегда завершали писателя: сессия выглядела LIVE, но микрофон и текст не уходили.
+        signal.await()
+        return writerEpoch == epoch && webSocket === ws
     }
 
     private suspend fun awaitWebSocketQueueCapacity(ws: WebSocket, writerEpoch: Long): Boolean {
@@ -1328,7 +1341,8 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 val allTools = buildJsonArray {
                     normalizeToolsForModel(cfg.toolsJson, capabilities)?.forEach { add(it) }
-                    if (cfg.enableGoogleSearch) {
+                    // Инструмент только для моделей с поддержкой grounding (раньше слался всем)
+                    if (cfg.enableGoogleSearch && capabilities.supportsSearchGrounding) {
                         addJsonObject {
                             putJsonObject("googleSearch") {}
                         }
@@ -1620,6 +1634,12 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
             }
         }
+    }
+
+    private fun isQuotaClose(code: Int, reason: String): Boolean {
+        if (code != 1011 && code != 1013) return false
+        val r = reason.lowercase()
+        return "quota" in r || "resource_exhausted" in r || "billing" in r || "rate limit" in r
     }
 
     private fun extractTranscriptText(element: JsonElement?): String? {
