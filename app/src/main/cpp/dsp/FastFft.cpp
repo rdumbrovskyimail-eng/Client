@@ -162,19 +162,29 @@ void FastFft::process(
 
     // УСТРАНЕНИЕ ДЕФЕКТА 172: Атомарная публикация через Seqlock без мьютекса
     const uint32_t currentSeq = snapshotSeq_.load(std::memory_order_relaxed);
-    snapshotSeq_.store(currentSeq + 1, std::memory_order_release); // Нечетное: идет запись
+    snapshotSeq_.store(currentSeq + 1, std::memory_order_relaxed); // Нечетное: идет запись
+    std::atomic_thread_fence(std::memory_order_release);
 
     for (size_t i = 0; i < audio::SPECTRUM_BANDS; ++i) {
-        activeSnapshot_.bands[i] = smoothedBands_[i];
+        snapshotBands_[i].store(smoothedBands_[i], std::memory_order_relaxed);
     }
-    activeSnapshot_.micRms = micRms;
-    activeSnapshot_.outRms = outRms;
+    snapshotMicRms_.store(micRms, std::memory_order_relaxed);
+    snapshotOutRms_.store(outRms, std::memory_order_relaxed);
 
     snapshotSeq_.store(currentSeq + 2, std::memory_order_release); // Четное: снимок стабилен
 }
 
 // УСТРАНЕНИЕ ДЕФЕКТА 172: 100% неблокирующее считывание снимка спектра UI без mutex
 void FastFft::getLatestSnapshot(SpectrumSnapshot& out) const {
+    SpectrumSnapshot candidate{};
+    auto readPayload = [&]() {
+        for (size_t i = 0; i < audio::SPECTRUM_BANDS; ++i) {
+            candidate.bands[i] = snapshotBands_[i].load(std::memory_order_relaxed);
+        }
+        candidate.micRms = snapshotMicRms_.load(std::memory_order_relaxed);
+        candidate.outRms = snapshotOutRms_.load(std::memory_order_relaxed);
+    };
+
     for (int attempt = 0; attempt < 8; ++attempt) {
         const uint32_t seq1 = snapshotSeq_.load(std::memory_order_acquire);
 
@@ -182,19 +192,20 @@ void FastFft::getLatestSnapshot(SpectrumSnapshot& out) const {
             continue; // Писатель обновляет снимок, повторяем попытку
         }
 
-        const SpectrumSnapshot candidate = activeSnapshot_;
+        readPayload();
         std::atomic_thread_fence(std::memory_order_acquire);
 
         const uint32_t seq2 = snapshotSeq_.load(std::memory_order_acquire);
 
-        if (seq1 == seq2 && (seq2 & 1u) == 0u) {
+        if (seq1 == seq2) {
             out = candidate;
             return;
         }
     }
 
-    // При коллизии возвращаем текущее состояние без захвата блокировок
-    out = activeSnapshot_;
+    // Писатель занят: поля атомарны (гонки данных нет), кадр визуализатора может смешать два снимка
+    readPayload();
+    out = candidate;
 }
 
 } // namespace client::dsp
