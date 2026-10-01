@@ -12,7 +12,9 @@ import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.support.v4.media.session.MediaSessionCompat
@@ -129,6 +131,7 @@ class LiveSessionForegroundService : Service() {
     private var powerTracker: SessionPowerBudgetTracker? = null
 
     private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var isCurrentNetworkWifi: Boolean = false
 
     companion object {
@@ -217,7 +220,7 @@ class LiveSessionForegroundService : Service() {
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
         checkCurrentNetworkTransport()
 
-        connectivityManager?.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+        val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
                 val isWifi = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
                 if (isCurrentNetworkWifi != isWifi) {
@@ -231,7 +234,16 @@ class LiveSessionForegroundService : Service() {
                 isCurrentNetworkWifi = false
                 updateWifiLockState(false)
             }
-        })
+        }
+        networkCallback = callback
+        // Главный поток: wifiLock меняется там же, где его трогает mediaObserverJob.
+        // Колбэк обязательно снимается в onDestroy().
+        runCatching {
+            connectivityManager?.registerDefaultNetworkCallback(callback, Handler(Looper.getMainLooper()))
+        }.onFailure {
+            networkCallback = null
+            logger.w("LiveSessionForegroundService: NetworkCallback не зарегистрирован: ${it.message}")
+        }
     }
 
     private fun checkCurrentNetworkTransport() {
@@ -410,6 +422,9 @@ class LiveSessionForegroundService : Service() {
         _isServiceActive.value = false
         mediaObserverJob?.cancel()
         serviceScope.cancel()
+
+        networkCallback?.let { cb -> runCatching { connectivityManager?.unregisterNetworkCallback(cb) } }
+        networkCallback = null
 
         powerTracker?.reportBudgetSummary()
         powerTracker = null
