@@ -68,12 +68,11 @@ fun ClientScreen(
     val permissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        // Старт только если микрофон запрашивали ИМЕННО в этом диалоге и его выдали. Иначе
-        // (запрошены лишь уведомления/Bluetooth при уже выданном микрофоне) повторный
-        // toggleConnection() сразу останавливал только что запущенную сессию.
-        val audioJustGranted = permissions[Manifest.permission.RECORD_AUDIO] == true
+        val audioGranted = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
 
-        if (audioJustGranted) {
+        if (audioGranted && viewModel.state.value.link == LinkState.IDLE) {
             viewModel.toggleConnection()
         }
     }
@@ -95,13 +94,17 @@ fun ClientScreen(
             optionalMissing.add(Manifest.permission.BLUETOOTH_CONNECT)
         }
 
-        if (requiredMissing.isEmpty()) {
+        // Остановка сессии разрешений не требует
+        if (viewModel.state.value.link != LinkState.IDLE) {
             viewModel.toggleConnection()
-            if (optionalMissing.isNotEmpty()) {
-                permissionsLauncher.launch(optionalMissing.toTypedArray())
-            }
+            return
+        }
+        val allMissing = requiredMissing + optionalMissing
+        if (allMissing.isEmpty()) {
+            viewModel.toggleConnection()
         } else {
-            permissionsLauncher.launch((requiredMissing + optionalMissing).toTypedArray())
+            // Сначала все разрешения (включая BLUETOOTH_CONNECT), старт — в колбэке
+            permissionsLauncher.launch(allMissing.toTypedArray())
         }
     }
 
