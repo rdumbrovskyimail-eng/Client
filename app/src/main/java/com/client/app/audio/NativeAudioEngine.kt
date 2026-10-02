@@ -102,7 +102,7 @@ class EchoAwareBargeInDetector {
     @Volatile private var minProbability = 0.6f
     @Volatile var candidateFrames: Int = 4
         private set
-    @Volatile var confirmMs: Long = 180L
+    @Volatile var confirmMs: Long = 450L
         private set
     private var streak = 0
 
@@ -113,7 +113,7 @@ class EchoAwareBargeInDetector {
             echoMargin = 2.0f
             minProbability = 0.5f
             candidateFrames = 3
-            confirmMs = 150L
+            confirmMs = 450L
             coupling = HEADSET_INITIAL_COUPLING
         } else {
             minCoupling = 0.01f
@@ -121,7 +121,7 @@ class EchoAwareBargeInDetector {
             echoMargin = 2.8f
             minProbability = 0.6f
             candidateFrames = 4
-            confirmMs = 180L
+            confirmMs = 450L
             coupling = SPEAKER_INITIAL_COUPLING
         }
         streak = 0
@@ -392,7 +392,6 @@ class NativeAudioEngine @Inject constructor(
 
     private fun applyAcousticProfileForRoute(profile: RouteProfile) {
         val quirks = profile.quirks
-        // Пороги Silero V5 (последовательные окна 32 мс): старт и гистерезис конца речи по маршруту
         when {
             profile.path == AudioRoutePath.SPEAKER_SHARED -> vadDetector.setThresholds(start = 0.55f, end = 0.35f)
             profile.path == AudioRoutePath.BLUETOOTH_A2DP_HIFI -> vadDetector.setThresholds(start = 0.50f, end = 0.35f)
@@ -873,11 +872,6 @@ class NativeAudioEngine @Inject constructor(
 
     /**
      * Один кадр 10 мс: VAD, оценка эха, аплинк и перебивание.
-     *
-     * Аплинк открыт только на речь пользователя (предбуфер 300 мс) и закрывается по паузе
-     * конца фразы → audioStreamEnd (гибридный VAD). Пока говорит модель, голос поверх эха
-     * сначала ставит вывод на паузу (кандидат), затем подтверждается (сброс ответа) или
-     * отклоняется (ответ продолжается с того же места).
      */
     private fun processCapturedFrame(
         frame: ByteArray,
@@ -893,7 +887,6 @@ class NativeAudioEngine @Inject constructor(
         val refMax = u.referenceMax()
         if (outNow > OUT_ACTIVE_RMS) u.lastOutputActiveMs = now
 
-        // Сброс воспроизведения извне (прерывание сервером, смена маршрута) снимает кандидата
         if (u.candidateSinceMs > 0L && playbackGeneration.get() != u.candidateGeneration) {
             u.candidateSinceMs = 0L
         }
@@ -907,7 +900,6 @@ class NativeAudioEngine @Inject constructor(
             bargeInDetector.resetStreak()
         }
         if (!rendering && u.wasRendering && !u.uplinkOpen) {
-            // Модель замолчала: решение VAD, набранное на её эхе, сбрасывается
             vadDetector.resetDecisionState()
         }
         u.wasRendering = rendering
@@ -947,8 +939,6 @@ class NativeAudioEngine @Inject constructor(
                 openUplink(u, PRE_ROLL_IDLE_FRAMES, seqNum, captureTimestampNs, instanceId)
             }
         } else if (rendering) {
-            // Модель начала ответ при открытом аплинке: голос поверх эха → перебивание,
-            // иначе фраза закрывается, чтобы эхо ответа не ушло на сервер (самоперебивание)
             val candidate = bargeInDetector.evaluateCandidate(gatedSpeech)
             if (candidate && localBargeInEnabled && !isBargeInActive && now >= u.refractoryUntilMs) {
                 startBargeInCandidate(u, now)
@@ -984,7 +974,6 @@ class NativeAudioEngine @Inject constructor(
         instanceId: Long
     ) {
         val elapsed = now - u.candidateSinceMs
-        // Первые ~100 мс в микрофоне ещё звучит хвост эха (латентность вывода) — оцениваем с его учётом
         val evidence = if (elapsed < 100L) {
             gatedSpeech
         } else {
@@ -1025,7 +1014,6 @@ class NativeAudioEngine @Inject constructor(
     ) {
         u.candidateSinceMs = 0L
         u.refractoryUntilMs = now + BARGE_IN_REFRACTORY_MS
-        // Ответ сброшен: хвоста эха больше нет, фраза пользователя не должна закрываться по «рендерингу»
         u.lastOutputActiveMs = 0L
         bargeInDetector.resetStreak()
         activateBargeIn(now)
@@ -1033,7 +1021,6 @@ class NativeAudioEngine @Inject constructor(
         invalidateAndFlushPlayback("local barge-in")
         hapticManager.triggerBargeIn()
         _bargeInEvents.tryEmit(Unit)
-        // Голос с момента начала + 120 мс до кандидата (без эха ответа)
         val framesToSend = (elapsedMs / 10L).toInt() + PRE_ROLL_BARGE_IN_FRAMES
         openUplink(u, framesToSend, seqNum, captureTimestampNs, instanceId)
         logger.d("NativeAudioEngine: перебивание подтверждено за $elapsedMs мс")
@@ -1080,8 +1067,6 @@ class NativeAudioEngine @Inject constructor(
         val sessionId = runCatching { bridge.getCaptureSessionId() }.getOrDefault(0)
         if (sessionId <= 0 || sessionId == attachedEffectSessionId) return
         releaseVoiceEffects()
-        // В Bluetooth-гарнитуре эхо и шум подавляет сама гарнитура: второй NS на телефоне портит голос.
-        // В Hi-Fi микрофон — телефонный, эффекты нужны.
         val routePath = router.currentProfile.value.path
         if (routePath.isBluetooth && routePath != AudioRoutePath.BLUETOOTH_A2DP_HIFI) return
         attachedEffectSessionId = sessionId
@@ -1118,7 +1103,6 @@ class NativeAudioEngine @Inject constructor(
 
                 try {
                     while (isActive && _isCapturing.value && captureDesired.get() && captureInstanceId.get() == instanceId) {
-                        // Блокирующее ожидание целого кадра 10 мс: без опроса и без нулевого паддинга
                         if (!bridge.waitForCaptureFrames(FRAME_SAMPLES, CAPTURE_WAIT_TIMEOUT_MS)) continue
 
                         captureDirectBuffer.clear()
@@ -1189,7 +1173,6 @@ class NativeAudioEngine @Inject constructor(
                     try {
                         val nowMs = SystemClock.elapsedRealtime()
                         if (!vadDetector.isNeuralActive.value && nowMs >= nextVadPrepareAttemptMs) {
-                            // Повтор с паузой: прежний код пересоздавал ONNX-сессию каждые 25 мс
                             nextVadPrepareAttemptMs = nowMs + VAD_PREPARE_RETRY_MS
                             vadDetector.prepare()
                         }
@@ -1211,7 +1194,6 @@ class NativeAudioEngine @Inject constructor(
         req: RouteTransitionRequest
     ) = audioLifecycleMutex.withLock { applyRouteLocked(req) }
 
-    /** Только под audioLifecycleMutex: kotlinx Mutex не реентерабелен. */
     private suspend fun applyRouteLocked(
         req: RouteTransitionRequest
     ) {
@@ -1230,7 +1212,9 @@ class NativeAudioEngine @Inject constructor(
                 router.isInputDeviceMatchingRoute(req.profile, actualInDev)
 
             if (isSameRoute) {
-                logger.d("NativeAudioEngine: applyRouteInternal: Идентичный маршрут уже активен, пересоздание стримов пропущено (No-Op)")
+                // Стримы уже переоткрыты восстановлением, но акустический профиль остался от прежнего маршрута
+                applyAcousticProfileForRoute(req.profile)
+                logger.d("NativeAudioEngine: applyRouteInternal: маршрут уже активен, применён профиль ${req.profile.path}")
                 return@withContext
             }
 
@@ -1497,7 +1481,6 @@ class NativeAudioEngine @Inject constructor(
             val now = SystemClock.elapsedRealtime()
 
             if (bridge.isPlaybackPaused()) {
-                // Пауза перебивания: очередь не расходуется, это не зависание
                 lastProgressTime = now
                 maxAllowedDurationMs += 5L
                 delay(5L)
