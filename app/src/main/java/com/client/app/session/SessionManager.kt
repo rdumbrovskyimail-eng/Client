@@ -790,7 +790,7 @@ class SessionManager @Inject constructor(
         val aadEnabled = prefs[KEY_AAD_ENABLED] ?: true
         currentAadEnabled = aadEnabled
         audioEngine.isAadMode = aadEnabled
-        audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: true)
+        audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: false)
 
         val realtimeInput = RealtimeInputSettings(
             aadEnabled = aadEnabled,
@@ -1370,6 +1370,9 @@ class SessionManager @Inject constructor(
         micControlJob = null
 
         audioEngine.drainPendingMicOutput()
+        if (hasPhysicalCapture && client.isReady) {
+            runCatching { finalizeMicActivityBounded() }
+        }
         isManualActivityActive.set(false)
         _state.update { it.copy(isMicActive = false) }
     }
@@ -2351,7 +2354,7 @@ class SessionManager @Inject constructor(
         dataStore.data.collect { prefs ->
             audioEngine.setVolume(prefs[KEY_VOLUME] ?: 1.0f)
             audioEngine.setMicGain(prefs[KEY_MIC_GAIN] ?: 1.0f)
-            audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: true)
+            audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: false)
             if (prefs[KEY_SESSION_RESUMPTION_ENABLED] == false) {
                 val hasStoredHandle = !prefs[KEY_SESSION_RESUMPTION_HANDLE].isNullOrBlank()
                 val hasStoredTimestamp = prefs[KEY_SESSION_RESUMPTION_TIMESTAMP] != null
