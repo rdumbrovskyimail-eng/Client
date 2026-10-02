@@ -328,6 +328,9 @@ class NativeAudioEngine @Inject constructor(
     private val poolLock = Any()
     private val leadInBuffer = ArrayDeque<ByteArray>(32)
 
+    private val audioEventPool = ArrayDeque<AudioStreamDataEvent>(64)
+    private val audioEventPoolLock = Any()
+
     private val bargeInDetector = EchoAwareBargeInDetector()
 
     @Volatile private var currentPlaybackVolume: Float = 1.0f
