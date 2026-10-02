@@ -205,7 +205,7 @@ class AudioDeviceRouter @Inject constructor(
     )
 
     // Hi-Fi Bluetooth: при подключённых A2DP-наушниках звук идёт как медиа, голос — с микрофона телефона
-    @Volatile var bluetoothHiFiEnabled: Boolean = true
+    @Volatile var bluetoothHiFiEnabled: Boolean = false
 
     fun requestReevaluation() {
         debounceTrigger.tryEmit(Unit)
@@ -291,6 +291,7 @@ class AudioDeviceRouter @Inject constructor(
     private fun isRelevantAudioDevice(device: AudioDeviceInfo): Boolean {
         return when (device.type) {
             AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
             AudioDeviceInfo.TYPE_BLE_HEADSET,
             AudioDeviceInfo.TYPE_BLE_SPEAKER,
             AudioDeviceInfo.TYPE_WIRED_HEADSET,
@@ -940,6 +941,7 @@ class AudioDeviceRouter @Inject constructor(
             }
 
             AudioRoutePath.WIRED_HEADSET -> {
+                if (profile.inputDeviceId == 0 && actualInput.type == AudioDeviceInfo.TYPE_BUILTIN_MIC) return true
                 if (actualInput.type != AudioDeviceInfo.TYPE_WIRED_HEADSET && actualInput.type != AudioDeviceInfo.TYPE_USB_HEADSET) {
                     logger.w("AudioDeviceRouter: Ожидался вход проводной гарнитуры, но получен тип ${actualInput.type}")
                     return false
@@ -948,7 +950,8 @@ class AudioDeviceRouter @Inject constructor(
             }
 
             AudioRoutePath.USB_HEADSET -> {
-                if (actualInput.type != AudioDeviceInfo.TYPE_USB_HEADSET && actualInput.type != AudioDeviceInfo.TYPE_WIRED_HEADSET) {
+                if (profile.inputDeviceId == 0 && actualInput.type == AudioDeviceInfo.TYPE_BUILTIN_MIC) return true
+                if (actualInput.type != AudioDeviceInfo.TYPE_USB_HEADSET && actualInput.type != AudioDeviceInfo.TYPE_USB_DEVICE && actualInput.type != AudioDeviceInfo.TYPE_WIRED_HEADSET) {
                     logger.w("AudioDeviceRouter: Ожидался вход USB-C гарнитуры, но получен тип ${actualInput.type}")
                     return false
                 }
