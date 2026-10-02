@@ -41,7 +41,7 @@ data class AppSettingsState(
     val outputTxMode: String = "VERBATIM",
 
     val aadEnabled: Boolean = true,
-    val btHiFiMode: Boolean = true,
+    val btHiFiMode: Boolean = false,
     val aadStartSensitivity: String = "START_SENSITIVITY_HIGH",
     val aadEndSensitivity: String = "END_SENSITIVITY_HIGH",
     val prefixPaddingMs: Int = 60,
@@ -153,7 +153,7 @@ class SettingsViewModel @Inject constructor(
                             outputTxMode = p[SessionManager.KEY_OUTPUT_TRANSCRIPTION_MODE] ?: "VERBATIM",
 
                             aadEnabled = p[SessionManager.KEY_AAD_ENABLED] ?: true,
-                            btHiFiMode = p[SessionManager.KEY_BT_HIFI_MODE] ?: true,
+                            btHiFiMode = p[SessionManager.KEY_BT_HIFI_MODE] ?: false,
                             aadStartSensitivity = p[SessionManager.KEY_AAD_START_SENSITIVITY] ?: "START_SENSITIVITY_HIGH",
                             aadEndSensitivity = p[SessionManager.KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_HIGH",
                             prefixPaddingMs = p[SessionManager.KEY_PREFIX_PADDING_MS] ?: 60,
