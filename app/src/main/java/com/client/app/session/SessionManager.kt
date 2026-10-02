@@ -196,7 +196,7 @@ class SessionManager @Inject constructor(
     private var transcriptStreamGenerationId: Long = -1L
     @Volatile private var currentOutputTranscriptionEnabled = true
 
-    @Volatile private var currentAadEnabled = true
+    @Volatile private var currentAadEnabled = false
     @Volatile private var activeSessionId = 0L
     @Volatile private var interactionStatus: String? = null
     @Volatile private var turnCompleteSeen = false
@@ -637,8 +637,6 @@ class SessionManager @Inject constructor(
         }
         if (candidateList.isEmpty()) return emptyList()
 
-        // 240k символов ≈ десятки тысяч токенов на КАЖДОЕ новое подключение — на бесплатном
-        // уровне это само по себе выбивает лимит токенов в минуту
         val maxHistoryChars = 24_000
         val out = ArrayDeque<ClientTurn>()
         var chars = 0
@@ -787,7 +785,7 @@ class SessionManager @Inject constructor(
             mode = prefs[KEY_OUTPUT_TRANSCRIPTION_MODE] ?: "VERBATIM"
         )
 
-        val aadEnabled = prefs[KEY_AAD_ENABLED] ?: true
+        val aadEnabled = prefs[KEY_AAD_ENABLED] ?: false
         currentAadEnabled = aadEnabled
         audioEngine.isAadMode = aadEnabled
         audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: false)
@@ -797,12 +795,11 @@ class SessionManager @Inject constructor(
             startSensitivity = prefs[KEY_AAD_START_SENSITIVITY] ?: "START_SENSITIVITY_HIGH",
             endSensitivity = prefs[KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_HIGH",
             prefixPaddingMs = prefs[KEY_PREFIX_PADDING_MS] ?: 60,
-            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 500,
+            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 800,
             activityHandling = prefs[KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
             turnCoverage = prefs[KEY_TURN_COVERAGE] ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
         )
 
-        // Гибридный VAD: клиент закрывает фразу по своей паузе (audioStreamEnd), серверный VAD страхует
         audioEngine.setEndOfSpeechHangoverMs(realtimeInput.silenceDurationMs)
         audioEngine.localBargeInEnabled = realtimeInput.activityHandling != "NO_INTERRUPTION"
 
@@ -877,7 +874,6 @@ class SessionManager @Inject constructor(
         }
 
         val forvoEnabled = prefs[KEY_ENABLE_FORVO] ?: false
-        // Google Search по умолчанию ВЫКЛЮЧЕН: с ним сервер закрывал сессию 1011 «quota exceeded»
         val searchEnabled = prefs[KEY_ENABLE_SEARCH] ?: false
 
         val dynamicTools = if (forvoEnabled) {
@@ -891,7 +887,12 @@ class SessionManager @Inject constructor(
                 LiveConfig(
                     apiKey = apiKey,
                     model = liveModel,
-                    systemInstruction = _state.value.activePrompt,
+                    systemInstruction = _state.value.activePrompt.trimEnd() + "\n\n" +
+                        "Тебя слушают в реальном времени и могут перебить. Если тебя перебили, " +
+                        "пользователь услышал только начало твоего последнего ответа, а не весь его текст. " +
+                        "Не продолжай с того места, где закончился твой ответ, и не переходи к новой теме: " +
+                        "сначала ответь на то, что сказал пользователь, а если он просит продолжить — " +
+                        "вернись к прерванной мысли и коротко повтори то, что он мог не услышать.",
                     voiceName = voice,
                     speechLanguage = speechLang,
                     temperature = temperature,
@@ -899,7 +900,6 @@ class SessionManager @Inject constructor(
                     thinkingLevel = thinkingLevel,
                     inputTranscription = inputTx,
                     outputTranscription = outputTx,
-                    // Серверная пауза — страховка на 200 мс длиннее клиентской (фразу закрывает клиент)
                     realtimeInput = realtimeInput.copy(
                         silenceDurationMs = (realtimeInput.silenceDurationMs + 200).coerceAtMost(3000)
                     ),
@@ -1283,7 +1283,6 @@ class SessionManager @Inject constructor(
         micControlJob?.cancel()
         micControlJob = null
 
-        // Один упорядоченный потребитель: кадры и события речи уходят строго в порядке захвата
         micAudioJob = scope.launch {
             try {
                 for (event in audioEngine.micOutput) {
@@ -1317,8 +1316,8 @@ class SessionManager @Inject constructor(
                             }
 
                             is AudioStreamControlEvent.SpeechEnd -> {
+                                logger.d("SessionManager: VAD SpeechEnd -> activityEnd (ушло ${client.getTransportAudioStats().outboundMicBytesDelivered / 32} мс аудио за сессию)")
                                 if (currentAadEnabled && client.isReady) {
-                                    // Гибридный VAD: клиент закрывает фразу сам — сервер отвечает без своей паузы
                                     client.sendAudioStreamEnd()
                                 } else if (!currentAadEnabled && client.isReady) {
                                     isManualActivityActive.set(false)
@@ -1428,7 +1427,6 @@ class SessionManager @Inject constructor(
     private fun observeBargeIn() = scope.launch {
         audioEngine.bargeInEvents.collect {
             if (!_state.value.isAiSpeaking) return@collect
-            // Вывод уже сброшен движком, хвост генерации отсечён транспортом
             _state.update {
                 it.copy(isAiSpeaking = false)
             }
@@ -1649,8 +1647,6 @@ class SessionManager @Inject constructor(
                                             goAwayJob = scope.launch {
                                                 try {
                                                     val millisLeft = event.millisLeft ?: 0L
-                                                    // Переход в паузе диалога (модель молчит, фраза не передаётся),
-                                                    // но не позже чем за 1.5 с до обрыва сервером
                                                     val deadline = SystemClock.elapsedRealtime() +
                                                         (millisLeft - 1500L).coerceAtLeast(0L)
                                                     while (SystemClock.elapsedRealtime() < deadline) {
@@ -1697,7 +1693,6 @@ class SessionManager @Inject constructor(
                                     }
 
                                     is GeminiEvent.Interrupted -> {
-                                        // Очередь и вывод уже сброшены клиентом синхронно, в порядке сообщений сокета
                                         audioEngine.resetBargeInState()
 
                                         _state.update {
@@ -1790,8 +1785,6 @@ class SessionManager @Inject constructor(
 
                                         cancelAllPendingToolJobs()
 
-                                        // 1007 — сервер отверг содержимое setup, 1008 — нарушение политики
-                                        // (ключ, доступ к модели). Повтор с тем же конфигом бесполезен.
                                         val configRejectCodes = setOf(400, 403, 404, 1007, 1008)
                                         val resumeRejected =
                                             activeConnectUsedResumption && event.code in configRejectCodes
@@ -1900,7 +1893,6 @@ class SessionManager @Inject constructor(
         scope.launch {
             val generation = audioEngine.currentPlaybackGeneration
 
-            // Защитный барьер: дожидаемся завершения вычитки входящего канала аудио
             val ingressDeadline = SystemClock.elapsedRealtime() + 2500L
             while (client.hasPendingAudioFrames && SystemClock.elapsedRealtime() < ingressDeadline) {
                 if (client.sessionId != sourceSessionId || client.epoch != sourceEpoch || !connectionDesired) {
@@ -1909,7 +1901,6 @@ class SessionManager @Inject constructor(
                 delay(20L)
             }
 
-            // Даем нативному буферу 60 мс на начало физического рендеринга перед проверкой опустошения
             delay(60L)
 
             val drained = audioEngine.awaitPlaybackDrained(generation = generation, stallTimeoutMs = 2500L)
