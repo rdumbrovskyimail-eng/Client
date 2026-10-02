@@ -37,31 +37,31 @@ jobs:
               (r'''A1''', r'''app/src/main/java/com/client/app/session/SessionManager.kt''',
                r'''        val aadEnabled = prefs[KEY_AAD_ENABLED] ?: true''',
                r'''        val aadEnabled = prefs[KEY_AAD_ENABLED] ?: false''',
-               1),
+               1, None),
               (r'''A1''', r'''app/src/main/java/com/client/app/session/SessionManager.kt''',
                r'''            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 500,''',
                r'''            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 800,''',
-               1),
+               1, None),
               (r'''A1''', r'''app/src/main/java/com/client/app/viewmodel/SettingsViewModel.kt''',
                r'''    val aadEnabled: Boolean = true,''',
                r'''    val aadEnabled: Boolean = false,''',
-               1),
+               1, None),
               (r'''A1''', r'''app/src/main/java/com/client/app/viewmodel/SettingsViewModel.kt''',
                r'''                            aadEnabled = p[SessionManager.KEY_AAD_ENABLED] ?: true,''',
                r'''                            aadEnabled = p[SessionManager.KEY_AAD_ENABLED] ?: false,''',
-               1),
+               1, None),
               (r'''A1''', r'''app/src/main/java/com/client/app/viewmodel/SettingsViewModel.kt''',
                r'''    val silenceDurationMs: Int = 500,''',
                r'''    val silenceDurationMs: Int = 800,''',
-               1),
+               1, None),
               (r'''A1''', r'''app/src/main/java/com/client/app/viewmodel/SettingsViewModel.kt''',
                r'''                            silenceDurationMs = p[SessionManager.KEY_SILENCE_DURATION_MS] ?: 500,''',
                r'''                            silenceDurationMs = p[SessionManager.KEY_SILENCE_DURATION_MS] ?: 800,''',
-               1),
+               1, None),
               (r'''A2''', r'''app/src/main/java/com/client/app/audio/NativeAudioEngine.kt''',
                r'''if (isBargeInActive || generation != currentPlaybackGeneration) return''',
                r'''if (generation != currentPlaybackGeneration) return''',
-               4),
+               4, None),
               (r'''A3''', r'''app/src/main/java/com/client/app/service/LiveSessionForegroundService.kt''',
                r'''            if (!permissionGranted) return false
                       return service.promoteToForeground()''',
@@ -69,7 +69,7 @@ jobs:
                       // Тип microphone уже активен — повторный startForeground() не нужен
                       if ((service.foregroundServiceType and ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE) != 0) return true
                       return service.promoteToForeground()''',
-               1),
+               1, None),
               (r'''A4''', r'''app/src/main/java/com/client/app/api/GeminiProtobufLiveClient.kt''',
                r'''                    logManager.e(
                                   "WebSocket:Failure",
@@ -91,29 +91,29 @@ jobs:
                                   t
                               )
           ''',
-               1),
+               1, None),
               (r'''B1''', r'''app/src/main/java/com/client/app/session/SessionManager.kt''',
                r'''        audioEngine.isAadMode = aadEnabled
                   audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: true)''',
                r'''        audioEngine.isAadMode = aadEnabled
                   audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: false)''',
-               1),
+               1, None),
               (r'''B1''', r'''app/src/main/java/com/client/app/session/SessionManager.kt''',
                r'''            audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: true)''',
                r'''            audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: false)''',
-               1),
+               1, None),
               (r'''B1''', r'''app/src/main/java/com/client/app/viewmodel/SettingsViewModel.kt''',
                r'''    val btHiFiMode: Boolean = true,''',
                r'''    val btHiFiMode: Boolean = false,''',
-               1),
+               1, None),
               (r'''B1''', r'''app/src/main/java/com/client/app/viewmodel/SettingsViewModel.kt''',
                r'''                            btHiFiMode = p[SessionManager.KEY_BT_HIFI_MODE] ?: true,''',
                r'''                            btHiFiMode = p[SessionManager.KEY_BT_HIFI_MODE] ?: false,''',
-               1),
+               1, None),
               (r'''B1''', r'''app/src/main/java/com/client/app/audio/AudioDeviceRouter.kt''',
                r'''    @Volatile var bluetoothHiFiEnabled: Boolean = true''',
                r'''    @Volatile var bluetoothHiFiEnabled: Boolean = false''',
-               1),
+               1, None),
               (r'''B2''', r'''app/src/main/java/com/client/app/audio/AudioDeviceRouter.kt''',
                r'''            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
                       AudioDeviceInfo.TYPE_BLE_HEADSET,
@@ -122,7 +122,7 @@ jobs:
                       AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
                       AudioDeviceInfo.TYPE_BLE_HEADSET,
                       AudioDeviceInfo.TYPE_BLE_SPEAKER,''',
-               1),
+               1, None),
               (r'''B3''', r'''app/src/main/java/com/client/app/audio/NativeAudioEngine.kt''',
                r'''            if (isSameRoute) {
                           logger.d("NativeAudioEngine: applyRouteInternal: Идентичный маршрут уже активен, пересоздание стримов пропущено (No-Op)")
@@ -134,7 +134,7 @@ jobs:
                           logger.d("NativeAudioEngine: applyRouteInternal: маршрут уже активен, применён профиль ${req.profile.path}")
                           return@withContext
                       }''',
-               1),
+               1, None),
               (r'''B4''', r'''app/src/main/java/com/client/app/ui/screens/ClientScreen.kt''',
                r'''    ) { permissions ->
                   // Старт только если микрофон запрашивали ИМЕННО в этом диалоге и его выдали. Иначе
@@ -157,7 +157,7 @@ jobs:
                       viewModel.toggleConnection()
                   }
               }''',
-               1),
+               1, r'''viewModel.state.value.link == com.client.app.session.LinkState.IDLE'''),
               (r'''B4''', r'''app/src/main/java/com/client/app/ui/screens/ClientScreen.kt''',
                r'''        if (requiredMissing.isEmpty()) {
                       viewModel.toggleConnection()
@@ -178,7 +178,7 @@ jobs:
                   } else {
                       permissionsLauncher.launch(allMissing.toTypedArray())
                   }''',
-               1),
+               1, r'''val allMissing = requiredMissing + optionalMissing'''),
               (r'''C1''', r'''app/src/main/java/com/client/app/audio/NativeAudioEngine.kt''',
                r'''    fun setMicGain(gain: Float) =
                   bridge.setMicGain(gain.coerceIn(0.5f, 2.0f))''',
@@ -189,12 +189,12 @@ jobs:
                   userMicGain = gain.coerceIn(0.5f, 2.0f)
                   bridge.setMicGain((userMicGain * routeMicCompensation).coerceIn(0.5f, 2.0f))
               }''',
-               1),
+               1, None),
               (r'''C1''', r'''app/src/main/java/com/client/app/audio/NativeAudioEngine.kt''',
                r'''        bridge.setMicGain(quirks.micGainCompensation)''',
                r'''        routeMicCompensation = quirks.micGainCompensation
                   bridge.setMicGain((userMicGain * routeMicCompensation).coerceIn(0.5f, 2.0f))''',
-               1),
+               1, None),
               (r'''C2''', r'''app/src/main/java/com/client/app/session/SessionManager.kt''',
                r'''        audioEngine.drainPendingMicOutput()
                   isManualActivityActive.set(false)''',
@@ -204,40 +204,40 @@ jobs:
                       runCatching { finalizeMicActivityBounded() }
                   }
                   isManualActivityActive.set(false)''',
-               1),
+               1, r'''runCatching { finalizeMicActivityBounded() }'''),
               (r'''C3''', r'''app/src/main/java/com/client/app/audio/AudioDeviceRouter.kt''',
                r'''            AudioRoutePath.WIRED_HEADSET -> {
                           if (actualInput.type != AudioDeviceInfo.TYPE_WIRED_HEADSET && actualInput.type != AudioDeviceInfo.TYPE_USB_HEADSET) {''',
                r'''            AudioRoutePath.WIRED_HEADSET -> {
                           if (profile.inputDeviceId == 0 && actualInput.type == AudioDeviceInfo.TYPE_BUILTIN_MIC) return true
                           if (actualInput.type != AudioDeviceInfo.TYPE_WIRED_HEADSET && actualInput.type != AudioDeviceInfo.TYPE_USB_HEADSET) {''',
-               1),
+               1, None),
               (r'''C3''', r'''app/src/main/java/com/client/app/audio/AudioDeviceRouter.kt''',
                r'''            AudioRoutePath.USB_HEADSET -> {
                           if (actualInput.type != AudioDeviceInfo.TYPE_USB_HEADSET && actualInput.type != AudioDeviceInfo.TYPE_WIRED_HEADSET) {''',
                r'''            AudioRoutePath.USB_HEADSET -> {
                           if (profile.inputDeviceId == 0 && actualInput.type == AudioDeviceInfo.TYPE_BUILTIN_MIC) return true
                           if (actualInput.type != AudioDeviceInfo.TYPE_USB_HEADSET && actualInput.type != AudioDeviceInfo.TYPE_USB_DEVICE && actualInput.type != AudioDeviceInfo.TYPE_WIRED_HEADSET) {''',
-               1),
+               1, None),
               (r'''C4''', r'''app/src/main/java/com/client/app/api/SocketCustomizer.kt''',
                r'''            ParcelFileDescriptor.fromSocket(socket)?.use { origPfd ->''',
                r'''            // До API 29 fromSocket() не делает dup: закрытие PFD закрывало сам сокет
                       if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) ParcelFileDescriptor.fromSocket(socket)?.use { origPfd ->''',
-               1),
+               1, None),
               (r'''D''', r'''app/src/main/java/com/client/app/session/SessionManager.kt''',
                r'''                            is AudioStreamControlEvent.SpeechEnd -> {
                                           if (currentAadEnabled && client.isReady) {''',
                r'''                            is AudioStreamControlEvent.SpeechEnd -> {
                                           logger.d("SessionManager: VAD SpeechEnd -> activityEnd (ушло ${client.getTransportAudioStats().outboundMicBytesDelivered / 32} мс аудио за сессию)")
                                           if (currentAadEnabled && client.isReady) {''',
-               1),
+               1, None),
               (r'''D''', r'''app/src/main/java/com/client/app/api/GeminiProtobufLiveClient.kt''',
                r'''                        logManager.net("WebSocket:RxBinary", "Получено ${bytes.size} байт")
                                   parseServerJsonMessage(bytes.utf8(), myEpoch, ws)''',
                r'''                        val text = bytes.utf8()
                                   logManager.net("WebSocket:RxBinary", describeServerFrame(text, bytes.size))
                                   parseServerJsonMessage(text, myEpoch, ws)''',
-               1),
+               1, None),
               (r'''D''', r'''app/src/main/java/com/client/app/api/GeminiProtobufLiveClient.kt''',
                r'''    private fun isQuotaClose(code: Int, reason: String): Boolean {''',
                r'''    private fun describeServerFrame(text: String, size: Int): String {
@@ -258,7 +258,7 @@ jobs:
               }
 
               private fun isQuotaClose(code: Int, reason: String): Boolean {''',
-               1),
+               1, None),
               (r'''E1''', r'''app/src/main/java/com/client/app/session/SessionManager.kt''',
                r'''                    systemInstruction = _state.value.activePrompt,''',
                r'''                    systemInstruction = _state.value.activePrompt.trimEnd() + "\n\n" +
@@ -267,19 +267,19 @@ jobs:
                                   "Не продолжай с того места, где закончился твой ответ, и не переходи к новой теме: " +
                                   "сначала ответь на то, что сказал пользователь, а если он просит продолжить — " +
                                   "вернись к прерванной мысли и коротко повтори то, что он мог не услышать.",''',
-               1),
+               1, None),
               (r'''E2''', r'''app/src/main/java/com/client/app/audio/NativeAudioEngine.kt''',
                r'''            candidateFrames = 3
                       confirmMs = 150L''',
                r'''            candidateFrames = 3
                       confirmMs = 450L''',
-               1),
+               1, None),
               (r'''E2''', r'''app/src/main/java/com/client/app/audio/NativeAudioEngine.kt''',
                r'''            candidateFrames = 4
                       confirmMs = 180L''',
                r'''            candidateFrames = 4
                       confirmMs = 450L''',
-               1),
+               1, None),
           ]
 
           changed = set()
@@ -296,13 +296,15 @@ jobs:
                   cache[path] = [raw.replace("\r\n", "\n"), crlf, raw]
               return cache[path]
 
-          for sec, path, old, new, n in EDITS:
+          for sec, path, old, new, n, marker in EDITS:
               try:
                   entry = load(path)
               except FileNotFoundError:
                   errors.append(f"{sec}: файл не найден: {path}")
                   continue
               text = entry[0]
+              if marker and marker in text:
+                  print(f"[skip] {sec} {path}: уже применено (ручная редакция)"); skipped += 1; continue
               c_old, c_new = text.count(old), text.count(new)
               if old in new and c_new >= n:
                   print(f"[skip] {sec} {path}: уже применено"); skipped += 1; continue
