@@ -1,5 +1,6 @@
 package com.client.app.api
 
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import com.client.app.audio.NativeAudioBridge
 import com.client.app.logging.AppLogManager
@@ -57,15 +58,17 @@ class TunedSocketFactory(
             socket.receiveBufferSize = 64 * 1024
 
             // Безусловное дублирование дескриптора сокета через dup() для исключения случайного закрытия сокета
-            ParcelFileDescriptor.fromSocket(socket)?.use { origPfd ->
-                origPfd.dup()?.use { dupPfd ->
-                    val nativeFd = dupPfd.fd
-                    if (nativeFd >= 0) {
-                        nativeBridge.tuneNativeSocket(nativeFd)
-                        logManager.net(
-                            "SocketCustomizer",
-                            "Применены TCP опции (fd=$nativeFd, tcpNoDelay=true, sndBuf=64K, rcvBuf=64K)"
-                        )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ParcelFileDescriptor.fromSocket(socket)?.use { origPfd ->
+                    origPfd.dup()?.use { dupPfd ->
+                        val nativeFd = dupPfd.fd
+                        if (nativeFd >= 0) {
+                            nativeBridge.tuneNativeSocket(nativeFd)
+                            logManager.net(
+                                "SocketCustomizer",
+                                "Применены TCP опции (fd=$nativeFd, tcpNoDelay=true, sndBuf=64K, rcvBuf=64K)"
+                            )
+                        }
                     }
                 }
             }
