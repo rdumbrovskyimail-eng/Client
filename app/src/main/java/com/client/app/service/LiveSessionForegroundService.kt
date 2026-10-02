@@ -160,6 +160,8 @@ class LiveSessionForegroundService : Service() {
                 Manifest.permission.RECORD_AUDIO
             ) == PackageManager.PERMISSION_GRANTED
             if (!permissionGranted) return false
+            // Тип microphone уже активен — повторный startForeground() не нужен
+            if ((service.foregroundServiceType and ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE) != 0) return true
             return service.promoteToForeground()
         }
     }
