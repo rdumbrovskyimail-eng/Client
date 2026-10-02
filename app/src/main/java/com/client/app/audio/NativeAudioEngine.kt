@@ -328,9 +328,6 @@ class NativeAudioEngine @Inject constructor(
     private val poolLock = Any()
     private val leadInBuffer = ArrayDeque<ByteArray>(32)
 
-    private val audioEventPool = ArrayDeque<AudioStreamDataEvent>(64)
-    private val audioEventPoolLock = Any()
-
     private val bargeInDetector = EchoAwareBargeInDetector()
 
     @Volatile private var currentPlaybackVolume: Float = 1.0f
@@ -400,7 +397,8 @@ class NativeAudioEngine @Inject constructor(
             else -> vadDetector.setThresholds(start = 0.50f, end = 0.35f)
         }
         bargeInDetector.configure(isHeadset = profile.path.isHeadset)
-        bridge.setMicGain(quirks.micGainCompensation)
+        routeMicCompensation = quirks.micGainCompensation
+        bridge.setMicGain((userMicGain * routeMicCompensation).coerceIn(0.5f, 2.0f))
         bridge.setOutputEqProfile(
             when (profile.path) {
                 AudioRoutePath.SPEAKER_SHARED -> 0
@@ -1550,8 +1548,13 @@ class NativeAudioEngine @Inject constructor(
         bridge.setVolume(clamped)
     }
 
-    fun setMicGain(gain: Float) =
-        bridge.setMicGain(gain.coerceIn(0.5f, 2.0f))
+    @Volatile private var userMicGain: Float = 1.0f
+    @Volatile private var routeMicCompensation: Float = 1.0f
+
+    fun setMicGain(gain: Float) {
+        userMicGain = gain.coerceIn(0.5f, 2.0f)
+        bridge.setMicGain((userMicGain * routeMicCompensation).coerceIn(0.5f, 2.0f))
+    }
 
     fun invalidateAndFlushPlayback(reason: String = ""): Long {
         val next = playbackGeneration.incrementAndGet().let { if (it <= 0L) 1L else it }
@@ -1570,7 +1573,7 @@ class NativeAudioEngine @Inject constructor(
         generation: Long
     ) {
         if (pcm.isEmpty() || !_isPlaying.value) return
-        if (isBargeInActive || generation != currentPlaybackGeneration) return
+        if (generation != currentPlaybackGeneration) return
 
         playbackStartGeneration.set(generation)
 
@@ -1579,7 +1582,7 @@ class NativeAudioEngine @Inject constructor(
         var lastSuccessfulWriteMs = SystemClock.elapsedRealtime()
 
         while (offset < total && _isPlaying.value) {
-            if (isBargeInActive || generation != currentPlaybackGeneration) return
+            if (generation != currentPlaybackGeneration) return
 
             val bytesToWrite = minOf(total - offset, MAX_JNI_WRITE_CHUNK_BYTES)
 
@@ -1614,7 +1617,7 @@ class NativeAudioEngine @Inject constructor(
         generation: Long
     ) {
         if (lengthBytes <= 0 || !_isPlaying.value) return
-        if (isBargeInActive || generation != currentPlaybackGeneration) return
+        if (generation != currentPlaybackGeneration) return
 
         playbackStartGeneration.set(generation)
 
@@ -1623,7 +1626,7 @@ class NativeAudioEngine @Inject constructor(
         var lastSuccessfulWriteMs = SystemClock.elapsedRealtime()
 
         while (offset < end && _isPlaying.value) {
-            if (isBargeInActive || generation != currentPlaybackGeneration) return
+            if (generation != currentPlaybackGeneration) return
 
             val bytesToWrite = minOf(end - offset, MAX_JNI_WRITE_CHUNK_BYTES)
 
