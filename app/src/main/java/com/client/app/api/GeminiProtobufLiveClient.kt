@@ -594,8 +594,9 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 override fun onMessage(ws: WebSocket, bytes: ByteString) {
                     if (myEpoch == epoch) {
-                        logManager.net("WebSocket:RxBinary", "Получено ${bytes.size} байт")
-                        parseServerJsonMessage(bytes.utf8(), myEpoch, ws)
+                        val text = bytes.utf8()
+                        logManager.net("WebSocket:RxBinary", describeServerFrame(text, bytes.size))
+                        parseServerJsonMessage(text, myEpoch, ws)
                     }
                 }
 
@@ -614,7 +615,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
                     stopOutboundWorkers(expectedWs = ws, expectedEpoch = myEpoch)
 
-                    // Квота/биллинг не лечатся переподключением: каждая попытка снова бьёт в лимит проекта
                     if (isQuotaClose(code, reason)) {
                         emitControlEvent(
                             GeminiEvent.Error(
@@ -638,13 +638,17 @@ class GeminiProtobufLiveClient @Inject constructor(
                     val httpCode = response?.code
                     val errBody = runCatching { response?.body?.string() }.getOrNull()
 
+                    if (myEpoch != epoch) {
+                        // Наш собственный close()/cancel() старой сессии — не ошибка
+                        logManager.d("WebSocket:Failure", "Старый сокет закрыт: ${t.localizedMessage}")
+                        return
+                    }
+
                     logManager.e(
                         "WebSocket:Failure",
                         "Сбой сокета (HTTP $httpCode): ${t.localizedMessage}. Ответ: $errBody",
                         t
                     )
-
-                    if (myEpoch != epoch) return
 
                     synchronized(sessionStateLock) {
                         if (myEpoch != epoch || webSocket !== ws) return
@@ -687,7 +691,6 @@ class GeminiProtobufLiveClient @Inject constructor(
             queuedOutboundAudioBytes.set(0L)
         }
 
-        // Воркер 1: сброс частичного аудиобатча по дедлайну (под тем же мьютексом, что и прямые отправки)
         scope.launch {
             while (isActive) {
                 delay(10L)
@@ -712,7 +715,6 @@ class GeminiProtobufLiveClient @Inject constructor(
             }
         }
 
-        // Воркер 2: единственный писатель в сокет — аудио и управление строго по порядку
         scope.launch {
             try {
                 while (true) {
@@ -799,7 +801,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         is ControlOutboundCommand.DirectJson -> command.jsonMessage
     }
 
-    /** Постановка аудио в очередь; при затяжном сетевом провале свежий звук не копится бесконечно. */
     private fun enqueueAudio(channel: SendChannel<OutboundItem>, pcm: ByteArray): Boolean {
         val bytes = pcm.size.toLong()
         if (queuedOutboundAudioBytes.addAndGet(bytes) > MAX_OUTBOUND_AUDIO_BACKLOG_BYTES) {
@@ -818,8 +819,6 @@ class GeminiProtobufLiveClient @Inject constructor(
     private suspend fun awaitWriterReady(ws: WebSocket, writerEpoch: Long): Boolean {
         if (isReady && writerEpoch == epoch && webSocket === ws) return true
         val signal = synchronized(sessionStateLock) { writerReadySignal } ?: return false
-        // Без таймаута: при закрытии сессии scope воркеров отменяется в stopOutboundWorkers().
-        // Прежние 5 с навсегда завершали писателя: сессия выглядела LIVE, но микрофон и текст не уходили.
         signal.await()
         return writerEpoch == epoch && webSocket === ws
     }
@@ -901,7 +900,6 @@ class GeminiProtobufLiveClient @Inject constructor(
         }
     }
 
-    /** Хвост фразы и audioStreamEnd уходят атомарно и строго в этом порядке (гибридный VAD). */
     suspend fun sendAudioStreamEnd() {
         outboundCommandMutex.withLock {
             val pending = synchronized(batchLock) {
@@ -952,7 +950,6 @@ class GeminiProtobufLiveClient @Inject constructor(
 
         if (!isWriterCurrent(target.first, target.second, target.third)) return@withLock false
 
-        // Недоотправленный аудиобатч уходит ДО управляющего сообщения
         val tail = synchronized(batchLock) {
             if (audioBatchBuffer.size() == 0) {
                 null
@@ -1341,7 +1338,6 @@ class GeminiProtobufLiveClient @Inject constructor(
 
                 val allTools = buildJsonArray {
                     normalizeToolsForModel(cfg.toolsJson, capabilities)?.forEach { add(it) }
-                    // Инструмент только для моделей с поддержкой grounding (раньше слался всем)
                     if (cfg.enableGoogleSearch && capabilities.supportsSearchGrounding) {
                         addJsonObject {
                             putJsonObject("googleSearch") {}
@@ -1516,7 +1512,6 @@ class GeminiProtobufLiveClient @Inject constructor(
             if (sc != null) {
                 val interrupted = sc["interrupted"]?.jsonPrimitive?.booleanOrNull == true
                 if (interrupted) {
-                    // Сброс синхронно, в порядке сообщений сокета: всё, что придёт после, — уже новый ответ
                     purgeAudioQueue(-1L)
                     audioEngine.invalidateAndFlushPlayback("server interrupted")
                     serverGenerationOpen = false
@@ -1560,7 +1555,6 @@ class GeminiProtobufLiveClient @Inject constructor(
                             totalServerAudioBytesReceived.addAndGet(bytes)
                             totalServerAudioFramesReceived.addAndGet(bytes / 2L)
 
-                            // Хвост генерации, прерванной локально: пользователь его уже не должен слышать
                             if (frameGenerationId == suppressedServerGenerationId) return@forEachIndexed
 
                             val generation = audioEngine.currentPlaybackGeneration
@@ -1634,6 +1628,23 @@ class GeminiProtobufLiveClient @Inject constructor(
                     }
             }
         }
+    }
+
+    private fun describeServerFrame(text: String, size: Int): String {
+        val root = runCatching { json.parseToJsonElement(text).jsonObject }.getOrNull()
+            ?: return "Rx $size Б: не JSON"
+        if (root.isEmpty()) return "Rx $size Б: пустой кадр"
+        val parts = mutableListOf<String>()
+        root.keys.filter { it != "serverContent" }.forEach { parts += it }
+        (root["serverContent"] as? JsonObject)?.forEach { (k, v) ->
+            parts += when (k) {
+                "modelTurn" -> "modelTurn[${((v as? JsonObject)?.get("parts") as? JsonArray)?.size ?: 0}]"
+                "inputTranscription", "interimInputTranscription", "outputTranscription" ->
+                    "$k='${extractTranscriptText(v).orEmpty().take(80)}'"
+                else -> k
+            }
+        }
+        return "Rx $size Б: ${parts.joinToString()}"
     }
 
     private fun isQuotaClose(code: Int, reason: String): Boolean {
