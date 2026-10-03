@@ -1,3 +1,4 @@
+
 package com.client.app.audio
 
 import android.content.Context
@@ -113,7 +114,7 @@ class EchoAwareBargeInDetector {
             echoMargin = 2.0f
             minProbability = 0.6f
             candidateFrames = 4
-            confirmMs = 250L
+            confirmMs = 450L
             coupling = HEADSET_INITIAL_COUPLING
         } else {
             minCoupling = 0.015f
@@ -831,7 +832,7 @@ class NativeAudioEngine @Inject constructor(
         var sumSq = 0.0
         var i = 0
         while (i < bytesCount - 1) {
-            val sample = (pcm[i].toInt() and 0xFF) or (pcm[i + 1].toInt shl 8)
+            val sample = (pcm[i].toInt() and 0xFF) or (pcm[i + 1].toInt() shl 8)
             val s16 = sample.toShort()
             val norm = s16 / 32768.0
             sumSq += norm * norm
@@ -1542,6 +1543,7 @@ class NativeAudioEngine @Inject constructor(
                 }
             } else if (currentPendingMs > lastPendingMs) {
                 val deltaGrowth = currentPendingMs - lastPendingMs
+                lastPendingMs = currentPendingMs
                 lastProgressTime = now
                 maxAllowedDurationMs += (deltaGrowth + 300L)
             } else {
