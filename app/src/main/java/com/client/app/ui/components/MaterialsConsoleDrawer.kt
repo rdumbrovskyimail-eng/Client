@@ -547,4 +547,12 @@ private fun AttachmentChip(
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    imageVector = Icons.Fil
+                    imageVector = Icons.Filled.Close,
+                    contentDescription = "Удалить",
+                    tint = ColorTextSecondary,
+                    modifier = Modifier.size(12.dp)
+                )
+            }
+        }
+    }
+}
