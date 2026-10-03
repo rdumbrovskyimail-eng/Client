@@ -111,17 +111,17 @@ class EchoAwareBargeInDetector {
             minCoupling = 0.002f
             maxCoupling = 0.6f
             echoMargin = 2.0f
-            minProbability = 0.5f
-            candidateFrames = 3
-            confirmMs = 450L
-            coupling = HEADSET_INITIAL_COUPLING
-        } else {
-            minCoupling = 0.01f
-            maxCoupling = 1.5f
-            echoMargin = 2.8f
             minProbability = 0.6f
             candidateFrames = 4
-            confirmMs = 450L
+            confirmMs = 250L
+            coupling = HEADSET_INITIAL_COUPLING
+        } else {
+            minCoupling = 0.015f
+            maxCoupling = 1.5f
+            echoMargin = 3.0f
+            minProbability = 0.7f
+            candidateFrames = 6
+            confirmMs = 300L
             coupling = SPEAKER_INITIAL_COUPLING
         }
         streak = 0
@@ -131,6 +131,8 @@ class EchoAwareBargeInDetector {
     fun adapt(micRms: Float, refNow: Float, refMax: Float) {
         if (refMax < REF_MIN_RMS || refNow < refMax * 0.6f) return
         val ratio = (micRms / refMax).coerceIn(0f, 4f)
+        // Кадры заметно громче ожидаемого эха (возможный голос пользователя) в обучение не идут
+        if (ratio > coupling * echoMargin) return
         val rate = if (ratio < coupling) FALL_RATE else RISE_RATE
         coupling = (coupling + (ratio - coupling) * rate).coerceIn(minCoupling, maxCoupling)
     }
@@ -168,8 +170,9 @@ class EchoAwareBargeInDetector {
         const val HEADSET_INITIAL_COUPLING = 0.05f
         const val REF_MIN_RMS = 0.004f
         const val ABS_MIN_RMS = 0.006f
-        private const val FALL_RATE = 0.08f
-        private const val RISE_RATE = 0.004f
+        // Симметричное сглаживание: оценка средней утечки эха, а не её редкого минимума
+        private const val FALL_RATE = 0.02f
+        private const val RISE_RATE = 0.02f
     }
 }
 
@@ -192,17 +195,23 @@ class NativeAudioEngine @Inject constructor(
         private const val BARGE_IN_RECOVERY_POLL_MS = 50L
         private const val FRAME_SAMPLES = 160                 // 10 мс @ 16 кГц
         private const val CAPTURE_WAIT_TIMEOUT_MS = 40
-        private const val PRE_ROLL_IDLE_FRAMES = 30           // 300 мс до срабатывания VAD: начало слова не теряется
+        private const val PRE_ROLL_IDLE_FRAMES = 45           // 450 мс: покрывает подтверждение речи и начало слова
+        private const val IDLE_SPEECH_CONFIRM_FRAMES = 15     // 150 мс уверенной близкой речи до открытия реплики
+        private const val NEAR_FIELD_MIN_PROB = 0.6f
+        private const val NEAR_FIELD_SNR = 3.2f               // ≈ +10 дБ над шумовым фоном
+        private const val NEAR_FIELD_MIN_RMS = 0.008f         // ≈ −42 дБFS: тихие далёкие источники отсекаются
         private const val PRE_ROLL_BARGE_IN_FRAMES = 12       // 120 мс до кандидата: без эха модели в аплинке
         private const val PRE_ROLL_MAX_FRAMES = 80
         private const val OUT_ACTIVE_RMS = 0.003f
         private const val RENDER_TAIL_MS = 250L               // хвост эха/латентности после последнего звука модели
         private const val AEC_CONVERGENCE_MS = 300L
         private const val BARGE_IN_CANDIDATE_MAX_MS = 600L
-        private const val BARGE_IN_FALSE_ALARM_SILENT_FRAMES = 8
+        private const val BARGE_IN_FALSE_ALARM_SILENT_FRAMES = 12
         private const val BARGE_IN_REFRACTORY_MS = 300L
         private const val REFERENCE_HISTORY_FRAMES = 12       // 120 мс: покрывает задержку тракта эха
         private const val VAD_PREPARE_RETRY_MS = 5000L
+        private const val ROUTE_RECOVERY_ATTEMPTS = 3
+        private const val ROUTE_RECOVERY_RETRY_MS = 400L
 
         private const val MAX_MIC_OUTPUT_BACKLOG_BYTES = 64L * 1024L
         private const val PLAYBACK_WRITE_STALL_TIMEOUT_MS = 1500L
@@ -846,6 +855,7 @@ class NativeAudioEngine @Inject constructor(
         var candidateSpeechFrames = 0
         var candidateSilentRun = 0
         var refractoryUntilMs = 0L
+        var idleSpeechFrames = 0
 
         fun pushReference(outRms: Float) {
             reference[referenceIndex] = outRms
@@ -897,6 +907,7 @@ class NativeAudioEngine @Inject constructor(
 
         if (rendering && !u.wasRendering) {
             u.renderingStartedMs = now
+            u.idleSpeechFrames = 0
             bargeInDetector.resetStreak()
         }
         if (!rendering && u.wasRendering && !u.uplinkOpen) {
@@ -936,7 +947,17 @@ class NativeAudioEngine @Inject constructor(
                     startBargeInCandidate(u, now)
                 }
             } else if (speechActive) {
-                openUplink(u, PRE_ROLL_IDLE_FRAMES, seqNum, captureTimestampNs, instanceId)
+                u.idleSpeechFrames = if (isNearFieldSpeech(micRms, vadProb, noiseFloor)) {
+                    u.idleSpeechFrames + 1
+                } else {
+                    maxOf(0, u.idleSpeechFrames - 2)
+                }
+                if (u.idleSpeechFrames >= IDLE_SPEECH_CONFIRM_FRAMES) {
+                    u.idleSpeechFrames = 0
+                    openUplink(u, PRE_ROLL_IDLE_FRAMES, seqNum, captureTimestampNs, instanceId)
+                }
+            } else {
+                u.idleSpeechFrames = 0
             }
         } else if (rendering) {
             val candidate = bargeInDetector.evaluateCandidate(gatedSpeech)
@@ -952,6 +973,10 @@ class NativeAudioEngine @Inject constructor(
         }
     }
 
+    /** Близкая уверенная речь: голос пользователя у микрофона, а не фон, кашель или далёкий источник. */
+    private fun isNearFieldSpeech(micRms: Float, vadProb: Float, noiseFloor: Float): Boolean =
+        vadProb >= NEAR_FIELD_MIN_PROB && micRms >= maxOf(noiseFloor * NEAR_FIELD_SNR, NEAR_FIELD_MIN_RMS)
+
     private fun startBargeInCandidate(u: UplinkState, now: Long) {
         u.candidateSinceMs = now
         u.candidateGeneration = playbackGeneration.get()
@@ -959,7 +984,7 @@ class NativeAudioEngine @Inject constructor(
         u.candidateSpeechFrames = 0
         u.candidateSilentRun = 0
         bridge.setPlaybackPaused(true)
-        logger.d("NativeAudioEngine: голос поверх ответа — пауза вывода (связь эха=${"%.3f".format(bargeInDetector.coupling)})")
+        logger.d("NativeAudioEngine: голос поверх ответа — приглушение вывода (связь эха=${"%.3f".format(bargeInDetector.coupling)})")
     }
 
     private fun handleBargeInCandidate(
@@ -974,11 +999,8 @@ class NativeAudioEngine @Inject constructor(
         instanceId: Long
     ) {
         val elapsed = now - u.candidateSinceMs
-        val evidence = if (elapsed < 100L) {
-            gatedSpeech
-        } else {
-            vadProb >= 0.5f && micRms > maxOf(noiseFloor * 2.5f, EchoAwareBargeInDetector.ABS_MIN_RMS)
-        }
+        // Вывод на время проверки приглушён, но не выключен: доказательство всегда считается с учётом эха
+        val evidence = gatedSpeech
         u.candidateFrames++
         if (evidence) {
             u.candidateSpeechFrames++
@@ -992,7 +1014,7 @@ class NativeAudioEngine @Inject constructor(
             elapsed >= bargeInDetector.confirmMs && speechMajority ->
                 commitBargeIn(u, now, elapsed, seqNum, captureTimestampNs, instanceId)
 
-            elapsed >= 120L && u.candidateSilentRun >= BARGE_IN_FALSE_ALARM_SILENT_FRAMES ->
+            elapsed >= 150L && u.candidateSilentRun >= BARGE_IN_FALSE_ALARM_SILENT_FRAMES ->
                 rejectBargeIn(u, now)
 
             elapsed >= BARGE_IN_CANDIDATE_MAX_MS ->
@@ -1019,7 +1041,7 @@ class NativeAudioEngine @Inject constructor(
         activateBargeIn(now)
         runCatching { bargeInCommitListener?.invoke() }
         invalidateAndFlushPlayback("local barge-in")
-        hapticManager.triggerBargeIn()
+        // Вибрация при перебивании отключена: телефон не должен давать физический отклик
         _bargeInEvents.tryEmit(Unit)
         val framesToSend = (elapsedMs / 10L).toInt() + PRE_ROLL_BARGE_IN_FRAMES
         openUplink(u, framesToSend, seqNum, captureTimestampNs, instanceId)
@@ -1254,26 +1276,36 @@ class NativeAudioEngine @Inject constructor(
             var routeInited = false
             var playbackRecovered = false
 
-            captureDirectMutex.withLock {
-                bridge.stopAudio()
-                bridge.setMediaPlaybackUsage(req.profile.path == AudioRoutePath.BLUETOOTH_A2DP_HIFI)
-                routeInited = bridge.initAudioRoute(
-                    isBluetooth = req.profile.isBluetooth,
-                    sampleRate = req.profile.targetSampleRate,
-                    inputDeviceId = req.profile.inputDeviceId,
-                    outputDeviceId = req.profile.outputDeviceId
-                )
+            for (attempt in 1..ROUTE_RECOVERY_ATTEMPTS) {
+                routeInited = false
+                playbackRecovered = false
+                captureDirectMutex.withLock {
+                    bridge.stopAudio()
+                    bridge.setMediaPlaybackUsage(req.profile.path == AudioRoutePath.BLUETOOTH_A2DP_HIFI)
+                    routeInited = bridge.initAudioRoute(
+                        isBluetooth = req.profile.isBluetooth,
+                        sampleRate = req.profile.targetSampleRate,
+                        inputDeviceId = req.profile.inputDeviceId,
+                        outputDeviceId = req.profile.outputDeviceId
+                    )
 
-                if (routeInited) {
-                    logActualNativeRoute(req.profile, "routeRecovery")
-                    vadDetector.resetState()
-                    synchronized(poolLock) {
-                        recycleLeadInBuffersLocked()
+                    if (routeInited) {
+                        logActualNativeRoute(req.profile, "routeRecovery")
+                        vadDetector.resetState()
+                        synchronized(poolLock) {
+                            recycleLeadInBuffersLocked()
+                        }
+                        applyAcousticProfileForRoute(req.profile)
+
+                        playbackRecovered = !keepPlaying || bridge.startPlaybackAudio()
+                        _isPlaying.value = playbackRecovered && keepPlaying
                     }
-                    applyAcousticProfileForRoute(req.profile)
-
-                    playbackRecovered = !keepPlaying || bridge.startPlaybackAudio()
-                    _isPlaying.value = playbackRecovered && keepPlaying
+                }
+                if (routeInited && (playbackRecovered || !keepPlaying)) break
+                if (attempt < ROUTE_RECOVERY_ATTEMPTS) {
+                    // Bluetooth-профиль ещё переключается (смена режима аудио): даём ему устояться
+                    logger.w("NativeAudioEngine: маршрут не поднялся (попытка $attempt/$ROUTE_RECOVERY_ATTEMPTS), повтор")
+                    delay(ROUTE_RECOVERY_RETRY_MS * attempt)
                 }
             }
 
