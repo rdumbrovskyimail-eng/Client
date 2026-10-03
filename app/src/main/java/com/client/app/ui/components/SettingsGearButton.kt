@@ -30,10 +30,10 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-// Цветовые константы белого минимализма
-private val ColorPillBackground = Color(0xFFFFFFFF)
-private val ColorHairline = Color(0xFFEBEBEB)
-private val ColorIconBlack = Color(0xFF09090B)
+// Чёрная тема: графитовые капсулы и светлые значки (имя ColorIconBlack сохранено ради точечной правки)
+private val ColorPillBackground = Color(0xFF111113)
+private val ColorHairline = Color(0xFF26262B)
+private val ColorIconBlack = Color(0xFFF4F4F5)
 private val ColorErrorBadge = Color(0xFFEA4335) // красный Gemini
 
 /**
