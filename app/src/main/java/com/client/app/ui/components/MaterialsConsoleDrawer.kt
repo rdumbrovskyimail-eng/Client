@@ -44,10 +44,12 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 // Цветовые константы белого минимализма
 private val ColorPillBackground = Color(0xFFFFFFFF)
@@ -102,7 +104,8 @@ private fun queryFileName(context: Context, uri: Uri): String {
 }
 
 /**
- * Левая нижняя плашка «Materials» и выезжающая снизу вверх консоль прикрепления файлов с текстом.
+ * Горизонтальная плашка «Materials», расположенная чуть ниже панели Prompt,
+ * и выезжающая сверху вниз консоль прикрепления файлов с текстом.
  */
 @Composable
 fun MaterialsConsoleDrawer(
@@ -119,13 +122,21 @@ fun MaterialsConsoleDrawer(
     // Контроль лазурно-голубого состояния текста плашки
     var isColorLatchedToCyan by remember { mutableStateOf(false) }
 
+    // Пружинный толчок вниз при нажатии
+    val pillVerticalBump = remember { Animatable(0f) }
+
     val animatedTextColor by animateColorAsState(
         targetValue = if (isColorLatchedToCyan) ColorActionCyan else ColorTextPrimary,
         animationSpec = tween(durationMillis = 400, easing = FastOutSlowInEasing),
         label = "materials_pill_color"
     )
 
-    // Лаунчер системного файлового селектора
+    val animatedBorderColor by animateColorAsState(
+        targetValue = if (isColorLatchedToCyan) ColorActionCyan.copy(alpha = 0.5f) else ColorHairline,
+        animationSpec = tween(durationMillis = 400, easing = FastOutSlowInEasing),
+        label = "materials_pill_border"
+    )
+
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetMultipleContents()
     ) { uris ->
@@ -135,7 +146,6 @@ fun MaterialsConsoleDrawer(
         }
     }
 
-    // Перехват жеста "Назад" при открытой консоли
     BackHandler(enabled = isDrawerOpen) {
         performTactileClick(context)
         isDrawerOpen = false
@@ -144,71 +154,92 @@ fun MaterialsConsoleDrawer(
     Box(modifier = modifier.fillMaxSize()) {
 
         // =====================================================================
-        // 1. ВЕРТИКАЛЬНАЯ ПЛАШКА-ЯЗЫЧОК "M-a-t-e-r-i-a-l-s" (Слева снизу)
+        // 1. ГОРИЗОНТАЛЬНАЯ КНОПКА "MATERIALS" (ЧУТЬ НИЖЕ ПАНЕЛИ PROMPT)
         // =====================================================================
         if (!isDrawerOpen) {
             Box(
                 modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(bottom = 54.dp)
-                    .width(44.dp)
-                    .height(200.dp)
+                    .align(Alignment.TopCenter)
+                    .padding(top = 56.dp, start = 20.dp, end = 20.dp)
+                    .offset { IntOffset(0, pillVerticalBump.value.roundToInt()) }
+                    .fillMaxWidth()
+                    .height(44.dp)
                     .shadow(
-                        elevation = 6.dp,
-                        shape = RoundedCornerShape(topStart = 0.dp, bottomStart = 0.dp, topEnd = 24.dp, bottomEnd = 24.dp),
-                        ambientColor = Color(0x0F000000),
-                        spotColor = Color(0x1A000000)
+                        elevation = 4.dp,
+                        shape = RoundedCornerShape(14.dp),
+                        ambientColor = Color(0x0A000000),
+                        spotColor = Color(0x14000000)
                     )
-                    .clip(RoundedCornerShape(topStart = 0.dp, bottomStart = 0.dp, topEnd = 24.dp, bottomEnd = 24.dp))
+                    .clip(RoundedCornerShape(14.dp))
                     .background(ColorPillBackground)
                     .border(
                         width = 1.dp,
-                        color = if (isColorLatchedToCyan) ColorActionCyan.copy(alpha = 0.5f) else ColorHairline,
-                        shape = RoundedCornerShape(topStart = 0.dp, bottomStart = 0.dp, topEnd = 24.dp, bottomEnd = 24.dp)
+                        color = animatedBorderColor,
+                        shape = RoundedCornerShape(14.dp)
                     )
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null
                     ) {
-                        performTactileClick(context)
-                        isDrawerOpen = true
+                        coroutineScope.launch {
+                            performTactileClick(context)
+
+                            launch {
+                                pillVerticalBump.animateTo(
+                                    targetValue = 4.dp.value,
+                                    animationSpec = tween(durationMillis = 100, easing = FastOutSlowInEasing)
+                                )
+                                pillVerticalBump.animateTo(
+                                    targetValue = 0f,
+                                    animationSpec = spring(
+                                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                                        stiffness = Spring.StiffnessLow
+                                    )
+                                )
+                            }
+
+                            isDrawerOpen = true
+                        }
                     },
                 contentAlignment = Alignment.Center
             ) {
-                Column(
-                    modifier = Modifier.fillMaxHeight(),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.SpaceEvenly
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
                 ) {
-                    val letters = listOf("M", "a", "t", "e", "r", "i", "a", "l", "s")
-                    letters.forEach { char ->
-                        Text(
-                            text = char,
-                            color = animatedTextColor,
-                            fontSize = 12.5.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Monospace,
-                            textAlign = TextAlign.Center
-                        )
-                    }
+                    Icon(
+                        imageVector = Icons.Filled.AttachFile,
+                        contentDescription = null,
+                        tint = animatedTextColor,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "M  A  T  E  R  I  A  L  S",
+                        color = animatedTextColor,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        letterSpacing = 2.sp,
+                        textAlign = TextAlign.Center
+                    )
                 }
             }
         }
 
         // =====================================================================
-        // 2. ВЫЕЗЖАЮЩАЯ СНИЗУ ВВЕРХ БЕЛАЯ КОНСОЛЬ-ШУХЛЯДКА (Vertical Drawer)
+        // 2. ВЫЕЗЖАЮЩАЯ СВЕРХУ ВНИЗ КОНСОЛЬ ПРИКРЕПЛЕНИЯ ВЛОЖЕНИЙ
         // =====================================================================
         AnimatedVisibility(
             visible = isDrawerOpen,
             enter = slideInVertically(
-                initialOffsetY = { it },
-                animationSpec = tween(durationMillis = 320, easing = CubicBezierEasing(0.16f, 1.0f, 0.3f, 1.0f))
+                initialOffsetY = { -it },
+                animationSpec = tween(durationMillis = 340, easing = CubicBezierEasing(0.16f, 1.0f, 0.3f, 1.0f))
             ) + fadeIn(animationSpec = tween(220)),
-            // Быстрое схлопывание вниз за 180 мс при нажатии OK
             exit = slideOutVertically(
-                targetOffsetY = { it },
-                animationSpec = tween(durationMillis = 180, easing = FastOutLinearInEasing)
-            ) + fadeOut(animationSpec = tween(150))
+                targetOffsetY = { -it },
+                animationSpec = tween(durationMillis = 200, easing = FastOutLinearInEasing)
+            ) + fadeOut(animationSpec = tween(160))
         ) {
             Box(
                 modifier = Modifier
@@ -222,36 +253,34 @@ fun MaterialsConsoleDrawer(
                         isDrawerOpen = false
                     }
             ) {
-                // Основной белый прямоугольный блок консоли
                 Box(
                     modifier = Modifier
-                        .align(Alignment.BottomCenter)
+                        .align(Alignment.TopCenter)
                         .fillMaxWidth()
                         .wrapContentHeight()
                         .shadow(
-                            elevation = 20.dp,
-                            shape = RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp, bottomStart = 0.dp, bottomEnd = 0.dp),
+                            elevation = 18.dp,
+                            shape = RoundedCornerShape(bottomStart = 26.dp, bottomEnd = 26.dp),
                             ambientColor = Color(0x14000000),
                             spotColor = Color(0x28000000)
                         )
-                        .clip(RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp, bottomStart = 0.dp, bottomEnd = 0.dp))
+                        .clip(RoundedCornerShape(bottomStart = 26.dp, bottomEnd = 26.dp))
                         .background(ColorDrawerBackground)
                         .border(
                             width = 1.dp,
                             color = ColorHairline,
-                            shape = RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp, bottomStart = 0.dp, bottomEnd = 0.dp)
+                            shape = RoundedCornerShape(bottomStart = 26.dp, bottomEnd = 26.dp)
                         )
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null
                         ) { /* Защита от кликов сквозь консоль */ }
+                        .windowInsetsPadding(WindowInsets.statusBars)
                         .padding(horizontal = 20.dp, vertical = 18.dp)
-                        .windowInsetsPadding(WindowInsets.navigationBars)
-                        .windowInsetsPadding(WindowInsets.ime)
                 ) {
                     Column(modifier = Modifier.fillMaxWidth()) {
 
-                        // Шапка консоли: заголовок и кнопка закрытия
+                        // Шапка: заголовок и кнопка закрытия
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -275,7 +304,6 @@ fun MaterialsConsoleDrawer(
                                 )
                             }
 
-                            // Кнопка закрытия
                             Box(
                                 modifier = Modifier
                                     .size(34.dp)
@@ -299,7 +327,7 @@ fun MaterialsConsoleDrawer(
 
                         Spacer(Modifier.height(14.dp))
 
-                        // Поле ввода текстового комментария (текст может быть пустым)
+                        // Поле ввода текстового комментария
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -367,14 +395,12 @@ fun MaterialsConsoleDrawer(
 
                         Spacer(Modifier.height(16.dp))
 
-                        // Нижняя панель действий: "Добавить материалы" и "ОК"
+                        // Нижняя панель действий: "Файлы / Фото" и "ОК"
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(10.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-
-                            // Кнопка добавления файлов / фото
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
@@ -410,7 +436,6 @@ fun MaterialsConsoleDrawer(
                                 }
                             }
 
-                            // Кнопка "ОК" (Быстрое закрытие, смена цвета на лазурный и отправка)
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
@@ -422,21 +447,13 @@ fun MaterialsConsoleDrawer(
                                         val textToSend = inputText.trim()
                                         val urisToSend = selectedUris.toList()
 
-                                        // Мгновенное сворачивание шухлядки
                                         isDrawerOpen = false
-
-                                        // Очистка внутреннего состояния консоли
                                         inputText = ""
                                         selectedUris.clear()
 
-                                        // Запуск цветовой фиксации плашки на лазурно-голубой
                                         coroutineScope.launch {
                                             isColorLatchedToCyan = true
-
-                                            // Передача данных в доменный контур сессии
                                             onSendMaterials(textToSend, urisToSend)
-
-                                            // Удержание цвета на время доставки/анализа материалов
                                             delay(3200L)
                                             isColorLatchedToCyan = false
                                         }
@@ -530,12 +547,4 @@ private fun AttachmentChip(
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    imageVector = Icons.Filled.Close,
-                    contentDescription = "Удалить",
-                    tint = ColorTextSecondary,
-                    modifier = Modifier.size(12.dp)
-                )
-            }
-        }
-    }
-}
+                    imageVector = Icons.Fil
