@@ -516,6 +516,7 @@ class SessionManager @Inject constructor(
                 }
 
                 is AnalysisResult.Failure -> {
+                    logger.w("SessionManager: анализ вложения не удался: ${result.reason}")
                     _state.update {
                         it.copy(error = "Ошибка анализа: ${result.reason}")
                     }
@@ -529,6 +530,32 @@ class SessionManager @Inject constructor(
         } finally {
             _state.update { it.copy(isAnalyzing = false) }
         }
+    }
+
+    /**
+     * Порядок по рекомендациям Live API: персона (промпт пользователя) → правила разговора → ограничения.
+     * Язык закрепляется формулировкой из документации Google («RESPOND IN … UNMISTAKABLY»):
+     * нативные аудиомодели сами выбирают язык и меняют его на коротких неразборчивых репликах.
+     */
+    private fun buildSystemInstruction(userPrompt: String, speechLang: String): String {
+        val locale = java.util.Locale.forLanguageTag(speechLang)
+        val langEn = locale.getDisplayLanguage(java.util.Locale.ENGLISH).ifBlank { "Russian" }.uppercase()
+        val langRu = locale.getDisplayLanguage(java.util.Locale.forLanguageTag("ru")).ifBlank { "русский" }
+        val rules = """
+            **Язык.** RESPOND IN $langEn. YOU MUST RESPOND UNMISTAKABLY IN $langEn.
+            Основной язык разговора — $langRu. Слова и фразы на других языках произноси только как учебный материал внутри ответа на языке «$langRu», либо если пользователь прямо попросит перейти на другой язык.
+            Никогда не меняй язык из-за короткой или неразборчивой реплики: если не расслышал, коротко переспроси на языке «$langRu».
+
+            **Ведение разговора.** Держи нить разговора и помни, на чём вы остановились. Не начинай разговор заново, не здоровайся повторно и не спрашивай «чем могу помочь», если беседа уже идёт.
+            Уточняющий вопрос относится к последней теме: отвечай в её контексте. Если не уверен, что имел в виду пользователь, переспроси, а не придумывай.
+            Если ошибся, исправься одной короткой фразой без повторных извинений и продолжи с правильного места. Не выдумывай, что было сказано раньше: опирайся только на реальную историю разговора.
+
+            **Перебивание.** Тебя слушают в реальном времени и могут перебить. Если тебя перебили, пользователь услышал только начало твоего последнего ответа. Не продолжай с того места, где закончился твой ответ: сначала ответь на то, что сказал пользователь, а если он просит продолжить — вернись к прерванной мысли и коротко повтори то, что он мог не услышать.
+
+            **Посторонние звуки.** Отвечай только на обращённую к тебе речь пользователя. Кашель, дыхание, шум, музыку, сигналы и звуки техники и транспорта, фоновые голоса и телевизор игнорируй: ничего на них не отвечай.
+        """.trimIndent()
+        val base = userPrompt.trim()
+        return if (base.isEmpty()) rules else "$base\n\n$rules"
     }
 
     private suspend fun ensureLive(): Boolean {
@@ -887,12 +914,7 @@ class SessionManager @Inject constructor(
                 LiveConfig(
                     apiKey = apiKey,
                     model = liveModel,
-                    systemInstruction = _state.value.activePrompt.trimEnd() + "\n\n" +
-                        "Тебя слушают в реальном времени и могут перебить. Если тебя перебили, " +
-                        "пользователь услышал только начало твоего последнего ответа, а не весь его текст. " +
-                        "Не продолжай с того места, где закончился твой ответ, и не переходи к новой теме: " +
-                        "сначала ответь на то, что сказал пользователь, а если он просит продолжить — " +
-                        "вернись к прерванной мысли и коротко повтори то, что он мог не услышать.",
+                    systemInstruction = buildSystemInstruction(_state.value.activePrompt, speechLang),
                     voiceName = voice,
                     speechLanguage = speechLang,
                     temperature = temperature,
