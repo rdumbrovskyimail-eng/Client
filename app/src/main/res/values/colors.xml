@@ -3,6 +3,7 @@
 <resources>
     <!-- 1. Иерархия поверхностей чистого белого листа (Pure White Surface Hierarchy) -->
     <color name="canvas_white">#FFFFFF</color>
+    <color name="canvas_black">#000000</color>
     <color name="surface_card">#FAFAFA</color>
     <color name="surface_input">#F8FAFC</color>
     <color name="hairline_border">#E2E8F0</color>
