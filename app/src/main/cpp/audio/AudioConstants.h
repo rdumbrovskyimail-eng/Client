@@ -43,6 +43,8 @@ constexpr size_t RING_BUFFER_CAPACITY_PLAYBACK_INPUT = 1u << 20; // ~43.7 с @ 2
 constexpr int32_t PLAYBACK_PRIME_MS = 50;       // предзаполнение перед стартом фразы (против заикания первого слога)
 constexpr int32_t PLAYBACK_PRIME_IDLE_MS = 60;  // если сеть молчит дольше — играем то, что есть (хвост фразы)
 constexpr int32_t PLAYBACK_FADE_MS = 8;         // затухание/нарастание при паузе, перебивании и опустошении
+constexpr float PLAYBACK_DUCK_GAIN = 0.18f;     // ≈ −15 дБ: модель уступает сразу, без обрыва звука
+constexpr int32_t PLAYBACK_DUCK_RAMP_MS = 25;   // плавность приглушения и возврата громкости
 
 // Профили тонкомпенсации выхода
 constexpr int32_t OUTPUT_EQ_SPEAKER = 0;        // встроенный динамик (режим связи)
