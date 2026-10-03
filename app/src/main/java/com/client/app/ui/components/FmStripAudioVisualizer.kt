@@ -41,7 +41,7 @@ private val ColorInkSoft = Color(0xFF262626)
 private val ColorInkMinor = Color(0xFFB8B8BD)
 private val ColorLabel = Color(0xFFA3A3A8)
 
-// Четыре цвета Gemini — единственные акценты интерфейса
+// Четыре цвета Gemini — акценты интерфейса
 private val GeminiBlue = Color(0xFF4285F4)
 private val GeminiRed = Color(0xFFEA4335)
 private val GeminiYellow = Color(0xFFFBBC04)
@@ -65,10 +65,9 @@ private class StripRenderState {
 }
 
 /**
- * FM-шкала голоса: 65 чёрных делений на белом листе.
+ * FM-шкала голоса: увеличенная по высоте в 2 раза (168.dp) акустическая панель.
  * Во время речи внутри делений загораются микролинии цветов Gemini, бегущие по шкале,
  * с мягким цветным ореолом. Речь модели и речь пользователя различаются направлением бега.
- * Анимация работает только в сессии (и полторы секунды затухания после неё) — в покое батарея не тратится.
  */
 @Composable
 fun FmStripAudioVisualizer(
@@ -85,7 +84,6 @@ fun FmStripAudioVisualizer(
     val isListening = state.isMicActive
     val hasError = state.error != null
 
-    // Кадровый цикл только пока идёт сессия (+ затухание); чтение времени — в фазе отрисовки, без перекомпозиции
     LaunchedEffect(sessionActive) {
         val stopAt = if (sessionActive) Long.MAX_VALUE else System.nanoTime() + 1_500_000_000L
         while (isActive) {
@@ -95,17 +93,17 @@ fun FmStripAudioVisualizer(
         }
     }
 
-    val shape = RoundedCornerShape(24.dp)
+    val shape = RoundedCornerShape(28.dp)
 
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .height(84.dp)
+            .height(168.dp) // Высота увеличена ровно в 2 раза (ранее 84.dp)
             .shadow(
-                elevation = 5.dp,
+                elevation = 6.dp,
                 shape = shape,
                 ambientColor = Color(0x0A000000),
-                spotColor = Color(0x12000000)
+                spotColor = Color(0x14000000)
             )
             .clip(shape)
             .background(ColorSurface)
@@ -115,7 +113,7 @@ fun FmStripAudioVisualizer(
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 16.dp, vertical = 16.dp)
+                .padding(horizontal = 20.dp, vertical = 26.dp)
         ) {
             val now = frameNanos.longValue
             val dt = if (render.lastFrameNanos == 0L || now <= render.lastFrameNanos) {
@@ -140,11 +138,11 @@ fun FmStripAudioVisualizer(
             drawNeedle(render = render, isLive = isLive)
         }
 
-        // Верхний ряд: шкала частот в духе аналоговых тюнеров Braun
+        // Верхний ряд: аналоговая шкала частот тюнера
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 5.dp)
+                .padding(horizontal = 24.dp, vertical = 10.dp)
                 .align(Alignment.TopCenter),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
@@ -154,27 +152,27 @@ fun FmStripAudioVisualizer(
                 Text(
                     text = label,
                     color = if (edge) ColorLabel else ColorLabel.copy(alpha = 0.65f),
-                    fontSize = 7.5.sp,
+                    fontSize = 8.5.sp,
                     fontFamily = FontFamily.Monospace,
                     fontWeight = if (edge) FontWeight.SemiBold else FontWeight.Medium,
-                    letterSpacing = 0.4.sp
+                    letterSpacing = 0.5.sp
                 )
             }
         }
 
-        // Нижний ряд: состояние тракта
+        // Нижний ряд: статус аудиотракта
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 5.dp)
+                .padding(horizontal = 24.dp, vertical = 10.dp)
                 .align(Alignment.BottomCenter),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "FM",
+                text = "FM · ULTRA",
                 color = ColorLabel,
-                fontSize = 7.5.sp,
+                fontSize = 8.5.sp,
                 fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.SemiBold,
                 letterSpacing = 1.sp
@@ -184,7 +182,7 @@ fun FmStripAudioVisualizer(
                     hasError -> "AUDIO FAULT"
                     isSpeaking -> "GEMINI · SPEAKING"
                     isLive && isListening -> "LISTENING"
-                    isLive -> "LIVE"
+                    isLive -> "LIVE DUPLEX"
                     sessionActive -> "CONNECTING"
                     else -> "READY"
                 },
@@ -194,15 +192,15 @@ fun FmStripAudioVisualizer(
                     isLive -> ColorInk
                     else -> ColorLabel
                 },
-                fontSize = 8.sp,
+                fontSize = 9.sp,
                 fontFamily = FontFamily.Monospace,
                 fontWeight = if (isSpeaking || isLive) FontWeight.Bold else FontWeight.Medium,
                 letterSpacing = 1.2.sp
             )
             Text(
-                text = "S23",
+                text = "WCD9385",
                 color = ColorLabel,
-                fontSize = 7.5.sp,
+                fontSize = 8.5.sp,
                 fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.SemiBold,
                 letterSpacing = 1.sp
@@ -233,14 +231,12 @@ private fun updateBallistics(
     render.outLevel = follow(render.outLevel, out, dt, 0.025f, 0.180f)
     render.micLevel = follow(render.micLevel, mic, dt, 0.025f, 0.180f)
 
-    // «Присутствие» голоса управляет яркостью цветных микролиний (плавное включение и гашение)
     val aiTarget = if (isSpeaking) (0.35f + render.outLevel * 3.0f).coerceAtMost(1f) else 0f
     val userTarget = if (isListening) (render.micLevel * 4.0f).coerceAtMost(1f) else 0f
     render.aiPresence = follow(render.aiPresence, aiTarget, dt, 0.060f, 0.420f)
     render.userPresence = follow(render.userPresence, userTarget, dt, 0.050f, 0.320f)
 }
 
-/** Цвет Gemini в точке p∈[0,1): плавный переход синий → красный → жёлтый → зелёный → синий. */
 private fun geminiColorAt(p: Float): Color {
     val x = (p - floor(p)) * 4f
     val i = x.toInt().coerceIn(0, 3)
@@ -256,15 +252,14 @@ private fun DrawScope.drawVoiceStrip(render: StripRenderState, dt: Float, isLive
     val spacing = w / (TOTAL_TICKS + 1)
     val t = render.timeSec
 
-    val majorW = 2.25.dp.toPx()
-    val midW = 1.75.dp.toPx()
+    val majorW = 2.4.dp.toPx()
+    val midW = 1.9.dp.toPx()
     val minorW = 1.5.dp.toPx()
-    val coreMinW = 0.8.dp.toPx()
+    val coreMinW = 0.9.dp.toPx()
 
     val ai = render.aiPresence
     val user = render.userPresence
     val presence = maxOf(ai, user)
-    // Речь модели бежит вправо, речь пользователя — влево
     val flow = if (ai >= user) t * 0.22f else -t * 0.22f
 
     val activity = maxOf(
@@ -277,7 +272,7 @@ private fun DrawScope.drawVoiceStrip(render: StripRenderState, dt: Float, isLive
         val tick = i + 1
         val x = tick * spacing
         val isCenter = tick == TOTAL_TICKS / 2 + 1
-        if (isCenter) continue // визирная нить рисуется отдельно
+        if (isCenter) continue
         val isMajor = tick % 5 == 1
         val isMid = tick % 5 == 3
 
@@ -288,20 +283,19 @@ private fun DrawScope.drawVoiceStrip(render: StripRenderState, dt: Float, isLive
             else -> render.bands[4] * 1.30f
         }
 
-        // Органическое «дыхание» шкалы: два медленных поля, без шума и дёрганья
         val organic = 0.5f + 0.5f * sin(i * 0.61f + t * 6.2f) * cos(i * 0.23f - t * 2.7f)
         val level = (activity * (0.55f + 0.45f * organic) + bandEnergy * 0.8f).coerceIn(0f, 1f)
 
         val base = when {
-            isMajor -> 0.30f
-            isMid -> 0.22f
-            else -> 0.15f
+            isMajor -> 0.26f
+            isMid -> 0.18f
+            else -> 0.12f
         }
-        val targetH = base + (0.94f - base) * level
+        val targetH = base + (0.95f - base) * level
         val smoothed = follow(render.heights[i], targetH, dt, 0.022f, 0.120f)
         render.heights[i] = smoothed
 
-        val halfH = (smoothed * h / 2f).coerceAtLeast(2.dp.toPx())
+        val halfH = (smoothed * (h / 2f)).coerceAtLeast(3.dp.toPx())
         val barW = when {
             isMajor -> majorW
             isMid -> midW
@@ -320,7 +314,6 @@ private fun DrawScope.drawVoiceStrip(render: StripRenderState, dt: Float, isLive
             val c = geminiColorAt(i / TOTAL_TICKS.toFloat() * 1.5f + flow)
             val coreAlpha = (presence * (0.55f + 0.9f * level)).coerceIn(0f, 1f)
 
-            // Мягкий цветной ореол вокруг деления (яркость на белом без потери контраста)
             drawLine(
                 color = c.copy(alpha = 0.16f * coreAlpha),
                 start = top,
@@ -329,10 +322,8 @@ private fun DrawScope.drawVoiceStrip(render: StripRenderState, dt: Float, isLive
                 cap = StrokeCap.Round
             )
 
-            // Чёрное (или серое) деление — каркас шкалы
             drawLine(color = barColor, start = top, end = bottom, strokeWidth = barW, cap = StrokeCap.Round)
 
-            // Цветная микролиния внутри деления: чёрные «капы» сверху и снизу, светящаяся сердцевина
             val inset = (barW * 1.1f).coerceAtMost(halfH * 0.5f)
             if (halfH - inset > 1f) {
                 drawLine(
@@ -352,20 +343,19 @@ private fun DrawScope.drawVoiceStrip(render: StripRenderState, dt: Float, isLive
 private fun DrawScope.drawNeedle(render: StripRenderState, isLive: Boolean) {
     val cx = size.width / 2f
     val h = size.height
-    val needleW = 1.5.dp.toPx()
+    val needleW = 1.75.dp.toPx()
 
     drawLine(
         color = ColorInk,
-        start = Offset(cx, 1.dp.toPx()),
-        end = Offset(cx, h - 1.dp.toPx()),
+        start = Offset(cx, 1.5.dp.toPx()),
+        end = Offset(cx, h - 1.5.dp.toPx()),
         strokeWidth = needleW,
         cap = StrokeCap.Round
     )
 
-    val beadRadius = 3.2.dp.toPx()
-    val beadCenter = Offset(cx, beadRadius + 0.5.dp.toPx())
+    val beadRadius = 4.dp.toPx()
+    val beadCenter = Offset(cx, beadRadius + 1.dp.toPx())
     if (isLive) {
-        // Бусина-индикатор: вращающийся спектр Gemini
         rotate(degrees = (render.timeSec * 90f) % 360f, pivot = beadCenter) {
             drawCircle(
                 brush = Brush.sweepGradient(GeminiSweep, center = beadCenter),
@@ -380,7 +370,7 @@ private fun DrawScope.drawNeedle(render: StripRenderState, isLive: Boolean) {
 
     drawCircle(
         color = ColorInk,
-        radius = 1.8.dp.toPx(),
-        center = Offset(cx, h - 1.8.dp.toPx() - 0.5.dp.toPx())
+        radius = 2.2.dp.toPx(),
+        center = Offset(cx, h - 2.2.dp.toPx() - 1.dp.toPx())
     )
 }
