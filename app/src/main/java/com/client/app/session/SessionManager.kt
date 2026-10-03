@@ -124,7 +124,8 @@ class SessionManager @Inject constructor(
         val KEY_OUTPUT_TRANSCRIPTION_VOCAB = stringPreferencesKey("gemini_output_tx_vocab")
         val KEY_OUTPUT_TRANSCRIPTION_MODE = stringPreferencesKey("gemini_output_tx_mode")
 
-        val KEY_AAD_ENABLED = booleanPreferencesKey("gemini_aad_enabled")
+        // v2: гибридный VAD по умолчанию; прежний ключ держал ручной режим без серверной страховки конца фразы
+        val KEY_AAD_ENABLED = booleanPreferencesKey("gemini_aad_enabled_v2")
         val KEY_AAD_START_SENSITIVITY = stringPreferencesKey("gemini_aad_start_sensitivity")
         val KEY_AAD_END_SENSITIVITY = stringPreferencesKey("gemini_aad_end_sensitivity")
         val KEY_PREFIX_PADDING_MS = intPreferencesKey("gemini_prefix_padding_ms")
@@ -216,6 +217,8 @@ class SessionManager @Inject constructor(
         observeBargeIn()
         observeFocus()
         observeForvoQuota()
+        // Прогрев Silero VAD заранее: к моменту setupComplete модель уже в памяти
+        scope.launch(Dispatchers.IO) { audioEngine.prewarmVad() }
     }
 
     private fun observeForvoQuota() = scope.launch {
@@ -238,6 +241,8 @@ class SessionManager @Inject constructor(
                     reconnectAttempts = 0
                     resumptionHandle = null
                     cancelReconnectWork()
+                    // Новая сессия начинается с чистого контекста
+                    _state.update { it.copy(messages = emptyList(), error = null) }
                     try {
                         startInternal(resume = false)
                     } catch (cancelled: CancellationException) {
@@ -308,6 +313,9 @@ class SessionManager @Inject constructor(
                 if (!changed) return@withLock
 
                 val shouldRestart = _state.value.link != LinkState.IDLE
+                // Сначала сохраняем: роль переживает перезапуск приложения и видна в настройках
+                runCatching { dataStore.edit { it[KEY_SYSTEM_PROMPT] = newPrompt } }
+                    .onFailure { logger.e("SessionManager: не удалось сохранить промпт", it) }
                 _state.update { it.copy(activePrompt = newPrompt) }
 
                 if (!shouldRestart || !connectionDesired) return@withLock
@@ -552,7 +560,7 @@ class SessionManager @Inject constructor(
 
             **Перебивание.** Тебя слушают в реальном времени и могут перебить. Если тебя перебили, пользователь услышал только начало твоего последнего ответа. Не продолжай с того места, где закончился твой ответ: сначала ответь на то, что сказал пользователь, а если он просит продолжить — вернись к прерванной мысли и коротко повтори то, что он мог не услышать.
 
-            **Посторонние звуки.** Отвечай только на обращённую к тебе речь пользователя. Кашель, дыхание, шум, музыку, сигналы и звуки техники и транспорта, фоновые голоса и телевизор игнорируй: ничего на них не отвечай.
+            **Реакция.** На каждую реплику, обращённую к тебе, отвечай сразу, без долгих пауз и вступлений. Если фраза неразборчива или оборвалась на полуслове — коротко переспроси, но не молчи. Кашель, дыхание, музыку, сигналы и звуки техники не комментируй.
         """.trimIndent()
         val base = userPrompt.trim()
         return if (base.isEmpty()) rules else "$base\n\n$rules"
@@ -812,7 +820,7 @@ class SessionManager @Inject constructor(
             mode = prefs[KEY_OUTPUT_TRANSCRIPTION_MODE] ?: "VERBATIM"
         )
 
-        val aadEnabled = prefs[KEY_AAD_ENABLED] ?: false
+        val aadEnabled = prefs[KEY_AAD_ENABLED] ?: true
         currentAadEnabled = aadEnabled
         audioEngine.isAadMode = aadEnabled
         audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: false)
@@ -822,7 +830,7 @@ class SessionManager @Inject constructor(
             startSensitivity = prefs[KEY_AAD_START_SENSITIVITY] ?: "START_SENSITIVITY_HIGH",
             endSensitivity = prefs[KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_HIGH",
             prefixPaddingMs = prefs[KEY_PREFIX_PADDING_MS] ?: 60,
-            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 800,
+            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 600,
             activityHandling = prefs[KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
             turnCoverage = prefs[KEY_TURN_COVERAGE] ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
         )
@@ -832,8 +840,8 @@ class SessionManager @Inject constructor(
 
         val compression = CompressionSettings(
             enabled = prefs[KEY_COMPRESSION_ENABLED] ?: true,
-            triggerTokens = prefs[KEY_COMPRESSION_TRIGGER_TOKENS] ?: 0,
-            targetTokens = prefs[KEY_COMPRESSION_TARGET_TOKENS] ?: 0
+            triggerTokens = prefs[KEY_COMPRESSION_TRIGGER_TOKENS] ?: 32_000,
+            targetTokens = prefs[KEY_COMPRESSION_TARGET_TOKENS] ?: 16_000
         )
 
         val resumptionEnabled = prefs[KEY_SESSION_RESUMPTION_ENABLED] ?: true
@@ -877,22 +885,7 @@ class SessionManager @Inject constructor(
             return
         }
 
-        if (!audioEngine.startPlayback()) {
-            audioEngine.stop()
-            if (startingFreshSession) {
-                connectionDesired = false
-                cancelReconnectWork()
-                stopForegroundService()
-            }
-            _state.update {
-                it.copy(
-                    error = "Сбой инициализации аудиодрайвера",
-                    link = LinkState.IDLE
-                )
-            }
-            return
-        }
-
+        // Статус «подключение» сразу; аудиомаршрут поднимается ниже, параллельно с рукопожатием
         _state.update {
             it.copy(
                 link = if (resume) LinkState.RECONNECTING else LinkState.CONNECTING,
@@ -986,6 +979,35 @@ class SessionManager @Inject constructor(
             }
 
             throw t
+        }
+
+        // Аудиомаршрут поднимается параллельно с TLS/WebSocket-рукопожатием и setup на сервере
+        val playbackStarted = try {
+            audioEngine.startPlayback()
+        } catch (cancelled: CancellationException) {
+            withContext(NonCancellable) { runCatching { client.disconnect() } }
+            throw cancelled
+        } catch (t: Throwable) {
+            logger.e("SessionManager: playback start failed", t)
+            false
+        }
+
+        if (!playbackStarted) {
+            runCatching { client.disconnect() }
+            audioEngine.stop()
+            if (startingFreshSession) {
+                connectionDesired = false
+                cancelReconnectWork()
+                stopForegroundService()
+            }
+            _state.update {
+                it.copy(
+                    error = "Сбой инициализации аудиодрайвера",
+                    link = LinkState.IDLE,
+                    isMicActive = false,
+                    isAiSpeaking = false
+                )
+            }
         }
     }
 
@@ -2365,6 +2387,12 @@ class SessionManager @Inject constructor(
 
     private fun observeSettings() = scope.launch {
         dataStore.data.collect { prefs ->
+            // Единый промпт для шторки Prompt и экрана настроек; применяется при следующем подключении
+            prefs[KEY_SYSTEM_PROMPT]?.let { stored ->
+                if (stored != _state.value.activePrompt) {
+                    _state.update { it.copy(activePrompt = stored) }
+                }
+            }
             audioEngine.setVolume(prefs[KEY_VOLUME] ?: 1.0f)
             audioEngine.setMicGain(prefs[KEY_MIC_GAIN] ?: 1.0f)
             audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: false)
