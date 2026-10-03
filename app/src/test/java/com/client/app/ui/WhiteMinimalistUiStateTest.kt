@@ -7,7 +7,7 @@ import kotlin.math.*
 import kotlin.test.*
 
 /**
- * Комплекс математических и алгоритмических тестов бело-минималистической архитектуры UI.
+ * Комплекс математических и алгоритмических тестов архитектуры UI.
  * Проверяет баллистику FM-полосы, спектральные окна, физику вращения шестеренки и цветовые автоматы.
  */
 class WhiteMinimalistUiStateTest {
@@ -180,22 +180,22 @@ class WhiteMinimalistUiStateTest {
 
     @Test
     fun testSessionPillColorLatchingStateTransitions() {
-        val colorBlack = 0xFF09090B
-        val colorAmber = 0xFFF59E0B
-        val colorEmerald = 0xFF10B981
+        val colorIdle = 0xFF0A0A0AL
+        val colorConnecting = 0xFFA1A1AAL
+        val colorLive = 0xFFF4F4F5L
 
         fun resolveTargetColor(linkState: LinkState): Long {
             return when (linkState) {
-                LinkState.LIVE -> colorEmerald
-                LinkState.CONNECTING, LinkState.RECONNECTING -> colorAmber
-                LinkState.IDLE -> colorBlack
+                LinkState.LIVE -> colorLive
+                LinkState.CONNECTING, LinkState.RECONNECTING -> colorConnecting
+                LinkState.IDLE -> colorIdle
             }
         }
 
-        assertEquals(colorBlack, resolveTargetColor(LinkState.IDLE), "В покое надпись сессии обязана быть глубоко черной")
-        assertEquals(colorAmber, resolveTargetColor(LinkState.CONNECTING), "При подключении надпись должна пульсировать янтарным")
-        assertEquals(colorAmber, resolveTargetColor(LinkState.RECONNECTING), "При реконнекте надпись должна быть янтарной")
-        assertEquals(colorEmerald, resolveTargetColor(LinkState.LIVE), "При установленном дуплексе цвет обязан стать изумрудно-зеленым")
+        assertEquals(colorIdle, resolveTargetColor(LinkState.IDLE), "В покое надпись сессии обязана быть глубоко темной")
+        assertEquals(colorConnecting, resolveTargetColor(LinkState.CONNECTING), "При подключении надпись должна быть серой")
+        assertEquals(colorConnecting, resolveTargetColor(LinkState.RECONNECTING), "При реконнекте надпись должна быть серой")
+        assertEquals(colorLive, resolveTargetColor(LinkState.LIVE), "При установленном дуплексе цвет обязан стать светлым")
     }
 
     @Test
