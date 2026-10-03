@@ -3,19 +3,19 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Базовая тема приложения: чистый белый лист без черных рамок и вспышек -->
-    <style name="Theme.ClientApp" parent="android:Theme.Material.Light.NoActionBar">
+    <style name="Theme.ClientApp" parent="android:Theme.Material.NoActionBar">
 
         <!-- 1. Абсолютная прозрачность системных баров для Edge-to-Edge -->
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
 
         <!-- 2. Темные системные пиктограммы (часы, Wi-Fi, заряд, полоса жестов) -->
-        <item name="android:windowLightStatusBar">true</item>
-        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
 
         <!-- 3. Устранение мигания черным фоном при холодном старте ОС -->
-        <item name="android:windowBackground">@color/canvas_white</item>
-        <item name="android:colorBackground">@color/canvas_white</item>
+        <item name="android:windowBackground">@color/canvas_black</item>
+        <item name="android:colorBackground">@color/canvas_black</item>
 
         <!-- 4. Активация отрисовки холста под системными панелями -->
         <item name="android:windowDrawsSystemBarBackgrounds">true</item>
@@ -25,7 +25,7 @@
         <item name="android:enforceNavigationBarContrast" tools:targetApi="q">false</item>
 
         <!-- 6. Элитный системный Splash Screen с монограммой 'G' (Android 12+ / API 31+) -->
-        <item name="android:windowSplashScreenBackground" tools:targetApi="s">@color/canvas_white</item>
+        <item name="android:windowSplashScreenBackground" tools:targetApi="s">@color/canvas_black</item>
         <item name="android:windowSplashScreenAnimatedIcon" tools:targetApi="s">@drawable/ic_launcher_foreground</item>
         <item name="android:windowSplashScreenIconBackgroundColor" tools:targetApi="s">@color/canvas_white</item>
 
