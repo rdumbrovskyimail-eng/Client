@@ -286,7 +286,9 @@ class GeminiProtobufLiveClient @Inject constructor(
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .writeTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(12, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(false)
+        // true: недоступный IP хоста (например, сломанный IPv6) не валит подключение — OkHttp пробует
+        // следующий адрес. Касается только установления соединения, открытая сессия не повторяется.
+        .retryOnConnectionFailure(true)
         .build()
 
     private val wsMutex = Mutex()
@@ -595,7 +597,13 @@ class GeminiProtobufLiveClient @Inject constructor(
                 override fun onMessage(ws: WebSocket, bytes: ByteString) {
                     if (myEpoch == epoch) {
                         val text = bytes.utf8()
-                        logManager.net("WebSocket:RxBinary", describeServerFrame(text, bytes.size))
+                        // Крупные кадры — это аудио модели: повторный полный разбор JSON ради лога
+                        // удваивал работу потока чтения сокета на каждом чанке
+                        logManager.net(
+                            "WebSocket:RxBinary",
+                            if (bytes.size <= 8_192) describeServerFrame(text, bytes.size)
+                            else "Rx ${bytes.size} Б: аудио модели"
+                        )
                         parseServerJsonMessage(text, myEpoch, ws)
                     }
                 }
