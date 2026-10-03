@@ -55,7 +55,8 @@ class TunedSocketFactory(
 
             // УСТРАНЕНИЕ БУФЕРБЛОАТА (RFC 8860): Рациональные 64 КБ буферы TCP для низкой задержки
             socket.sendBufferSize = 64 * 1024
-            socket.receiveBufferSize = 64 * 1024
+            // SO_RCVBUF не задаём: явный размер отключает автонастройку окна TCP в ядре,
+            // а аудио модели приходит пачками быстрее реального времени
 
             // Безусловное дублирование дескриптора сокета через dup() для исключения случайного закрытия сокета
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -66,7 +67,7 @@ class TunedSocketFactory(
                             nativeBridge.tuneNativeSocket(nativeFd)
                             logManager.net(
                                 "SocketCustomizer",
-                                "Применены TCP опции (fd=$nativeFd, tcpNoDelay=true, sndBuf=64K, rcvBuf=64K)"
+                                "Применены TCP опции (fd=$nativeFd, tcpNoDelay=true, sndBuf=64K, rcvBuf=auto)"
                             )
                         }
                     }
