@@ -43,17 +43,17 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.client.app.viewmodel.SettingsViewModel
 
-// Палитра белого минимализма для экрана настроек
-private val ColorCanvasWhite = Color(0xFFFFFFFF)
-private val ColorCardBackground = Color(0xFFFAFAFA)
-private val ColorFieldBackground = Color(0xFFFFFFFF)
-private val ColorHairline = Color(0xFFEBEBEB)
-private val ColorTextPrimary = Color(0xFF09090B)
-private val ColorTextSecondary = Color(0xFF71717A)
-private val ColorTextMuted = Color(0xFFA1A1AA)
+// Чёрная палитра экрана настроек (имена сохранены ради точечной правки, значения инвертированы)
+private val ColorCanvasWhite = Color(0xFF000000)
+private val ColorCardBackground = Color(0xFF111113)
+private val ColorFieldBackground = Color(0xFF18181B)
+private val ColorHairline = Color(0xFF27272A)
+private val ColorTextPrimary = Color(0xFFF4F4F5)
+private val ColorTextSecondary = Color(0xFFA1A1AA)
+private val ColorTextMuted = Color(0xFF71717A)
 
-private val ColorControlBlack = Color(0xFF09090B)
-private val ColorControlWhite = Color(0xFFFFFFFF)
+private val ColorControlBlack = Color(0xFFF4F4F5)
+private val ColorControlWhite = Color(0xFF09090B)
 
 /**
  * Тактильный микроотклик для переключателей и чипов настроек.
@@ -191,7 +191,7 @@ fun SettingsScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(12.dp))
-                    .background(Color(0xFFF8FAFC))
+                    .background(Color(0xFF111113))
                     .border(1.dp, ColorHairline, RoundedCornerShape(12.dp))
                     .padding(12.dp)
             ) {
@@ -895,7 +895,7 @@ private fun whiteChipColors() = FilterChipDefaults.filterChipColors(
 private fun whiteSwitchColors() = SwitchDefaults.colors(
     checkedThumbColor = ColorControlWhite,
     checkedTrackColor = ColorControlBlack,
-    uncheckedThumbColor = ColorControlWhite,
+    uncheckedThumbColor = ColorTextMuted,
     uncheckedTrackColor = ColorHairline,
     uncheckedBorderColor = ColorHairline
 )
