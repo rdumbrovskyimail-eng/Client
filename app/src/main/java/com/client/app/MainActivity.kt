@@ -9,7 +9,7 @@ import androidx.compose.animation.*
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.lightColorScheme
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.ui.graphics.Color
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -23,24 +23,26 @@ import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
 
 /**
- * Эталонная палитра белого минимализма для Samsung Galaxy S23 Ultra (Braun / Dieter Rams / Apple Snow White).
+ * Чёрная палитра приложения (FM-лента голоса остаётся белой и задаёт цвета сама).
  */
-private val S23UltraPureWhiteScheme = lightColorScheme(
-    primary = Color(0xFF09090B),
-    onPrimary = Color(0xFFFFFFFF),
-    secondary = Color(0xFF10B981),
-    onSecondary = Color(0xFFFFFFFF),
-    tertiary = Color(0xFF0EA5E9),
+private val ObsidianBlackScheme = darkColorScheme(
+    primary = Color(0xFFF4F4F5),
+    onPrimary = Color(0xFF09090B),
+    secondary = Color(0xFF34A853),
+    onSecondary = Color(0xFF000000),
+    tertiary = Color(0xFF4285F4),
     onTertiary = Color(0xFFFFFFFF),
-    background = Color(0xFFFFFFFF),
-    onBackground = Color(0xFF09090B),
-    surface = Color(0xFFFFFFFF),
-    onSurface = Color(0xFF09090B),
-    surfaceVariant = Color(0xFFFAFAFA),
-    onSurfaceVariant = Color(0xFF71717A),
-    outline = Color(0xFFE2E8F0),
-    outlineVariant = Color(0xFFCBD5E1),
-    error = Color(0xFFEF4444),
+    background = Color(0xFF000000),
+    onBackground = Color(0xFFF4F4F5),
+    surface = Color(0xFF0D0D0F),
+    onSurface = Color(0xFFF4F4F5),
+    surfaceVariant = Color(0xFF18181B),
+    onSurfaceVariant = Color(0xFFA1A1AA),
+    surfaceContainer = Color(0xFF111113),
+    surfaceContainerHigh = Color(0xFF18181B),
+    outline = Color(0xFF3F3F46),
+    outlineVariant = Color(0xFF27272A),
+    error = Color(0xFFEA4335),
     onError = Color(0xFFFFFFFF)
 )
 
@@ -53,23 +55,17 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Конфигурация прозрачного Edge-to-Edge с черными системными глифами
+        // Прозрачный Edge-to-Edge со светлыми системными значками на чёрном холсте
         enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.light(
-                android.graphics.Color.TRANSPARENT,
-                android.graphics.Color.TRANSPARENT
-            ),
-            navigationBarStyle = SystemBarStyle.light(
-                android.graphics.Color.TRANSPARENT,
-                android.graphics.Color.TRANSPARENT
-            )
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
         )
 
         // Аппаратная фиксация 120.000 Гц на дисплейном контроллере Dynamic AMOLED 2X S23 Ultra
         DisplayRateManager.setHighRefreshRate(window, true)
 
         setContent {
-            MaterialTheme(colorScheme = S23UltraPureWhiteScheme) {
+            MaterialTheme(colorScheme = ObsidianBlackScheme) {
                 val navController = rememberNavController()
 
                 NavHost(
