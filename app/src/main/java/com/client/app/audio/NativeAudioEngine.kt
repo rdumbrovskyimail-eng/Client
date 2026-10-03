@@ -1542,7 +1542,6 @@ class NativeAudioEngine @Inject constructor(
                 }
             } else if (currentPendingMs > lastPendingMs) {
                 val deltaGrowth = currentPendingMs - lastPendingMs
-                lastPendingMs = currentPendingMs
                 lastProgressTime = now
                 maxAllowedDurationMs += (deltaGrowth + 300L)
             } else {
