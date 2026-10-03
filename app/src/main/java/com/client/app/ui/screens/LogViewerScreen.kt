@@ -49,19 +49,19 @@ import com.client.app.logging.LogEntry
 import com.client.app.logging.LogLevel
 import kotlinx.coroutines.launch
 
-// Цветовые константы белого минимализма для журнала логов
-private val ColorCanvasWhite = Color(0xFFFFFFFF)
-private val ColorCardBackground = Color(0xFFFAFAFA)
-private val ColorFieldBackground = Color(0xFFFFFFFF)
-private val ColorHairline = Color(0xFFE2E8F0)
-private val ColorTextPrimary = Color(0xFF09090B)
-private val ColorTextSecondary = Color(0xFF71717A)
-private val ColorTextMuted = Color(0xFFA1A1AA)
-private val ColorPayloadBackground = Color(0xFFF1F5F9)
-private val ColorPayloadText = Color(0xFF0F172A)
+// Чёрная палитра журнала логов (имена сохранены ради точечной правки, значения инвертированы)
+private val ColorCanvasWhite = Color(0xFF000000)
+private val ColorCardBackground = Color(0xFF111113)
+private val ColorFieldBackground = Color(0xFF18181B)
+private val ColorHairline = Color(0xFF27272A)
+private val ColorTextPrimary = Color(0xFFF4F4F5)
+private val ColorTextSecondary = Color(0xFFA1A1AA)
+private val ColorTextMuted = Color(0xFF71717A)
+private val ColorPayloadBackground = Color(0xFF0B0B0D)
+private val ColorPayloadText = Color(0xFFE4E4E7)
 
-private val ColorButtonBlack = Color(0xFF09090B)
-private val ColorButtonTextWhite = Color(0xFFFFFFFF)
+private val ColorButtonBlack = Color(0xFFF4F4F5)
+private val ColorButtonTextWhite = Color(0xFF09090B)
 
 private enum class LogFilter(val label: String) {
     ALL("Все"),
@@ -177,7 +177,7 @@ fun LogViewerScreen(
                                 Box(
                                     modifier = Modifier
                                         .clip(RoundedCornerShape(8.dp))
-                                        .background(Color(0xFFFEE2E2))
+                                        .background(Color(0x33EF4444))
                                         .border(1.dp, Color(0xFFEF4444).copy(alpha = 0.4f), RoundedCornerShape(8.dp))
                                         .padding(horizontal = 6.dp, vertical = 2.dp)
                                 ) {
@@ -459,13 +459,13 @@ private fun WhiteLogItemRow(
     var isExpanded by remember { mutableStateOf(false) }
 
     val (badgeBg, badgeText) = when (entry.level) {
-        LogLevel.ERROR -> Color(0xFFFEE2E2) to Color(0xFFDC2626)
-        LogLevel.WARN -> Color(0xFFFEF3C7) to Color(0xFFD97706)
-        LogLevel.NETWORK -> Color(0xFFDBEAFE) to Color(0xFF2563EB)
-        LogLevel.AUDIO -> Color(0xFFD1FAE5) to Color(0xFF059669)
-        LogLevel.VAD -> Color(0xFFEDE9FE) to Color(0xFF7C3AED)
-        LogLevel.INFO -> Color(0xFFE0F2FE) to Color(0xFF0284C7)
-        else -> Color(0xFFF1F5F9) to Color(0xFF475569)
+        LogLevel.ERROR -> Color(0x33EF4444) to Color(0xFFF87171)
+        LogLevel.WARN -> Color(0x33F59E0B) to Color(0xFFFBBF24)
+        LogLevel.NETWORK -> Color(0x333B82F6) to Color(0xFF60A5FA)
+        LogLevel.AUDIO -> Color(0x3310B981) to Color(0xFF34D399)
+        LogLevel.VAD -> Color(0x338B5CF6) to Color(0xFFA78BFA)
+        LogLevel.INFO -> Color(0x330EA5E9) to Color(0xFF38BDF8)
+        else -> Color(0x3371717A) to Color(0xFFA1A1AA)
     }
 
     Column(
@@ -542,7 +542,7 @@ private fun WhiteLogItemRow(
         // Основной текст сообщения
         Text(
             text = entry.message,
-            color = if (entry.level == LogLevel.ERROR) Color(0xFFDC2626) else ColorTextPrimary,
+            color = if (entry.level == LogLevel.ERROR) Color(0xFFF87171) else ColorTextPrimary,
             fontSize = 12.sp,
             fontFamily = FontFamily.Monospace,
             lineHeight = 16.sp
