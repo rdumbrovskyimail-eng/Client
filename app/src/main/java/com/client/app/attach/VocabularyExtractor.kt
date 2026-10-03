@@ -57,8 +57,8 @@ class VocabularyExtractor @Inject constructor(
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
-        .callTimeout(180, TimeUnit.SECONDS)
+        .readTimeout(300, TimeUnit.SECONDS)
+        .callTimeout(330, TimeUnit.SECONDS)
         .build()
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -136,7 +136,11 @@ class VocabularyExtractor @Inject constructor(
                 put("responseMimeType", "application/json")
                 put("responseSchema", schema(forLanguageLearning))
                 put("maxOutputTokens", 65536)
-                if (!isFallbackAttempt) put("mediaResolution", "MEDIA_RESOLUTION_HIGH")
+                if (!isFallbackAttempt) {
+                    put("mediaResolution", "MEDIA_RESOLUTION_HIGH")
+                    // Распознавание текста не требует глубоких рассуждений: low в разы быстрее и не съедает лимит
+                    put("thinkingConfig", buildJsonObject { put("thinkingLevel", "low") })
+                }
             })
 
             put("safetySettings", buildJsonArray {
@@ -221,6 +225,9 @@ class VocabularyExtractor @Inject constructor(
 
         if (candidate["finishReason"]?.jsonPrimitive?.contentOrNull == "SAFETY") {
             return AnalysisResult.Failure("Материал заблокирован фильтрами безопасности Google")
+        }
+        if (candidate["finishReason"]?.jsonPrimitive?.contentOrNull == "MAX_TOKENS") {
+            return AnalysisResult.Failure("Материал слишком объёмный для одного запроса: отправьте меньше страниц за раз")
         }
 
         val payload = candidate["content"]?.jsonObject?.get("parts")?.jsonArray
