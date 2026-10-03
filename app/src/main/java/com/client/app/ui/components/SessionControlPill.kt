@@ -1,376 +1,243 @@
 package com.client.app.ui.components
 
-import androidx.compose.foundation.Canvas
+import android.content.Context
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.DrawScope
-import androidx.compose.ui.graphics.drawscope.rotate
-import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.client.app.audio.NativeAudioEngine
 import com.client.app.session.LinkState
-import com.client.app.session.SessionState
-import kotlinx.coroutines.isActive
-import kotlin.math.cos
-import kotlin.math.exp
-import kotlin.math.floor
-import kotlin.math.sin
+import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
-private const val TOTAL_TICKS = 65
+// Белый минимализм: чернила + акценты Gemini (жёлтый — подключение, зелёный — эфир)
+private val ColorPillBackground = Color(0xFFFFFFFF)
+private val ColorHairlineDefault = Color(0xFFEBEBEB)
+private val ColorHairlineLive = Color(0xFF34A853).copy(alpha = 0.45f)
 
-// Белый минимализм: чернила, бумага, волосяные линии
-private val ColorSurface = Color(0xFFFFFFFF)
-private val ColorHairline = Color(0xFFEBEBEB)
-private val ColorInk = Color(0xFF0A0A0A)
-private val ColorInkSoft = Color(0xFF262626)
-private val ColorInkMinor = Color(0xFFB8B8BD)
-private val ColorLabel = Color(0xFFA3A3A8)
+private val ColorTextIdle = Color(0xFF0A0A0A)
+private val ColorTextConnecting = Color(0xFF8A8A8F)
+private val ColorTextLive = Color(0xFF0A0A0A)
+private val ColorLedConnecting = Color(0xFFFBBC04)
+private val ColorLedLive = Color(0xFF34A853)
 
-// Четыре цвета Gemini — акценты интерфейса
-private val GeminiBlue = Color(0xFF4285F4)
-private val GeminiRed = Color(0xFFEA4335)
-private val GeminiYellow = Color(0xFFFBBC04)
-private val GeminiGreen = Color(0xFF34A853)
-private val GeminiPalette = arrayOf(GeminiBlue, GeminiRed, GeminiYellow, GeminiGreen)
-private val GeminiSweep = listOf(GeminiBlue, GeminiRed, GeminiYellow, GeminiGreen, GeminiBlue)
-
-/**
- * Состояние отрисовки без аллокаций в кадре: сглаженные полосы спектра, высоты делений,
- * «присутствие» голоса и время кадра для баллистики, не зависящей от частоты экрана (60/120 Гц).
- */
-private class StripRenderState {
-    val bands = FloatArray(5)
-    val heights = FloatArray(TOTAL_TICKS)
-    var outLevel = 0f
-    var micLevel = 0f
-    var aiPresence = 0f
-    var userPresence = 0f
-    var lastFrameNanos = 0L
-    var timeSec = 0f
+/** Пульс светодиода только на время подключения: меняется лишь слой, без лишних перекомпозиций. */
+private fun Modifier.connectingPulse(): Modifier = composed {
+    val transition = rememberInfiniteTransition(label = "connecting_pulse")
+    val pulse by transition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 800, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulse_alpha"
+    )
+    graphicsLayer { alpha = pulse }
 }
 
 /**
- * FM-шкала голоса: увеличенная по высоте в 2 раза (168.dp) акустическая панель.
- * Во время речи внутри делений загораются микролинии цветов Gemini, бегущие по шкале,
- * с мягким цветным ореолом. Речь модели и речь пользователя различаются направлением бега.
+ * Тактильный импульс щелчка X-Axis LRA для физического отклика клавиши сессии.
  */
-@Composable
-fun FmStripAudioVisualizer(
-    nativeEngine: NativeAudioEngine,
-    state: SessionState,
-    modifier: Modifier = Modifier
-) {
-    val render = remember { StripRenderState() }
-    val frameNanos = remember { mutableLongStateOf(0L) }
-
-    val sessionActive = state.link != LinkState.IDLE
-    val isLive = state.link == LinkState.LIVE
-    val isSpeaking = state.isAiSpeaking
-    val isListening = state.isMicActive
-    val hasError = state.error != null
-
-    LaunchedEffect(sessionActive) {
-        val stopAt = if (sessionActive) Long.MAX_VALUE else System.nanoTime() + 1_500_000_000L
-        while (isActive) {
-            val t = withFrameNanos { it }
-            frameNanos.longValue = t
-            if (t >= stopAt) break
-        }
-    }
-
-    val shape = RoundedCornerShape(28.dp)
-
-    Box(
-        modifier = modifier
-            .fillMaxWidth()
-            .height(168.dp) // Высота увеличена ровно в 2 раза (ранее 84.dp)
-            .shadow(
-                elevation = 6.dp,
-                shape = shape,
-                ambientColor = Color(0x0A000000),
-                spotColor = Color(0x14000000)
-            )
-            .clip(shape)
-            .background(ColorSurface)
-            .border(1.dp, ColorHairline, shape),
-        contentAlignment = Alignment.Center
-    ) {
-        Canvas(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 20.dp, vertical = 26.dp)
-        ) {
-            val now = frameNanos.longValue
-            val dt = if (render.lastFrameNanos == 0L || now <= render.lastFrameNanos) {
-                1f / 120f
-            } else {
-                ((now - render.lastFrameNanos) / 1_000_000_000f).coerceIn(0f, 0.05f)
-            }
-            render.lastFrameNanos = now
-            render.timeSec += dt
-
-            updateBallistics(
-                render = render,
-                dt = dt,
-                spectrum = nativeEngine.spectrumUniforms.get(),
-                out = nativeEngine.outLevel.value,
-                mic = nativeEngine.micLevel.value,
-                isSpeaking = isSpeaking,
-                isListening = isListening && isLive
-            )
-
-            drawVoiceStrip(render = render, dt = dt, isLive = isLive)
-            drawNeedle(render = render, isLive = isLive)
-        }
-
-        // Верхний ряд: аналоговая шкала частот тюнера
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 24.dp, vertical = 10.dp)
-                .align(Alignment.TopCenter),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            listOf("88", "92", "96", "100", "104", "108").forEachIndexed { index, label ->
-                val edge = index == 0 || index == 5
-                Text(
-                    text = label,
-                    color = if (edge) ColorLabel else ColorLabel.copy(alpha = 0.65f),
-                    fontSize = 8.5.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = if (edge) FontWeight.SemiBold else FontWeight.Medium,
-                    letterSpacing = 0.5.sp
-                )
-            }
-        }
-
-        // Нижний ряд: статус аудиотракта
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 24.dp, vertical = 10.dp)
-                .align(Alignment.BottomCenter),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "FM · ULTRA",
-                color = ColorLabel,
-                fontSize = 8.5.sp,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.SemiBold,
-                letterSpacing = 1.sp
-            )
-            Text(
-                text = when {
-                    hasError -> "AUDIO FAULT"
-                    isSpeaking -> "GEMINI · SPEAKING"
-                    isLive && isListening -> "LISTENING"
-                    isLive -> "LIVE DUPLEX"
-                    sessionActive -> "CONNECTING"
-                    else -> "READY"
-                },
-                color = when {
-                    hasError -> GeminiRed
-                    isSpeaking -> ColorInk
-                    isLive -> ColorInk
-                    else -> ColorLabel
-                },
-                fontSize = 9.sp,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = if (isSpeaking || isLive) FontWeight.Bold else FontWeight.Medium,
-                letterSpacing = 1.2.sp
-            )
-            Text(
-                text = "WCD9385",
-                color = ColorLabel,
-                fontSize = 8.5.sp,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.SemiBold,
-                letterSpacing = 1.sp
-            )
-        }
-    }
-}
-
-/** Экспоненциальная баллистика с постоянными времени: одинаково на 60 и 120 Гц. */
-private fun follow(current: Float, target: Float, dt: Float, attackSec: Float, releaseSec: Float): Float {
-    val tau = if (target > current) attackSec else releaseSec
-    val k = 1f - exp(-dt / tau)
-    return (current + (target - current) * k).coerceIn(0f, 1f)
-}
-
-private fun updateBallistics(
-    render: StripRenderState,
-    dt: Float,
-    spectrum: FloatArray,
-    out: Float,
-    mic: Float,
-    isSpeaking: Boolean,
-    isListening: Boolean
-) {
-    for (b in 0 until 5) {
-        render.bands[b] = follow(render.bands[b], spectrum.getOrElse(b) { 0f }, dt, 0.030f, 0.160f)
-    }
-    render.outLevel = follow(render.outLevel, out, dt, 0.025f, 0.180f)
-    render.micLevel = follow(render.micLevel, mic, dt, 0.025f, 0.180f)
-
-    val aiTarget = if (isSpeaking) (0.35f + render.outLevel * 3.0f).coerceAtMost(1f) else 0f
-    val userTarget = if (isListening) (render.micLevel * 4.0f).coerceAtMost(1f) else 0f
-    render.aiPresence = follow(render.aiPresence, aiTarget, dt, 0.060f, 0.420f)
-    render.userPresence = follow(render.userPresence, userTarget, dt, 0.050f, 0.320f)
-}
-
-private fun geminiColorAt(p: Float): Color {
-    val x = (p - floor(p)) * 4f
-    val i = x.toInt().coerceIn(0, 3)
-    val f = x - i
-    val s = f * f * (3f - 2f * f)
-    return lerp(GeminiPalette[i], GeminiPalette[(i + 1) % 4], s)
-}
-
-private fun DrawScope.drawVoiceStrip(render: StripRenderState, dt: Float, isLive: Boolean) {
-    val w = size.width
-    val h = size.height
-    val cy = h / 2f
-    val spacing = w / (TOTAL_TICKS + 1)
-    val t = render.timeSec
-
-    val majorW = 2.4.dp.toPx()
-    val midW = 1.9.dp.toPx()
-    val minorW = 1.5.dp.toPx()
-    val coreMinW = 0.9.dp.toPx()
-
-    val ai = render.aiPresence
-    val user = render.userPresence
-    val presence = maxOf(ai, user)
-    val flow = if (ai >= user) t * 0.22f else -t * 0.22f
-
-    val activity = maxOf(
-        render.outLevel * 1.9f,
-        render.micLevel * 2.2f,
-        if (isLive) 0.05f else 0.02f
-    ).coerceAtMost(1f)
-
-    for (i in 0 until TOTAL_TICKS) {
-        val tick = i + 1
-        val x = tick * spacing
-        val isCenter = tick == TOTAL_TICKS / 2 + 1
-        if (isCenter) continue
-        val isMajor = tick % 5 == 1
-        val isMid = tick % 5 == 3
-
-        val bandEnergy = when {
-            tick <= 14 -> render.bands[0] * 0.85f + render.bands[1] * 0.65f
-            tick <= 34 -> render.bands[2] * 1.15f
-            tick <= 50 -> render.bands[3] * 1.20f
-            else -> render.bands[4] * 1.30f
-        }
-
-        val organic = 0.5f + 0.5f * sin(i * 0.61f + t * 6.2f) * cos(i * 0.23f - t * 2.7f)
-        val level = (activity * (0.55f + 0.45f * organic) + bandEnergy * 0.8f).coerceIn(0f, 1f)
-
-        val base = when {
-            isMajor -> 0.26f
-            isMid -> 0.18f
-            else -> 0.12f
-        }
-        val targetH = base + (0.95f - base) * level
-        val smoothed = follow(render.heights[i], targetH, dt, 0.022f, 0.120f)
-        render.heights[i] = smoothed
-
-        val halfH = (smoothed * (h / 2f)).coerceAtLeast(3.dp.toPx())
-        val barW = when {
-            isMajor -> majorW
-            isMid -> midW
-            else -> minorW
-        }
-        val barColor = when {
-            isMajor -> ColorInk
-            isMid -> ColorInkSoft
-            else -> ColorInkMinor
-        }
-
-        val top = Offset(x, cy - halfH)
-        val bottom = Offset(x, cy + halfH)
-
-        if (presence > 0.01f) {
-            val c = geminiColorAt(i / TOTAL_TICKS.toFloat() * 1.5f + flow)
-            val coreAlpha = (presence * (0.55f + 0.9f * level)).coerceIn(0f, 1f)
-
-            drawLine(
-                color = c.copy(alpha = 0.16f * coreAlpha),
-                start = top,
-                end = bottom,
-                strokeWidth = barW * 3.4f,
-                cap = StrokeCap.Round
-            )
-
-            drawLine(color = barColor, start = top, end = bottom, strokeWidth = barW, cap = StrokeCap.Round)
-
-            val inset = (barW * 1.1f).coerceAtMost(halfH * 0.5f)
-            if (halfH - inset > 1f) {
-                drawLine(
-                    color = c.copy(alpha = coreAlpha),
-                    start = Offset(x, cy - halfH + inset),
-                    end = Offset(x, cy + halfH - inset),
-                    strokeWidth = maxOf(barW * 0.46f, coreMinW),
-                    cap = StrokeCap.Round
+private fun performTactileClick(context: Context, intensity: Float = 1.0f) {
+    runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+            val vibrator = vibratorManager?.defaultVibrator
+            if (vibrator?.hasVibrator() == true) {
+                vibrator.vibrate(
+                    VibrationEffect.startComposition()
+                        .addPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK, intensity, 0)
+                        .compose()
                 )
             }
         } else {
-            drawLine(color = barColor, start = top, end = bottom, strokeWidth = barW, cap = StrokeCap.Round)
+            @Suppress("DEPRECATION")
+            val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            if (vibrator?.hasVibrator() == true) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
+                } else {
+                    vibrator.vibrate(20L)
+                }
+            }
         }
     }
 }
 
-private fun DrawScope.drawNeedle(render: StripRenderState, isLive: Boolean) {
-    val cx = size.width / 2f
-    val h = size.height
-    val needleW = 1.75.dp.toPx()
+/**
+ * Горизонтальная полукруглая капсула управления голосовой сессией (Start Session / End Session).
+ * Располагается под FM-лентой звука, снабжена светодиодом состояния и упругой механической отдачей.
+ */
+@Composable
+fun SessionControlPill(
+    linkState: LinkState,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
 
-    drawLine(
-        color = ColorInk,
-        start = Offset(cx, 1.5.dp.toPx()),
-        end = Offset(cx, h - 1.5.dp.toPx()),
-        strokeWidth = needleW,
-        cap = StrokeCap.Round
-    )
+    // Пружинная механическая отдача при нажатии (легкий толчок вниз)
+    val verticalBump = remember { Animatable(0f) }
 
-    val beadRadius = 4.dp.toPx()
-    val beadCenter = Offset(cx, beadRadius + 1.dp.toPx())
-    if (isLive) {
-        rotate(degrees = (render.timeSec * 90f) % 360f, pivot = beadCenter) {
-            drawCircle(
-                brush = Brush.sweepGradient(GeminiSweep, center = beadCenter),
-                radius = beadRadius,
-                center = beadCenter
-            )
-        }
-        drawCircle(color = ColorSurface, radius = beadRadius * 0.38f, center = beadCenter)
-    } else {
-        drawCircle(color = ColorInk, radius = beadRadius, center = beadCenter)
+    val isConnected = linkState == LinkState.LIVE
+    val isConnecting = linkState == LinkState.CONNECTING || linkState == LinkState.RECONNECTING
+
+    val targetTextColor = when {
+        isConnected -> ColorTextLive
+        isConnecting -> ColorTextConnecting
+        else -> ColorTextIdle
     }
 
-    drawCircle(
-        color = ColorInk,
-        radius = 2.2.dp.toPx(),
-        center = Offset(cx, h - 2.2.dp.toPx() - 1.dp.toPx())
+    val animatedLedColor by animateColorAsState(
+        targetValue = when {
+            isConnected -> ColorLedLive
+            isConnecting -> ColorLedConnecting
+            else -> ColorTextIdle
+        },
+        animationSpec = tween(durationMillis = 500, easing = FastOutSlowInEasing),
+        label = "session_pill_led_color"
     )
+
+    val animatedTextColor by animateColorAsState(
+        targetValue = targetTextColor,
+        animationSpec = tween(durationMillis = 650, easing = FastOutSlowInEasing),
+        label = "session_pill_text_color"
+    )
+
+    val animatedBorderColor by animateColorAsState(
+        targetValue = if (isConnected) ColorHairlineLive else ColorHairlineDefault,
+        animationSpec = tween(durationMillis = 500, easing = FastOutSlowInEasing),
+        label = "session_pill_border_color"
+    )
+
+    val auraScale by animateFloatAsState(
+        targetValue = if (isConnected) 1.25f else 1.0f,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
+        label = "aura_scale"
+    )
+
+    val pillShape = RoundedCornerShape(26.dp)
+
+    Box(
+        modifier = modifier
+            .height(52.dp)
+            .offset { IntOffset(0, verticalBump.value.roundToInt()) }
+            .shadow(
+                elevation = if (isConnected) 8.dp else 5.dp,
+                shape = pillShape,
+                ambientColor = if (isConnected) Color(0x1434A853) else Color(0x0F000000),
+                spotColor = if (isConnected) Color(0x2434A853) else Color(0x1A000000)
+            )
+            .clip(pillShape)
+            .background(ColorPillBackground)
+            .border(
+                width = 1.dp,
+                color = animatedBorderColor,
+                shape = pillShape
+            )
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null
+            ) {
+                coroutineScope.launch {
+                    performTactileClick(context, intensity = if (isConnected) 0.75f else 1.0f)
+
+                    launch {
+                        verticalBump.animateTo(
+                            targetValue = 4.dp.value,
+                            animationSpec = tween(durationMillis = 100, easing = FastOutSlowInEasing)
+                        )
+                        verticalBump.animateTo(
+                            targetValue = 0f,
+                            animationSpec = spring(
+                                dampingRatio = Spring.DampingRatioMediumBouncy,
+                                stiffness = Spring.StiffnessLow
+                            )
+                        )
+                    }
+
+                    onClick()
+                }
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 20.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            // Светодиодный индикатор слева с мягким ореолом
+            Box(
+                modifier = Modifier.size(16.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                if (isConnected || isConnecting) {
+                    Box(
+                        modifier = Modifier
+                            .size(14.dp)
+                            .scale(auraScale)
+                            .then(if (isConnecting) Modifier.connectingPulse() else Modifier)
+                            .clip(CircleShape)
+                            .background(animatedLedColor.copy(alpha = 0.24f))
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .size(7.dp)
+                        .then(if (isConnecting) Modifier.connectingPulse() else Modifier)
+                        .clip(CircleShape)
+                        .background(animatedLedColor)
+                )
+            }
+
+            Spacer(Modifier.width(12.dp))
+
+            // Горизонтальный текст действия
+            val label = when {
+                isConnected -> "END SESSION"
+                isConnecting -> "CONNECTING..."
+                else -> "START SESSION"
+            }
+
+            Text(
+                text = label,
+                color = animatedTextColor,
+                fontSize = 12.5.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
+                letterSpacing = 1.2.sp,
+                textAlign = TextAlign.Center
+            )
+        }
+    }
 }
