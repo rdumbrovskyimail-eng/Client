@@ -35,14 +35,15 @@ import com.client.app.session.LinkState
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
-// Белый минимализм: чернила + акценты Gemini (жёлтый — подключение, зелёный — эфир)
-private val ColorPillBackground = Color(0xFFFFFFFF)
-private val ColorHairlineDefault = Color(0xFFEBEBEB)
-private val ColorHairlineLive = Color(0xFF34A853).copy(alpha = 0.45f)
+// Чёрная тема: в покое — светлая капсула-призыв, в эфире — графит (жёлтый — подключение, зелёный — эфир)
+private val ColorPillIdle = Color(0xFFF4F4F5)
+private val ColorPillActive = Color(0xFF141416)
+private val ColorHairlineDefault = Color(0xFF2A2A2E)
+private val ColorHairlineLive = Color(0xFF34A853).copy(alpha = 0.55f)
 
 private val ColorTextIdle = Color(0xFF0A0A0A)
-private val ColorTextConnecting = Color(0xFF8A8A8F)
-private val ColorTextLive = Color(0xFF0A0A0A)
+private val ColorTextConnecting = Color(0xFFA1A1AA)
+private val ColorTextLive = Color(0xFFF4F4F5)
 private val ColorLedConnecting = Color(0xFFFBBC04)
 private val ColorLedLive = Color(0xFF34A853)
 
@@ -137,6 +138,12 @@ fun SessionControlPill(
         label = "session_pill_border_color"
     )
 
+    val animatedPillColor by animateColorAsState(
+        targetValue = if (isConnected || isConnecting) ColorPillActive else ColorPillIdle,
+        animationSpec = tween(durationMillis = 450, easing = FastOutSlowInEasing),
+        label = "session_pill_background"
+    )
+
     val auraScale by animateFloatAsState(
         targetValue = if (isConnected) 1.25f else 1.0f,
         animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
@@ -156,7 +163,7 @@ fun SessionControlPill(
                 spotColor = if (isConnected) Color(0x2434A853) else Color(0x1A000000)
             )
             .clip(pillShape)
-            .background(ColorPillBackground)
+            .background(animatedPillColor)
             .border(
                 width = 1.dp,
                 color = animatedBorderColor,
