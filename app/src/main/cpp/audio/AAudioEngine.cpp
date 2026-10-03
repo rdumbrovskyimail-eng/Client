@@ -1591,17 +1591,14 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
         engine->playbackRampGain_ = 0.0f;
     }
 
-    const bool paused = engine->playbackPaused_.load(std::memory_order_acquire);
-
-    // 1) Полная пауза: тишина, позиция очереди сохраняется (ничего не теряется)
-    if (paused && engine->playbackRampGain_ <= 0.0f) {
-        std::memset(samples, 0, frames * sizeof(int16_t));
-        engine->outRms_.store(0.0f, std::memory_order_relaxed);
-        return AAUDIO_CALLBACK_RESULT_CONTINUE;
-    }
+    // «Пауза» на время проверки перебивания = мягкое приглушение: звук не обрывается,
+    // очередь не встаёт, провалов и щелчков нет; ответ сбрасывается только после подтверждения
+    const bool ducked = engine->playbackPaused_.load(std::memory_order_acquire);
+    const float targetGain = ducked ? PLAYBACK_DUCK_GAIN : 1.0f;
+    const float duckStep = 1.0f / std::max(1.0f, static_cast<float>(rate) * PLAYBACK_DUCK_RAMP_MS / 1000.0f);
 
     // 2) Предзаполнение перед стартом фразы: убирает заикание первого слога при сетевом джиттере
-    if (engine->playbackPriming_ && !paused) {
+    if (engine->playbackPriming_) {
         const size_t buffered = engine->playbackBuffer_.availableRead();
         const size_t primeFrames = static_cast<size_t>(rate) * PLAYBACK_PRIME_MS / 1000;
         bool startNow = buffered >= primeFrames;
@@ -1623,30 +1620,32 @@ aaudio_data_callback_result_t AAudioEngine::playbackCallback(
         engine->playbackRampGain_ = 0.0f;
     }
 
-    // 3) При уходе в паузу читаем ровно столько, сколько занимает затухание: остальное остаётся в очереди
-    size_t want = frames;
-    if (paused) {
-        const size_t rampFrames = static_cast<size_t>(std::ceil(engine->playbackRampGain_ / rampStep));
-        want = std::min(frames, std::max<size_t>(1, rampFrames));
-    }
-
-    const size_t read = engine->playbackBuffer_.read(samples, want);
+    const size_t read = engine->playbackBuffer_.read(samples, frames);
     if (read > 0) {
         engine->playbackDspCv_.notify_one();
     }
 
+    // Фейд-ин начала фразы (rampStep) и плавное приглушение/возврат (duckStep) к targetGain
     float ramp = engine->playbackRampGain_;
-    if ((paused && ramp > 0.0f) || (!paused && ramp < 1.0f)) {
+    if (ramp != targetGain) {
         for (size_t i = 0; i < read; ++i) {
-            ramp = paused ? std::max(0.0f, ramp - rampStep) : std::min(1.0f, ramp + rampStep);
+            if (ramp < targetGain) {
+                ramp = std::min(targetGain, ramp + (ramp < PLAYBACK_DUCK_GAIN ? rampStep : duckStep));
+            } else {
+                ramp = std::max(targetGain, ramp - duckStep);
+            }
             samples[i] = static_cast<int16_t>(std::lrintf(static_cast<float>(samples[i]) * ramp));
         }
         engine->playbackRampGain_ = ramp;
+    } else if (ramp != 1.0f) {
+        for (size_t i = 0; i < read; ++i) {
+            samples[i] = static_cast<int16_t>(std::lrintf(static_cast<float>(samples[i]) * ramp));
+        }
     }
 
     if (read < frames) {
         std::memset(samples + read, 0, (frames - read) * sizeof(int16_t));
-        if (!paused) {
+        {
             // Опустошение: гасим хвост без щелчка и готовим предзаполнение следующей фразы
             const size_t tail = std::min(read, fadeFrames);
             for (size_t i = 0; i < tail; ++i) {
