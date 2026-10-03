@@ -50,9 +50,13 @@ private val ColorTextPrimary = Color(0xFF09090B)
 private val ColorTextSecondary = Color(0xFF71717A)
 
 /**
- * Главный экран приложения: «Чистый белый лист» флагманского уровня на базе Samsung Galaxy S23 Ultra.
- * Полностью исключает чат и сферу, концентрируя внимание на аналоговой FM-полосе звука,
- * поворотной черной шестеренке и трех физических выдвижных органах управления.
+ * Главный экран приложения с обновлённой пространственной геометрией:
+ * - В самом верху: горизонтальный блок Prompt на всю ширину экрана.
+ * - Чуть ниже Prompt: горизонтальная кнопка Materials.
+ * - Под Materials справа: контроллер шестерёнки настроек и терминала логов.
+ * - Внизу экрана: увеличенная в 2 раза FM-лента визуализации речи (168.dp),
+ *   расположенная на симметричном расстоянии к низу экрана.
+ * - Прямо под визуализатором: горизонтальная кнопка Start Session (~70% ширины визуализатора).
  */
 @Composable
 fun ClientScreen(
@@ -64,7 +68,6 @@ fun ClientScreen(
     val errorCount by viewModel.errorCount.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
-    // Обработчик системных разрешений на микрофон и сопутствующие модули
     val permissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
@@ -77,7 +80,6 @@ fun ClientScreen(
         }
     }
 
-    // Запуск сессии с предварительной проверкой разрешений
     fun handleSessionClick() {
         val requiredMissing = mutableListOf<String>()
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -94,7 +96,6 @@ fun ClientScreen(
             optionalMissing.add(Manifest.permission.BLUETOOTH_CONNECT)
         }
 
-        // Остановка сессии разрешений не требует
         if (viewModel.state.value.link != LinkState.IDLE) {
             viewModel.toggleConnection()
             return
@@ -103,13 +104,12 @@ fun ClientScreen(
         if (allMissing.isEmpty()) {
             viewModel.toggleConnection()
         } else {
-            // Сначала все разрешения (включая BLUETOOTH_CONNECT), старт — в колбэке
             permissionsLauncher.launch(allMissing.toTypedArray())
         }
     }
 
     // =========================================================================
-    // БАЗОВЫЙ ХОЛСТ: БЕЛЫЙ ЛИСТ (Screen Canvas)
+    // БАЗОВЫЙ ХОЛСТ: ЧИСТЫЙ БЕЛЫЙ ЛИСТ
     // =========================================================================
     BoxWithConstraints(
         modifier = Modifier
@@ -117,17 +117,55 @@ fun ClientScreen(
             .background(ColorCanvasWhite)
     ) {
         val screenHeight = maxHeight
-        // Высота FM-полоски строго на отметке ~1/5 (19-20%) высоты экрана
-        val fmTopOffset = screenHeight * 0.19f
+        // Симметричный отступ снизу: 19% высоты экрана
+        val fmBottomOffset = screenHeight * 0.19f
 
         // =====================================================================
-        // 1. АКУСТИЧЕСКАЯ FM-ПОЛОСКА ВИЗУАЛИЗАЦИИ ЗВУКА (Спикер Gemini Live)
+        // 1. САМЫЙ ВЕРХ: ГОРИЗОНТАЛЬНЫЙ БЛОК "PROMPT" НА ВСЮ ШИРИНУ ЭКРАНА
+        // =====================================================================
+        PromptConsoleDrawer(
+            currentPrompt = state.activePrompt,
+            onApplyPrompt = { newPrompt ->
+                viewModel.applyPrompt(newPrompt)
+            },
+            modifier = Modifier
+                .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.statusBars)
+        )
+
+        // =====================================================================
+        // 2. ЧУТЬ НИЖЕ PROMPT: ГОРИЗОНТАЛЬНАЯ КНОПКА "MATERIALS"
+        // =====================================================================
+        MaterialsConsoleDrawer(
+            onSendMaterials = { text, uris ->
+                viewModel.sendText(text, uris)
+            },
+            modifier = Modifier
+                .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.statusBars)
+        )
+
+        // =====================================================================
+        // 3. ПОД ПАНЕЛЬЮ МАТЕРИАЛОВ СПРАВА: ШЕСТЕРЁНКА НАСТРОЕК И ТЕРМИНАЛ
+        // =====================================================================
+        SettingsGearButton(
+            onOpenSettings = onNavigateSettings,
+            onOpenLogs = onNavigateLogs,
+            errorCount = errorCount,
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .windowInsetsPadding(WindowInsets.statusBars)
+                .padding(top = 112.dp, end = 20.dp)
+        )
+
+        // =====================================================================
+        // 4. НИЖНЯЯ ЗОНА: УВЕЛИЧЕННАЯ В 2 РАЗА FM-ПОЛОСКА (168.dp)
         // =====================================================================
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .align(Alignment.TopCenter)
-                .padding(top = fmTopOffset)
+                .align(Alignment.BottomCenter)
+                .padding(bottom = fmBottomOffset)
                 .padding(horizontal = 24.dp)
         ) {
             FmStripAudioVisualizer(
@@ -137,52 +175,21 @@ fun ClientScreen(
         }
 
         // =====================================================================
-        // 2. ВЕРХНИЙ ПРАВЫЙ УГОЛ: ЧЕРНАЯ ШЕСТЕРЕНКА НАСТРОЕК С ПРУЖИННЫМ КРУЧЕНИЕМ
-        // =====================================================================
-        SettingsGearButton(
-            onOpenSettings = onNavigateSettings,
-            onOpenLogs = onNavigateLogs,
-            errorCount = errorCount,
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .windowInsetsPadding(WindowInsets.statusBars)
-                .padding(top = 16.dp, end = 20.dp)
-        )
-
-        // =====================================================================
-        // 3. НИЖНЯЯ ПРАВАЯ ПЛАШКА: "START A SESSION" (Черный -> Изумрудный)
+        // 5. НЕМНОЖКО НИЖЕ ВИЗУАЛИЗАТОРА: ГОРИЗОНТАЛЬНАЯ КНОПКА START SESSION
+        // (~30% меньше по длине, чем визуализатор: 68% ширины экрана, по центру)
         // =====================================================================
         SessionControlPill(
             linkState = state.link,
             onClick = { handleSessionClick() },
             modifier = Modifier
-                .fillMaxSize()
+                .align(Alignment.BottomCenter)
+                .padding(bottom = (fmBottomOffset - 66.dp).coerceAtLeast(16.dp))
+                .fillMaxWidth(0.68f)
                 .windowInsetsPadding(WindowInsets.navigationBars)
         )
 
         // =====================================================================
-        // 4. ЛЕВАЯ НИЖНЯЯ ПЛАШКА И ШУХЛЯДКА ВЛОЖЕНИЙ: "MATERIALS" (Черный -> Лазурный)
-        // =====================================================================
-        MaterialsConsoleDrawer(
-            onSendMaterials = { text, uris ->
-                viewModel.sendText(text, uris)
-            },
-            modifier = Modifier.fillMaxSize()
-        )
-
-        // =====================================================================
-        // 5. ЛЕВАЯ ЦЕНТРАЛЬНАЯ ПЛАШКА И ШУХЛЯДКА РОЛИ: "PROMPT" (Радуга "веселка")
-        // =====================================================================
-        PromptConsoleDrawer(
-            currentPrompt = state.activePrompt,
-            onApplyPrompt = { newPrompt ->
-                viewModel.applyPrompt(newPrompt)
-            },
-            modifier = Modifier.fillMaxSize()
-        )
-
-        // =====================================================================
-        // 6. ДЕЛИКАТНЫЙ СИСТЕМНЫЙ БЕЙДЖ ОШИБОК (Появляется только при сбое)
+        // 6. СИСТЕМНЫЙ БЕЙДЖ ОШИБКИ (ПОЯВЛЯЕТСЯ ПРИ СБОЕ)
         // =====================================================================
         AnimatedVisibility(
             visible = state.error != null,
@@ -191,7 +198,7 @@ fun ClientScreen(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .windowInsetsPadding(WindowInsets.navigationBars)
-                .padding(bottom = 16.dp, start = 60.dp, end = 60.dp)
+                .padding(bottom = 12.dp, start = 40.dp, end = 40.dp)
         ) {
             state.error?.let { errorMessage ->
                 Box(
@@ -212,7 +219,6 @@ fun ClientScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        // Микросветодиод статуса ошибки
                         Box(
                             modifier = Modifier
                                 .size(7.dp)
