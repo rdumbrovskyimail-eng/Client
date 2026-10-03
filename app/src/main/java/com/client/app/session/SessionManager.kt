@@ -124,8 +124,9 @@ class SessionManager @Inject constructor(
         val KEY_OUTPUT_TRANSCRIPTION_VOCAB = stringPreferencesKey("gemini_output_tx_vocab")
         val KEY_OUTPUT_TRANSCRIPTION_MODE = stringPreferencesKey("gemini_output_tx_mode")
 
-        // v2: гибридный VAD по умолчанию; прежний ключ держал ручной режим без серверной страховки конца фразы
-        val KEY_AAD_ENABLED = booleanPreferencesKey("gemini_aad_enabled_v2")
+        // v3: ручной VAD (activityStart/activityEnd) по умолчанию — сервер отвечает сразу по activityEnd.
+        // В v2 был гибридный режим: сервер не получал тишину после фразы, не видел её конца и молчал.
+        val KEY_AAD_ENABLED = booleanPreferencesKey("gemini_aad_enabled_v3")
         val KEY_AAD_START_SENSITIVITY = stringPreferencesKey("gemini_aad_start_sensitivity")
         val KEY_AAD_END_SENSITIVITY = stringPreferencesKey("gemini_aad_end_sensitivity")
         val KEY_PREFIX_PADDING_MS = intPreferencesKey("gemini_prefix_padding_ms")
@@ -145,7 +146,6 @@ class SessionManager @Inject constructor(
         val KEY_INITIAL_HISTORY_TURNS = intPreferencesKey("gemini_initial_history_turns")
 
         val KEY_ENABLE_FORVO = booleanPreferencesKey("enable_forvo")
-        // Новый ключ: прежнее сохранённое «true» больше не включает поиск (из-за него сессия падала по квоте)
         val KEY_ENABLE_SEARCH = booleanPreferencesKey("enable_search_v2")
         val KEY_VOLUME = floatPreferencesKey("audio_volume")
         val KEY_MIC_GAIN = floatPreferencesKey("audio_mic_gain")
@@ -205,6 +205,11 @@ class SessionManager @Inject constructor(
         LiveModelCapabilitiesRegistry.forModel(DEFAULT_LIVE_MODEL)
 
     private val isManualActivityActive = AtomicBoolean(false)
+    // Страховка ручного VAD: если в шуме локальный детектор не видит конца фразы,
+    // activityEnd уходит принудительно — иначе модель ждёт бесконечно
+    @Volatile private var manualActivityStartedAtMs = 0L
+    // 20 мс цифровой тишины (16 кГц, 16 бит) для серверного VAD в гибридном режиме
+    private val trailingSilenceFrame = ByteArray(640)
     private val isTextTurnInProgress = AtomicBoolean(false)
 
     private val activeToolJobs = ConcurrentHashMap<ToolCallKey, Job>()
@@ -217,7 +222,6 @@ class SessionManager @Inject constructor(
         observeBargeIn()
         observeFocus()
         observeForvoQuota()
-        // Прогрев Silero VAD заранее: к моменту setupComplete модель уже в памяти
         scope.launch(Dispatchers.IO) { audioEngine.prewarmVad() }
     }
 
@@ -241,7 +245,6 @@ class SessionManager @Inject constructor(
                     reconnectAttempts = 0
                     resumptionHandle = null
                     cancelReconnectWork()
-                    // Новая сессия начинается с чистого контекста
                     _state.update { it.copy(messages = emptyList(), error = null) }
                     try {
                         startInternal(resume = false)
@@ -313,7 +316,6 @@ class SessionManager @Inject constructor(
                 if (!changed) return@withLock
 
                 val shouldRestart = _state.value.link != LinkState.IDLE
-                // Сначала сохраняем: роль переживает перезапуск приложения и видна в настройках
                 runCatching { dataStore.edit { it[KEY_SYSTEM_PROMPT] = newPrompt } }
                     .onFailure { logger.e("SessionManager: не удалось сохранить промпт", it) }
                 _state.update { it.copy(activePrompt = newPrompt) }
@@ -540,11 +542,6 @@ class SessionManager @Inject constructor(
         }
     }
 
-    /**
-     * Порядок по рекомендациям Live API: персона (промпт пользователя) → правила разговора → ограничения.
-     * Язык закрепляется формулировкой из документации Google («RESPOND IN … UNMISTAKABLY»):
-     * нативные аудиомодели сами выбирают язык и меняют его на коротких неразборчивых репликах.
-     */
     private fun buildSystemInstruction(userPrompt: String, speechLang: String): String {
         val locale = java.util.Locale.forLanguageTag(speechLang)
         val langEn = locale.getDisplayLanguage(java.util.Locale.ENGLISH).ifBlank { "Russian" }.uppercase()
@@ -820,7 +817,7 @@ class SessionManager @Inject constructor(
             mode = prefs[KEY_OUTPUT_TRANSCRIPTION_MODE] ?: "VERBATIM"
         )
 
-        val aadEnabled = prefs[KEY_AAD_ENABLED] ?: true
+        val aadEnabled = prefs[KEY_AAD_ENABLED] ?: false
         currentAadEnabled = aadEnabled
         audioEngine.isAadMode = aadEnabled
         audioEngine.setBluetoothHiFiEnabled(prefs[KEY_BT_HIFI_MODE] ?: false)
@@ -830,7 +827,7 @@ class SessionManager @Inject constructor(
             startSensitivity = prefs[KEY_AAD_START_SENSITIVITY] ?: "START_SENSITIVITY_HIGH",
             endSensitivity = prefs[KEY_AAD_END_SENSITIVITY] ?: "END_SENSITIVITY_HIGH",
             prefixPaddingMs = prefs[KEY_PREFIX_PADDING_MS] ?: 60,
-            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 600,
+            silenceDurationMs = prefs[KEY_SILENCE_DURATION_MS] ?: 800,
             activityHandling = prefs[KEY_ACTIVITY_HANDLING] ?: "START_OF_ACTIVITY_INTERRUPTS",
             turnCoverage = prefs[KEY_TURN_COVERAGE] ?: "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"
         )
@@ -885,7 +882,6 @@ class SessionManager @Inject constructor(
             return
         }
 
-        // Статус «подключение» сразу; аудиомаршрут поднимается ниже, параллельно с рукопожатием
         _state.update {
             it.copy(
                 link = if (resume) LinkState.RECONNECTING else LinkState.CONNECTING,
@@ -981,7 +977,6 @@ class SessionManager @Inject constructor(
             throw t
         }
 
-        // Аудиомаршрут поднимается параллельно с TLS/WebSocket-рукопожатием и setup на сервере
         val playbackStarted = try {
             audioEngine.startPlayback()
         } catch (cancelled: CancellationException) {
@@ -1336,6 +1331,15 @@ class SessionManager @Inject constructor(
                             val audio = event.data
                             try {
                                 if (
+                                    !currentAadEnabled &&
+                                    isManualActivityActive.get() &&
+                                    android.os.SystemClock.elapsedRealtime() - manualActivityStartedAtMs > 30_000L &&
+                                    isManualActivityActive.compareAndSet(true, false)
+                                ) {
+                                    logger.w("SessionManager: реплика длиннее 30 с (шум?) -> принудительный activityEnd")
+                                    withTimeoutOrNull(500L) { client.sendActivityEnd() }
+                                }
+                                if (
                                     !forvoPlayer.isPlaying.value &&
                                     !isTextTurnInProgress.get() &&
                                     (currentAadEnabled || isManualActivityActive.get()) &&
@@ -1354,14 +1358,19 @@ class SessionManager @Inject constructor(
                             is AudioStreamControlEvent.SpeechStart -> {
                                 if (!currentAadEnabled && client.isReady) {
                                     isManualActivityActive.set(true)
+                                    manualActivityStartedAtMs = android.os.SystemClock.elapsedRealtime()
                                     logger.d("SessionManager: VAD SpeechStart -> activityStart")
                                     client.sendActivityStart()
                                 }
                             }
 
                             is AudioStreamControlEvent.SpeechEnd -> {
-                                logger.d("SessionManager: VAD SpeechEnd -> activityEnd (ушло ${client.getTransportAudioStats().outboundMicBytesDelivered / 32} мс аудио за сессию)")
+                                logger.d("SessionManager: VAD SpeechEnd -> ${if (currentAadEnabled) "тишина + audioStreamEnd" else "activityEnd"} (ушло ${client.getTransportAudioStats().outboundMicBytesDelivered / 32} мс аудио за сессию)")
                                 if (currentAadEnabled && client.isReady) {
+                                    // Серверный VAD видит конец фразы только по тишине в самом аудиопотоке, а локальный
+                                    // VAD обрывает поток сразу после фразы. Без досылки тишины сервер навсегда остаётся
+                                    // в состоянии «пользователь говорит» и не отвечает. 100 × 20 мс = 2 с.
+                                    repeat(100) { client.sendAudioPcm(trailingSilenceFrame, trailingSilenceFrame.size) }
                                     client.sendAudioStreamEnd()
                                 } else if (!currentAadEnabled && client.isReady) {
                                     isManualActivityActive.set(false)
@@ -2387,7 +2396,6 @@ class SessionManager @Inject constructor(
 
     private fun observeSettings() = scope.launch {
         dataStore.data.collect { prefs ->
-            // Единый промпт для шторки Prompt и экрана настроек; применяется при следующем подключении
             prefs[KEY_SYSTEM_PROMPT]?.let { stored ->
                 if (stored != _state.value.activePrompt) {
                     _state.update { it.copy(activePrompt = stored) }
