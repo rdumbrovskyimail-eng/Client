@@ -43,7 +43,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -89,7 +88,8 @@ private fun performTactileClick(context: Context) {
 }
 
 /**
- * Левая вертикальная плашка «Prompt» с радужной анимацией дисперсии и выезжающей горизонтальной консолью.
+ * Верхняя горизонтальная плашка «Prompt» на всю ширину экрана с горизонтальной радужной дисперсией
+ * и выезжающей сверху вниз консолью редактирования системной роли Gemini Live.
  */
 @Composable
 fun PromptConsoleDrawer(
@@ -104,20 +104,18 @@ fun PromptConsoleDrawer(
     var isDrawerOpen by remember { mutableStateOf(false) }
     var draftPromptText by remember(currentPrompt) { mutableStateOf(currentPrompt) }
 
-    // Контроль спектрального радужного свечения ("веселка")
+    // Контроль спектрального радужного свечения (цвета Gemini)
     var isRainbowActive by remember { mutableStateOf(false) }
     val rainbowOffsetAnim = remember { Animatable(0f) }
 
-    // Анимация упругого толчка плашки вправо перед раскрытием
-    val pillHorizontalBump = remember { Animatable(0f) }
+    // Пружинный толчок вниз при нажатии на верхнюю плашку
+    val pillVerticalBump = remember { Animatable(0f) }
 
-    // Перехват жеста "Назад" при открытой шухлядке
     BackHandler(enabled = isDrawerOpen) {
         performTactileClick(context)
         isDrawerOpen = false
     }
 
-    // Кисть четырёх цветов Gemini: синий → красный → жёлтый → зелёный
     val rainbowColors = listOf(
         Color(0xFF4285F4),
         Color(0xFFEA4335),
@@ -126,36 +124,37 @@ fun PromptConsoleDrawer(
         Color(0xFF4285F4)
     )
 
-    val rainbowBrush = Brush.verticalGradient(
+    // Горизонтальный градиент бегущей волны
+    val rainbowBrush = Brush.horizontalGradient(
         colors = rainbowColors,
-        startY = rainbowOffsetAnim.value,
-        endY = rainbowOffsetAnim.value + 260f
+        startX = rainbowOffsetAnim.value,
+        endX = rainbowOffsetAnim.value + 400f
     )
 
     Box(modifier = modifier.fillMaxSize()) {
 
         // =====================================================================
-        // 1. ВЕРТИКАЛЬНАЯ ПЛАШКА-ЯЗЫЧОК "P-r-o-m-p-t" (У левого края по центру)
+        // 1. ВЕРХНИЙ ГОРИЗОНТАЛЬНЫЙ БЛОК "P R O M P T" НА ВСЮ ШИРИНУ ЭКРАНА
         // =====================================================================
         if (!isDrawerOpen) {
             Box(
                 modifier = Modifier
-                    .align(Alignment.CenterStart)
-                    .offset { IntOffset(pillHorizontalBump.value.roundToInt(), 0) }
-                    .width(42.dp)
-                    .height(174.dp)
+                    .align(Alignment.TopCenter)
+                    .offset { IntOffset(0, pillVerticalBump.value.roundToInt()) }
+                    .fillMaxWidth()
+                    .height(48.dp)
                     .shadow(
-                        elevation = 6.dp,
-                        shape = RoundedCornerShape(topStart = 0.dp, bottomStart = 0.dp, topEnd = 24.dp, bottomEnd = 24.dp),
-                        ambientColor = Color(0x0F000000),
-                        spotColor = Color(0x1A000000)
+                        elevation = 4.dp,
+                        shape = RoundedCornerShape(bottomStart = 20.dp, bottomEnd = 20.dp),
+                        ambientColor = Color(0x0A000000),
+                        spotColor = Color(0x14000000)
                     )
-                    .clip(RoundedCornerShape(topStart = 0.dp, bottomStart = 0.dp, topEnd = 24.dp, bottomEnd = 24.dp))
+                    .clip(RoundedCornerShape(bottomStart = 20.dp, bottomEnd = 20.dp))
                     .background(ColorPillBackground)
                     .border(
                         width = 1.dp,
                         color = ColorHairline,
-                        shape = RoundedCornerShape(topStart = 0.dp, bottomStart = 0.dp, topEnd = 24.dp, bottomEnd = 24.dp)
+                        shape = RoundedCornerShape(bottomStart = 20.dp, bottomEnd = 20.dp)
                     )
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
@@ -165,26 +164,28 @@ fun PromptConsoleDrawer(
                             performTactileClick(context)
                             isRainbowActive = true
 
-                            // Запуск упругого толчка вправо и прогона световой волны
+                            // Механический пружинный толчок плашки вниз
                             launch {
-                                pillHorizontalBump.animateTo(
-                                    targetValue = 6.dp.value,
-                                    animationSpec = tween(durationMillis = 120, easing = FastOutSlowInEasing)
+                                pillVerticalBump.animateTo(
+                                    targetValue = 4.dp.value,
+                                    animationSpec = tween(durationMillis = 110, easing = FastOutSlowInEasing)
                                 )
-                                pillHorizontalBump.animateTo(
+                                pillVerticalBump.animateTo(
                                     targetValue = 0f,
-                                    animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow)
+                                    animationSpec = spring(
+                                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                                        stiffness = Spring.StiffnessLow
+                                    )
                                 )
                             }
 
-                            // Прогон спектрального градиента
-                            rainbowOffsetAnim.snapTo(-300f)
+                            // Горизонтальный пробег радуги слева направо
+                            rainbowOffsetAnim.snapTo(-400f)
                             rainbowOffsetAnim.animateTo(
-                                targetValue = 400f,
-                                animationSpec = tween(durationMillis = 380, easing = LinearEasing)
+                                targetValue = 1200f,
+                                animationSpec = tween(durationMillis = 420, easing = LinearEasing)
                             )
 
-                            // Открытие консоли-шухлядки
                             draftPromptText = currentPrompt
                             isDrawerOpen = true
                             isRainbowActive = false
@@ -192,41 +193,50 @@ fun PromptConsoleDrawer(
                     },
                 contentAlignment = Alignment.Center
             ) {
-                Column(
-                    modifier = Modifier.fillMaxHeight(),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.SpaceEvenly
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    val letters = listOf("P", "r", "o", "m", "p", "t")
-                    letters.forEach { char ->
-                        Text(
-                            text = char,
-                            style = if (isRainbowActive) {
-                                TextStyle(brush = rainbowBrush, fontSize = 13.5.sp, fontWeight = FontWeight.Black)
-                            } else {
-                                TextStyle(color = ColorTextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                            },
-                            fontFamily = FontFamily.Monospace,
-                            textAlign = TextAlign.Center
-                        )
-                    }
+                    Text(
+                        text = "P  R  O  M  P  T",
+                        style = if (isRainbowActive) {
+                            TextStyle(
+                                brush = rainbowBrush,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Black,
+                                letterSpacing = 2.5.sp
+                            )
+                        } else {
+                            TextStyle(
+                                color = ColorTextPrimary,
+                                fontSize = 12.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 2.5.sp
+                            )
+                        },
+                        fontFamily = FontFamily.Monospace,
+                        textAlign = TextAlign.Center
+                    )
                 }
             }
         }
 
         // =====================================================================
-        // 2. ВЫЕЗЖАЮЩАЯ СЛЕВА НАПРАВО БЕЛАЯ КОНСОЛЬ-ШУХЛЯДКА (Horizontal Drawer)
+        // 2. ВЫЕЗЖАЮЩАЯ СВЕРХУ ВНИЗ БЕЛАЯ КОНСОЛЬ РЕДАКТИРОВАНИЯ
         // =====================================================================
         AnimatedVisibility(
             visible = isDrawerOpen,
-            enter = slideInHorizontally(
-                initialOffsetX = { -it },
-                animationSpec = tween(durationMillis = 380, easing = CubicBezierEasing(0.16f, 1.0f, 0.3f, 1.0f))
-            ) + fadeIn(animationSpec = tween(250)),
-            exit = slideOutHorizontally(
-                targetOffsetX = { -it },
-                animationSpec = tween(durationMillis = 280, easing = FastOutLinearInEasing)
-            ) + fadeOut(animationSpec = tween(200))
+            enter = slideInVertically(
+                initialOffsetY = { -it },
+                animationSpec = tween(durationMillis = 360, easing = CubicBezierEasing(0.16f, 1.0f, 0.3f, 1.0f))
+            ) + fadeIn(animationSpec = tween(240)),
+            exit = slideOutVertically(
+                targetOffsetY = { -it },
+                animationSpec = tween(durationMillis = 260, easing = FastOutLinearInEasing)
+            ) + fadeOut(animationSpec = tween(180))
         ) {
             Box(
                 modifier = Modifier
@@ -240,30 +250,30 @@ fun PromptConsoleDrawer(
                         isDrawerOpen = false
                     }
             ) {
-                // Основной прямоугольный блок консоли
                 Box(
                     modifier = Modifier
-                        .align(Alignment.CenterStart)
-                        .fillMaxWidth(0.90f)
+                        .align(Alignment.TopCenter)
+                        .fillMaxWidth()
                         .fillMaxHeight(0.68f)
                         .shadow(
                             elevation = 16.dp,
-                            shape = RoundedCornerShape(topStart = 0.dp, bottomStart = 0.dp, topEnd = 24.dp, bottomEnd = 24.dp),
+                            shape = RoundedCornerShape(bottomStart = 24.dp, bottomEnd = 24.dp),
                             ambientColor = Color(0x14000000),
                             spotColor = Color(0x28000000)
                         )
-                        .clip(RoundedCornerShape(topStart = 0.dp, bottomStart = 0.dp, topEnd = 24.dp, bottomEnd = 24.dp))
+                        .clip(RoundedCornerShape(bottomStart = 24.dp, bottomEnd = 24.dp))
                         .background(ColorDrawerBackground)
                         .border(
                             width = 1.dp,
                             color = ColorHairline,
-                            shape = RoundedCornerShape(topStart = 0.dp, bottomStart = 0.dp, topEnd = 24.dp, bottomEnd = 24.dp)
+                            shape = RoundedCornerShape(bottomStart = 24.dp, bottomEnd = 24.dp)
                         )
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null
                         ) { /* Изоляция кликов внутри консоли */ }
-                        .padding(20.dp)
+                        .windowInsetsPadding(WindowInsets.statusBars)
+                        .padding(horizontal = 20.dp, vertical = 16.dp)
                 ) {
                     Column(
                         modifier = Modifier
@@ -271,7 +281,7 @@ fun PromptConsoleDrawer(
                             .windowInsetsPadding(WindowInsets.ime)
                     ) {
 
-                        // Шапка консоли: заголовок и крестик закрытия
+                        // Шапка: заголовок и кнопка закрытия
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -295,7 +305,6 @@ fun PromptConsoleDrawer(
                                 )
                             }
 
-                            // Кнопка закрытия
                             Box(
                                 modifier = Modifier
                                     .size(36.dp)
@@ -317,7 +326,7 @@ fun PromptConsoleDrawer(
                             }
                         }
 
-                        Spacer(Modifier.height(16.dp))
+                        Spacer(Modifier.height(14.dp))
 
                         // Рабочее поле ввода текста промпта
                         Box(
@@ -354,16 +363,14 @@ fun PromptConsoleDrawer(
                             )
                         }
 
-                        Spacer(Modifier.height(16.dp))
+                        Spacer(Modifier.height(14.dp))
 
-                        // Нижняя панель действий: стандартные минималистичные кнопки
+                        // Нижняя панель действий
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-
-                            // 1. Кнопка "Копировать"
                             MinimalistActionButton(
                                 icon = Icons.Filled.ContentCopy,
                                 label = "Копия",
@@ -376,7 +383,6 @@ fun PromptConsoleDrawer(
                                 }
                             }
 
-                            // 2. Кнопка "Вставить"
                             MinimalistActionButton(
                                 icon = Icons.Filled.ContentPaste,
                                 label = "Вставка",
@@ -389,7 +395,6 @@ fun PromptConsoleDrawer(
                                 }
                             }
 
-                            // 3. Кнопка "Очистить"
                             MinimalistActionButton(
                                 icon = Icons.Filled.DeleteOutline,
                                 label = "Сброс",
@@ -399,7 +404,6 @@ fun PromptConsoleDrawer(
                                 draftPromptText = ""
                             }
 
-                            // 4. Кнопка "Применить" (Акцентная черная капсула)
                             Box(
                                 modifier = Modifier
                                     .weight(1.35f)
